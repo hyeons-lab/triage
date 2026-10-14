@@ -106,22 +106,48 @@ typedef RailLayoutRecord = ({
 
 /// Daemon-host disk space for the volume holding the daemon's state.
 /// 0/0 means the daemon could not probe it (or predates stats entirely).
-typedef DaemonStatsRecord = ({int diskFreeBytes, int diskTotalBytes});
+typedef DaemonStatsRecord = ({
+  int diskFreeBytes,
+  int diskTotalBytes,
+  int? cpuPercent,
+  int? batteryPercent,
+  String batteryState,
+});
 
 /// Whether a poll result is worth rendering over the current reading. A
-/// zero-total record is a transient probe failure, not an empty disk: the
-/// poller keeps the last good reading instead of flickering the line out.
+/// record with no usable leg is a transient probe failure, not an empty
+/// machine: the poller keeps the last good reading instead of flickering
+/// the lines out.
 bool isUsableDaemonStats(DaemonStatsRecord? stats) {
-  return stats != null && stats.diskTotalBytes > 0;
+  return stats != null &&
+      (stats.diskTotalBytes > 0 ||
+          stats.cpuPercent != null ||
+          stats.batteryPercent != null);
 }
 
 /// Reads daemon stats out of a `hello` or `get_daemon_stats` response map.
-/// Both carry the same `disk_*` keys; absent keys read as unknown (0/0), so
-/// a hello from a daemon predating stats degrades to a hidden line.
+/// Both carry the same keys; absent disk keys read as unknown (0/0), so a
+/// hello from a daemon predating stats degrades to hidden lines. Host
+/// percents normalize here for both protocols: negative (the FlatBuffers
+/// unknown sentinel) reads as null, above 100 clamps, and an unrecognized
+/// battery state reads as unknown.
 DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
+  int? legiblePercent(String key) {
+    final raw = response[key];
+    if (raw is! num) return null;
+    final value = raw.toInt();
+    if (value < 0) return null;
+    return value > 100 ? 100 : value;
+  }
+
+  final rawState = response['battery_state']?.toString().toLowerCase();
+  const knownStates = {'unknown', 'charging', 'discharging', 'full'};
   return (
     diskFreeBytes: (response['disk_free_bytes'] as num?)?.toInt() ?? 0,
     diskTotalBytes: (response['disk_total_bytes'] as num?)?.toInt() ?? 0,
+    cpuPercent: legiblePercent('cpu_percent'),
+    batteryPercent: legiblePercent('battery_percent'),
+    batteryState: knownStates.contains(rawState) ? rawState! : 'unknown',
   );
 }
 
@@ -133,7 +159,30 @@ DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
 ///   falling back to raw base64 bytes if uncompressed.
 /// - `List<dynamic>`: legacy uncompressed JSON integer byte arrays.
 Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
-  final raw = snapshot['raw_output'];
+  return historyBytesFromField(snapshot['raw_output']);
+}
+
+/// Extracts the journaled scrollback prefix (lines at or older than the
+/// raw window seam) from a parsed snapshot map. Empty from old hosts; same
+/// encodings as the raw tail.
+Uint8List rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) {
+  return historyBytesFromField(snapshot['raw_output_prefix']);
+}
+
+/// Whether a parsed snapshot carries replayable history: either the raw
+/// tail or the journaled prefix counts. A prefix-only snapshot is
+/// reachable when the raw tail is empty but offset-0 journal survivors
+/// remain (a failed tail read re-queries the journal at seam 0, so only
+/// records stamped exactly 0 ride along); the restore fallback must not
+/// discard it as history-less.
+bool snapshotCarriesHistory(Map<String, dynamic> snapshot) {
+  return rawOutputFromSnapshot(snapshot).isNotEmpty ||
+      rawOutputPrefixFromSnapshot(snapshot).isNotEmpty;
+}
+
+/// Decodes one compressed-bytes history field (snapshot tail or fetch page)
+/// from either transport encoding into raw PTY bytes.
+Uint8List historyBytesFromField(dynamic raw) {
   if (raw is Uint8List) return raw;
   if (raw is String) {
     if (raw.isEmpty) return Uint8List(0);
@@ -205,6 +254,17 @@ class TriageWebSocketClient {
   int _requestIdCounter = 0;
 
   bool get isConnected => _channel != null;
+
+  // Monotonic proof-of-life: any inbound frame (response, event, output)
+  // shows the socket delivers, even when one request is slow behind a big
+  // one on the daemon's serial per-connection queue.
+  final Stopwatch _rxStopwatch = Stopwatch();
+  int _lastRxElapsedMs = 0;
+
+  /// Milliseconds since any frame arrived. Zero when disconnected or before the first connect.
+  int get millisSinceLastInbound => (isConnected && _rxStopwatch.isRunning)
+      ? _rxStopwatch.elapsedMilliseconds - _lastRxElapsedMs
+      : 0;
 
   /// Default to FlatBuffers unless the server explicitly negotiated JSON.
   /// This ensures connections through reverse proxies that strip
@@ -286,6 +346,10 @@ class TriageWebSocketClient {
       }
       _channel = pending;
       _subscription = subscription;
+      _rxStopwatch
+        ..reset()
+        ..start();
+      _lastRxElapsedMs = 0;
     } catch (error) {
       // This attempt never took ownership (`_channel` is assigned only on
       // success), so the same rule as the handlers above applies: if another
@@ -305,6 +369,7 @@ class TriageWebSocketClient {
   }
 
   void _handleIncomingMessage(dynamic messageData) {
+    _lastRxElapsedMs = _rxStopwatch.elapsedMilliseconds;
     try {
       final Map<String, dynamic> message;
       final binaryMessage = _asBinaryMessage(messageData);
@@ -915,9 +980,15 @@ class TriageWebSocketClient {
     required String sessionId,
     required String clientId,
     String mode = 'InteractiveController',
+    int? historyBytes,
   }) async {
     return _send('attach_session', {
-      'request': {'session_id': sessionId, 'client_id': clientId, 'mode': mode},
+      'request': {
+        'session_id': sessionId,
+        'client_id': clientId,
+        'mode': mode,
+        if (historyBytes != null) 'history_bytes': historyBytes,
+      },
     });
   }
 
@@ -1061,9 +1132,13 @@ class TriageWebSocketClient {
     final subscription = _subscription;
     _channel = null;
     _subscription = null;
+    _rxStopwatch
+      ..stop()
+      ..reset();
+    _lastRxElapsedMs = 0;
     // Stop listening first: on a half-open socket the close below never
     // completes, so the stream would never end on its own and the subscription
-    // would keep this channel — and its socket — alive past every reconnect.
+    // would keep this channel (and its socket) alive past every reconnect.
     unawaited(subscription?.cancel().catchError((_) {}));
     if (channel != null) {
       // Closing is a handshake, and a half-open socket never answers it. Bound
@@ -1209,6 +1284,18 @@ class TriageWebSocketClient {
     return {'type': 'unknown', 'unhandled': what, 'tag': tag};
   }
 
+  /// Reads a generated `BatteryState` getter as its lowercase wire name. The
+  /// generated `fromValue` throws on values from a newer daemon, so a guard
+  /// here (rather than at the call site) keeps one future enum member from
+  /// failing the whole hello/stats decode.
+  String _batteryStateName(fbs.BatteryState Function() read) {
+    try {
+      return read().name.toLowerCase();
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
   Map<String, dynamic> _parseServerResult(
     fbs.ServerResultPayloadTypeId? type,
     dynamic result,
@@ -1237,6 +1324,9 @@ class TriageWebSocketClient {
           'disk_free_bytes': hello.diskFreeBytes,
           'disk_total_bytes': hello.diskTotalBytes,
           'tailscale_pairing_available': hello.tailscalePairingAvailable,
+          'cpu_percent': hello.cpuPercent,
+          'battery_percent': hello.batteryPercent,
+          'battery_state': _batteryStateName(() => hello.batteryState),
         };
       case 3: // PairedResult
         final paired = result as fbs.PairedResult;
@@ -1405,6 +1495,9 @@ class TriageWebSocketClient {
           'result': 'daemon_stats',
           'disk_free_bytes': stats.diskFreeBytes,
           'disk_total_bytes': stats.diskTotalBytes,
+          'cpu_percent': stats.cpuPercent,
+          'battery_percent': stats.batteryPercent,
+          'battery_state': _batteryStateName(() => stats.batteryState),
         };
       default:
         return _unhandled('server result', type.value);
@@ -1445,6 +1538,13 @@ class TriageWebSocketClient {
                 ? snap.rawOutput as Uint8List
                 : Uint8List.fromList(snap.rawOutput!)),
       'raw_output_start': snap.rawOutputStart,
+      // Journaled scrollback lines at or older than the raw window seam,
+      // replayed ahead of it on full replays and ignored by delta merges.
+      'raw_output_prefix': snap.rawOutputPrefix == null
+          ? null
+          : (snap.rawOutputPrefix is Uint8List
+                ? snap.rawOutputPrefix as Uint8List
+                : Uint8List.fromList(snap.rawOutputPrefix!)),
       // Local-LLM one-line description of the session, if generated.
       'snippet': snap.snippet,
       // Local-LLM longer-form summary for the hover popover / search.
@@ -1688,6 +1788,7 @@ class TriageWebSocketClient {
           sessionId: request?['session_id'] as String?,
           clientId: request?['client_id'] as String?,
           mode: mode,
+          historyBytes: (request?['history_bytes'] as num?)?.toInt(),
         );
         break;
 

@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:triage_client/daemon_disk_stats.dart';
+import 'package:triage_client/daemon_host_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:xterm/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
@@ -27,6 +28,7 @@ import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/size_drift.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
+import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
@@ -356,11 +358,11 @@ class SessionVm {
     this.cwd,
     this.isRemote = false,
     this.isExited = false,
-  })  : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
-        // so the field must stay mutable no matter what a caller passes —
-        // a lazy placeholder seeds an immutable empty list.
-        rows = List<StyledRow>.of(rows),
-        terminalController = TerminalController() {
+  }) : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
+       // so the field must stay mutable no matter what a caller passes:
+       // a lazy placeholder seeds an immutable empty list.
+       rows = List<StyledRow>.of(rows),
+       terminalController = TerminalController() {
     terminal = xt.Terminal(
       maxLines: 50000,
       // Re-wrap the whole buffer on resize, like a real terminal — otherwise
@@ -636,6 +638,19 @@ class SessionVm {
     return displayTitle;
   }
 
+  /// What the rail row and workspace header show for this session: the
+  /// sticky [status], except a remote session on a dead socket always reads
+  /// disconnected. The sticky string only moves on observed events, so
+  /// without this a half-dead socket holds a green "attached" while typing
+  /// goes nowhere. Local sessions and exited sessions report as-is: the
+  /// socket is irrelevant to the former and cannot revive the latter.
+  ({String text, Color color}) displayStatus({required bool connected}) {
+    if (!connected && isRemote && !isExited && status != 'exited') {
+      return (text: 'disconnected', color: const Color(0xffff6b6b));
+    }
+    return (text: status, color: statusColor);
+  }
+
   /// The inferred worktree currently leading the row, or null when the live
   /// context names its own workstream — a distinct current worktree or a branch
   /// that isn't the default — so the inference stays out of the way, or when
@@ -728,6 +743,17 @@ class SessionVm {
   // True once this remote session has been subscribed/attached (lazy-loaded).
   // Non-selected sessions stay unloaded until the user opens them.
   bool loaded = false;
+  // History window currently held, in raw bytes requested from the daemon.
+  // Starts at the first-page window and doubles toward the platform replay
+  // budget as the user pages older scrollback (see `_pageHistoryUp`).
+  int historyWindowBytes = kHistoryFirstWindowBytes;
+  // Absolute log offset of the oldest byte held, from the last applied
+  // history. Null until the first history lands; 0 means the log start is
+  // loaded and paging stops.
+  int? historyStart;
+  // A scroll-up page re-attach is in flight; near-top triggers coalesce
+  // behind it instead of stacking replays.
+  bool pagingHistory = false;
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
@@ -807,19 +833,29 @@ class SessionVm {
     List<int> rawOutput, {
     int? throughOutputSeq,
     int? rawOutputStart,
+    int? windowBytes,
+    List<int> rawOutputPrefix = const [],
     bool isExited = false,
   }) {
+    historyStart = rawOutputStart;
+    if (windowBytes != null) {
+      historyWindowBytes = windowBytes;
+    }
     _pendingHistory = _PendingHistory(
       rawOutput,
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
+      windowBytes: windowBytes,
+      rawOutputPrefix: rawOutputPrefix,
     );
     tdbg(
       'vm.applyHistory',
-      '$title ${rawOutput.length}B seq=$throughOutputSeq '
+      '$title ${rawOutput.length}B+${rawOutputPrefix.length}P '
+          'seq=$throughOutputSeq '
           'phase=${store.state.phase} viewReady=$_viewReady',
     );
-    if (!store.state.scrollbackReady || store.appliedLogBytes == null) {
+    if (store.state.phase != AttachPhase.awaitingHistory &&
+        (!store.state.scrollbackReady || store.appliedLogBytes == null)) {
       store.dispatch(const Attach());
     }
     this.isExited = isExited;
@@ -855,6 +891,8 @@ class SessionVm {
         rows: _viewRows,
         throughOutputSeq: pending.throughOutputSeq,
         rawOutputStart: pending.rawOutputStart,
+        windowBytes: pending.windowBytes,
+        rawOutputPrefix: pending.rawOutputPrefix,
       ),
     );
     if (isExited) {
@@ -895,11 +933,15 @@ class _PendingHistory {
     this.rawOutput,
     this.throughOutputSeq, {
     this.rawOutputStart,
+    this.windowBytes,
+    this.rawOutputPrefix = const [],
   });
 
   final List<int> rawOutput;
   final int? throughOutputSeq;
   final int? rawOutputStart;
+  final int? windowBytes;
+  final List<int> rawOutputPrefix;
 }
 
 /// Aborts a session load whose daemon changed mid-flight.
@@ -939,6 +981,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // letting it veto the load it will never perform.
   final GenerationClaims _loadingClaims = GenerationClaims();
   final Map<String, List<int>> _pendingInputBytes = {};
+
+  /// Cap per session for input buffered while lease-less or offline. Past
+  /// this the session is gone or wedged rather than merely slow, so further
+  /// bytes drop with a log instead of growing the buffer without bound.
+  static const int _maxPendingInputBytes = 4096;
   final GenerationClaims _leaseAcquisitionClaims = GenerationClaims();
   // Marks the selected session's rail tile so reopening the rail can scroll it
   // to the top — the session you're in should be the first thing you see.
@@ -956,6 +1003,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Refreshes [_daemonStats] while connected; disk pressure builds over the
   // course of a session, so a connect-time reading alone goes stale.
   Timer? _daemonStatsTimer;
+  Timer? _railReconcileTimer;
+  bool _isReconcilingRail = false;
+  static const Duration _railReconcileInterval = Duration(seconds: 60);
+  // Liveness probe for the socket; a failed beat tears the connection down
+  // through the close path so a half-dead socket cannot hold a green
+  // indicator while typing goes nowhere.
+  Timer? _heartbeatTimer;
   // The active daemon's disk stats, seeded from the hello handshake and kept
   // current by [_daemonStatsTimer]. Null while unknown (no connection, or a
   // daemon predating stats), which hides the free-space line.
@@ -1139,6 +1193,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // Daemon disk-stats refresh cadence. Disk pressure builds over minutes, so a
   // minute keeps the free-space line honest without chattering the socket.
   static const Duration _daemonStatsPollInterval = Duration(seconds: 60);
+  // Liveness cadence: comfortably above the 10s request timeout so one slow
+  // beat cannot destroy a healthy connection, and short enough that a dead
+  // socket is noticed while the user is still looking at it.
+  static const Duration _heartbeatInterval = Duration(seconds: 25);
+  // Inbound silence that must accompany a failed beat before the socket is
+  // torn down: three beats' worth. A beat routinely fails on a
+  // slow-but-alive connection (its hello waits behind a huge history
+  // replay on the daemon's serial per-connection queue), and tearing down
+  // there aborts the very load the user is waiting for, then reconnects
+  // into the same wedge. Only sustained silence means dead.
+  static const Duration _heartbeatSilenceTolerance = Duration(seconds: 75);
 
   @override
   void initState() {
@@ -1413,6 +1478,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _customLabels = {};
     _railSortMode = SessionRailSortMode.byRepo;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
+    _stopHeartbeat();
     _daemonStats = null;
   }
 
@@ -1889,8 +1956,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       if (_isRemoteSession(session)) {
         if (!_client.isConnected) {
+          // Mark, but do not drop: the bytes buffer in
+          // `_sendRemoteSessionInput` and flush when the reconnect
+          // re-acquires the lease.
           _markRemoteSessionDisconnected(session);
-          return;
         }
 
         if (session.isExited || session.status == 'exited') {
@@ -1988,6 +2057,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'InteractiveController',
+        // Lease-only: the snapshot is discarded, so probe with the minimum
+        // window instead of shipping a megabyte tail to throw away.
+        historyBytes: kHistoryLeaseProbeBytes,
       );
       // A disconnect in between resets leases: a zombie `true` here would
       // bypass the buffer-and-acquire path and drop input.
@@ -2046,7 +2118,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     String sessionId,
     List<int> bytes,
   ) {
-    if (session.hasInputLease) {
+    if (!session.hasInputLease || !_client.isConnected) {
+      // Buffer input so keystrokes are never dropped while acquiring the
+      // lease or while the socket is down; both flush on (re-)acquire.
+      final buffer = _pendingInputBytes.putIfAbsent(sessionId, () => <int>[]);
+      if (buffer.length + bytes.length > _maxPendingInputBytes) {
+        debugPrint(
+          'Dropping ${bytes.length} input bytes for $sessionId: '
+          'pending buffer full',
+        );
+        return;
+      }
+      buffer.addAll(bytes);
+      // No-ops while offline (its own guard returns first); the reconnect
+      // path below flushes proactively, and the next keystroke retries.
+      unawaited(_acquireInputLeaseAndFlush(session, sessionId));
+    } else {
       _client
           .writeInput(sessionId: sessionId, clientId: _clientId, bytes: bytes)
           .catchError((error) {
@@ -2054,11 +2141,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               _markRemoteSessionDisconnected(session);
             }
           });
-    } else {
-      // Buffer input so keystrokes are never dropped while acquiring the lease.
-      final buffer = _pendingInputBytes.putIfAbsent(sessionId, () => <int>[]);
-      buffer.addAll(bytes);
-      unawaited(_acquireInputLeaseAndFlush(session, sessionId));
     }
   }
 
@@ -2146,19 +2228,203 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           generation != _connectGeneration ||
           serverId != _activeServerId ||
           !_client.isConnected ||
+          stats == null ||
           !isUsableDaemonStats(stats)) {
         return;
       }
       // A null or zero-total read is a failed poll (or a daemon predating
       // stats): keep the last reading rather than flickering the line in
-      // and out.
-      setState(() => _daemonStats = stats);
+      // and out. When a poll arrives with partial legs (such as a transient
+      // CPU tick miss), merge non-null legs onto existing readings.
+      setState(() {
+        if (_daemonStats == null) {
+          _daemonStats = stats;
+        } else {
+          _daemonStats = (
+            diskFreeBytes: stats.diskTotalBytes > 0
+                ? stats.diskFreeBytes
+                : _daemonStats!.diskFreeBytes,
+            diskTotalBytes: stats.diskTotalBytes > 0
+                ? stats.diskTotalBytes
+                : _daemonStats!.diskTotalBytes,
+            cpuPercent: stats.cpuPercent ?? _daemonStats!.cpuPercent,
+            batteryPercent:
+                stats.batteryPercent ?? _daemonStats!.batteryPercent,
+            batteryState: stats.batteryPercent != null
+                ? stats.batteryState
+                : _daemonStats!.batteryState,
+          );
+        }
+      });
     });
   }
 
   void _stopDaemonStatsPolling() {
     _daemonStatsTimer?.cancel();
     _daemonStatsTimer = null;
+  }
+
+  /// Anti-entropy for the rail: lifecycle pushes are fire-and-forget with no
+  /// replay, so any miss (a gap the client never noticed, a tab that predates
+  /// a handler) leaves rows stale until the next reconnect. Once a minute,
+  /// diff the rail against the daemon's list and replay the delta through
+  /// the same application paths as the pushes, so a missed push heals
+  /// without a refresh. Guarded by generation and server id like the stats
+  /// poll, so a tick landing after a switch never files one daemon's
+  /// sessions onto another's rail.
+  void _startRailReconcile(int generation, String serverId) {
+    _railReconcileTimer?.cancel();
+    _railReconcileTimer = Timer.periodic(_railReconcileInterval, (_) async {
+      if (_disposed ||
+          !mounted ||
+          _isReconcilingRail ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId ||
+          !_clientInitialized ||
+          !_client.isConnected) {
+        return;
+      }
+      _isReconcilingRail = true;
+      try {
+        await _reconcileRail(generation, serverId);
+      } finally {
+        _isReconcilingRail = false;
+      }
+    });
+  }
+
+  void _stopRailReconcile() {
+    _railReconcileTimer?.cancel();
+    _railReconcileTimer = null;
+    _isReconcilingRail = false;
+  }
+
+  Future<void> _reconcileRail(int generation, String serverId) async {
+    bool stale() =>
+        _disposed ||
+        !mounted ||
+        generation != _connectGeneration ||
+        serverId != _activeServerId ||
+        !_client.isConnected;
+    List<String> ids;
+    try {
+      ids = await _client.listSessions();
+    } catch (_) {
+      return;
+    }
+    if (stale()) return;
+    final live = ids.toSet();
+    final known = <String>{};
+    for (final s in _sessions) {
+      final sid = s.remoteSessionId;
+      if (sid != null) known.add(sid);
+    }
+    // Removals first: a replaced row keeps its slot when the add lands.
+    for (final sid in known.difference(live)) {
+      _applySessionTerminated(sid);
+    }
+    final added = live.difference(known);
+    if (added.isNotEmpty) {
+      // One batch fetch for the rows' first paint, shaped like the push the
+      // application path expects. The bulk response carries no cwd; live cwd
+      // arrives via push, as on the connect-time load.
+      Map<String, SessionContextRecord> contexts;
+      try {
+        contexts = await _client.listSessionContexts();
+      } catch (_) {
+        return;
+      }
+      if (stale()) return;
+      for (final sid in added) {
+        final ctx = contexts[sid];
+        _applySessionStarted({
+          'session_id': sid,
+          'repository_root': ctx?.repositoryRoot,
+          'worktree_root': ctx?.worktreeRoot,
+          'branch': ctx?.branch,
+          'last_input_ms': ctx?.lastInputMs,
+          'last_activity_ms': ctx?.lastActivityMs,
+        }, sid);
+      }
+    }
+    // Labels: the daemon is authoritative during periodic anti-entropy.
+    // For every key present on the daemon, update the local cache if divergent.
+    // For any local label whose session is live on the daemon but lacks a
+    // daemon label, clear the local label.
+    final RailLayoutRecord? layout;
+    try {
+      layout = await _client.getRailLayout();
+    } catch (_) {
+      return;
+    }
+    if (layout == null || stale()) return;
+    final daemonLabels = layout.customLabels;
+    for (final entry in daemonLabels.entries) {
+      final have =
+          _customLabels[entry.key] ?? _customLabels['triage / ${entry.key}'];
+      if (have != entry.value) {
+        _applyCustomLabelUpdated(entry.key, entry.value);
+      }
+    }
+    for (final key in _customLabels.keys.toList()) {
+      final sid = key.startsWith('triage / ') ? key.substring(9) : key;
+      if (!daemonLabels.containsKey(sid) && live.contains(sid)) {
+        final label = _customLabels[key];
+        if (label != null) {
+          _applyCustomLabelUpdated(sid, null);
+        }
+      }
+    }
+  }
+
+  /// Probes socket liveness with a cheap `hello` while this connection
+  /// lives. A failed beat alone (timeout, not auth: an unauthenticated
+  /// hello still answers) only tears the socket down through the close
+  /// path when no frame of any kind has arrived for
+  /// [_heartbeatSilenceTolerance]: the beat's job is to solicit traffic
+  /// when idle, and any inbound traffic is the liveness proof, not the
+  /// beat itself. Guarded like the stats poller, plus foreground (a
+  /// throttled background timer must not destroy a connection nobody is
+  /// watching) and pairing (nothing to prove before auth).
+  void _startHeartbeat(int generation) {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) async {
+      if (_disposed ||
+          generation != _connectGeneration ||
+          !_clientInitialized ||
+          !_client.isConnected ||
+          _needsPairing ||
+          !_clientForeground) {
+        return;
+      }
+      try {
+        await _client.hello(clientId: _clientId, token: _bearerToken);
+      } catch (e) {
+        if (_disposed || generation != _connectGeneration) return;
+        if (!_client.isConnected) return;
+        if (_client.millisSinceLastInbound <
+            _heartbeatSilenceTolerance.inMilliseconds) {
+          debugPrint(
+            'Heartbeat failed but the socket carried traffic recently; '
+            'keeping it: $e',
+          );
+          return;
+        }
+        debugPrint(
+          'Heartbeat failed with no inbound traffic for '
+          '${_heartbeatSilenceTolerance.inSeconds}s; tearing down: $e',
+        );
+        try {
+          await _client.disconnect();
+        } catch (_) {}
+        _onWebSocketClosed(generation);
+      }
+    });
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
   }
 
   Future<void> _connectWebSocket({bool isReconnect = false}) async {
@@ -2182,6 +2448,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
+    _stopHeartbeat();
     final generation = ++_connectGeneration;
     if (_clientInitialized) {
       final subscription = _websocketSubscription;
@@ -2285,6 +2553,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _daemonStats = daemonStatsFromResponse(helloRes);
       });
       _startDaemonStatsPolling(generation, serverId);
+      _startRailReconcile(generation, serverId);
+      _startHeartbeat(generation);
 
       await _loadDaemonSessions();
       _reconnectAttempt = 0;
@@ -2665,6 +2935,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           } else {
             s.dispose();
             TerminalPane.destroySession(s.title);
+            if (sid != null) {
+              _pendingInputBytes.remove(sid);
+            }
           }
         }
       } else {
@@ -2672,6 +2945,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           s.dispose();
           TerminalPane.destroySession(s.title);
         }
+        _pendingInputBytes.clear();
       }
       setState(() {
         _sessionsServerId = _activeServerId;
@@ -2793,6 +3067,26 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               'claim denied',
             );
           }
+        }
+      }
+
+      // Input typed while the socket was down buffered instead of dropping;
+      // flush it now that the selected session is re-attached rather than
+      // waiting for the next keystroke. Other sessions flush on select.
+      if (!_isStale(generation) &&
+          sessionIds.isNotEmpty &&
+          targetSelectedIndex >= 0 &&
+          targetSelectedIndex < sessionIds.length) {
+        final targetSid = sessionIds[targetSelectedIndex];
+        final targetVmIndex = _sessions.indexWhere(
+          (s) => s.remoteSessionId == targetSid,
+        );
+        if (targetVmIndex != -1 &&
+            !failedSessionIds.contains(targetSid) &&
+            (_pendingInputBytes[targetSid]?.isNotEmpty ?? false)) {
+          unawaited(
+            _acquireInputLeaseAndFlush(_sessions[targetVmIndex], targetSid),
+          );
         }
       }
 
@@ -3137,7 +3431,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   int _nextLocalActivityStamp() {
     var newest = 0;
     for (final session in _sessions) {
-      if (session.lastInteractionMs > newest) newest = session.lastInteractionMs;
+      if (session.lastInteractionMs > newest) {
+        newest = session.lastInteractionMs;
+      }
     }
     return newest + 1;
   }
@@ -3699,10 +3995,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Observer: loading a session to look at it must not steal the input
       // lease from another client (or agent) typing there. The first
       // keystroke acquires it through the buffer-and-flush path instead.
+      // First-page window: first paint waits on the viewport, and
+      // scrolling near the top re-attaches with a doubling window.
       final attachRes = await _client.attachSession(
         sessionId: sid,
         clientId: _clientId,
         mode: 'Observer',
+        historyBytes: kHistoryFirstWindowBytes,
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
@@ -3711,7 +4010,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // replaying its empty history would clear the terminal to a blank screen.
       if (replayTargetSize != null &&
           preparedSnapshot != null &&
-          _rawOutputFromSnapshot(preparedSnapshot).isNotEmpty &&
+          snapshotCarriesHistory(preparedSnapshot) &&
           !_snapshotSizeMatches(snapshot, replayTargetSize)) {
         snapshot = preparedSnapshot;
       }
@@ -3759,6 +4058,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _rawOutputFromSnapshot(snapshot ?? const {}),
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
+        windowBytes: kHistoryFirstWindowBytes,
+        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -3878,6 +4179,127 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
     } finally {
       _websocketProcessingEvent = false;
+    }
+  }
+
+  /// Applies a custom-label change from a push or the rail reconcile:
+  /// updates the cached labels and the row, and persists. Null/blank clears.
+  void _applyCustomLabelUpdated(String sessionId, String? rawLabel) {
+    final trimmed = rawLabel?.trim();
+    final key = sessionId;
+    _customLabels.remove('triage / $key');
+    if (trimmed != null && trimmed.isNotEmpty) {
+      _customLabels[key] = trimmed;
+    } else {
+      _customLabels.remove(key);
+    }
+    for (final session in _sessions) {
+      if (session.remoteSessionId == sessionId) {
+        session.customLabel = (trimmed != null && trimmed.isNotEmpty)
+            ? trimmed
+            : null;
+      }
+    }
+    unawaited(_persistCustomLabels());
+    if (mounted) setState(() {});
+  }
+
+  /// Inserts a rail row for a session the daemon reports that this client has
+  /// no row for yet: from a `session_started` push or the rail reconcile.
+  /// Idempotent: an existing row short-circuits, so a push racing the
+  /// reconcile (or a redelivered push) cannot double-insert.
+  void _applySessionStarted(Map<String, dynamic> message, String sessionId) {
+    final existingIndex = _sessions.indexWhere(
+      (s) => s.remoteSessionId == sessionId,
+    );
+    if (existingIndex != -1) return;
+
+    final wasEmpty = _sessions.isEmpty;
+    final session = _loadingDaemonSession(sessionId, loading: wasEmpty);
+    session.applyContext(
+      repoRoot: message['repository_root']?.toString(),
+      worktreeRoot: message['worktree_root']?.toString(),
+      branch: message['branch']?.toString(),
+      cwd: message['current_working_directory']?.toString(),
+      updateCwd: message['current_working_directory'] != null,
+    );
+    final lastInput = message['last_input_ms'];
+    if (lastInput is int) {
+      session.lastInteractionMs = lastInput;
+    } else if (lastInput is num) {
+      session.lastInteractionMs = lastInput.toInt();
+    }
+    final lastOutput = message['last_activity_ms'];
+    if (lastOutput is int) {
+      session.lastOutputMs = lastOutput;
+    } else if (lastOutput is num) {
+      session.lastOutputMs = lastOutput.toInt();
+    }
+    _setupSessionInputListener(session);
+
+    void apply() {
+      _sessions.add(session);
+      _regroupRail();
+    }
+
+    if (mounted) {
+      setState(apply);
+    } else {
+      apply();
+    }
+
+    if (wasEmpty && !_disposed) {
+      _loadSessionWithPairingFallback(sessionId);
+    }
+  }
+
+  /// Drops the rail row for a removed session (from a `session_terminated`
+  /// push or the rail reconcile), disposing its pane, unpinning it, clearing
+  /// its cached label, and attaching the neighbour when it was selected.
+  /// Idempotent: an unknown id short-circuits.
+  void _applySessionTerminated(String sessionId) {
+    final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
+    if (index == -1) return;
+
+    final session = _sessions[index];
+    session.dispose();
+    TerminalPane.destroySession(session.title);
+    _pendingInputBytes.remove(sessionId);
+
+    final wasSelected = index == _selectedIndex;
+    if (index < _selectedIndex) {
+      _selectedIndex--;
+    }
+    _sessions.removeAt(index);
+    if (_selectedIndex >= _sessions.length) {
+      _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
+    }
+
+    var newPins = _pins;
+    if (_pins.sessionIds.contains(sessionId)) {
+      newPins = unpin(_pins, sessionId: sessionId);
+      unawaited(_persistPins(newPins));
+    }
+    if (_customLabels.containsKey(sessionId) ||
+        _customLabels.containsKey('triage / $sessionId')) {
+      _customLabels.remove(sessionId);
+      _customLabels.remove('triage / $sessionId');
+      unawaited(_persistCustomLabels());
+    }
+
+    _applyPins(newPins, persist: false);
+
+    if (wasSelected &&
+        _sessions.isNotEmpty &&
+        _selectedIndex >= 0 &&
+        _selectedIndex < _sessions.length) {
+      final nextSelected = _sessions[_selectedIndex];
+      if (!nextSelected.loaded) {
+        final sid = _sessionIdFor(nextSelected);
+        if (sid != null) {
+          _loadSessionWithPairingFallback(sid);
+        }
+      }
     }
   }
 
@@ -4050,120 +4472,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (type == 'session_custom_label_updated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null) return;
-      final rawLabel = message['custom_label']?.toString();
-      final trimmed = rawLabel?.trim();
-      final key = sessionId;
-      _customLabels.remove('triage / $key');
-      if (trimmed != null && trimmed.isNotEmpty) {
-        _customLabels[key] = trimmed;
-      } else {
-        _customLabels.remove(key);
-      }
-      for (final session in _sessions) {
-        if (session.remoteSessionId == sessionId) {
-          session.customLabel = (trimmed != null && trimmed.isNotEmpty)
-              ? trimmed
-              : null;
-        }
-      }
-      unawaited(_persistCustomLabels());
-      if (mounted) setState(() {});
+      _applyCustomLabelUpdated(sessionId, message['custom_label']?.toString());
       return;
     }
 
     if (type == 'session_started') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final existingIndex = _sessions.indexWhere(
-        (s) => s.remoteSessionId == sessionId,
-      );
-      if (existingIndex != -1) return;
-
-      final wasEmpty = _sessions.isEmpty;
-      final session = _loadingDaemonSession(sessionId, loading: wasEmpty);
-      session.applyContext(
-        repoRoot: message['repository_root']?.toString(),
-        worktreeRoot: message['worktree_root']?.toString(),
-        branch: message['branch']?.toString(),
-        cwd: message['current_working_directory']?.toString(),
-        updateCwd: message['current_working_directory'] != null,
-      );
-      final lastInput = message['last_input_ms'];
-      if (lastInput is int) {
-        session.lastInteractionMs = lastInput;
-      } else if (lastInput is num) {
-        session.lastInteractionMs = lastInput.toInt();
-      }
-      final lastOutput = message['last_activity_ms'];
-      if (lastOutput is int) {
-        session.lastOutputMs = lastOutput;
-      } else if (lastOutput is num) {
-        session.lastOutputMs = lastOutput.toInt();
-      }
-      _setupSessionInputListener(session);
-
-      void apply() {
-        _sessions.add(session);
-        _regroupRail();
-      }
-
-      if (mounted) {
-        setState(apply);
-      } else {
-        apply();
-      }
-
-      if (wasEmpty && !_disposed) {
-        _loadSessionWithPairingFallback(sessionId);
-      }
+      _applySessionStarted(message, sessionId);
       return;
     }
 
     if (type == 'session_terminated') {
       final sessionId = message['session_id'] as String?;
       if (sessionId == null || sessionId.trim().isEmpty) return;
-      final index = _sessions.indexWhere((s) => s.remoteSessionId == sessionId);
-      if (index == -1) return;
-
-      final session = _sessions[index];
-      session.dispose();
-      TerminalPane.destroySession(session.title);
-
-      final wasSelected = index == _selectedIndex;
-      if (index < _selectedIndex) {
-        _selectedIndex--;
-      }
-      _sessions.removeAt(index);
-      if (_selectedIndex >= _sessions.length) {
-        _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
-      }
-
-      var newPins = _pins;
-      if (_pins.sessionIds.contains(sessionId)) {
-        newPins = unpin(_pins, sessionId: sessionId);
-        unawaited(_persistPins(newPins));
-      }
-      if (_customLabels.containsKey(sessionId) ||
-          _customLabels.containsKey('triage / $sessionId')) {
-        _customLabels.remove(sessionId);
-        _customLabels.remove('triage / $sessionId');
-        unawaited(_persistCustomLabels());
-      }
-
-      _applyPins(newPins, persist: false);
-
-      if (wasSelected &&
-          _sessions.isNotEmpty &&
-          _selectedIndex >= 0 &&
-          _selectedIndex < _sessions.length) {
-        final nextSelected = _sessions[_selectedIndex];
-        if (!nextSelected.loaded) {
-          final sid = _sessionIdFor(nextSelected);
-          if (sid != null) {
-            _loadSessionWithPairingFallback(sid);
-          }
-        }
-      }
+      _applySessionTerminated(sessionId);
       return;
     }
 
@@ -4253,7 +4576,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
-          await _applySnapshotToSession(session, sessionId, snapshot);
+          // Pushed snapshots are served unwindowed at the full history
+          // cap: replay them at the platform budgets, not the held
+          // window, or the trim over-shrinks them.
+          await _applySnapshotToSession(
+            session,
+            sessionId,
+            snapshot,
+            unwindowed: true,
+          );
         }
       } else if (event.containsKey('LeaseChanged')) {
         final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
@@ -4285,6 +4616,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, dynamic> snapshot, {
     (int, int)? renderSize,
     bool replayHistory = true,
+    // True when the snapshot was served unwindowed at the full history
+    // cap (server-pushed ResyncRequired): the replay must keep the
+    // platform budgets instead of the session's narrower held window,
+    // which would over-trim the payload. A plain null windowBytes
+    // parameter cannot express this (its null would have to mean both
+    // "use held" and "use platform budgets"), so the tri-state rides a
+    // bool.
+    bool unwindowed = false,
   }) async {
     // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
     // _loadDaemonSessions) while the refresh was in flight — applying to a
@@ -4312,6 +4651,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final fittedCols = renderSize?.$2 ?? cols;
     final fittedRows = renderSize?.$1 ?? rowsVal;
     final rawOutput = _rawOutputFromSnapshot(snapshot);
+    final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final snapshotRawOutputStart = snapshot['raw_output_start'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
@@ -4329,6 +4669,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
+        windowBytes: unwindowed ? null : session.historyWindowBytes,
+        rawOutputPrefix: rawOutputPrefix,
         isExited: exited,
       );
     } else if (exited != session.isExited) {
@@ -4394,6 +4736,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) =>
       rawOutputFromSnapshot(snapshot);
 
+  Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
+      rawOutputPrefixFromSnapshot(snapshot);
+
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.
   /// Prefers visible_rows, falling back to the flattened text of styled_rows.
@@ -4426,6 +4771,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onWebSocketError(dynamic error, int generation) {
     if (_disposed || generation != _connectGeneration) return;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
+    _stopHeartbeat();
     setState(() {
       _connectionStatus = 'Error';
       _connectionStatusColor = const Color(0xffff6b6b);
@@ -4438,6 +4785,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _onWebSocketClosed(int generation) {
     if (_disposed || generation != _connectGeneration) return;
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
+    _stopHeartbeat();
     setState(() {
       _connectionStatus = 'Connection Closed';
       _connectionStatusColor = const Color(0xff7f8b8d);
@@ -4458,6 +4807,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _wakeWatchdogTimer?.cancel();
     _stopDaemonStatsPolling();
+    _stopRailReconcile();
+    _stopHeartbeat();
     _connectGeneration++;
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
@@ -4600,34 +4951,41 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }());
       }
     }
-    if (sid != null && !session.isExited && subscribed) {
-      // A success arriving after a purge must not resurrect the lease the
-      // disconnect just reset; the catch below already fails safe to false.
-      final leaseGeneration = _connectGeneration;
-      // Observer: selecting resyncs the flag from whoever holds the lease
-      // without stealing it; typing claims it on demand.
-      unawaited(
-        _client
-            .attachSession(
-              sessionId: sid,
-              clientId: _clientId,
-              mode: 'Observer',
-            )
-            .then((attachRes) {
-              if (_isStale(leaseGeneration)) return;
-              session.hasInputLease = _attachGrantsInputLease(attachRes);
-            })
-            .catchError((Object e) {
-              if (e is TriageAuthException) {
+    if (sid != null && !session.isExited) {
+      if (_pendingInputBytes[sid]?.isNotEmpty ?? false) {
+        // Pending input buffered while unselected: flush immediately on select.
+        unawaited(_acquireInputLeaseAndFlush(session, sid));
+      } else if (subscribed) {
+        // A success arriving after a purge must not resurrect the lease the
+        // disconnect just reset; the catch below already fails safe to false.
+        final leaseGeneration = _connectGeneration;
+        // Observer: selecting resyncs the flag from whoever holds the lease
+        // without stealing it; typing claims it on demand.
+        unawaited(
+          _client
+              .attachSession(
+                sessionId: sid,
+                clientId: _clientId,
+                mode: 'Observer',
+                // Lease-only resync: the snapshot is discarded.
+                historyBytes: kHistoryLeaseProbeBytes,
+              )
+              .then((attachRes) {
+                if (_isStale(leaseGeneration)) return;
+                session.hasInputLease = _attachGrantsInputLease(attachRes);
+              })
+              .catchError((Object e) {
+                if (e is TriageAuthException) {
+                  session.hasInputLease = false;
+                  _routeStaleAuthFailure(leaseGeneration);
+                  return;
+                }
+                if (_isStale(leaseGeneration)) return;
+                debugPrint('Select lease attach failed for $sid: $e');
                 session.hasInputLease = false;
-                _routeStaleAuthFailure(leaseGeneration);
-                return;
-              }
-              if (_isStale(leaseGeneration)) return;
-              debugPrint('Select lease attach failed for $sid: $e');
-              session.hasInputLease = false;
-            }),
-      );
+              }),
+        );
+      }
     }
     if (session.hasFitted && (sid == null || subscribed)) {
       // Already fitted and subscribed: refresh metadata without clearing and replaying history.
@@ -4679,6 +5037,96 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  /// Whether a scroll-up page would launch for [session] right now: all of
+  /// [_pageHistoryUp]'s gates, synchronously answerable so the `onNearTop`
+  /// callback can report back whether it launched a page (the pane
+  /// auto-continues through barren pages on `true`, and reports exhausted
+  /// scrollback on `false`).
+  bool _canPageHistory(SessionVm session) {
+    if (!_client.isConnected || !session.isRemote || !session.loaded) {
+      return false;
+    }
+    if (session.pagingHistory) return false;
+    final start = session.historyStart;
+    if (start == null || start <= 0) return false;
+    final maxWindow = kIsWeb
+        ? kHistoryReplayWebMaxBytes
+        : kHistoryReplayMaxBytes;
+    final nextWindow = nextHistoryWindowBytes(
+      current: session.historyWindowBytes,
+      max: maxWindow,
+    );
+    if (nextWindow <= session.historyWindowBytes) return false;
+    return _sessionIdFor(session) != null;
+  }
+
+  /// Page older scrollback after a near-top scroll: re-attach with a
+  /// doubling history window (up to the platform replay budget) and replay
+  /// the wider tail. Stops at the log start (`historyStart == 0`) and
+  /// coalesces triggers behind one in-flight page.
+  Future<void> _pageHistoryUp(SessionVm session) async {
+    if (!_canPageHistory(session)) return;
+    final maxWindow = kIsWeb
+        ? kHistoryReplayWebMaxBytes
+        : kHistoryReplayMaxBytes;
+    final nextWindow = nextHistoryWindowBytes(
+      current: session.historyWindowBytes,
+      max: maxWindow,
+    );
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    final generation = _connectGeneration;
+    session.pagingHistory = true;
+    if (mounted) setState(() {});
+    session.terminalController.notifyHistoryPageStarted();
+    // Reset lifecycle before attach so live chunks arriving during the
+    // round-trip buffer in pendingLive rather than writing to the sink
+    // and getting erased by full replay.
+    session.store.dispatch(const Attach());
+    var success = false;
+    try {
+      // Observer: paging must not steal the lease from whoever is typing.
+      final attachRes = await _client.attachSession(
+        sessionId: sessionId,
+        clientId: _clientId,
+        mode: 'Observer',
+        historyBytes: nextWindow,
+      );
+      if (_isStale(generation) || _disposed || !_sessions.contains(session)) {
+        return;
+      }
+      session.hasInputLease = _attachGrantsInputLease(attachRes);
+      final responseObj = attachRes['response'] as Map<String, dynamic>?;
+      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
+      final raw = _rawOutputFromSnapshot(snapshot);
+      // Full replay, not a delta merge: the wider window extends backward,
+      // which the store's same-end branch would no-op. The Attach above reset
+      // the lifecycle; live chunks covered by it drop as duplicates by output_seq.
+      session.historyWindowBytes = nextWindow;
+      session.applyHistory(
+        raw,
+        throughOutputSeq: snapshot['output_seq'] as int?,
+        rawOutputStart: snapshot['raw_output_start'] as int?,
+        windowBytes: nextWindow,
+        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot),
+        isExited: snapshot['exited'] == true,
+      );
+      success = true;
+    } on TriageAuthException {
+      _routeStaleAuthFailure(generation);
+    } catch (e) {
+      tdbg('history.page', 'page up failed for $sessionId: $e');
+    } finally {
+      session.pagingHistory = false;
+      if (!success) {
+        session.store.dispatch(const CancelAttach());
+        session.terminalController.notifyHistoryPageCancelled();
+      }
+      if (mounted) setState(() {});
+    }
+  }
+
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
     bool includeHistory = false,
@@ -4704,10 +5152,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
     try {
       // Observer: a refresh must not steal the lease from whoever is typing.
+      // The held window, so a refresh neither regresses paged-up depth nor
+      // ships a megabyte tail the replay trim would drop.
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'Observer',
+        historyBytes: session.historyWindowBytes,
       );
       // The purge or reconnect may have landed during the attach: returning
       // before the restore/resize branches keeps those writes off the new
@@ -4766,6 +5217,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               sessionId: sessionId,
               clientId: _clientId,
               mode: 'Observer',
+              historyBytes: session.historyWindowBytes,
             );
             final freshResponseObj =
                 freshAttachRes['response'] as Map<String, dynamic>?;
@@ -5039,6 +5491,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             sessionId: sessionId,
             clientId: _clientId,
             mode: 'InteractiveController',
+            // Freshly spawned: no history yet, first-page window suffices.
+            historyBytes: kHistoryFirstWindowBytes,
           );
           // The daemon changed under us: this snapshot belongs to the one
           // we left, and the tile below must not land on the new rail.
@@ -5085,6 +5539,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             _rawOutputFromSnapshot(snapshot ?? const {}),
             throughOutputSeq: outputSeq,
             rawOutputStart: rawOutputStart,
+            windowBytes: kHistoryFirstWindowBytes,
+            rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
             isExited: exited,
           );
 
@@ -5221,6 +5677,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _sessions.removeAt(index);
         session.dispose();
         TerminalPane.destroySession(session.title);
+        final removedId = _sessionIdFor(session) ?? session.remoteSessionId;
+        if (removedId != null) _pendingInputBytes.remove(removedId);
         if (_selectedIndex >= _sessions.length) {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
         }
@@ -5346,65 +5804,67 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final String? result;
     try {
       result = await showMenu<String>(
-      context: context,
-      position: rect,
-      color: const Color(0xff1b2327),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: const BorderSide(color: Color(0xff334044)),
-      ),
-      items: [
-        PopupMenuItem<String>(
-          value: 'edit_label',
-          height: 38,
-          padding: const EdgeInsets.symmetric(horizontal: 14),
-          child: Row(
-            children: [
-              Icon(
-                hasLabel ? Icons.edit_outlined : Icons.label_outline,
-                size: 16,
-                color: const Color(0xff7fd1c7),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  hasLabel ? 'Edit custom label...' : 'Assign custom label...',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Color(0xffcdd7d6),
-                    fontSize: 13,
-                  ),
-                ),
-              ),
-            ],
-          ),
+        context: context,
+        position: rect,
+        color: const Color(0xff1b2327),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+          side: const BorderSide(color: Color(0xff334044)),
         ),
-        if (hasLabel)
+        items: [
           PopupMenuItem<String>(
-            value: 'clear_label',
+            value: 'edit_label',
             height: 38,
             padding: const EdgeInsets.symmetric(horizontal: 14),
-            child: const Row(
+            child: Row(
               children: [
                 Icon(
-                  Icons.label_off_outlined,
+                  hasLabel ? Icons.edit_outlined : Icons.label_outline,
                   size: 16,
-                  color: Color(0xffe06c75),
+                  color: const Color(0xff7fd1c7),
                 ),
-                SizedBox(width: 10),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Text(
-                    'Clear custom label',
+                    hasLabel
+                        ? 'Edit custom label...'
+                        : 'Assign custom label...',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: Color(0xffcdd7d6), fontSize: 13),
+                    style: const TextStyle(
+                      color: Color(0xffcdd7d6),
+                      fontSize: 13,
+                    ),
                   ),
                 ),
               ],
             ),
           ),
-      ],
+          if (hasLabel)
+            PopupMenuItem<String>(
+              value: 'clear_label',
+              height: 38,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              child: const Row(
+                children: [
+                  Icon(
+                    Icons.label_off_outlined,
+                    size: 16,
+                    color: Color(0xffe06c75),
+                  ),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Clear custom label',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(color: Color(0xffcdd7d6), fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
       );
     } finally {
       _contextMenuOpen = false;
@@ -5644,12 +6104,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         ),
         connectionStatus: _connectionStatus,
         connectionStatusColor: _connectionStatusColor,
+        connected: _client.isConnected,
         serverLabel: _activeServer?.label,
         diskStatus: _daemonStats == null
             ? null
             : formatDiskFree(
                 _daemonStats!.diskFreeBytes,
                 _daemonStats!.diskTotalBytes,
+              ),
+        hostStatus: _daemonStats == null
+            ? null
+            : formatHostStats(
+                cpuPercent: _daemonStats!.cpuPercent,
+                batteryPercent: _daemonStats!.batteryPercent,
+                batteryState: _daemonStats!.batteryState,
               ),
         onOpenSettings: _openConnectionSettings,
         onToggleJudgePolicy: _toggleSessionJudgePolicy,
@@ -5691,9 +6159,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ? emptyWorkspace
           : SessionWorkspace(
               session: currentSession,
+              connected: _client.isConnected,
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
+              onNearTop: () {
+                final session = currentSession;
+                if (!_canPageHistory(session)) return false;
+                unawaited(_pageHistoryUp(session));
+                return true;
+              },
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
@@ -5838,7 +6313,9 @@ class SessionRail extends StatefulWidget {
     required this.showShellMenu,
     required this.connectionStatus,
     required this.connectionStatusColor,
+    required this.connected,
     this.diskStatus,
+    this.hostStatus,
     required this.onOpenSettings,
     required this.isCollapsed,
     required this.onToggleCollapse,
@@ -5907,9 +6384,15 @@ class SessionRail extends StatefulWidget {
   final bool showShellMenu;
   final String connectionStatus;
   final Color connectionStatusColor;
+  // Live socket state: rows read disconnected on a dead socket no matter
+  // what their sticky session string says.
+  final bool connected;
   // Preformatted free-space line ("12,340 MB free (23%)"), or null while
   // unknown, which hides the line. Rendered below [connectionStatus].
   final String? diskStatus;
+  // Preformatted host line ("CPU 12% · Battery 87% (charging)"), or null
+  // while unknown, which hides the line. Rendered below [diskStatus].
+  final String? hostStatus;
   // Name of the daemon these sessions belong to. Null when none is configured
   // (the injected-client test path).
   final String? serverLabel;
@@ -6050,6 +6533,7 @@ class _SessionRailState extends State<SessionRail> {
             if (widget.serverLabel != null) widget.serverLabel!,
             widget.connectionStatus,
             if (widget.diskStatus != null) widget.diskStatus!,
+            if (widget.hostStatus != null) widget.hostStatus!,
           ].join(' — '),
           child: Container(
             width: 10,
@@ -6239,6 +6723,7 @@ class _SessionRailState extends State<SessionRail> {
               color: widget.connectionStatusColor,
               serverLabel: widget.serverLabel,
               diskStatus: widget.diskStatus,
+              hostStatus: widget.hostStatus,
             ),
           ),
         ),
@@ -6422,6 +6907,9 @@ class _SessionRailState extends State<SessionRail> {
                       final matchIndex = rowIndexFor[index]!;
                       final entry = matchingEntries[matchIndex];
                       final session = entry.session;
+                      final display = session.displayStatus(
+                        connected: widget.connected,
+                      );
                       final originalIndex = entry.originalIndex;
                       final key = ValueKey<String>(_rowKeyFor(session));
                       final tile = SessionListTile(
@@ -6431,8 +6919,8 @@ class _SessionRailState extends State<SessionRail> {
                         selected: originalIndex == widget.selectedIndex,
                         title: session.railTitleAt(now),
                         glanceTitle: session.glanceTitleAt(now),
-                        subtitle: session.status,
-                        statusColor: session.statusColor,
+                        subtitle: display.text,
+                        statusColor: display.color,
                         icon: session.icon,
                         branch: session.branch,
                         repoName: session.repoName,
@@ -6679,17 +7167,20 @@ class _ConnectionStatus extends StatelessWidget {
     required this.color,
     this.serverLabel,
     this.diskStatus,
+    this.hostStatus,
   });
 
   final String status;
   final Color color;
   final String? serverLabel;
   final String? diskStatus;
+  final String? hostStatus;
 
   @override
   Widget build(BuildContext context) {
     final label = serverLabel;
     final disk = diskStatus;
+    final host = hostStatus;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -6722,6 +7213,15 @@ class _ConnectionStatus extends StatelessWidget {
                 if (disk != null)
                   Text(
                     disk,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xff7f8b8d),
+                      fontSize: 12,
+                    ),
+                  ),
+                if (host != null)
+                  Text(
+                    host,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
                       color: Color(0xff7f8b8d),
@@ -10205,8 +10705,10 @@ class SessionWorkspace extends StatelessWidget {
   const SessionWorkspace({
     super.key,
     required this.session,
+    required this.connected,
     this.onCloseSession,
     this.onViewFit,
+    this.onNearTop,
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
@@ -10215,8 +10717,14 @@ class SessionWorkspace extends StatelessWidget {
   });
 
   final SessionVm session;
+  final bool connected;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
+  // The terminal scrolled near the top of its scrollback: page older
+  // history by re-attaching with a wider window. Returns whether a page
+  // was launched, so the pane can auto-continue through barren pages or
+  // report exhausted scrollback when no deeper window is available.
+  final bool Function()? onNearTop;
   // Mobile only: opens the session rail overlay from the workspace header.
   final VoidCallback? onOpenRail;
   // Re-asserts this device's terminal size on the shared PTY.
@@ -10233,6 +10741,7 @@ class SessionWorkspace extends StatelessWidget {
       children: [
         WorkspaceHeader(
           session: session,
+          connected: connected,
           onClose: onCloseSession,
           onOpenRail: onOpenRail,
           onRefit: onRefit,
@@ -10241,24 +10750,76 @@ class SessionWorkspace extends StatelessWidget {
           onToggleSoftKeyboard: onToggleSoftKeyboard,
         ),
         Expanded(
-          child: TerminalPane(
-            key: ValueKey(session.title),
-            terminalId: session.title,
-            controller: session.terminalController,
-            terminal: session.terminal,
-            fallbackRows: session.rows,
-            onTerminalResizeBind: (callback) {
-              session.onTerminalResize = callback;
-            },
-            onViewFit: (cols, rows) {
-              session.noteViewFit(cols, rows);
-              onViewFit?.call(cols, rows);
-            },
-            focusCursorRevision: session.focusCursorRevision,
-            bracketedPasteEnabled: session.bracketedPasteEnabled,
-            isExited: session.status == 'exited',
-            isLoading: session.status == 'loading' || !session.loaded,
-            softKeyboardEnabled: softKeyboardEnabled,
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: TerminalPane(
+                  key: ValueKey(session.title),
+                  terminalId: session.title,
+                  controller: session.terminalController,
+                  terminal: session.terminal,
+                  fallbackRows: session.rows,
+                  onTerminalResizeBind: (callback) {
+                    session.onTerminalResize = callback;
+                  },
+                  onViewFit: (cols, rows) {
+                    session.noteViewFit(cols, rows);
+                    onViewFit?.call(cols, rows);
+                  },
+                  onNearTop: onNearTop,
+                  focusCursorRevision: session.focusCursorRevision,
+                  bracketedPasteEnabled: session.bracketedPasteEnabled,
+                  isExited: session.status == 'exited',
+                  isLoading: session.status == 'loading' || !session.loaded,
+                  softKeyboardEnabled: softKeyboardEnabled,
+                ),
+              ),
+              if (session.pagingHistory)
+                Positioned(
+                  top: 8,
+                  left: 0,
+                  right: 0,
+                  child: IgnorePointer(
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xCC1E1E1E),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(
+                            color: const Color(0x33FFFFFF),
+                            width: 1,
+                          ),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Color(0xFF90CAF9),
+                              ),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              'Loading history...',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFFE0E0E0),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
       ],
@@ -10270,6 +10831,7 @@ class WorkspaceHeader extends StatelessWidget {
   const WorkspaceHeader({
     super.key,
     required this.session,
+    required this.connected,
     this.onClose,
     this.onOpenRail,
     this.onRefit,
@@ -10279,6 +10841,9 @@ class WorkspaceHeader extends StatelessWidget {
   });
 
   final SessionVm session;
+  // Live socket state: the status dot reads disconnected on a dead socket
+  // no matter what the sticky session string says.
+  final bool connected;
   final VoidCallback? onClose;
   // Mobile only: opens the session rail overlay. Null on desktop, where the
   // rail is always visible beside the workspace.
@@ -10320,6 +10885,7 @@ class WorkspaceHeader extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isNarrow = constraints.maxWidth < 600;
+        final display = session.displayStatus(connected: connected);
         return Container(
           height: 68,
           padding: EdgeInsets.symmetric(horizontal: isNarrow ? 12 : 22),
@@ -10405,17 +10971,17 @@ class WorkspaceHeader extends StatelessWidget {
                 SizedBox(width: isNarrow ? 2 : 4),
               ],
               Tooltip(
-                message: session.status,
+                message: display.text,
                 child: Icon(
                   Icons.circle,
                   size: isNarrow ? 10 : 12,
-                  color: session.statusColor,
+                  color: display.color,
                 ),
               ),
               if (!isNarrow) ...[
                 const SizedBox(width: 8),
                 Text(
-                  session.status,
+                  display.text,
                   style: const TextStyle(color: Color(0xffcdd7d6)),
                 ),
               ],
@@ -10440,9 +11006,7 @@ class WorkspaceHeader extends StatelessWidget {
               if (onToggleSoftKeyboard != null) ...[
                 IconButton(
                   icon: Icon(
-                    softKeyboardEnabled
-                        ? Icons.keyboard
-                        : Icons.keyboard_hide,
+                    softKeyboardEnabled ? Icons.keyboard : Icons.keyboard_hide,
                     size: isNarrow ? 18 : 24,
                     color: softKeyboardEnabled
                         ? const Color(0xffcdd7d6)

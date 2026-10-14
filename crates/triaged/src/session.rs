@@ -25,15 +25,18 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
-use tattoy_wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
+use tattoy_wezterm_term::{
+    Intensity, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize, Underline,
+};
 use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
-    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest,
-    SessionApi, SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope,
-    SessionEventReceiver, SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot,
-    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
-    SubscribeSessionEventsRequest, TerminalColor, TerminalCursor, TerminalStyle, WriteInputRequest,
+    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputControllerKind,
+    InputLeaseRequest, InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest,
+    RestoreSessionRequest, SessionApi, SessionContext, SessionContextRow, SessionEvent,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionPins,
+    SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
+    StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
+    TerminalStyle, WriteInputRequest,
 };
 use triage_core::session::{SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN};
 use triage_transport_ws::ServerMessage;
@@ -68,6 +71,11 @@ const _: () = assert!(
 );
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
+/// Bound on one actor's context reply inside the `list_session_contexts`
+/// fan-out. A leg past this is wedged, not slow (~40ms was the per-leg cost
+/// at load 150), so the batch degrades that row to `None` rather than
+/// hanging every client's rail load behind one stuck session.
+const SESSION_CONTEXT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_REPLAY_BUFFER: usize = 1024;
 const MAX_OSC_BUFFER: usize = 4096;
 /// Maximum number of recent judge decisions retained in memory for the settings
@@ -189,6 +197,16 @@ const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_DEVICE_CODE_TTL: Duration = Duration::from_secs(15 * 60);
 const PAIRING_PIN_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PENDING_PAIRING_CHALLENGES: usize = 64;
+/// How long denied input waits for its client to acquire the lease before it
+/// is dropped. Acquire-on-denial is one round trip, so anything older is from
+/// a client that went away.
+const PARKED_INPUT_TTL: Duration = Duration::from_secs(10);
+/// Cap per (session, client) so a client typing into a denied lease for
+/// minutes cannot grow the parked map without bound. Bytes past the cap are
+/// dropped, and the client is already re-acquiring on the first denial.
+const PARKED_INPUT_CAP_BYTES: usize = 4096;
+/// Maximum number of distinct clients that can concurrently park denied input per session.
+const MAX_PARKED_CLIENTS_PER_SESSION: usize = 8;
 const MAX_PAIRING_CLIENT_ID_LENGTH: usize = 128;
 
 /// Normalize a user-typed pairing code per Crockford Base32 rules:
@@ -301,12 +319,27 @@ struct JudgeState {
     rules: crate::judge::JudgeRules,
 }
 
+/// Input bytes one client was denied while lease-less, waiting for that
+/// client to acquire the lease. Denied means never written, so flushing on
+/// acquire is exactly-once by construction.
+struct ParkedInput {
+    client: ClientId,
+    bytes: Vec<u8>,
+    parked_at: Instant,
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     /// Side inboxes for session-to-session coordination mail (agents via
     /// MCP). In-memory only: not persisted, not carried across handover.
     inboxes: Mutex<HashMap<SessionId, VecDeque<SessionMessage>>>,
+    /// Input bytes denied by the lease, parked per session and client until
+    /// the denied client acquires the lease (then flushed to the actor) or
+    /// the TTL lapses. In-memory only: a denied write returns its error
+    /// unchanged so the client still re-acquires; this only saves the bytes
+    /// that error would otherwise destroy.
+    parked_input: Mutex<HashMap<SessionId, Vec<ParkedInput>>>,
     /// Daemon-monotonic message id counter (starts at 1; 0 is never valid).
     next_message_id: AtomicU64,
     sessions: Mutex<HashMap<SessionId, ManagedSession>>,
@@ -433,6 +466,10 @@ fn broadcast_to_global_senders(senders: &GlobalSenders, message: ServerMessage) 
         // resend (context updates won't otherwise be re-emitted).
         Err(TrySendError::Full(_)) => {
             delivered_to_all = false;
+            tracing::debug!(
+                kind = message.kind(),
+                "global push channel full; dropping push for a slow client"
+            );
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -650,23 +687,22 @@ impl SessionManager {
         });
         let next_session = next_session_sequence(sessions.keys());
         let paired_devices = load_paired_devices(&config.log_dir);
-        let (require_pairing, tailscale_pair_users) =
-            if let Ok(path) = triage_core::config::Config::default_path() {
-                if path.exists() {
-                    triage_core::config::Config::load_from_path(&path)
-                        .map(|c| (c.remote.require_pairing, c.remote.tailscale_pair_users))
-                        .unwrap_or((true, Vec::new()))
-                } else {
-                    (true, Vec::new())
-                }
-            } else {
-                (true, Vec::new())
-            };
+        let (require_pairing, tailscale_pair_users) = if cfg!(test) {
+            (true, Vec::new())
+        } else {
+            triage_core::config::Config::default_path()
+                .ok()
+                .filter(|p| p.exists())
+                .and_then(|p| triage_core::config::Config::load_from_path(p).ok())
+                .map(|c| (c.remote.require_pairing, c.remote.tailscale_pair_users))
+                .unwrap_or_else(|| (true, Vec::new()))
+        };
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
             next_session: AtomicU64::new(next_session),
             inboxes: Mutex::new(HashMap::new()),
+            parked_input: Mutex::new(HashMap::new()),
             next_message_id: AtomicU64::new(1),
             sessions: Mutex::new(sessions),
             pins: Mutex::new(pins),
@@ -1116,6 +1152,15 @@ impl SessionManager {
         }
     }
 
+    /// Drops a session's custom label from memory on shutdown or removal.
+    /// The shutdown manifest already committed the on-disk layout without it,
+    /// so this drops the in-memory entry to prevent ghost rows upon reuse.
+    fn forget_custom_label(&self, session_id: &SessionId) {
+        if let Ok(mut labels) = self.custom_labels() {
+            labels.remove(session_id.as_str());
+        }
+    }
+
     /// Installs the tool-call approval judge. Cheap: the rule tables are pure
     /// data and the model is the summarizer's, already resident. No-op when
     /// `judge.enabled` is false, which leaves every query answering `ask`.
@@ -1186,6 +1231,126 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         overrides.remove(session_id);
+    }
+
+    /// Parks bytes `write_input` denied, for delivery when `client_id`
+    /// acquires the lease. Expired entries are swept on every park and take,
+    /// so dead sessions leave nothing behind; the stamp stays at the first
+    /// parked byte so a client typing into a denial for minutes still ages
+    /// out instead of refreshing its parking forever.
+    ///
+    /// Lock order: the sessions guard may be held (sessions-then-parked, as
+    /// in `write_input`); this never takes the sessions lock, so the order
+    /// cannot invert.
+    fn park_denied_input(&self, session_id: &SessionId, client_id: &ClientId, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_parked_input(&mut parked);
+        let entries = parked.entry(session_id.clone()).or_default();
+        if let Some(existing) = entries.iter_mut().find(|entry| entry.client == *client_id) {
+            let room = PARKED_INPUT_CAP_BYTES.saturating_sub(existing.bytes.len());
+            if bytes.len() > room {
+                tracing::warn!(
+                    session_id = %session_id,
+                    client_id = %client_id,
+                    dropped_bytes = bytes.len() - room,
+                    "parked input buffer cap reached; dropping excess denied input"
+                );
+            }
+            existing.bytes.extend(bytes.into_iter().take(room));
+        } else if entries.len() < MAX_PARKED_CLIENTS_PER_SESSION {
+            let mut bytes = bytes;
+            if bytes.len() > PARKED_INPUT_CAP_BYTES {
+                tracing::warn!(
+                    session_id = %session_id,
+                    client_id = %client_id,
+                    dropped_bytes = bytes.len() - PARKED_INPUT_CAP_BYTES,
+                    "parked input buffer cap reached; dropping excess denied input"
+                );
+            }
+            bytes.truncate(PARKED_INPUT_CAP_BYTES);
+            entries.push(ParkedInput {
+                client: client_id.clone(),
+                bytes,
+                parked_at: Instant::now(),
+            });
+        } else {
+            tracing::warn!(
+                session_id = %session_id,
+                client_id = %client_id,
+                dropped_bytes = bytes.len(),
+                "maximum parked clients per session reached; dropping denied input"
+            );
+        }
+    }
+
+    /// Takes everything parked for `client_id` on `session_id`, for the
+    /// flush-on-acquire paths. Empty when nothing was denied (the common
+    /// case) or when it all expired.
+    fn take_parked_input(&self, session_id: &SessionId, client_id: &ClientId) -> Vec<u8> {
+        let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
+        Self::sweep_parked_input(&mut parked);
+        let Some(entries) = parked.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let Some(index) = entries.iter().position(|entry| entry.client == *client_id) else {
+            return Vec::new();
+        };
+        let entry = entries.remove(index);
+        if entries.is_empty() {
+            parked.remove(session_id);
+        }
+        entry.bytes
+    }
+
+    /// Drops a session's parked input when the session goes away, so a
+    /// restored session reusing the id cannot inherit bytes parked for an
+    /// earlier incarnation (same hazard as `forget_judge_override`).
+    fn forget_parked_input(&self, session_id: &SessionId) {
+        let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
+        parked.remove(session_id);
+    }
+
+    fn sweep_parked_input(parked: &mut HashMap<SessionId, Vec<ParkedInput>>) {
+        let now = Instant::now();
+        parked.retain(|_, entries| {
+            entries
+                .retain(|entry| now.saturating_duration_since(entry.parked_at) < PARKED_INPUT_TTL);
+            !entries.is_empty()
+        });
+    }
+
+    /// Acquires the input lease for a client, drains any input parked during denial,
+    /// forwards it to the session actor under the sessions lock, and broadcasts the event.
+    fn grant_input_lease_and_flush(
+        &self,
+        session_id: &SessionId,
+        client_id: &ClientId,
+        kind: InputControllerKind,
+        lease: &mut InputLeaseState,
+        actor: &SessionActor,
+    ) -> Result<LeaseChange> {
+        let change = lease.acquire(client_id.clone(), kind);
+        let parked = self.take_parked_input(session_id, client_id);
+        if !parked.is_empty() {
+            let dropped_bytes = parked.len();
+            if let Err(error) = request_write_input(&actor.tx, parked) {
+                tracing::warn!(
+                    %session_id,
+                    %client_id,
+                    dropped_bytes,
+                    ?error,
+                    "failed to flush parked input after lease grant; dropping it"
+                );
+            }
+        }
+        actor.broadcast_event(SessionEvent::LeaseChanged {
+            session_id: session_id.clone(),
+            change: change.clone(),
+        })?;
+        Ok(change)
     }
 
     /// One session's judge policy: its override, and the resolved answer.
@@ -1653,7 +1818,8 @@ impl SessionManager {
         session_id: &SessionId,
     ) -> Result<PathBuf> {
         let pins = self.pins()?;
-        let custom_labels = self.custom_labels()?;
+        let mut custom_labels = self.custom_labels()?.clone();
+        custom_labels.remove(session_id.as_str());
         let json = encode_manifest(sessions, Some(session_id), &pins, &custom_labels)?;
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
@@ -1961,13 +2127,14 @@ impl SessionManager {
             Sender<ActorCommand>,
             PersistedSessionLaunch,
             SessionStamps,
+            InputLeaseState,
         )> = self
             .sessions()?
             .iter()
             .filter_map(|(id, managed)| match managed {
                 ManagedSession::Live {
                     actor,
-                    lease: _,
+                    lease,
                     launch,
                     // The adopted process stays alive across a handover, so the new
                     // daemon reads its live cwd directly (see `adopted_session_cwd`);
@@ -1981,6 +2148,7 @@ impl SessionManager {
                         activity_ms: actor.last_activity_ms(),
                         input_ms: actor.last_input_ms(),
                     },
+                    lease.clone(),
                 )),
                 _ => None,
             })
@@ -2000,10 +2168,10 @@ impl SessionManager {
         // all.
         let inflight: Vec<_> = pending
             .into_iter()
-            .filter_map(|(id, cmd_tx, launch, stamps)| {
+            .filter_map(|(id, cmd_tx, launch, stamps, lease)| {
                 let (tx, rx) = mpsc::channel();
                 match cmd_tx.send(ActorCommand::ExtractHandoverState { response: tx }) {
-                    Ok(()) => Some((id, rx, launch, stamps)),
+                    Ok(()) => Some((id, rx, launch, stamps, lease)),
                     Err(err) => {
                         tracing::warn!(session_id = %id, ?err, "Failed to send extract command to actor");
                         None
@@ -2016,7 +2184,7 @@ impl SessionManager {
         // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
         let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
 
-        for (id, rx, launch, stamps) in inflight {
+        for (id, rx, launch, stamps, lease) in inflight {
             // Bounded, unlike every other actor round-trip in this file. An actor that
             // cannot answer a descriptor dup and three counters before the budget runs
             // out is parked (a `write_all` to a session whose child stopped reading),
@@ -2076,6 +2244,7 @@ impl SessionManager {
                 last_activity_ms: stamps.activity_ms,
                 last_input_ms: stamps.input_ms,
                 judge_override,
+                lease,
             });
         }
 
@@ -2561,7 +2730,7 @@ impl SessionManager {
             h_sess.id.clone(),
             ManagedSession::Live {
                 actor,
-                lease: InputLeaseState::default(),
+                lease: h_sess.lease.clone(),
                 launch,
                 last_known_cwd,
             },
@@ -2840,6 +3009,7 @@ fn spawn_adopted_pty_runtime(
         .open(&target_log_path)
         .with_context(|| format!("opening session log {}", target_log_path.display()))?;
 
+    let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
         log_path: target_log_path,
@@ -2857,6 +3027,8 @@ fn spawn_adopted_pty_runtime(
         log_cache: None,
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
+        scrollback: Some(scrollback),
+        scroll_seq_baseline: None,
     };
 
     let (replay_len, replay) = read_replay_tail(&h_sess.log_path)?;
@@ -3114,31 +3286,38 @@ impl SessionApi for SessionManager {
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
 
+        let history_cap = request
+            .history_bytes
+            .filter(|cap| *cap > 0)
+            .map(|cap| cap.min(RAW_OUTPUT_TAIL_CAP))
+            .unwrap_or(RAW_OUTPUT_TAIL_CAP);
+
         match session {
             ManagedSession::Live { actor, lease, .. } => {
+                // Flush-on-grant: bytes this client was denied while lease-less
+                // are delivered now that the attach grants it the lease.
+                // Observers never grant, so their parked bytes stay parked.
                 if let Some(kind) = request.mode.controller_kind() {
-                    let change = lease.acquire(request.client_id, kind);
-                    actor.broadcast_event(SessionEvent::LeaseChanged {
-                        session_id: request.session_id.clone(),
-                        change,
-                    })?;
+                    self.grant_input_lease_and_flush(
+                        &request.session_id,
+                        &request.client_id,
+                        kind,
+                        lease,
+                        actor,
+                    )?;
                 }
 
-                // The lease mutation and its event stay under the lock (see
-                // `broadcast_event`); the snapshot round-trip must not. Every client
-                // attach lands here, so an actor parked on a stuck PTY would freeze
-                // the whole daemon on the commonest request there is.
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
-                let snapshot = request_snapshot_with_history(&cmd_tx)?;
+                let snapshot = request_snapshot_with_history(&cmd_tx, history_cap)?;
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
                     lease,
                 })
             }
             ManagedSession::Historical { session, lease } => {
-                let snapshot = session.snapshot_with_history();
+                let snapshot = session.snapshot_with_history(history_cap);
                 let lease = lease.clone();
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
@@ -3186,26 +3365,28 @@ impl SessionApi for SessionManager {
     }
 
     fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
-        let mut sessions = self.sessions()?;
-        let session = sessions
-            .get_mut(&request.session_id)
-            .with_context(|| format!("session {} not found", request.session_id))?;
-        match session {
-            ManagedSession::Live { actor, lease, .. } => {
-                let change = lease.acquire(request.client_id, request.kind);
-                actor.broadcast_event(SessionEvent::LeaseChanged {
-                    session_id: request.session_id,
-                    change: change.clone(),
-                })?;
-                Ok(change)
+        let change = {
+            let mut sessions = self.sessions()?;
+            let session = sessions
+                .get_mut(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            match session {
+                ManagedSession::Live { actor, lease, .. } => self.grant_input_lease_and_flush(
+                    &request.session_id,
+                    &request.client_id,
+                    request.kind,
+                    lease,
+                    actor,
+                )?,
+                ManagedSession::Historical { .. } => {
+                    bail!("restored historical sessions cannot acquire input leases")
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
             }
-            ManagedSession::Historical { .. } => {
-                bail!("restored historical sessions cannot acquire input leases")
-            }
-            ManagedSession::Restoring { .. } => {
-                bail!("session {} is being restored", request.session_id)
-            }
-        }
+        };
+        Ok(change)
     }
 
     fn release_input_lease(
@@ -3264,15 +3445,24 @@ impl SessionApi for SessionManager {
                     ManagedSession::Live { .. } => unreachable!(),
                 }
             };
-            let holder = lease.holder.as_ref().with_context(|| {
-                format!("session {} has no input lease holder", request.session_id)
-            })?;
-            ensure!(
-                holder.client_id == request.client_id,
-                "client {} does not hold input lease for session {}",
-                request.client_id,
-                request.session_id
-            );
+            // A denial still bails with the same message (the client parses it
+            // to re-acquire), but the bytes are parked first so the acquire
+            // they trigger can deliver them instead of losing the keystroke.
+            let denied = match lease.holder.as_ref() {
+                None => Some(format!(
+                    "session {} has no input lease holder",
+                    request.session_id
+                )),
+                Some(holder) if holder.client_id != request.client_id => Some(format!(
+                    "client {} does not hold input lease for session {}",
+                    request.client_id, request.session_id
+                )),
+                _ => None,
+            };
+            if let Some(message) = denied {
+                self.park_denied_input(&request.session_id, &request.client_id, request.bytes);
+                bail!(message);
+            }
             actor.tx.clone()
         };
         request_write_input(&cmd_tx, request.bytes)
@@ -3424,7 +3614,7 @@ impl SessionApi for SessionManager {
             request.session_id.clone(),
             ManagedSession::Live {
                 actor,
-                lease: InputLeaseState::default(),
+                lease: lease.clone(),
                 launch,
                 last_known_cwd,
             },
@@ -3591,10 +3781,16 @@ impl SessionApi for SessionManager {
                     let Some(removed) = sessions.remove(&session_id) else {
                         bail!("historical session {session_id} disappeared during shutdown");
                     };
-                    if let Err(error) = self.persist_manifest(&sessions) {
+                    let pins = self.pins()?;
+                    let mut candidate_labels = self.custom_labels()?.clone();
+                    candidate_labels.remove(session_id.as_str());
+                    if let Err(error) =
+                        self.persist_manifest_with_layout(&sessions, &pins, &candidate_labels)
+                    {
                         sessions.insert(session_id.clone(), removed);
                         return Err(error);
                     }
+                    self.forget_custom_label(&session_id);
                     ShutdownTarget::Historical {
                         completed,
                         log_path,
@@ -3652,7 +3848,9 @@ impl SessionApi for SessionManager {
                         sessions.insert(session_id.clone(), removed);
                         bail!("session {session_id} changed state during shutdown");
                     };
-                    if let Err(error) = &rewrite_result {
+                    if rewrite_result.is_ok() {
+                        self.forget_custom_label(&session_id);
+                    } else if let Err(error) = &rewrite_result {
                         match historical_fallback {
                             Ok(session) => {
                                 sessions.insert(
@@ -3686,6 +3884,8 @@ impl SessionApi for SessionManager {
         self.forget_snippet(&session_id);
         self.forget_judge_override(&session_id);
         self.forget_inbox(&session_id);
+        self.forget_parked_input(&session_id);
+        self.forget_custom_label(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -3764,23 +3964,152 @@ impl SessionApi for SessionManager {
         // Same `HashMap`-iteration hazard as `list_sessions`: sort so a client
         // building its list from this response gets a stable fallback order.
         sources.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
-        Ok(sources
-            .into_iter()
-            .map(|(session_id, source, stamps)| {
-                let context = match source {
-                    ContextSource::Ready(context) => context,
-                    // A live actor mid-shutdown simply yields no context rather
-                    // than failing the whole batch.
-                    ContextSource::Live(tx) => request_session_context(&tx).ok().flatten(),
-                };
-                SessionContextRow {
-                    session_id,
-                    context,
-                    last_activity_ms: stamps.activity_ms,
-                    last_input_ms: stamps.input_ms,
+        // Fan out: send every live actor its Context command before
+        // collecting any reply, so the actors resolve concurrently instead
+        // of one round-trip at a time (~5.6ms each sequential: 373ms for 66
+        // sessions on the load path, ahead of the attach on the daemon's
+        // serial per-connection queue). Replies are collected back in
+        // session order, and a live actor mid-shutdown still yields no
+        // context rather than failing the whole batch.
+        // Split the already-resolved rows from the legs still awaiting an
+        // actor reply; only the latter need a collection thread. Live legs
+        // start as `None` placeholders so a timed-out reply degrades the row
+        // instead of failing the batch.
+        let mut rows = Vec::with_capacity(sources.len());
+        let mut live = Vec::new();
+        for (session_id, source, stamps) in sources {
+            let row = SessionContextRow {
+                session_id: session_id.clone(),
+                context: None,
+                last_activity_ms: stamps.activity_ms,
+                last_input_ms: stamps.input_ms,
+            };
+            match source {
+                ContextSource::Ready(context) => {
+                    rows.push(SessionContextRow { context, ..row });
                 }
-            })
-            .collect())
+                ContextSource::Live(tx) => {
+                    let (resp_tx, resp_rx) = mpsc::channel();
+                    match tx.send(ActorCommand::Context { response: resp_tx }) {
+                        Ok(()) => {
+                            live.push((rows.len(), session_id, resp_rx));
+                            rows.push(row);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                %err,
+                                "failed to send context command to session actor; degrading to None"
+                            );
+                            rows.push(row);
+                        }
+                    }
+                }
+            }
+        }
+        // Collect concurrently: sequential `recv` costs the SUM of every
+        // actor's scheduling latency (2.8s for 68 sessions at load 150), one
+        // thread per pending reply costs the MAX. Each leg is also
+        // timeout-bounded, so a wedged actor yields `None` like the
+        // mid-shutdown case instead of hanging the whole batch forever.
+        // Joins land back in `rows` order, never by arrival, so a slow
+        // session cannot file its context under another session's id.
+        let live_slots: Vec<_> = live
+            .into_iter()
+            .map(|(index, session_id, rx)| (index, session_id, Mutex::new(Some(rx))))
+            .collect();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(live_slots.len());
+            let mut fallbacks = Vec::new();
+
+            for (index, session_id, rx_slot) in &live_slots {
+                let thread_name = format!("ctx-fanout-{session_id}");
+                let sid = session_id.clone();
+                let spawn_res = std::thread::Builder::new()
+                    .name(thread_name)
+                    .spawn_scoped(scope, move || {
+                        let rx = rx_slot.lock().ok().and_then(|mut g| g.take())?;
+                        match rx.recv_timeout(SESSION_CONTEXT_REQUEST_TIMEOUT) {
+                            Ok(Ok(context)) => context,
+                            Ok(Err(err)) => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    %err,
+                                    "actor returned error for context request; degrading to None"
+                                );
+                                None
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    timeout_secs = SESSION_CONTEXT_REQUEST_TIMEOUT.as_secs(),
+                                    "timed out waiting for session context reply; degrading to None"
+                                );
+                                None
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                tracing::warn!(
+                                    session_id = %sid,
+                                    "session actor disconnected before replying to context request; degrading to None"
+                                );
+                                None
+                            }
+                        }
+                    });
+
+                match spawn_res {
+                    Ok(handle) => handles.push((*index, handle)),
+                    Err(err) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            %err,
+                            "failed to spawn context fanout thread; falling back to synchronous receive"
+                        );
+                        fallbacks.push((*index, session_id, rx_slot));
+                    }
+                }
+            }
+
+            for (index, handle) in handles {
+                if let Ok(context) = handle.join() {
+                    rows[index].context = context;
+                }
+            }
+
+            for (index, session_id, rx_slot) in fallbacks {
+                let Some(rx) = rx_slot.lock().ok().and_then(|mut g| g.take()) else {
+                    continue;
+                };
+                let context = match rx.recv_timeout(SESSION_CONTEXT_REQUEST_TIMEOUT) {
+                    Ok(Ok(context)) => context,
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            %err,
+                            "actor returned error for context request during fallback; degrading to None"
+                        );
+                        None
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            timeout_secs = SESSION_CONTEXT_REQUEST_TIMEOUT.as_secs(),
+                            "timed out waiting for session context reply during fallback; degrading to None"
+                        );
+                        None
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "session actor disconnected during fallback; degrading to None"
+                        );
+                        None
+                    }
+                };
+                rows[index].context = context;
+            }
+        });
+        Ok(rows)
     }
 
     fn session_judge_policy(
@@ -5079,11 +5408,13 @@ impl HistoricalSession {
     /// As [`Self::snapshot`], but carrying the raw output-history tail for
     /// client-side re-emulation. Historical sessions are only ever read on the
     /// attach/snapshot paths, so this is always history-bearing.
-    fn snapshot_with_history(&self) -> SessionSnapshot {
+    fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
         overlay_raw_output_history(
             self.snapshot(),
             &self.persisted.log_path,
             self.output.bytes_logged,
+            history_cap,
+            self.output.scrollback.as_ref(),
         )
     }
 
@@ -5484,6 +5815,12 @@ struct OutputState {
     log_cache: Option<Vec<u8>>,
     pending_carriage_return: bool,
     pending_escape_buffer: Vec<u8>,
+    /// Ingest-time scrollback journal. `None` where there is no session
+    /// dir (unit tests); the ingest hook skips journaling then.
+    scrollback: Option<crate::scrollback::ScrollbackJournal>,
+    /// Stable-row boundary baseline for scroll detection. `None` until
+    /// the first post-advance sample seeds it.
+    scroll_seq_baseline: Option<StableRowIndex>,
 }
 
 /// Visible rows + output sequence + git context + cwd, returned by the actor's
@@ -5507,6 +5844,7 @@ enum ActorCommand {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
     SnapshotWithHistory {
+        history_cap: u64,
         response: Sender<ActorResult<SessionSnapshot>>,
     },
     /// Cheap visible-rows-only snapshot for the summarizer: no styled rows and
@@ -5926,8 +6264,11 @@ impl ActorState {
                 let _ = response.send(Ok(self.snapshot()));
                 false
             }
-            ActorCommand::SnapshotWithHistory { response } => {
-                let _ = response.send(Ok(self.snapshot_with_history()));
+            ActorCommand::SnapshotWithHistory {
+                history_cap,
+                response,
+            } => {
+                let _ = response.send(Ok(self.snapshot_with_history(history_cap)));
                 false
             }
             ActorCommand::SummaryRows { response } => {
@@ -6053,11 +6394,13 @@ impl ActorState {
     /// A snapshot carrying the raw output-history tail for client-side
     /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
     /// the plain [`Self::snapshot`] so they never carry history.
-    fn snapshot_with_history(&self) -> SessionSnapshot {
+    fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
         overlay_raw_output_history(
             self.snapshot(),
             &self.output.log_path,
             self.output.bytes_logged,
+            history_cap,
+            self.output.scrollback.as_ref(),
         )
     }
 
@@ -6202,7 +6545,7 @@ impl ActorState {
             event: SessionEvent::ResyncRequired {
                 session_id,
                 latest_event_seq,
-                snapshot: self.snapshot_with_history(),
+                snapshot: self.snapshot_with_history(RAW_OUTPUT_TAIL_CAP),
             },
         }
     }
@@ -6485,27 +6828,151 @@ impl OutputState {
     }
 
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
-        self.log
-            .write_all(bytes)
-            .context("writing PTY output log")?;
-        self.bytes_logged += bytes.len() as u64;
-        self.active_segment_bytes += bytes.len() as u64;
-        self.output_seq += 1;
-        if self.is_segmented_log() {
-            self.rotate_segment_if_oversized();
-        } else {
-            self.trim_log_if_oversized();
-        }
-        if let Some(cache) = &mut self.log_cache {
-            if cache.len() + bytes.len() <= 1024 * 1024 {
-                cache.extend_from_slice(bytes);
-            } else {
+        match self.log.write_all(bytes) {
+            Ok(()) => {
+                self.bytes_logged += bytes.len() as u64;
+                self.active_segment_bytes += bytes.len() as u64;
+                if self.is_segmented_log() {
+                    self.rotate_segment_if_oversized();
+                } else {
+                    self.trim_log_if_oversized();
+                }
+                if let Some(cache) = &mut self.log_cache {
+                    if cache.len() + bytes.len() <= 1024 * 1024 {
+                        cache.extend_from_slice(bytes);
+                    } else {
+                        self.log_cache = None;
+                    }
+                }
+            }
+            Err(error) => {
+                // A failed log write (full disk) degrades history, not
+                // liveness: the chunk still advances the terminal and the
+                // output sequence below, so callers broadcast it instead of
+                // freezing every attached client. `write_all` may have
+                // persisted a prefix before failing, so re-sync the counters
+                // to the on-disk length and drop the cache rather than trust
+                // either; the baseline is the active segment's length for
+                // segmented logs, where `bytes_logged` is cumulative.
+                tracing::warn!(
+                    log_path = %self.log_path.display(),
+                    error = ?error,
+                    "failed to write PTY output log; continuing live-only"
+                );
+                let baseline = if self.is_segmented_log() {
+                    self.active_segment_bytes
+                } else {
+                    self.bytes_logged
+                };
+                let on_disk = self
+                    .log
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(baseline);
+                let persisted = on_disk.saturating_sub(baseline).min(bytes.len() as u64);
+                self.bytes_logged += persisted;
+                self.active_segment_bytes += persisted;
                 self.log_cache = None;
             }
         }
+        self.output_seq += 1;
         let current_working_directory = self.extract_current_working_directory(bytes);
+        self.init_scroll_baseline();
         self.advance_translated_bytes(bytes);
+        self.journal_scrolled_lines();
+        // Reads serve only flushed bytes, so every chunk (scrolling or
+        // desert) makes the journal current through it. Without this a
+        // journal under the periodic-flush threshold is all buffer and
+        // serves nothing.
+        if let Some(journal) = self.scrollback.as_mut() {
+            journal.flush_buffer();
+            journal.drain_pending_seals(&self.compression_tx);
+        }
         Ok(current_working_directory)
+    }
+
+    /// Anchor the scroll baseline before the first advance.
+    ///
+    /// The baseline must predate the first chunk's scrolls: anchoring
+    /// after the advance would silently skip them. Restore and reflow
+    /// rebuild the terminal through `advance_replayed_bytes`, which
+    /// never calls this, so the first *live* chunk anchors onto the
+    /// rebuilt window instead of re-journaling persisted lines.
+    fn init_scroll_baseline(&mut self) {
+        if self.scroll_seq_baseline.is_some()
+            || self.scrollback.as_ref().is_none_or(|j| !j.is_enabled())
+            || self.terminal.is_alt_screen_active()
+        {
+            return;
+        }
+        let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
+        self.scroll_seq_baseline = Some(first_visible);
+    }
+
+    /// Journal lines that scrolled into scrollback during this chunk.
+    ///
+    /// The stable index of the first visible row only moves when lines
+    /// scroll: rows between the baseline and the new boundary entered
+    /// scrollback since the last chunk, so they are encoded once and
+    /// appended, stamped with the chunk's end log offset. Scrollback
+    /// rows are immutable (wipes and eviction only remove them), so
+    /// encoding at first sight is final.
+    ///
+    /// Desert chunks (TUI redraws with no scrolling) cost two integer
+    /// reads. Wipes, resizes, and terminal replacement move the window
+    /// discontinuously; every such case re-anchors the baseline without
+    /// journaling, losing at most one chunk's scrolls. Wiped lines keep
+    /// their records: history is a record, not a mirror. Restore and
+    /// reflow replay through `advance_replayed_bytes`, which never calls
+    /// this, so rebuilt terminals cannot double-journal persisted lines.
+    fn journal_scrolled_lines(&mut self) {
+        if self.scrollback.as_ref().is_none_or(|j| !j.is_enabled())
+            || self.terminal.is_alt_screen_active()
+        {
+            return;
+        }
+        let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
+        let baseline = match self.scroll_seq_baseline {
+            Some(baseline) => baseline,
+            None => {
+                self.scroll_seq_baseline = Some(first_visible);
+                return;
+            }
+        };
+        if baseline >= first_visible {
+            // No new scroll, or a wipe/reflow/replacement moved the
+            // window back: re-anchor without journaling.
+            self.scroll_seq_baseline = Some(first_visible);
+            return;
+        }
+        let screen = self.terminal.screen();
+        let top = screen.phys_to_stable_row_index(0);
+        let start = baseline.max(top);
+        let Some(phys_start) = screen.stable_row_to_phys(start) else {
+            self.scroll_seq_baseline = Some(first_visible);
+            return;
+        };
+        // `phys_row(0)` is the first visible row's phys index, i.e. the
+        // scrollback/viewport boundary. (`scrollback_rows` sounds right
+        // but returns the total row count despite its doc comment.)
+        let phys_end = screen.phys_row(0);
+        if phys_start >= phys_end {
+            self.scroll_seq_baseline = Some(first_visible);
+            return;
+        }
+        let palette = self.terminal.palette();
+        let lines = self
+            .terminal
+            .screen()
+            .lines_in_phys_range(phys_start..phys_end);
+        let offset = self.bytes_logged;
+        if let Some(journal) = self.scrollback.as_mut() {
+            for mut line in lines {
+                let bytes = crate::scrollback::encode_line(&mut line, &palette);
+                journal.append(offset, &bytes);
+            }
+        }
+        self.scroll_seq_baseline = Some(first_visible);
     }
 
     fn is_segmented_log(&self) -> bool {
@@ -6559,6 +7026,9 @@ impl OutputState {
                         crate::storage::CompressionJob {
                             raw_path: old_segment_path.clone(),
                             compressed_path,
+                            // Segment raws are immutable post-rotation:
+                            // a missing one is anomalous and must warn.
+                            allow_missing_raw: false,
                         },
                     )) {
                         tracing::warn!(
@@ -6614,6 +7084,13 @@ impl OutputState {
         // `read_raw_output_tail` would then seek past EOF.
         let dropped = self.bytes_logged.saturating_sub(len);
         self.bytes_logged = len;
+        // Journal offsets share the log's coordinate space: drop records
+        // below the new head and shift the survivors onto it. Segmented
+        // logs never reach this path (absolute offsets, immutable
+        // segments), so no rebase is needed there.
+        if let Some(journal) = self.scrollback.as_mut() {
+            journal.rebase(dropped);
+        }
         // The cache mirrors the head of the log, so it no longer corresponds to
         // anything on disk once the front is dropped.
         self.log_cache = None;
@@ -6699,6 +7176,7 @@ impl OutputState {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
         self.cwd_sequence_buffer.clear();
+        self.scroll_seq_baseline = None;
 
         if let Some(cache) = self.log_cache.clone() {
             self.advance_replayed_bytes(&cache);
@@ -6902,6 +7380,7 @@ fn spawn_pty_runtime(
                 .and_then(crate::storage::parse_segment_index)
                 .unwrap_or((1, false));
             let active_segment_bytes = fs::metadata(&config.log_path).map(|m| m.len()).unwrap_or(0);
+            let scrollback = crate::scrollback::open_journal_for_log(&config.log_path);
             Ok(PtyRuntime {
                 master: pair.master,
                 child,
@@ -6925,6 +7404,8 @@ fn spawn_pty_runtime(
                     log_cache: Some(Vec::new()),
                     pending_carriage_return: false,
                     pending_escape_buffer: Vec::new(),
+                    scrollback: Some(scrollback),
+                    scroll_seq_baseline: None,
                 },
                 size: config.size,
                 current_working_directory: None,
@@ -6949,6 +7430,7 @@ fn spawn_pty_runtime(
                 .and_then(crate::storage::parse_segment_index)
                 .unwrap_or((1, false));
             let active_segment_bytes = fs::metadata(&config.log_path).map(|m| m.len()).unwrap_or(0);
+            let scrollback = crate::scrollback::open_journal_for_log(&config.log_path);
             let mut output = OutputState {
                 log: log.try_clone().context("cloning restored session log")?,
                 log_path: config.log_path.clone(),
@@ -6966,6 +7448,8 @@ fn spawn_pty_runtime(
                 log_cache: Some(Vec::new()),
                 pending_carriage_return: false,
                 pending_escape_buffer: Vec::new(),
+                scrollback: Some(scrollback),
+                scroll_seq_baseline: None,
             };
             let (replay_len, replay) = read_replay_tail(&config.log_path)?;
             let replayed_working_directory = if replay_len == 0 {
@@ -7062,6 +7546,7 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
             .with_context(|| format!("opening session log {}", target_log_path.display()))?
     };
 
+    let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
     Ok(OutputState {
         log,
         log_path: target_log_path,
@@ -7079,6 +7564,8 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         log_cache: Some(Vec::new()),
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
+        scrollback: Some(scrollback),
+        scroll_seq_baseline: None,
     })
 }
 
@@ -7117,10 +7604,12 @@ fn snapshot_from_output(
         context,
         bracketed_paste_enabled: output.terminal.bracketed_paste_enabled(),
         exited,
-        // History (raw_output) is attached only on the attach/resync/snapshot
-        // paths via `*_with_history`; resize broadcasts carry none.
+        // History (raw_output + raw_output_prefix) is attached only on the
+        // attach/resync/snapshot paths via `*_with_history`; resize
+        // broadcasts carry none.
         raw_output: Vec::new(),
         raw_output_start: 0,
+        raw_output_prefix: Vec::new(),
         // Populated by the manager from its snippet cache when a snapshot is
         // returned to a caller; the actor has no access to the cache.
         snippet: None,
@@ -7187,14 +7676,62 @@ const _: () = assert!(
 /// Overlays the raw output-history tail onto a snapshot for client-side
 /// re-emulation. Used by the attach/resync/snapshot paths; the resize broadcast
 /// keeps the plain `snapshot()` so it never carries the tail.
+///
+/// When a scrollback journal is passed, journaled lines at or older than
+/// the raw window seam ride along in `raw_output_prefix`, ahead of the raw
+/// tail in
+/// `raw_output`: desert sessions whose raw tail replays to a single screen
+/// get their real scrolled lines back. The two fields stay separate (never
+/// concatenated) so `raw_output_start` keeps addressing `raw_output[0]` and
+/// the client's delta byte-accounting runs on raw coordinates alone; full
+/// replays prepend the prefix, delta merges ignore it.
+///
+/// Two-phase fill, so an empty or inapplicable journal never shrinks the
+/// raw tail: probe the prefix first (budget half the cap); when it is
+/// empty the raw tail takes the whole cap exactly as before. Otherwise the
+/// raw tail takes the remaining room and the prefix re-queries against the
+/// true seam, so the total stays within `history_cap`.
 fn overlay_raw_output_history(
     mut snapshot: SessionSnapshot,
     log_path: &Path,
     bytes_logged: u64,
+    history_cap: u64,
+    journal: Option<&crate::scrollback::ScrollbackJournal>,
 ) -> SessionSnapshot {
-    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, RAW_OUTPUT_TAIL_CAP);
+    let Some(journal) = journal else {
+        let (start, raw) = read_raw_output_tail(log_path, bytes_logged, history_cap);
+        snapshot.raw_output = raw;
+        snapshot.raw_output_start = start;
+        return snapshot;
+    };
+    let probe_budget = (history_cap / 2).min(usize::MAX as u64) as usize;
+    let probe = journal.read_prefix_at_or_older_than(bytes_logged, probe_budget);
+    if probe.is_empty() {
+        let (start, raw) = read_raw_output_tail(log_path, bytes_logged, history_cap);
+        snapshot.raw_output = raw;
+        snapshot.raw_output_start = start;
+        return snapshot;
+    }
+    let raw_cap = history_cap.saturating_sub(probe.len() as u64);
+    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, raw_cap);
+    // A second scan on purpose: the probe fills its budget with the
+    // newest bytes whatever the seam, while this query skips above-seam
+    // records for free and reaches older records a filled probe dropped,
+    // so filtering the probe in memory would under-serve. Fusing needs
+    // the tail first, which unfixes the split policy; cold path, revisit
+    // only if attach latency matters.
+    let prefix = journal.read_prefix_at_or_older_than(start, probe.len());
+    if prefix.is_empty() && raw.len() as u64 == raw_cap {
+        // Everything probed sits above the true seam: no prefix after
+        // all, so hand the room back to the raw tail.
+        let (start, raw) = read_raw_output_tail(log_path, bytes_logged, history_cap);
+        snapshot.raw_output = raw;
+        snapshot.raw_output_start = start;
+        return snapshot;
+    }
     snapshot.raw_output = raw;
     snapshot.raw_output_start = start;
+    snapshot.raw_output_prefix = prefix;
     snapshot
 }
 
@@ -7590,10 +8127,16 @@ fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     recv_actor_result(resp_rx, "reading session snapshot")
 }
 
-fn request_snapshot_with_history(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+fn request_snapshot_with_history(
+    tx: &Sender<ActorCommand>,
+    history_cap: u64,
+) -> Result<SessionSnapshot> {
     let (resp_tx, resp_rx) = mpsc::channel();
-    tx.send(ActorCommand::SnapshotWithHistory { response: resp_tx })
-        .context("sending session snapshot with history command")?;
+    tx.send(ActorCommand::SnapshotWithHistory {
+        history_cap,
+        response: resp_tx,
+    })
+    .context("sending session snapshot with history command")?;
     recv_actor_result(resp_rx, "reading session snapshot with history")
 }
 
@@ -7619,7 +8162,7 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         ActorCommand::Snapshot { response } => {
             let _ = response.send(Err(error));
         }
-        ActorCommand::SnapshotWithHistory { response } => {
+        ActorCommand::SnapshotWithHistory { response, .. } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::SummaryRows { response } => {
@@ -8803,6 +9346,7 @@ mod tests {
             pid: std::process::id(),
             process_identity: None,
             judge_override: None,
+            lease: InputLeaseState::default(),
         };
 
         let mut master: libc::c_int = 0;
@@ -8948,6 +9492,7 @@ mod tests {
                         last_activity_ms: 0,
                         last_input_ms: 0,
                         judge_override: None,
+                        lease: InputLeaseState::default(),
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -9386,6 +9931,73 @@ mod tests {
             "historical reflow should not write terminal replies to the live PTY"
         );
         let _ = std::fs::remove_file(log_path);
+    }
+
+    #[test]
+    fn output_state_reflow_does_not_journal_replayed_history() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let log_path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 10,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&log_path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Ingest 10 lines: fits within 10 rows, no scrolls into scrollback yet.
+        output
+            .ingest(
+                b"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8\r\nline9",
+            )
+            .expect("ingest initial lines");
+
+        let initial_journaled = {
+            let journal = output.scrollback.as_mut().expect("journal");
+            journal.read_prefix_at_or_older_than(1000, 1024)
+        };
+        assert!(
+            initial_journaled.is_empty(),
+            "no lines scrolled yet on 10-row terminal"
+        );
+
+        // Reflow/resize terminal to 3 rows: replays log into 3 rows.
+        // During replay, lines 0..6 scroll into the terminal's internal scrollback.
+        let new_size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let writer = shared_pty_writer(Box::new(std::io::sink()));
+        output
+            .reflow_from_log(&new_size, writer)
+            .expect("reflow log");
+
+        // Ingest a new single live line
+        output
+            .ingest(b"\r\nlive_after_resize\r\n")
+            .expect("ingest live after resize");
+
+        let after_journaled = {
+            let journal = output.scrollback.as_mut().expect("journal");
+            journal.read_prefix_at_or_older_than(1000, 1024)
+        };
+
+        // If reflow had not reset scroll_seq_baseline to None, the pre-resize baseline (0)
+        // would cause all replayed lines (line0..line6) to be journaled on this live chunk.
+        // With scroll_seq_baseline reset, only the newly scrolled lines from the live chunk are journaled.
+        let text = String::from_utf8_lossy(&after_journaled);
+        assert!(
+            !text.contains("line0"),
+            "replayed history lines must not be journaled after reflow: {text:?}"
+        );
+        assert!(
+            !text.contains("line1"),
+            "replayed history lines must not be journaled after reflow: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9990,6 +10602,7 @@ mod tests {
                         last_activity_ms: 0,
                         last_input_ms: 0,
                         judge_override: None,
+                        lease: InputLeaseState::default(),
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -10699,6 +11312,7 @@ mod tests {
 
         let observed = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: observer.clone(),
                 mode: triage_core::session::AttachMode::Observer,
@@ -10718,6 +11332,7 @@ mod tests {
 
         let controlled = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: local_tui.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11162,6 +11777,7 @@ mod tests {
         let client_id = ClientId::new("restore-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11209,6 +11825,7 @@ mod tests {
         let client_id = ClientId::new("revive-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11258,6 +11875,7 @@ mod tests {
         // It accepts input again through the normal attach + write path.
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11296,6 +11914,7 @@ mod tests {
         let client_id = ClientId::new("demote-activity-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11420,6 +12039,7 @@ mod tests {
         let client_id = ClientId::new("input-stamp-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11456,6 +12076,384 @@ mod tests {
         assert!(stamped <= now_unix_millis());
 
         let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// The contexts batch must return one row per session in stable sort-key
+    /// order and correlate each session with its own resolved context.
+    #[test]
+    fn list_session_contexts_returns_every_session_in_order() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let mut session_data = Vec::new();
+        for i in 1..=3 {
+            let repo = unique_log_dir();
+            std::fs::create_dir_all(&repo).expect("create repo dir");
+            let branch = format!("feat/test-{}", i);
+            git_test_command(&repo, &["init", &format!("--initial-branch={branch}")]);
+            git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+            git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+            std::fs::write(repo.join("README.md"), "test\n").expect("write test file");
+            git_test_command(&repo, &["add", "README.md"]);
+            git_test_command(&repo, &["commit", "-m", "initial"]);
+
+            let mut req = StartSessionRequest::new(long_running_shell_command());
+            req.cwd = Some(repo.clone());
+            let id = manager.start_session(req).expect("start session");
+            session_data.push((id, branch, repo));
+        }
+
+        session_data
+            .sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
+
+        let rows = manager.list_session_contexts().expect("list contexts");
+        assert_eq!(rows.len(), session_data.len());
+        for (row, (expected_id, expected_branch, _)) in rows.iter().zip(&session_data) {
+            assert_eq!(
+                &row.session_id, expected_id,
+                "session id matches sort order"
+            );
+            assert_eq!(
+                row.context.as_ref().and_then(|c| c.branch.as_deref()),
+                Some(expected_branch.as_str()),
+                "context matches session"
+            );
+        }
+
+        for (id, _, repo) in session_data {
+            let _ = manager.shutdown_session(id);
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// A wedged actor must degrade its row to `None`, not hang the batch: one
+    /// stuck session used to wedge every client's rail load behind an
+    /// unbounded sequential `recv` in `list_session_contexts`.
+    #[test]
+    fn list_session_contexts_survives_a_wedged_actor() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        // Hermetic git repos for healthy sessions before and after the wedged actor.
+        let mut healthy_sessions = Vec::new();
+        for (i, branch) in [("1", "feat/healthy-1"), ("2", "feat/healthy-2")] {
+            let repo = unique_log_dir();
+            std::fs::create_dir_all(&repo).expect("create repo dir");
+            git_test_command(&repo, &["init", &format!("--initial-branch={branch}")]);
+            git_test_command(&repo, &["config", "user.email", "triage@example.invalid"]);
+            git_test_command(&repo, &["config", "user.name", "Triage Test"]);
+            std::fs::write(repo.join("README.md"), format!("{i}\n")).expect("write test file");
+            git_test_command(&repo, &["add", "README.md"]);
+            git_test_command(&repo, &["commit", "-m", "initial"]);
+
+            let mut req = StartSessionRequest::new(long_running_shell_command());
+            req.cwd = Some(repo.clone());
+            let id = manager.start_session(req).expect("start session");
+            healthy_sessions.push((id, branch, repo));
+        }
+
+        // A live session whose actor channel nobody drains.
+        // Naming it session-0 ensures it sorts before generated sessions
+        // (session-1, session-2), testing that a wedged actor at the head
+        // of the batch does not block concurrent resolution of subsequent handles.
+        let (tx, _never_drained) = mpsc::channel();
+        let wedged_id = SessionId::new("session-0").expect("session id");
+        {
+            let mut sessions = manager.sessions().expect("lock sessions");
+            sessions.insert(
+                wedged_id.clone(),
+                ManagedSession::Live {
+                    actor: SessionActor {
+                        tx,
+                        worker: None,
+                        reader: None,
+                        writer: None,
+                        last_activity_ms: Arc::new(AtomicU64::new(0)),
+                        last_input_ms: Arc::new(AtomicU64::new(0)),
+                    },
+                    lease: InputLeaseState::default(),
+                    launch: PersistedSessionLaunch {
+                        command: "true".to_string(),
+                        args: Vec::new(),
+                        cwd: None,
+                        size: SessionSize::default(),
+                        log_path: log_dir.join("wedged.log"),
+                    },
+                    last_known_cwd: None,
+                },
+            );
+        }
+
+        let start = Instant::now();
+        let rows = manager.list_session_contexts().expect("list contexts");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= SESSION_CONTEXT_REQUEST_TIMEOUT - Duration::from_millis(250),
+            "batch returned before timeout elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SESSION_CONTEXT_REQUEST_TIMEOUT + Duration::from_secs(10),
+            "wedged actor hung the batch: {elapsed:?}"
+        );
+        assert_eq!(rows.len(), 3, "three rows returned, wedged included");
+
+        // Verify that rows[0] is session-0 (the wedged actor at the head)
+        // and degraded to None without preventing subsequent healthy sessions
+        // from resolving their git contexts concurrently.
+        assert_eq!(rows[0].session_id, wedged_id);
+        assert!(rows[0].context.is_none(), "wedged actor degrades to None");
+
+        assert_eq!(rows[1].session_id, healthy_sessions[0].0);
+        assert_eq!(
+            rows[1].context.as_ref().and_then(|c| c.branch.as_deref()),
+            Some("feat/healthy-1"),
+            "healthy session 1 resolves its context"
+        );
+
+        assert_eq!(rows[2].session_id, healthy_sessions[1].0);
+        assert_eq!(
+            rows[2].context.as_ref().and_then(|c| c.branch.as_deref()),
+            Some("feat/healthy-2"),
+            "healthy session 2 resolves its context"
+        );
+
+        for (id, _, repo) in healthy_sessions {
+            let _ = manager.shutdown_session(id);
+            let _ = std::fs::remove_dir_all(&repo);
+        }
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Bytes denied by the lease must not be lost: the daemon parks them and
+    /// delivers them when the denied client acquires the lease (here via a
+    /// controller attach, which takes the lease over). Polls the grid for the
+    /// PTY echo rather than sleeping a fixed guess.
+    #[test]
+    fn denied_input_is_delivered_on_attach_acquire() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let holder = ClientId::new("park-first-holder").expect("client id");
+        let waiter = ClientId::new("park-waiter").expect("client id");
+        manager
+            .attach_session(AttachSessionRequest {
+                history_bytes: None,
+                session_id: session_id.clone(),
+                client_id: holder,
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("first attach takes the lease");
+
+        let denied = manager.write_input(WriteInputRequest {
+            session_id: session_id.clone(),
+            client_id: waiter.clone(),
+            bytes: b"echo parked-on-attach\r".to_vec(),
+        });
+        assert!(
+            denied.is_err(),
+            "the write must be denied while another client holds the lease"
+        );
+        let error_msg = denied.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not hold input lease for session")
+                && error_msg.contains(session_id.as_str()),
+            "denial message must match client-expected format: {error_msg}"
+        );
+
+        manager
+            .attach_session(AttachSessionRequest {
+                history_bytes: None,
+                session_id: session_id.clone(),
+                client_id: waiter,
+                mode: triage_core::session::AttachMode::InteractiveController,
+            })
+            .expect("second attach takes the lease over");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot");
+            let text: String = snapshot
+                .styled_rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
+                .collect();
+            if text.contains("parked-on-attach") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "denied bytes never reached the session after the takeover"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Same as above through the standalone lease RPC rather than attach.
+    #[test]
+    fn denied_input_is_delivered_on_lease_rpc_acquire() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let holder = ClientId::new("rpc-first-holder").expect("client id");
+        let waiter = ClientId::new("rpc-waiter").expect("client id");
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: session_id.clone(),
+                client_id: holder,
+                kind: triage_core::session::InputControllerKind::Interactive,
+            })
+            .expect("first acquire takes the lease");
+
+        let denied = manager.write_input(WriteInputRequest {
+            session_id: session_id.clone(),
+            client_id: waiter.clone(),
+            bytes: b"echo parked-on-rpc\r".to_vec(),
+        });
+        assert!(
+            denied.is_err(),
+            "the write must be denied while another client holds the lease"
+        );
+        let error_msg = denied.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("does not hold input lease for session")
+                && error_msg.contains(session_id.as_str()),
+            "denial message must match client-expected format: {error_msg}"
+        );
+
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: session_id.clone(),
+                client_id: waiter,
+                kind: triage_core::session::InputControllerKind::Interactive,
+            })
+            .expect("second acquire takes the lease over");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot");
+            let text: String = snapshot
+                .styled_rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.text.as_str()))
+                .collect();
+            if text.contains("parked-on-rpc") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "denied bytes never reached the session after the takeover"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Parked input is capped per client and take-once: a client typing into
+    /// a denial for minutes cannot grow the map without bound, and a flush
+    /// cannot deliver the same bytes twice.
+    #[test]
+    fn parked_input_is_capped_and_take_once() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-cap").expect("session id");
+        let client = ClientId::new("cap-client").expect("client id");
+        let other = ClientId::new("cap-other").expect("client id");
+
+        manager.park_denied_input(&session_id, &client, vec![b'x'; PARKED_INPUT_CAP_BYTES]);
+        manager.park_denied_input(&session_id, &client, b"overflow".to_vec());
+        manager.park_denied_input(&session_id, &other, b"y".to_vec());
+
+        let taken = manager.take_parked_input(&session_id, &client);
+        assert_eq!(taken.len(), PARKED_INPUT_CAP_BYTES);
+        assert!(
+            manager.take_parked_input(&session_id, &client).is_empty(),
+            "a take must drain, so a second flush cannot redeliver"
+        );
+        assert_eq!(
+            manager.take_parked_input(&session_id, &other),
+            b"y",
+            "one client's take must not touch another's parked bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Expired entries are swept on touch, so clients that went away leave
+    /// nothing behind, while active client entries are preserved.
+    #[test]
+    fn parked_input_sweep_drops_expired_entries() {
+        let session_id = SessionId::new("session-sweep").expect("session id");
+        let client = ClientId::new("sweep-client").expect("client id");
+        let active_client = ClientId::new("active-client").expect("client id");
+        let mut parked = HashMap::new();
+        parked.insert(
+            session_id.clone(),
+            vec![
+                ParkedInput {
+                    client,
+                    bytes: b"old".to_vec(),
+                    parked_at: Instant::now()
+                        .checked_sub(PARKED_INPUT_TTL + Duration::from_secs(1))
+                        .expect("recent past"),
+                },
+                ParkedInput {
+                    client: active_client.clone(),
+                    bytes: b"fresh".to_vec(),
+                    parked_at: Instant::now(),
+                },
+            ],
+        );
+        SessionManager::sweep_parked_input(&mut parked);
+        let remaining = parked
+            .get(&session_id)
+            .expect("session still has active client");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].client, active_client);
+        assert_eq!(remaining[0].bytes, b"fresh");
+    }
+
+    #[test]
+    fn parked_input_is_capped_by_client_count() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-client-cap").expect("session id");
+
+        for i in 0..MAX_PARKED_CLIENTS_PER_SESSION {
+            let client = ClientId::new(format!("client-{}", i)).expect("client id");
+            manager.park_denied_input(&session_id, &client, b"data".to_vec());
+        }
+
+        // The next client should be rejected because the session has reached the max parked clients.
+        let overflow_client = ClientId::new("client-overflow").expect("client id");
+        manager.park_denied_input(&session_id, &overflow_client, b"overflow".to_vec());
+        assert!(
+            manager
+                .take_parked_input(&session_id, &overflow_client)
+                .is_empty()
+        );
+
+        // Existing client can still append up to byte cap.
+        let client_0 = ClientId::new("client-0").expect("client id");
+        manager.park_denied_input(&session_id, &client_0, b"-more".to_vec());
+        assert_eq!(
+            manager.take_parked_input(&session_id, &client_0),
+            b"data-more"
+        );
+
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
@@ -11551,6 +12549,7 @@ mod tests {
         let client_id = ClientId::new("demote-cwd-client").expect("client id");
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11660,6 +12659,7 @@ mod tests {
         // session was not demoted and its actor not reaped.
         let response = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: ClientId::new("non-restorable-client").expect("client id"),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11797,6 +12797,7 @@ mod tests {
         assert_eq!(snapshot.current_working_directory, Some(cwd.clone()));
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -11859,6 +12860,7 @@ mod tests {
         assert_eq!(snapshot.current_working_directory, Some(launch_cwd.clone()));
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12033,6 +13035,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: client_id.clone(),
                 mode: triage_core::session::AttachMode::InteractiveController,
@@ -12667,6 +13670,8 @@ mod tests {
             log_cache: Some(Vec::new()),
             pending_carriage_return: false,
             pending_escape_buffer: Vec::new(),
+            scrollback: None,
+            scroll_seq_baseline: None,
         };
 
         output
@@ -12758,6 +13763,8 @@ mod tests {
             snapshot_from_output(&output, &SessionSize::default(), None, None, false),
             &path,
             output.bytes_logged,
+            RAW_OUTPUT_TAIL_CAP,
+            None,
         );
         assert_eq!(snapshot.raw_output.len(), RAW_OUTPUT_TAIL_CAP as usize);
         assert_eq!(
@@ -12765,6 +13772,350 @@ mod tests {
             output.bytes_logged - RAW_OUTPUT_TAIL_CAP
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A requested attach cap ships only the newest bytes: first paint waits
+    /// on the viewport page, with older pages fetched on demand.
+    #[test]
+    fn attach_history_cap_limits_the_served_tail() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output
+            .ingest(b"0123456789abcdef")
+            .expect("ingest fixed payload");
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            6,
+            None,
+        );
+        assert_eq!(snapshot.raw_output, b"abcdef");
+        assert_eq!(snapshot.raw_output_start, output.bytes_logged - 6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn attach_session_historical_limits_history_tail_to_requested_cap() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-cap-test").expect("session id");
+        let log_path = log_dir
+            .join("sessions")
+            .join("session-cap-test")
+            .join("segment-000001.tlog");
+        std::fs::create_dir_all(log_path.parent().unwrap()).expect("create session log dir");
+        std::fs::write(&log_path, b"0123456789abcdef").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: "echo".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize {
+                    rows: 6,
+                    cols: 40,
+                    pixel_width: 800,
+                    pixel_height: 240,
+                    dpi: 96,
+                },
+                log_path: log_path.clone(),
+                exited: true,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+            },
+        );
+
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let attached = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("cap-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: Some(6),
+            })
+            .expect("attach session");
+
+        assert_eq!(attached.snapshot.raw_output, b"abcdef");
+        assert_eq!(attached.snapshot.raw_output_start, 16 - 6);
+
+        // history_bytes: None returns full tail
+        let attached_full = manager
+            .attach_session(AttachSessionRequest {
+                session_id,
+                client_id: ClientId::new("cap-client-2").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("attach session full");
+        assert_eq!(attached_full.snapshot.raw_output, b"0123456789abcdef");
+        assert_eq!(attached_full.snapshot.raw_output_start, 0);
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn attach_session_live_limits_history_tail_to_requested_cap() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config);
+
+        let request = StartSessionRequest::new(long_running_shell_command());
+        let session_id = manager.start_session(request).expect("start session");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let snap = manager
+                .attach_session(AttachSessionRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("probe-client").unwrap(),
+                    mode: triage_core::session::AttachMode::Observer,
+                    history_bytes: None,
+                })
+                .expect("probe attach");
+            if snap.snapshot.raw_output.len() >= 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let full = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: ClientId::new("full-client").unwrap(),
+                mode: triage_core::session::AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("full attach");
+
+        if !full.snapshot.raw_output.is_empty() {
+            let cap = 2.min(full.snapshot.raw_output.len());
+            let capped = manager
+                .attach_session(AttachSessionRequest {
+                    session_id: session_id.clone(),
+                    client_id: ClientId::new("cap-client").unwrap(),
+                    mode: triage_core::session::AttachMode::Observer,
+                    history_bytes: Some(cap as u64),
+                })
+                .expect("capped attach");
+
+            assert_eq!(capped.snapshot.raw_output.len(), cap);
+            assert_eq!(
+                capped.snapshot.raw_output,
+                &full.snapshot.raw_output[full.snapshot.raw_output.len() - cap..]
+            );
+            assert_eq!(
+                capped.snapshot.raw_output_start,
+                full.snapshot.raw_output_start + (full.snapshot.raw_output.len() - cap) as u64
+            );
+        }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Desert fixture: scrolled lines journaled early, then buried under a
+    /// flood of in-place redraws. The served history must carry the
+    /// journaled lines in `raw_output_prefix` (the only reachable copy of
+    /// the scrolled lines) ahead of the raw desert tail in `raw_output`,
+    /// within the cap, with `raw_output_start` still addressing the raw
+    /// tail's first byte so delta merges can ignore the prefix.
+    #[test]
+    fn overlay_prefixes_journaled_lines_ahead_of_desert_tail() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Three lines scroll (one chunk, stamped @ 35)...
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n")
+            .expect("ingest scrolled lines");
+        // ...then 42 KB of cursor-addressed redraws that scroll nothing.
+        for _ in 0..2500 {
+            output
+                .ingest(b"\x1b[1;1H0123456789\x1b[K")
+                .expect("redraw in place");
+        }
+        assert!(output.bytes_logged > 40_000);
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+
+        // Cap smaller than the log: the raw window cannot reach the
+        // journaled offsets, so the overlay must split.
+        let cap = 32768;
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            cap,
+            output.scrollback.as_ref(),
+        );
+
+        let prefix = b"\x1b[0mline1\r\n\x1b[0mline2\r\n\x1b[0mline3\r\n";
+        assert_eq!(
+            snapshot.raw_output_prefix, prefix,
+            "prefix must carry exactly the journaled lines"
+        );
+        let raw_len = cap as usize - prefix.len();
+        assert_eq!(
+            snapshot.raw_output_start,
+            output.bytes_logged - raw_len as u64
+        );
+        let log = fs::read(&path).expect("read log");
+        assert_eq!(
+            snapshot.raw_output,
+            &log[log.len() - raw_len..],
+            "raw tail must be the log's last raw_len bytes, prefix-free"
+        );
+        assert_eq!(
+            snapshot.raw_output.len() + snapshot.raw_output_prefix.len(),
+            cap as usize,
+            "split fill must use exactly the cap"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When the whole log fits the cap, the raw tail covers the journal:
+    /// the re-query at the true seam finds nothing, so the overlay serves
+    /// the entire log as raw bytes with an empty prefix: the pre-journal
+    /// shape, bit for bit.
+    #[test]
+    fn overlay_serves_whole_log_when_cap_covers_journal() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n")
+            .expect("ingest scrolled lines");
+        for _ in 0..2500 {
+            output
+                .ingest(b"\x1b[1;1H0123456789\x1b[K")
+                .expect("redraw in place");
+        }
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+
+        let cap = 65536;
+        assert!(output.bytes_logged < cap);
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            cap,
+            output.scrollback.as_ref(),
+        );
+
+        let log = fs::read(&path).expect("read log");
+        assert_eq!(snapshot.raw_output_start, 0);
+        assert_eq!(snapshot.raw_output, log);
+        assert!(
+            snapshot.raw_output_prefix.is_empty(),
+            "covered journal must leave the prefix empty"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When the probe finds journaled lines but every one sits above
+    /// the true seam (late-stamped scrolls inside the raw window), the
+    /// re-query comes back empty and the overlay hands the probe room
+    /// back to the raw tail instead of serving a short window.
+    #[test]
+    fn overlay_hands_room_back_when_prefix_sits_above_the_seam() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+        for _ in 0..500 {
+            output.ingest(b"\x1b[1;1H0123456789\x1b[K").expect("pad");
+        }
+        output
+            .ingest(b"late1\r\nlate2\r\nlate3\r\nlate4\r\nlate5\r\n")
+            .expect("scroll late");
+        for _ in 0..1500 {
+            output.ingest(b"\x1b[1;1H0123456789\x1b[K").expect("redraw");
+        }
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+        let cap = 32768;
+        assert!(output.bytes_logged > cap);
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            cap,
+            output.scrollback.as_ref(),
+        );
+        assert!(snapshot.raw_output_prefix.is_empty());
+        assert_eq!(snapshot.raw_output.len(), cap as usize);
+        assert_eq!(snapshot.raw_output_start, output.bytes_logged - cap);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// When the raw window already covers the journaled offsets, the
+    /// prefix must be empty: serving it would replay lines twice.
+    #[test]
+    fn overlay_serves_no_prefix_when_raw_covers_journal() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n")
+            .expect("ingest scrolled lines");
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.bytes_logged,
+            65536,
+            output.scrollback.as_ref(),
+        );
+
+        assert_eq!(snapshot.raw_output_start, 0);
+        assert_eq!(
+            snapshot.raw_output,
+            b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n"
+        );
+        assert!(
+            snapshot.raw_output_prefix.is_empty(),
+            "covered journal must leave the split prefix empty"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Trimming must drop the *front* of the log and keep the newest bytes: the
@@ -12903,6 +14254,363 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// Desert flood: TUI-style in-place redraws scroll nothing, so the
+    /// journal stays empty no matter how many bytes pass through. This
+    /// is the case the journal exists for in reverse: the raw bytes
+    /// are unreachable desert, and there are no scrolled lines to save.
+    #[test]
+    fn ingest_desert_flood_journals_nothing() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 5,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Scroll once first: the non-empty baseline pins the guard
+        // instead of passing on a dead journal.
+        output
+            .ingest(b"b1\r\nb2\r\nb3\r\nb4\r\nb5\r\nb6\r\n")
+            .expect("scroll baseline");
+        let before = output
+            .scrollback
+            .as_ref()
+            .expect("journal")
+            .read_prefix_at_or_older_than(u64::MAX, 1 << 20);
+        assert!(!before.is_empty(), "scrolls must journal before the flood");
+        // Home before refilling: the baseline left the cursor at the
+        // bottom, where the fill itself would scroll and journal.
+        output.ingest(b"\x1b[H").expect("home cursor");
+        // Fill the screen without scrolling, then redraw in place.
+        output
+            .ingest(b"a1\r\na2\r\na3\r\na4\r\na5")
+            .expect("fill screen");
+        for _ in 0..50 {
+            output
+                .ingest(b"\x1b[Hredraw-line-1\x1b[K\r\nredraw-2\x1b[K")
+                .expect("redraw in place");
+        }
+
+        let journal = output.scrollback.as_ref().expect("journal");
+        assert_eq!(
+            journal.read_prefix_at_or_older_than(u64::MAX, 1 << 20),
+            before,
+            "in-place redraws must journal nothing"
+        );
+        assert!(
+            output.scroll_seq_baseline.is_some(),
+            "the baseline must initialize even with no scrolls"
+        );
+        assert!(
+            output.bytes_logged > 1000,
+            "the test must actually flood bytes: {}",
+            output.bytes_logged
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Scrolling journals each scrolled line once, stamped with its
+    /// chunk's end offset, so the serve-time seam can split prefix from
+    /// raw tail exactly.
+    #[test]
+    fn ingest_scrolling_journals_lines_with_chunk_offsets() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Three lines fill three rows; the third newline scrolls line1.
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\n")
+            .expect("ingest lines 1-3");
+        assert_eq!(output.bytes_logged, 21);
+        // Each further line scrolls exactly one more.
+        output.ingest(b"line4\r\n").expect("ingest line 4");
+        assert_eq!(output.bytes_logged, 28);
+        output.ingest(b"line5\r\n").expect("ingest line 5");
+        assert_eq!(output.bytes_logged, 35);
+
+        // No explicit flush: ingest must leave the journal serve-visible
+        // on its own (the serve paths hold only a shared reference).
+        let journal = output.scrollback.as_ref().expect("journal");
+        // line1 @ 21 is older than a raw window starting at 27; the
+        // seam is inclusive, so at 28 the whole chunk [21..28] that
+        // scrolled line2 sits below the seam and line2 joins line1.
+        let prefix = journal.read_prefix_at_or_older_than(27, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        assert!(
+            text.contains("line1") && !text.contains("line2"),
+            "seam at 27 must serve exactly line1: {text:?}"
+        );
+        let prefix = journal.read_prefix_at_or_older_than(28, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        assert!(
+            text.contains("line1") && text.contains("line2"),
+            "inclusive seam at 28 must serve lines 1-2: {text:?}"
+        );
+        let prefix = journal.read_prefix_at_or_older_than(36, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        let (l1, l2, l3) = (text.find("line1"), text.find("line2"), text.find("line3"));
+        assert!(
+            matches!((l1, l2, l3), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "records must append oldest-first: {text:?}"
+        );
+        assert!(
+            !text.contains("line4") && !text.contains("line5"),
+            "viewport lines must never journal: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Alt-screen scrolling journals nothing: the alternate buffer has
+    /// no scrollback, so its churn must never pollute the journal.
+    #[test]
+    fn ingest_alt_screen_scrolls_journal_nothing() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Positive control: main-screen scrolls journal first, so the
+        // post-alt assertion pins the guard instead of passing on a dead
+        // journal (no baseline, nothing appended, nothing to compare).
+        output
+            .ingest(b"m1\r\nm2\r\nm3\r\nm4\r\nm5\r\n")
+            .expect("scroll main screen");
+        let before = output
+            .scrollback
+            .as_ref()
+            .expect("journal")
+            .read_prefix_at_or_older_than(u64::MAX, 1 << 20);
+        assert!(!before.is_empty(), "main scrolls must journal");
+
+        output.ingest(b"\x1b[?1049h").expect("enter alt screen");
+        output
+            .ingest(b"a1\r\na2\r\na3\r\na4\r\na5\r\n")
+            .expect("scroll alt screen");
+        output.ingest(b"\x1b[?1049l").expect("leave alt screen");
+
+        let journal = output.scrollback.as_ref().expect("journal");
+        assert_eq!(
+            journal.read_prefix_at_or_older_than(u64::MAX, 1 << 20),
+            before,
+            "alt-screen scrolls must add nothing"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A scrollback wipe (`ED 3`) keeps already-journaled lines and
+    /// re-anchors the baseline, so post-wipe scrolls journal exactly
+    /// once instead of re-journaling the pre-wipe window.
+    #[test]
+    fn ingest_wipe_keeps_journaled_lines_and_reanchors() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\n")
+            .expect("scroll before wipe");
+        output.ingest(b"\x1b[3J").expect("wipe scrollback");
+        output
+            .ingest(b"line4\r\nline5\r\nline6\r\n")
+            .expect("scroll after wipe");
+
+        let journal = output.scrollback.as_ref().expect("journal");
+        let prefix = journal.read_prefix_at_or_older_than(u64::MAX, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix).into_owned();
+        assert!(
+            text.contains("line1"),
+            "pre-wipe record survives the wipe: {text:?}"
+        );
+        assert_eq!(
+            text.matches("line1").count(),
+            1,
+            "no double-journal across the wipe: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Ingest drains rotation seals: past 10k scrolled lines the rotated
+    /// file must be sealed (inline here, since `test_output_state` carries
+    /// no worker). Without the drain call the raw would sit unsealed
+    /// forever and retention (which prunes sealed files only) would free
+    /// nothing.
+    #[test]
+    fn ingest_rotation_drains_its_seal_inline() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Chunked: the emulator retains 3500 scrollback rows, so one giant
+        // chunk would evict most scrolled lines before the hook could
+        // encode them. Per-chunk scrolls journal fully and accumulate:
+        // 12 x 900 lines clears the 10k rotation boundary with margin
+        // (the first viewport rows never scroll).
+        for c in 0..12 {
+            let mut chunk = Vec::new();
+            for i in 0..900 {
+                chunk.extend_from_slice(format!("c{c}l{i:04}\r\n").as_bytes());
+            }
+            output.ingest(&chunk).expect("ingest chunk");
+        }
+        assert!(
+            dir.join("scrollback-000000.slog.zst").exists(),
+            "ingest must drain the rotation seal"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A legacy trim rebases the journal into the trimmed coordinate
+    /// space: records below the cut drop, survivors shift onto the new
+    /// head, and the seam keeps working.
+    #[test]
+    fn ingest_trim_rebases_journal_offsets() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 3,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        output
+            .ingest(b"line1\r\nline2\r\nline3\r\n")
+            .expect("ingest lines 1-3");
+        output
+            .ingest(b"line4\r\nline5\r\n")
+            .expect("ingest lines 4-5");
+        assert_eq!(output.bytes_logged, 35);
+
+        // Pad without scrolling to push past the bound: 35 + 16 = 51,
+        // trimmed back to 20, so the cut lands at absolute offset 31.
+        // line1 @ 21 drops; line2, line3 @ 35 shift to 4.
+        output.max_log_bytes = 30;
+        output.retain_log_bytes = 20;
+        output
+            .ingest(b"pad-pad-pad-pad!")
+            .expect("pad past the bound");
+        assert_eq!(output.bytes_logged, 20);
+
+        let journal = output.scrollback.as_mut().expect("journal");
+        journal.flush_buffer();
+        let prefix = journal.read_prefix_at_or_older_than(20, 1 << 20);
+        let text = String::from_utf8_lossy(&prefix);
+        assert!(
+            !text.contains("line1"),
+            "records below the cut must drop: {text:?}"
+        );
+        assert!(
+            text.contains("line2") && text.contains("line3"),
+            "survivors must stay servable past the trim: {text:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed log write (full disk) must degrade history, not liveness:
+    /// the chunk still advances the terminal and the output sequence, so the
+    /// actor's Ok path broadcasts it instead of freezing every attached
+    /// client. The failure is forced portably by swapping in a read-only
+    /// handle, whose writes fail with EBADF on every platform.
+    #[test]
+    fn ingest_failure_still_advances_terminal_and_sequence() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+        output
+            .ingest(b"third\r\n")
+            .expect("consecutive failures must also survive");
+
+        assert_eq!(
+            output.output_seq, 3,
+            "failed chunks still advance the output sequence monotonically"
+        );
+        assert_eq!(
+            output.bytes_logged, 7,
+            "counters must stay synced to the on-disk length across failures"
+        );
+        assert!(
+            output.log_cache.is_none(),
+            "a failed write invalidates the log cache"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\n",
+            "unlogged chunks must not corrupt on-disk content"
+        );
+        let rows = visible_rows(&output.terminal);
+        assert!(
+            rows.iter().any(|row| row.contains("second")),
+            "the terminal must advance past a failed write: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("third")),
+            "the terminal must advance past consecutive failed writes: {rows:?}"
+        );
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output
+            .ingest(b"fourth\r\n")
+            .expect("resumed write must succeed");
+        assert_eq!(output.output_seq, 4);
+        assert_eq!(output.bytes_logged, 7 + 8);
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\nfourth\r\n",
+            "resumed writes must append cleanly after skipped chunks"
+        );
+
+        drop(output);
+        let _ = fs::remove_file(&path);
+    }
+
     /// The log path is data from the manifest or a handover payload, so a
     /// corrupted one must not turn shutdown into an arbitrary-file delete.
     #[test]
@@ -13030,6 +14738,11 @@ mod tests {
             log_cache: Some(Vec::new()),
             pending_carriage_return: false,
             pending_escape_buffer: Vec::new(),
+            // No journal by default: `unique_log_path` tests share the
+            // temp dir, and journals in one directory would interleave.
+            // Journal tests open their own in a `unique_log_dir`.
+            scrollback: None,
+            scroll_seq_baseline: None,
         }
     }
 
@@ -14153,6 +15866,7 @@ mod tests {
                         last_activity_ms: 0,
                         last_input_ms: 0,
                         judge_override: Some(false),
+                        lease: InputLeaseState::default(),
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -14424,6 +16138,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
+    /// Shutdown must take the session's custom label with it: the label map
+    /// is keyed by id, not by record membership, so without an explicit
+    /// forget a removed session's label outlives it (in memory and on disk)
+    /// and a later session reusing the name collides with a ghost row.
+    #[test]
+    fn shutdown_session_forgets_the_custom_label() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        let survivor_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start survivor session");
+        manager
+            .set_session_custom_label(session_id.clone(), Some("doomed".to_string()))
+            .expect("set doomed label");
+        manager
+            .set_session_custom_label(survivor_id.clone(), Some("survivor".to_string()))
+            .expect("set survivor label");
+
+        let layout = manager.get_rail_layout().expect("layout");
+        assert!(layout.custom_labels.contains_key(session_id.as_str()));
+        assert_eq!(
+            layout
+                .custom_labels
+                .get(survivor_id.as_str())
+                .map(String::as_str),
+            Some("survivor")
+        );
+
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown");
+
+        let layout = manager.get_rail_layout().expect("layout after shutdown");
+        assert!(
+            !layout.custom_labels.contains_key(session_id.as_str()),
+            "label must not outlive its session"
+        );
+        assert_eq!(
+            layout
+                .custom_labels
+                .get(survivor_id.as_str())
+                .map(String::as_str),
+            Some("survivor"),
+            "surviving session label must remain intact"
+        );
+
+        // Nor on disk: a cold restart must not resurrect it, but must keep survivor.
+        let manager2 = SessionManager::new(config);
+        let layout2 = manager2.get_rail_layout().expect("layout after restart");
+        assert!(!layout2.custom_labels.contains_key(session_id.as_str()));
+        assert_eq!(
+            layout2
+                .custom_labels
+                .get(survivor_id.as_str())
+                .map(String::as_str),
+            Some("survivor"),
+            "surviving session label must remain intact on disk"
+        );
+
+        let _ = manager.shutdown_session(survivor_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn handover_preserves_rail_pins_and_custom_labels() {
@@ -14536,6 +16318,7 @@ mod tests {
 
         let _attached = manager
             .attach_session(AttachSessionRequest {
+                history_bytes: None,
                 session_id: session_id.clone(),
                 client_id: ClientId::new("test-client").unwrap(),
                 mode: triage_core::session::AttachMode::Observer,

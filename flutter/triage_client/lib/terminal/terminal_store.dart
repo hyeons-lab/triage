@@ -38,6 +38,63 @@ const int kHistoryReplayMaxBytes = 256 * 1024;
 const int kHistoryReplayWebMaxLines = 50000;
 const int kHistoryReplayWebMaxBytes = 1024 * 1024;
 
+/// First history window requested on attach: enough for the viewport plus
+/// instant scrollback, small enough that first paint never waits on a
+/// megabyte tail. Scrolling near the top re-attaches with a doubling
+/// window (see [nextHistoryWindowBytes]) up to the platform replay
+/// budget above.
+const int kHistoryFirstWindowBytes = 64 * 1024;
+
+/// History window requested by attaches that discard the snapshot (input
+/// lease acquisition): just enough to keep the protocol's empty-tail
+/// shape without shipping a megabyte to throw away.
+const int kHistoryLeaseProbeBytes = 1024;
+
+/// Next history window after [current] when paging older scrollback:
+/// doubling keeps the cumulative transfer near 2x the final depth,
+/// capped at [max] (the platform replay budget, since the trim drops
+/// anything older anyway).
+int nextHistoryWindowBytes({required int current, required int max}) {
+  if (current <= 0) return max <= 0 ? 0 : kHistoryFirstWindowBytes.clamp(1, max);
+  final doubled = current * 2;
+  return doubled >= max ? max : doubled;
+}
+
+/// Both emulators' scrollback capacity in lines (xterm.dart `maxLines` and
+/// the xterm.js `scrollback` option): the backstop the scaled line budget
+/// below can never exceed.
+const int kEmulatorMaxScrollbackLines = 50000;
+
+/// Replay-trim budgets for a served history window, in
+/// ([maxLines], [maxBytes]) kept newest-first by [trimHistoryTail].
+///
+/// The line budget scales with the window on native targets so each
+/// deeper page emulates strictly more than the last: trimming every page
+/// to the first-page budget replays the same suffix of the same log end
+/// over and over and the buffer never grows. (On web the platform line
+/// budget already equals the emulator backstop, so every window replays
+/// the same line count and only the byte budget grows.) The byte budget
+/// is the window itself, so a page never parses more than it asked for.
+/// A null window (local seeds
+/// and other replays that were never windowed) keeps the platform
+/// budgets, exactly as before.
+({int maxLines, int maxBytes}) historyTrimBudgetsForWindow(
+  int? windowBytes, {
+  required bool web,
+}) {
+  final platformLines = web ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines;
+  final platformBytes = web ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+  if (windowBytes == null || windowBytes <= 0) {
+    return (maxLines: platformLines, maxBytes: platformBytes);
+  }
+  final scaledLines =
+      platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
+  return (
+    maxLines: min(max(1, scaledLines), kEmulatorMaxScrollbackLines),
+    maxBytes: min(windowBytes, platformBytes),
+  );
+}
+
 /// Trims a full-replay history payload to its newest complete lines.
 ///
 /// xterm is append-only, so a replay must still arrive oldest-first; this keeps
@@ -240,6 +297,12 @@ class TerminalStore extends ChangeNotifier {
   // subsequent history snapshots without clearing the terminal.
   int? _appliedLogBytes;
 
+  // Baselines stashed on Attach() and restored if attach is cancelled via
+  // CancelAttach(), so a failed re-attach does not leave dedup baselines null.
+  int? _stashedAppliedLiveSeq;
+  int? _stashedAppliedLogBytes;
+  int? _stashedHistoryHighWaterSeq;
+
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
@@ -290,9 +353,13 @@ class TerminalStore extends ChangeNotifier {
   TerminalState _reduce(TerminalState s, TerminalIntent intent) {
     switch (intent) {
       case Attach():
-        // Start of a fresh attach lifecycle: drop any carries and any live
-        // chunks buffered against a prior attach so they cannot leak into this
-        // session once HistoryBytes arrives.
+        // Start of a fresh attach lifecycle: stash baselines in case attach
+        // fails or is cancelled, then drop carries and live chunks buffered
+        // against a prior attach so they cannot leak into this session once
+        // HistoryBytes arrives.
+        _stashedAppliedLiveSeq = _appliedLiveSeq;
+        _stashedAppliedLogBytes = _appliedLogBytes;
+        _stashedHistoryHighWaterSeq = s.historyHighWaterSeq;
         _resetCarries();
         _clearPendingLive();
         _appliedLiveSeq = null;
@@ -306,6 +373,26 @@ class TerminalStore extends ChangeNotifier {
           // The [HistoryBytes] that ends this attach re-establishes it.
           resetHistoryHighWaterSeq: true,
         );
+
+      case CancelAttach():
+        if (s.phase == AttachPhase.awaitingHistory) {
+          _appliedLiveSeq = _stashedAppliedLiveSeq;
+          _appliedLogBytes = _stashedAppliedLogBytes;
+          final restoredHighWaterSeq = _stashedHistoryHighWaterSeq;
+          _stashedAppliedLiveSeq = null;
+          _stashedAppliedLogBytes = null;
+          _stashedHistoryHighWaterSeq = null;
+          if (s.sized) {
+            _flushPendingLive(restoredHighWaterSeq);
+          }
+          return s.copyWith(
+            phase: AttachPhase.live,
+            scrollbackReady: true,
+            historyHighWaterSeq: restoredHighWaterSeq,
+            resetHistoryHighWaterSeq: restoredHighWaterSeq == null,
+          );
+        }
+        return s;
 
       case Detach():
         _closeFrameOnWire();
@@ -328,6 +415,9 @@ class TerminalStore extends ChangeNotifier {
         _clearPendingLive();
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
+        _stashedAppliedLiveSeq = null;
+        _stashedAppliedLogBytes = null;
+        _stashedHistoryHighWaterSeq = null;
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -347,6 +437,8 @@ class TerminalStore extends ChangeNotifier {
         :final rows,
         :final throughOutputSeq,
         :final rawOutputStart,
+        :final windowBytes,
+        :final rawOutputPrefix,
       ):
         return _reduceHistory(
           s,
@@ -355,6 +447,8 @@ class TerminalStore extends ChangeNotifier {
           rows,
           throughOutputSeq,
           rawOutputStart: rawOutputStart,
+          windowBytes: windowBytes,
+          rawOutputPrefix: rawOutputPrefix,
         );
 
       case LiveBytes(:final bytes, :final outputSeq):
@@ -396,7 +490,12 @@ class TerminalStore extends ChangeNotifier {
     int rows,
     int? throughOutputSeq, {
     int? rawOutputStart,
+    int? windowBytes,
+    List<int> rawOutputPrefix = const [],
   }) {
+    _stashedAppliedLiveSeq = null;
+    _stashedAppliedLogBytes = null;
+    _stashedHistoryHighWaterSeq = null;
     // Replay at the client's target grid size ([cols] x [rows], the current
     // emulator/view size chosen by the caller, not the host capture size). A
     // later viewport [Resize] reflows and the live repaint self-heals.
@@ -415,8 +514,12 @@ class TerminalStore extends ChangeNotifier {
     // the seq baseline past in-flight live would drop the replayed bytes as
     // duplicates. First history and exited sessions still fall through to the
     // full replay below; a genuinely truncated log replays on its first
-    // non-empty tail, which still carries the regression evidence.
-    if (bytes.isEmpty && s.scrollbackReady && !s.exited) {
+    // non-empty tail, which still carries the regression evidence. The
+    // journaled prefix counts as payload: a prefix-only snapshot still paints.
+    if (bytes.isEmpty &&
+        rawOutputPrefix.isEmpty &&
+        s.scrollbackReady &&
+        !s.exited) {
       if (next.sized) {
         _flushPendingLive(next.historyHighWaterSeq);
       }
@@ -562,8 +665,8 @@ class TerminalStore extends ChangeNotifier {
 
     tdbg(
       'store.history',
-      'FULL REPLAY ${bytes.length}B at ${cols}x$rows '
-          'throughSeq=$throughSeq rawStart=$rawStart',
+      'FULL REPLAY ${bytes.length}B+${rawOutputPrefix.length}P at ${cols}x$rows '
+          'throughSeq=$throughSeq rawStart=$rawStart windowBytes=$windowBytes',
     );
     _sink.clear();
     // Reset carries so history starts a fresh decode stream; history then
@@ -577,18 +680,32 @@ class TerminalStore extends ChangeNotifier {
     _beginHostInputSuppression();
     // Viewport-first: replay only the newest lines so a megabyte tail doesn't
     // stall first paint; the baseline below still uses the original end offset
-    // (trimming drops a prefix) so delta merges stay anchored.
+    // (trimming drops a prefix) so delta merges stay anchored. The budgets
+    // scale with the served window so each deeper page emulates more than
+    // the last instead of replaying the same trimmed suffix.
     // `kIsWeb` selects the xterm.js sink exactly: every other target parses
     // through package:xterm on the UI thread.
+    //
+    // The journaled prefix replays ahead of the raw tail (it holds the
+    // scrolled lines the raw window can no longer reach). It joins the
+    // replay stream only: every byte coordinate above and below stays in
+    // raw-log space, so delta merges keep ignoring the prefix. Trimming
+    // the combined stream keeps the newest bytes, so an over-budget
+    // prefix sheds its oldest lines first; windowed replays then still
+    // fit the raw tail, while unwindowed ones trim it as before.
+    final replaySource = rawOutputPrefix.isEmpty
+        ? bytes
+        : [...rawOutputPrefix, ...bytes];
+    final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
     final replayBytes = trimHistoryTail(
-      bytes,
-      maxLines: kIsWeb ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines,
-      maxBytes: kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes,
+      replaySource,
+      maxLines: budgets.maxLines,
+      maxBytes: budgets.maxBytes,
     );
-    if (!identical(replayBytes, bytes)) {
+    if (!identical(replayBytes, replaySource)) {
       tdbg(
         'store.history',
-        'TRIMMED replay ${bytes.length}B -> ${replayBytes.length}B',
+        'TRIMMED replay ${replaySource.length}B -> ${replayBytes.length}B',
       );
     }
     _writeDecoded(replayBytes);

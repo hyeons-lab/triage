@@ -534,6 +534,7 @@ void main() {
         sessionId: 'session-789',
         clientId: 'client-abc',
         mode: 'Observer',
+        historyBytes: 65536,
       );
       f.catchError((_) => <String, dynamic>{});
 
@@ -551,6 +552,7 @@ void main() {
       expect(attachReq.sessionId, equals('session-789'));
       expect(attachReq.clientId, equals('client-abc'));
       expect(attachReq.mode, equals(fbs.AttachMode.Observer));
+      expect(attachReq.historyBytes, equals(65536));
     });
 
     test('attachSession rejects unknown attach modes', () async {
@@ -1307,6 +1309,38 @@ void main() {
       expect(rawOutputFromSnapshot({'raw_output': null}), isEmpty);
     });
 
+    test('history gate counts either the raw tail or the prefix', () {
+      final raw = Uint8List.fromList([1, 2, 3]);
+      final prefix = Uint8List.fromList([4, 5]);
+      expect(
+        snapshotCarriesHistory({'raw_output': raw, 'raw_output_prefix': prefix}),
+        isTrue,
+      );
+      expect(snapshotCarriesHistory({'raw_output': raw}), isTrue);
+      // A prefix-only restore snapshot still carries history: dropping
+      // the prefix leg silently discards it as history-less.
+      expect(snapshotCarriesHistory({'raw_output_prefix': prefix}), isTrue);
+      expect(snapshotCarriesHistory({'raw_output': Uint8List(0)}), isFalse);
+      expect(snapshotCarriesHistory({}), isFalse);
+    });
+
+    test('prefix extractor reads raw_output_prefix with the same encodings', () {
+      final original = utf8.encode('journaled old line\n');
+      final encoded = base64Encode(GZipEncoder().encode(original));
+      expect(
+        rawOutputPrefixFromSnapshot({'raw_output_prefix': encoded}),
+        equals(Uint8List.fromList(original)),
+      );
+      expect(rawOutputPrefixFromSnapshot({}), isEmpty);
+      expect(rawOutputPrefixFromSnapshot({'raw_output_prefix': null}), isEmpty);
+      // The raw tail key must not leak into the prefix: a wrong key
+      // string fails silent as an empty prefix at every attach site.
+      expect(
+        rawOutputPrefixFromSnapshot({'raw_output': encoded}),
+        isEmpty,
+      );
+    });
+
     test('rejects corrupted gzip stream and returns empty Uint8List', () {
       final corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
       final encoded = base64Encode(corrupt);
@@ -1352,20 +1386,133 @@ void main() {
     test('rejects null and zero-total probe failures', () {
       expect(isUsableDaemonStats(null), isFalse);
       expect(
-        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 0)),
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: null,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        )),
         isFalse,
       );
     });
 
     test('accepts positive totals including a full disk', () {
       expect(
-        isUsableDaemonStats((diskFreeBytes: 0, diskTotalBytes: 100)),
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 100,
+          cpuPercent: null,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        )),
         isTrue,
       );
       expect(
-        isUsableDaemonStats((diskFreeBytes: 50, diskTotalBytes: 100)),
+        isUsableDaemonStats((
+          diskFreeBytes: 50,
+          diskTotalBytes: 100,
+          cpuPercent: 12,
+          batteryPercent: 87,
+          batteryState: 'charging',
+        )),
         isTrue,
       );
+    });
+
+    test('accepts host-only readings when disk is unknown', () {
+      expect(
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: 12,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        )),
+        isTrue,
+      );
+      expect(
+        isUsableDaemonStats((
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: null,
+          batteryPercent: 87,
+          batteryState: 'discharging',
+        )),
+        isTrue,
+      );
+    });
+  });
+
+  group('daemonStatsFromResponse', () {
+    test('reads host legs alongside disk', () {
+      final stats = daemonStatsFromResponse({
+        'disk_free_bytes': 50,
+        'disk_total_bytes': 100,
+        'cpu_percent': 12,
+        'battery_percent': 87,
+        'battery_state': 'charging',
+      });
+      expect(stats.diskFreeBytes, 50);
+      expect(stats.diskTotalBytes, 100);
+      expect(stats.cpuPercent, 12);
+      expect(stats.batteryPercent, 87);
+      expect(stats.batteryState, 'charging');
+    });
+
+    test('missing keys degrade to hidden legs (old daemons)', () {
+      final stats = daemonStatsFromResponse({
+        'disk_free_bytes': 50,
+        'disk_total_bytes': 100,
+      });
+      expect(stats.cpuPercent, isNull);
+      expect(stats.batteryPercent, isNull);
+      expect(stats.batteryState, 'unknown');
+    });
+
+    test('normalizes sentinel, clamp, and bad state', () {
+      final stats = daemonStatsFromResponse({
+        'disk_free_bytes': 50,
+        'disk_total_bytes': 100,
+        'cpu_percent': -1,
+        'battery_percent': 101,
+        'battery_state': 'calibrating',
+      });
+      expect(stats.cpuPercent, isNull);
+      expect(stats.batteryPercent, 100);
+      expect(stats.batteryState, 'unknown');
+    });
+  });
+
+  group('millisSinceLastInbound', () {
+    test('is zero before connect, grows with silence, resets on traffic',
+        () async {
+      final sink = RecordingWebSocketSink();
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-json',
+      );
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      expect(client.millisSinceLastInbound, 0);
+
+      await client.connect();
+      final fresh = client.millisSinceLastInbound;
+      expect(fresh, lessThan(60000));
+
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      final silent = client.millisSinceLastInbound;
+      expect(silent, greaterThan(fresh));
+
+      channel.addIncoming(jsonEncode({'type': 'session_started'}));
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(client.millisSinceLastInbound, lessThan(silent));
+
+      await client.disconnect();
+      expect(client.millisSinceLastInbound, 0);
     });
   });
 }

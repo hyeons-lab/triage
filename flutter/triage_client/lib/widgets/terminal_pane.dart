@@ -1,7 +1,78 @@
+import 'dart:async';
+
+import 'package:flutter/widgets.dart';
+
 import '../terminal/debug_log.dart';
 import 'terminal_pane_stub.dart'
     if (dart.library.js_util) 'terminal_pane_web.dart'
     as impl;
+
+/// Transient pill shown at the top of the terminal when scrollback paging
+/// exhausts without yielding older lines: a TUI redrawing in place (or the
+/// platform window maxed on barren output) means the loaded scrollback is
+/// genuinely all there is in reach: the view is not stuck, there is
+/// nothing older to load. Shared by both pane implementations so the
+/// wording cannot drift between them.
+class NoOlderScrollbackPill extends StatelessWidget {
+  const NoOlderScrollbackPill({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const IgnorePointer(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Color(0xcc161b1d),
+          borderRadius: BorderRadius.all(Radius.circular(12)),
+        ),
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Text(
+            'No older scrollback in reach',
+            style: TextStyle(color: Color(0xffcdd7d6), fontSize: 12),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Whether a landed history page was barren: it added no buffer lines
+/// while the user is still near the top, so the window was a TUI
+/// redrawing in place and the pane should ask for a deeper one instead
+/// of sitting on identical content. Shared by both pane implementations
+/// (the native pane runs this in CI; the web pane cannot, so the web
+/// behavior is covered by construction plus the predicate's unit test).
+bool shouldContinuePastBarrenPage({
+  required int addedLines,
+  required bool nearTop,
+}) => addedLines <= 0 && nearTop;
+
+/// Latch behind [NoOlderScrollbackPill]: shows the pill for 3 seconds,
+/// re-arming on every exhaustion note. Shared by both pane
+/// implementations so the timer discipline cannot drift between them;
+/// each pane keeps its own platform guards at its call sites.
+mixin NoOlderScrollbackLatch<T extends StatefulWidget> on State<T> {
+  bool showNoOlderScrollback = false;
+  Timer? _noOlderScrollbackTimer;
+
+  void noteHistoryExhausted() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => showNoOlderScrollback = false);
+      }
+    });
+    if (mounted && !showNoOlderScrollback) {
+      setState(() => showNoOlderScrollback = true);
+    }
+  }
+
+  void cancelNoOlderScrollbackTimer() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = null;
+    showNoOlderScrollback = false;
+  }
+}
 
 class TerminalController {
   final List<void Function(String)> _writeListeners = [];
@@ -91,6 +162,33 @@ class TerminalController {
     }
   }
 
+  // Fired before a scroll-up page re-attach so panes can stash their
+  // scroll anchor; the replay that follows carries a bigger window, and
+  // the anchor is restored adjusted by the added rows.
+  final List<void Function()> _historyPageStartedListeners = [];
+  void addHistoryPageStartedListener(void Function() listener) =>
+      _historyPageStartedListeners.add(listener);
+  void removeHistoryPageStartedListener(void Function() listener) =>
+      _historyPageStartedListeners.remove(listener);
+
+  void notifyHistoryPageStarted() {
+    for (final listener in List.from(_historyPageStartedListeners)) {
+      listener();
+    }
+  }
+
+  final List<void Function()> _historyPageCancelledListeners = [];
+  void addHistoryPageCancelledListener(void Function() listener) =>
+      _historyPageCancelledListeners.add(listener);
+  void removeHistoryPageCancelledListener(void Function() listener) =>
+      _historyPageCancelledListeners.remove(listener);
+
+  void notifyHistoryPageCancelled() {
+    for (final listener in List.from(_historyPageCancelledListeners)) {
+      listener();
+    }
+  }
+
   void write(String data) {
     if (_writeListeners.isEmpty) {
       tdbg(
@@ -165,6 +263,8 @@ class TerminalController {
     _resizeOutListeners.clear();
     _interactionListeners.clear();
     _historyReplayedListeners.clear();
+    _historyPageStartedListeners.clear();
+    _historyPageCancelledListeners.clear();
     _writeBuffer.clear();
   }
 }

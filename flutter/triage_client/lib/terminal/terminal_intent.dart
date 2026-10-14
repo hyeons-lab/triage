@@ -37,6 +37,10 @@ final class LiveBytes extends TerminalIntent {
 /// full session output log, used for non-destructive delta-merging.
 /// Null counters mean unknown (unanchored pathways replay or apply
 /// defensively); negatives are corrupt and sanitize to null.
+/// [rawOutputPrefix] carries journaled scrollback lines at or older than
+/// the raw window seam (the host's `raw_output_prefix`, inclusive of the
+/// seam offset); full replays emulate it ahead of [bytes], delta merges
+/// ignore it so byte accounting stays in raw coordinates.
 final class HistoryBytes extends TerminalIntent {
   const HistoryBytes(
     this.bytes, {
@@ -44,6 +48,8 @@ final class HistoryBytes extends TerminalIntent {
     required this.rows,
     this.throughOutputSeq,
     this.rawOutputStart,
+    this.windowBytes,
+    this.rawOutputPrefix = const [],
   });
 
   final List<int> bytes;
@@ -51,6 +57,11 @@ final class HistoryBytes extends TerminalIntent {
   final int rows;
   final int? throughOutputSeq;
   final int? rawOutputStart;
+  final List<int> rawOutputPrefix;
+  // The history window this payload was served for, sizing the replay
+  // trim (see historyTrimBudgetsForWindow in terminal_store.dart). Null
+  // for replays that were never windowed, which keep the platform budgets.
+  final int? windowBytes;
 }
 
 /// The view's measured viewport changed (debounced fit detection).
@@ -71,6 +82,12 @@ final class UserInput extends TerminalIntent {
 /// Session attach started; the store enters `awaitingHistory`.
 final class Attach extends TerminalIntent {
   const Attach();
+}
+
+/// An attach attempt was cancelled or failed; resumes live phase and flushes
+/// any pending live chunks received while awaiting history.
+final class CancelAttach extends TerminalIntent {
+  const CancelAttach();
 }
 
 /// Session detached; live/history writes stop until the next [Attach].

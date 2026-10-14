@@ -137,6 +137,10 @@ fn current_disk_bytes() -> (u64, u64) {
     }
 }
 
+fn current_host_stats() -> triage_core::host::HostStats {
+    triage_core::host::daemon_host_stats()
+}
+
 #[derive(Debug)]
 pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     api: A,
@@ -341,6 +345,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
 
                 let update = self.api.server_update_info();
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
+                let host = current_host_stats();
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
@@ -350,6 +355,12 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     disk_free_bytes,
                     disk_total_bytes,
                     tailscale_pairing_available: self.authenticator.tailscale_pairing_available(),
+                    cpu_percent: host.cpu_percent,
+                    battery_percent: host.battery.map(|battery| battery.percent),
+                    battery_state: host
+                        .battery
+                        .map(|battery| battery.state)
+                        .unwrap_or(triage_core::host::BatteryState::Unknown),
                 })
             }
             ClientRequest::PairingChallenge { client_id } => {
@@ -538,9 +549,16 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             }
             ClientRequest::GetDaemonStats => {
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
+                let host = current_host_stats();
                 Ok(ServerResult::DaemonStats {
                     disk_free_bytes,
                     disk_total_bytes,
+                    cpu_percent: host.cpu_percent,
+                    battery_percent: host.battery.map(|battery| battery.percent),
+                    battery_state: host
+                        .battery
+                        .map(|battery| battery.state)
+                        .unwrap_or(triage_core::host::BatteryState::Unknown),
                 })
             }
             ClientRequest::SetRailPins {
@@ -830,6 +848,27 @@ pub enum ServerMessage {
     },
 }
 
+impl ServerMessage {
+    /// Short stable name for logs and metrics. Matches the serde tag so a
+    /// logged kind greps the same on both sides of the wire.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ServerMessage::Response { .. } => "response",
+            ServerMessage::Error { .. } => "error",
+            ServerMessage::Event { .. } => "event",
+            ServerMessage::SubscriptionClosed { .. } => "subscription_closed",
+            ServerMessage::SessionSnippetUpdated { .. } => "session_snippet_updated",
+            ServerMessage::SessionContextUpdated { .. } => "session_context_updated",
+            ServerMessage::UpdateAvailable { .. } => "update_available",
+            ServerMessage::SessionJudgePolicyUpdated { .. } => "session_judge_policy_updated",
+            ServerMessage::RailPinsUpdated { .. } => "rail_pins_updated",
+            ServerMessage::SessionCustomLabelUpdated { .. } => "session_custom_label_updated",
+            ServerMessage::SessionStarted { .. } => "session_started",
+            ServerMessage::SessionTerminated { .. } => "session_terminated",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ServerResult {
@@ -855,6 +894,19 @@ pub enum ServerResult {
         /// configured). Defaults false so hellos from older daemons parse.
         #[serde(default)]
         tailscale_pairing_available: bool,
+        /// Host CPU busy percent and battery level/state for the daemon
+        /// selector. `None`/unknown means the probe failed or the first
+        /// CPU sample is still seeding; defaulted so results from older
+        /// daemons parse, skipped on the wire when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_percent: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_percent: Option<u8>,
+        #[serde(
+            default,
+            skip_serializing_if = "triage_core::host::BatteryState::is_unknown"
+        )]
+        battery_state: triage_core::host::BatteryState,
     },
     Paired {
         token: String,
@@ -917,6 +969,15 @@ pub enum ServerResult {
     DaemonStats {
         disk_free_bytes: u64,
         disk_total_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_percent: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        battery_percent: Option<u8>,
+        #[serde(
+            default,
+            skip_serializing_if = "triage_core::host::BatteryState::is_unknown"
+        )]
+        battery_state: triage_core::host::BatteryState,
     },
 }
 
@@ -996,6 +1057,7 @@ mod tests {
                 disk_free_bytes,
                 disk_total_bytes,
                 tailscale_pairing_available,
+                ..
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(actual, authenticated);
@@ -1444,6 +1506,7 @@ mod tests {
             exited: false,
             raw_output: Vec::new(),
             raw_output_start: 0,
+            raw_output_prefix: Vec::new(),
             snippet: None,
             snippet_detail: None,
         }
@@ -1464,6 +1527,7 @@ mod tests {
     fn attach_request_can_use_interactive_controller_mode() {
         let request = ClientRequest::AttachSession {
             request: AttachSessionRequest {
+                history_bytes: None,
                 session_id: SessionId::new("session-1").unwrap(),
                 client_id: ClientId::new("client-1").unwrap(),
                 mode: AttachMode::InteractiveController,
@@ -1806,11 +1870,16 @@ mod tests {
         // reports this build with nothing newer known.
         assert_eq!(hello.server_version().unwrap(), env!("CARGO_PKG_VERSION"));
         assert!(!hello.update_available());
-        assert!(hello.latest_version().is_none());
-        // Disk fields ride the handshake too, as a live probe: assert the
-        // invariant, not exact bytes.
+        // Disk and host stats ride the handshake too, as a live probe:
+        // assert the invariants, not exact bytes.
         assert_disk_invariant(hello.disk_free_bytes(), hello.disk_total_bytes());
         assert!(!hello.tailscale_pairing_available());
+        if let Some(cpu) = flatbuffers_proto::percent_from_wire(hello.cpu_percent()) {
+            assert!(cpu <= 100);
+        }
+        if let Some(battery) = flatbuffers_proto::percent_from_wire(hello.battery_percent()) {
+            assert!(battery <= 100);
+        }
     }
 
     #[test]
@@ -1820,6 +1889,9 @@ mod tests {
             result: ServerResult::DaemonStats {
                 disk_free_bytes: 12_345,
                 disk_total_bytes: 67_890,
+                cpu_percent: Some(42),
+                battery_percent: Some(87),
+                battery_state: triage_core::host::BatteryState::Charging,
             },
         };
         let bytes = flatbuffers_proto::serialize_server_message(&msg);
@@ -1830,6 +1902,39 @@ mod tests {
                 result: flatbuffers_proto::ServerResultBorrowed::DaemonStats {
                     disk_free_bytes: 12_345,
                     disk_total_bytes: 67_890,
+                    cpu_percent: Some(42),
+                    battery_percent: Some(87),
+                    battery_state: triage_core::host::BatteryState::Charging,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn flatbuffers_daemon_stats_unknown_roundtrip() {
+        // Unknown legs must survive the round trip as unknown (-1), not as
+        // a bogus 0: 0% CPU and 0% battery are both valid readings.
+        let msg = ServerMessage::Response {
+            id: Some(json!("stats-fb-unknown")),
+            result: ServerResult::DaemonStats {
+                disk_free_bytes: 0,
+                disk_total_bytes: 0,
+                cpu_percent: None,
+                battery_percent: None,
+                battery_state: triage_core::host::BatteryState::Unknown,
+            },
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("stats-fb-unknown"),
+                result: flatbuffers_proto::ServerResultBorrowed::DaemonStats {
+                    disk_free_bytes: 0,
+                    disk_total_bytes: 0,
+                    cpu_percent: None,
+                    battery_percent: None,
+                    battery_state: triage_core::host::BatteryState::Unknown,
                 },
             }
         );
@@ -1877,6 +1982,7 @@ mod tests {
                         disk_free_bytes,
                         disk_total_bytes,
                         tailscale_pairing_available,
+                        ..
                     } => {
                         assert_eq!(protocol_version, PROTOCOL_VERSION);
                         assert!(!authenticated);
@@ -2199,10 +2305,20 @@ mod tests {
                     ServerResult::DaemonStats {
                         disk_free_bytes,
                         disk_total_bytes,
+                        cpu_percent,
+                        battery_percent,
+                        ..
                     },
             } => {
                 assert_eq!(id, json!("stats-1"));
                 assert_disk_invariant(disk_free_bytes, disk_total_bytes);
+                // Live host legs are unknown-or-bounded, never bogus.
+                if let Some(cpu) = cpu_percent {
+                    assert!(cpu <= 100, "cpu {cpu} exceeds 100");
+                }
+                if let Some(battery) = battery_percent {
+                    assert!(battery <= 100, "battery {battery} exceeds 100");
+                }
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -2224,6 +2340,7 @@ mod tests {
                     ServerResult::DaemonStats {
                         disk_free_bytes,
                         disk_total_bytes,
+                        ..
                     },
                 ..
             } => {
@@ -2438,6 +2555,57 @@ mod tests {
     }
 
     #[test]
+    fn flatbuffers_attach_session_history_bytes_roundtrip() {
+        let request = ClientMessage {
+            id: Some(json!("attach-fb")),
+            request: ClientRequest::AttachSession {
+                request: AttachSessionRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    client_id: ClientId::new("client-1").unwrap(),
+                    mode: AttachMode::Observer,
+                    history_bytes: Some(65536),
+                },
+            },
+        };
+
+        let bytes = flatbuffers_proto::serialize_client_message(&request);
+        let fb_msg = flatbuffers::root::<fb::ClientMessage>(&bytes).unwrap();
+        let parsed = flatbuffers_proto::parse_client_message(fb_msg).unwrap();
+
+        match parsed.request {
+            ClientRequest::AttachSession { request } => {
+                assert_eq!(request.history_bytes, Some(65536));
+                assert_eq!(request.mode, AttachMode::Observer);
+            }
+            other => panic!("unexpected parsed request: {other:?}"),
+        }
+
+        // None history_bytes serializes as 0 and parses back as None.
+        let request_none = ClientMessage {
+            id: Some(json!("attach-fb-none")),
+            request: ClientRequest::AttachSession {
+                request: AttachSessionRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    client_id: ClientId::new("client-1").unwrap(),
+                    mode: AttachMode::Observer,
+                    history_bytes: None,
+                },
+            },
+        };
+
+        let bytes_none = flatbuffers_proto::serialize_client_message(&request_none);
+        let fb_msg_none = flatbuffers::root::<fb::ClientMessage>(&bytes_none).unwrap();
+        let parsed_none = flatbuffers_proto::parse_client_message(fb_msg_none).unwrap();
+
+        match parsed_none.request {
+            ClientRequest::AttachSession { request } => {
+                assert_eq!(request.history_bytes, None);
+            }
+            other => panic!("unexpected parsed request: {other:?}"),
+        }
+    }
+
+    #[test]
     fn json_session_lifecycle_roundtrip() {
         let started = ServerMessage::SessionStarted {
             session_id: SessionId::new("s-1").unwrap(),
@@ -2459,5 +2627,123 @@ mod tests {
         let terminated_deserialized: ServerMessage =
             serde_json::from_str(&terminated_json).unwrap();
         assert_eq!(terminated, terminated_deserialized);
+    }
+
+    #[test]
+    fn server_message_kind_matches_serde_tag() {
+        let messages = vec![
+            ServerMessage::Response {
+                id: Some(json!("1")),
+                result: ServerResult::Unit,
+            },
+            ServerMessage::Error {
+                id: Some(json!("2")),
+                error: ProtocolError::new("internal", "test error"),
+            },
+            ServerMessage::Event {
+                subscription_id: SubscriptionId::new("sub-1").unwrap(),
+                envelope: SessionEventEnvelope {
+                    event_seq: 1,
+                    event: SessionEvent::Output {
+                        session_id: SessionId::new("s-1").unwrap(),
+                        output_seq: 1,
+                        bytes: vec![1, 2, 3],
+                    },
+                },
+            },
+            ServerMessage::SubscriptionClosed {
+                subscription_id: SubscriptionId::new("sub-1").unwrap(),
+            },
+            ServerMessage::SessionSnippetUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                snippet: "snippet".to_string(),
+                detail: None,
+                output_seq: 1,
+            },
+            ServerMessage::SessionContextUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                current_working_directory: Some("/dir".to_string()),
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            },
+            ServerMessage::UpdateAvailable {
+                current_version: "1.0.0".to_string(),
+                latest_version: "1.1.0".to_string(),
+            },
+            ServerMessage::SessionJudgePolicyUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                policy: SessionJudgePolicy {
+                    explicit: None,
+                    effective: false,
+                },
+            },
+            ServerMessage::RailPinsUpdated {
+                group_keys: vec!["group".to_string()],
+                session_ids: vec!["s-1".to_string()],
+            },
+            ServerMessage::SessionCustomLabelUpdated {
+                session_id: SessionId::new("s-1").unwrap(),
+                custom_label: Some("label".to_string()),
+            },
+            ServerMessage::SessionStarted {
+                session_id: SessionId::new("s-1").unwrap(),
+                current_working_directory: Some("/dir".to_string()),
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+                last_activity_ms: 100,
+                last_input_ms: 200,
+            },
+            ServerMessage::SessionTerminated {
+                session_id: SessionId::new("s-1").unwrap(),
+            },
+        ];
+
+        for msg in messages {
+            let serialized = serde_json::to_value(&msg).unwrap();
+            let tag = serialized.get("type").and_then(Value::as_str);
+            assert_eq!(
+                Some(msg.kind()),
+                tag,
+                "msg.kind() does not match serde type tag for {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_battery_state_is_omitted_from_json_results() {
+        let stats_unknown = ServerResult::DaemonStats {
+            disk_free_bytes: 100,
+            disk_total_bytes: 200,
+            cpu_percent: None,
+            battery_percent: None,
+            battery_state: triage_core::host::BatteryState::Unknown,
+        };
+        let serialized = serde_json::to_value(&stats_unknown).unwrap();
+        assert!(serialized.get("battery_state").is_none());
+        assert!(serialized.get("cpu_percent").is_none());
+        assert!(serialized.get("battery_percent").is_none());
+
+        let stats_charging = ServerResult::DaemonStats {
+            disk_free_bytes: 100,
+            disk_total_bytes: 200,
+            cpu_percent: Some(25),
+            battery_percent: Some(80),
+            battery_state: triage_core::host::BatteryState::Charging,
+        };
+        let serialized_charging = serde_json::to_value(&stats_charging).unwrap();
+        assert_eq!(
+            serialized_charging
+                .get("battery_state")
+                .and_then(Value::as_str),
+            Some("charging")
+        );
+        assert_eq!(
+            serialized_charging
+                .get("cpu_percent")
+                .and_then(Value::as_u64),
+            Some(25)
+        );
     }
 }

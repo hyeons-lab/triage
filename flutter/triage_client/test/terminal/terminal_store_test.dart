@@ -113,6 +113,39 @@ void main() {
     expect(store.state.scrollbackReady, isTrue);
   });
 
+  test('a deeper window replays more lines than the first-page trim', () {
+    // The native first-page budget keeps 1000 lines; serving the same
+    // 2000-line suffix for a doubled window must keep twice the lines,
+    // not replay the identical trimmed suffix (which left paging stuck
+    // showing the same content on every page).
+    final lines = List.generate(2000, (i) => 'line $i\n').join();
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b(lines),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryFirstWindowBytes,
+      ),
+    );
+    final firstReplay = sink.written.toString();
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b(lines),
+        cols: 80,
+        rows: 24,
+        windowBytes: kHistoryFirstWindowBytes * 2,
+      ),
+    );
+    final secondReplay = sink.written.toString().substring(firstReplay.length);
+    // The write path normalizes LF to CRLF; match the replayed form.
+    expect(firstReplay, isNot(contains('line 0\r\n')));
+    expect(firstReplay, contains('line 1999\r\n'));
+    expect(secondReplay, contains('line 0\r\n'));
+    expect(secondReplay, contains('line 1999\r\n'));
+  });
+
   test('outputSeq <= history high-water is dropped as duplicate', () {
     store.dispatch(const Attach());
     store.dispatch(
@@ -985,6 +1018,119 @@ void main() {
       expect(store.state.historyHighWaterSeq, 15);
     },
   );
+
+  test(
+    'full replay prepends the journaled prefix but anchors bytes on the raw tail',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      final prefixText = 'journaled old line\r\n';
+      final rawText = 'raw tail\r\n';
+      store.dispatch(
+        HistoryBytes(
+          b(rawText),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 100,
+          rawOutputPrefix: b(prefixText),
+        ),
+      );
+
+      final painted = sink.written.toString();
+      expect(
+        painted,
+        contains(prefixText),
+        reason: 'prefix must paint at all: $painted',
+      );
+      expect(
+        painted.indexOf(prefixText),
+        lessThan(painted.indexOf(rawText)),
+        reason: 'prefix must replay ahead of the raw tail: $painted',
+      );
+      // Byte coordinates stay in raw-log space: the prefix is extra.
+      expect(store.appliedLogBytes, 100 + rawText.length);
+    },
+  );
+
+  test('prefix-only history still paints after scrollback is ready', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    final initialText = 'hello world\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b(initialText),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+      ),
+    );
+    expect(store.appliedLogBytes, initialText.length);
+
+    // Empty raw tail with a nonempty prefix: the early-return guard must
+    // not swallow it (a prefix-only snapshot still paints).
+    final prefixText = 'journaled old line\r\n';
+    store.dispatch(
+      HistoryBytes(
+        const [],
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 15,
+        rawOutputPrefix: b(prefixText),
+      ),
+    );
+
+    final painted = sink.written.toString();
+    expect(
+      painted,
+      contains(prefixText),
+      reason: 'prefix-only payload must paint: $painted',
+    );
+  });
+
+  test('delta merge ignores the journaled prefix', () {
+    final sink = FakeTerminalSink();
+    final store = TerminalStore(sink);
+    store.dispatch(const Resize(80, 24));
+
+    final initialText = 'hello world\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b(initialText),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
+        rawOutputPrefix: b('old prefix\r\n'),
+      ),
+    );
+    expect(store.appliedLogBytes, initialText.length);
+
+    // A resync whose prefix changed but whose raw tail only grew: the
+    // delta merge must apply the raw delta and never paint the prefix.
+    final addedText = 'second line\r\n';
+    store.dispatch(
+      HistoryBytes(
+        b('$initialText$addedText'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 15,
+        rawOutputStart: 0,
+        rawOutputPrefix: b('new prefix that must not paint\r\n'),
+      ),
+    );
+
+    expect(sink.ops.where((op) => op == 'clear').length, 1);
+    expect(sink.ops.last, 'write:$addedText');
+    expect(sink.written.toString(), isNot(contains('must not paint')));
+    expect(store.appliedLogBytes, initialText.length + addedText.length);
+    expect(store.state.historyHighWaterSeq, 15);
+  });
 
   test('delta merge: subsequent snapshot already fully covered is a no-op', () {
     final sink = FakeTerminalSink();
@@ -2355,5 +2501,33 @@ void main() {
 
     expect(sink.written.toString(), contains('line of terminal output\r\n'));
     expect(stopwatch.elapsedMilliseconds, lessThan(2000));
+  });
+
+  test('CancelAttach resumes live phase and flushes queued live output', () {
+    final cancelSink = FakeTerminalSink();
+    final cancelStore = TerminalStore(cancelSink);
+    cancelStore.dispatch(const Resize(80, 24));
+    cancelStore.dispatch(const Attach());
+    cancelStore.dispatch(
+      HistoryBytes(b('init'), cols: 80, rows: 24, throughOutputSeq: 1),
+    );
+    cancelSink.ops.clear();
+
+    // Start a re-attach (such as during history paging)
+    cancelStore.dispatch(const Attach());
+    expect(cancelStore.state.phase, AttachPhase.awaitingHistory);
+
+    // Live output arrives while awaiting history
+    cancelStore.dispatch(LiveBytes(b('buffered live'), outputSeq: 2));
+    expect(cancelSink.ops.where((op) => op.startsWith('write:')), isEmpty);
+
+    // Attach fails or cancels: CancelAttach restores live phase and flushes
+    cancelStore.dispatch(const CancelAttach());
+    expect(cancelStore.state.phase, AttachPhase.live);
+    expect(cancelStore.state.scrollbackReady, isTrue);
+    expect(cancelSink.ops, ['write:buffered live']);
+    expect(cancelStore.appliedLogBytes, equals(4 + 'buffered live'.length));
+    expect(cancelStore.appliedLiveSeq, equals(2));
+    expect(cancelStore.state.historyHighWaterSeq, equals(1));
   });
 }

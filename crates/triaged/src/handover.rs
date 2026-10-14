@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use triage_core::session::{SessionId, SessionSize};
+use triage_core::session::{InputLeaseState, SessionId, SessionSize};
 
 /// Non-reusable identity of a child process carried with its PTY master.
 ///
@@ -41,6 +41,12 @@ pub struct HandoverSession {
     pub last_input_ms: u64,
     #[serde(default)]
     pub judge_override: Option<bool>,
+    /// Whoever held the session's input lease when the swap began. Carried
+    /// across so the successor does not silently deny the next write from a
+    /// client that still believes it holds the lease. Defaults to no holder
+    /// for a state blob written before this field existed.
+    #[serde(default)]
+    pub lease: InputLeaseState,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

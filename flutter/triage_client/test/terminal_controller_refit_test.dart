@@ -42,4 +42,31 @@ void main() {
     controller.refit();
     expect(count, 0);
   });
+
+  test('history page started and cancelled listeners lifecycle', () {
+    final controller = TerminalController();
+    var startedCount = 0;
+    var cancelledCount = 0;
+    void onStarted() => startedCount++;
+    void onCancelled() => cancelledCount++;
+
+    controller.addHistoryPageStartedListener(onStarted);
+    controller.addHistoryPageCancelledListener(onCancelled);
+
+    controller.notifyHistoryPageStarted();
+    expect(startedCount, 1);
+    expect(cancelledCount, 0);
+
+    controller.notifyHistoryPageCancelled();
+    expect(startedCount, 1);
+    expect(cancelledCount, 1);
+
+    controller.removeHistoryPageCancelledListener(onCancelled);
+    controller.notifyHistoryPageCancelled();
+    expect(cancelledCount, 1);
+
+    controller.dispose();
+    controller.notifyHistoryPageStarted();
+    expect(startedCount, 1);
+  });
 }

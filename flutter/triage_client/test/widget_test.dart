@@ -27,6 +27,12 @@ import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
+import 'package:xterm/xterm.dart' as xt;
+
+/// One history window a test serves for a session: the raw tail bytes, the
+/// absolute log offset they start at, and the output sequence they run
+/// through. Pages over the same log end share [seq] with an older [start].
+typedef FakeHistoryWindow = ({List<int> bytes, int start, int seq});
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
   FakeTriageWebSocketClient({
@@ -108,12 +114,37 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> attachSessionCalls = [];
   // Parallel to [attachSessionCalls]: the attach mode per call.
   final List<String> attachSessionModes = [];
+  // Parallel to [attachSessionCalls]: the requested history window per call.
+  final List<int?> attachHistoryWindowsRequested = [];
+  // History served per session per requested window. When a session has an
+  // entry, its attach snapshots carry raw_output/raw_output_start for the
+  // requested window (falling back to the first entry when the exact window
+  // is not keyed); sessions without one attach history-less, as before.
+  final Map<String, Map<int, FakeHistoryWindow>> attachHistoryWindows = {};
+
+  Map<String, dynamic> _historyKeysFor(String sessionId, int? window) {
+    final byWindow = attachHistoryWindows[sessionId];
+    if (byWindow == null || byWindow.isEmpty) return const {};
+    final served =
+        byWindow[window] ?? byWindow.entries.first.value;
+    return {
+      'raw_output': served.bytes,
+      'raw_output_start': served.start,
+      'bytes_logged': served.start + served.bytes.length,
+      'output_seq': served.seq,
+    };
+  }
   // Lease holder the fake reports for Observer attaches, per session. Absent
   // means nobody holds it. Interactive attaches always grant to the caller,
   // mirroring the daemon's steal-on-attach.
   final Map<String, String?> attachLeaseHolders = {};
   final List<String> restoreSessionCalls = [];
   final Map<String, String> restoreSessionSizes = {};
+  // Prefix-only history the restore echo carries, per session. The daemon's
+  // restore snapshot replays journaled scrollback when the raw tail is gone;
+  // keyed sessions get `raw_output_prefix` with no `raw_output`, which is
+  // what the restore fallback gate must adopt rather than discard.
+  final Map<String, List<int>> restoreHistoryPrefix = {};
   final List<String> helloClientIds = [];
   final List<String?> helloTokens = [];
   final List<String> snapshotSessionCalls = [];
@@ -256,9 +287,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required String sessionId,
     required String clientId,
     String mode = 'InteractiveController',
+    int? historyBytes,
   }) async {
     attachSessionCalls.add(sessionId);
     attachSessionModes.add(mode);
+    attachHistoryWindowsRequested.add(historyBytes);
     final attachCompleter = attachCompleters[sessionId];
     if (attachCompleter != null) {
       return attachCompleter.future;
@@ -280,6 +313,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           'snapshot': {
             'size': _snapshotSize,
             'exited': exitedSessionIds.contains(sessionId),
+            ..._historyKeysFor(sessionId, historyBytes),
             'visible_rows': visibleRows,
             'styled_rows': visibleRows
                 .map(
@@ -311,6 +345,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       'response': {
         'lease': _attachLeaseFor(sessionId, clientId, mode),
         'snapshot': {
+          ..._historyKeysFor(sessionId, historyBytes),
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
             // Normally absent, matching a daemon that reports only the branch on
@@ -425,10 +460,12 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     restoreSessionCalls.add(sessionId);
     restoreSessionSizes[sessionId] = '${cols}x$rows';
     exitedSessionIds.remove(sessionId);
+    final prefix = restoreHistoryPrefix[sessionId];
     return {
       'snapshot': {
         'size': {'rows': rows, 'cols': cols},
         'exited': false,
+        if (prefix != null) 'raw_output_prefix': prefix,
       },
     };
   }
@@ -879,6 +916,36 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       },
     });
   }
+
+  /// Emits a server-pushed resync carrying a full-history snapshot. The
+  /// daemon serves these unwindowed at the history cap; the client must
+  /// replay them at the platform budgets, not the held window.
+  void emitResyncRequired(
+    String sessionId,
+    List<int> rawOutput, {
+    int start = 1000000,
+    int seq = 50,
+  }) {
+    _testEventController.add({
+      'type': 'event',
+      'envelope': {
+        'event': {
+          'ResyncRequired': {
+            'session_id': sessionId,
+            'snapshot': {
+              'size': {'rows': 24, 'cols': 80},
+              'exited': false,
+              'raw_output': rawOutput,
+              'raw_output_start': start,
+              'bytes_logged': start + rawOutput.length,
+              'output_seq': seq,
+            },
+          },
+        },
+      },
+    });
+  }
+
 }
 
 Future<void> withPlatform(
@@ -1339,6 +1406,93 @@ void main() {
   );
 
   testWidgets(
+    'daemon stats poll paints host line under disk line',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final poll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll;
+      await tester.pump(const Duration(seconds: 61));
+      poll.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: 12,
+        batteryPercent: 87,
+        batteryState: 'charging',
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsOneWidget);
+      expect(
+        find.text('CPU 12% · Battery 87% (charging)'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'daemon stats poll with unknown host stats hides host status line',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final poll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll;
+      await tester.pump(const Duration(seconds: 61));
+      poll.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsOneWidget);
+      expect(find.textContaining('CPU'), findsNothing);
+      expect(find.textContaining('Battery'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'daemon stats poll preserves previous non-null stats on partial poll miss',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      final poll1 = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll1;
+      await tester.pump(const Duration(seconds: 61));
+      poll1.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: 25,
+        batteryPercent: 80,
+        batteryState: 'charging',
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('CPU 25% · Battery 80% (charging)'), findsOneWidget);
+
+      final poll2 = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = poll2;
+      await tester.pump(const Duration(seconds: 61));
+      poll2.complete((
+        diskFreeBytes: 50 * 1024 * 1024,
+        diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: 79,
+        batteryState: 'charging',
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('CPU 25% · Battery 79% (charging)'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
     'daemon stats poll resolving after close repaints nothing',
     (WidgetTester tester) async {
       final client = FakeTriageWebSocketClient();
@@ -1354,6 +1508,9 @@ void main() {
       firstPoll.complete((
         diskFreeBytes: 50 * 1024 * 1024,
         diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
       ));
       await tester.pumpAndSettle();
       expect(find.textContaining('free ('), findsOneWidget);
@@ -1370,6 +1527,9 @@ void main() {
       client.hangDaemonStats!.complete((
         diskFreeBytes: 50 * 1024 * 1024,
         diskTotalBytes: 100 * 1024 * 1024,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
       ));
       await tester.pumpAndSettle();
 
@@ -1608,6 +1768,84 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('ft-standard-WSL2 x86_64)'), findsNothing);
+  });
+
+  testWidgets('resync-required snapshot replays unwindowed, not at held window', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient();
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // 500 lines x 300 B = 150 KiB: the platform budgets (256 KiB) keep
+    // all of it, while the 64 KiB held window trims to ~218 lines. The
+    // ResyncRequired call site must replay unwindowed; read the buffer
+    // through the pane widget, since the fallback rendered rows never
+    // fit enough to discriminate. Fit the view first: history stays
+    // staged until a real grid size lands, which never happens under
+    // FLUTTER_TEST.
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+    final buf = StringBuffer();
+    for (var i = 0; i < 500; i++) {
+      buf.writeln('history line $i'.padRight(299));
+    }
+    client.emitResyncRequired('flutter-spike', utf8.encode(buf.toString()));
+    await tester.pumpAndSettle();
+
+    final terminal = tester
+        .widget<TerminalPane>(find.byType(TerminalPane))
+        .terminal;
+    // Each 300-char line wraps to ~4 rows at the fitted width, so the
+    // trimmed mutant (~218 logical lines) still shows ~870 buffer rows:
+    // pin the oldest line's survival, not just a row count.
+    final seen = StringBuffer();
+    for (var i = 0; i < terminal.buffer.lines.length; i++) {
+      seen.writeln(terminal.buffer.lines[i].toString());
+    }
+    expect(seen.toString(), contains('history line 0'));
+    expect(terminal.buffer.lines.length, greaterThanOrEqualTo(1500));
+  });
+
+  testWidgets('exited-session restore adopts a prefix-only prepared snapshot', (
+    WidgetTester tester,
+  ) async {
+    final client = FakeTriageWebSocketClient(
+      exitedSessionIds: {'flutter-spike'},
+    );
+    // The journaled scrollback the restore echo carries after the raw
+    // tail is gone: prefix bytes with no `raw_output` at all.
+    const prefixLine = 'restored journal prefix line';
+    client.restoreHistoryPrefix['flutter-spike'] = utf8.encode(
+      '$prefixLine\r\n',
+    );
+    await tester.pumpWidget(TriageClientApp(client: client));
+    await tester.pumpAndSettle();
+
+    // Precondition: the restore echo size must mismatch the attach
+    // snapshot size (24x80), or the fallback gate never runs. Both the
+    // estimated size and any leaked fitted size satisfy this; assert it
+    // so a harness change fails loudly instead of vacuously.
+    expect(client.restoreSessionCalls, contains('flutter-spike'));
+    expect(client.restoreSessionSizes['flutter-spike'], isNot('80x24'));
+
+    // The raw-only gate would discard the prefix-only prepared snapshot
+    // as history-less; the helper gate adopts it and the terminal paints
+    // the prefix. Reverting the call site to the raw-only check must
+    // fail this test. The load stages history until the view fits a real
+    // grid, which never happens under FLUTTER_TEST, so drive the fit
+    // directly like the reclaim tests do.
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+
+    final terminal = tester
+        .widget<TerminalPane>(find.byType(TerminalPane))
+        .terminal;
+    final seen = StringBuffer();
+    for (var i = 0; i < terminal.buffer.lines.length; i++) {
+      seen.writeln(terminal.buffer.lines[i].toString());
+    }
+    expect(seen.toString(), contains(prefixLine));
   });
 
   testWidgets('refreshes selected remote session from daemon snapshot', (
@@ -2196,6 +2434,39 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('triage / websocket-session-api'), findsNothing);
+    },
+  );
+
+  testWidgets(
+    'rail reconcile converges rows and labels with no push delivered',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / main'), findsWidgets);
+
+      // The daemon's membership changes with no push delivered (a miss the
+      // client never noticed): the reconcile must add, remove, and relabel
+      // through the same paths as the pushes. The stats poll is parked so
+      // its timer cannot error into this test's async zone.
+      client.hangDaemonStats = Completer<DaemonStatsRecord?>();
+      client.initialSessions = ['main', 'reconciled-new'];
+      client.railLayout = (
+        groupKeys: <String>[],
+        sessionIds: <String>[],
+        customLabels: {
+          'main': 'Renamed Main',
+          'reconciled-new': 'Fresh Label',
+        },
+      );
+      await tester.pump(const Duration(seconds: 61));
+      await tester.pumpAndSettle();
+
+      expect(find.text('triage / flutter-spike'), findsNothing);
+      expect(find.text('triage / websocket-session-api'), findsNothing);
+      expect(find.text('Renamed Main'), findsWidgets);
+      expect(find.text('Fresh Label'), findsWidgets);
     },
   );
 
@@ -5402,6 +5673,207 @@ void main() {
     );
   });
 
+  group('history paging', () {
+    test('barren-page predicate truth table', () {
+      // A page continues past itself only when it added nothing while
+      // the user is still near the top; every other combination
+      // re-seats on the landed content. Shared by both pane
+      // implementations, so this pins the web behavior too.
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 0, nearTop: true),
+        isTrue,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: -3, nearTop: true),
+        isTrue,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 1, nearTop: true),
+        isFalse,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 0, nearTop: false),
+        isFalse,
+      );
+      expect(
+        shouldContinuePastBarrenPage(addedLines: 5, nearTop: false),
+        isFalse,
+      );
+    });
+
+    List<int> historyLines(int from, int to) {
+      final buf = StringBuffer();
+      for (var i = from; i < to; i++) {
+        buf.writeln('history line $i');
+      }
+      return utf8.encode(buf.toString());
+    }
+
+    List<StyledRow> fallbackRows(int count) => List.generate(
+      count,
+      (i) => StyledRow(
+        spans: [
+          StyledSpan(text: 'Log line $i', style: const TerminalStyle()),
+        ],
+      ),
+    );
+
+    List<int?> windowsFor(FakeTriageWebSocketClient client, String sid) => [
+      for (var i = 0; i < client.attachSessionCalls.length; i++)
+        if (client.attachSessionCalls[i] == sid)
+          client.attachHistoryWindowsRequested[i],
+    ];
+
+    testWidgets('scrolling to the top re-attaches with a doubled window', (
+      WidgetTester tester,
+    ) async {
+      final client = FakeTriageWebSocketClient();
+      client.snapshotVisibleRows['flutter-spike'] = List.generate(
+        100,
+        (i) => 'Log line $i',
+      );
+      final first = historyLines(0, 100);
+      final second = historyLines(0, 200);
+      client.attachHistoryWindows['flutter-spike'] = {
+        65536: (bytes: first, start: 100000, seq: 7),
+        131072: (
+          bytes: second,
+          start: 100000 - (second.length - first.length),
+          seq: 7,
+        ),
+      };
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+
+      expect(windowsFor(client, 'flutter-spike'), [65536]);
+
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final controller = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      controller.jumpTo(0);
+      await tester.pumpAndSettle();
+
+      expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
+    });
+
+    Future<void> pumpStandalonePane(
+      WidgetTester tester, {
+      required TerminalController controller,
+      required xt.Terminal terminal,
+      required String terminalId,
+      bool Function()? onNearTop,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TerminalPane(
+              terminalId: terminalId,
+              controller: controller,
+              terminal: terminal,
+              fallbackRows: fallbackRows(100),
+              onTerminalResizeBind: (_) {},
+              focusCursorRevision: 0,
+              onNearTop: onNearTop,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a barren page auto-continues, then reports no older scrollback', (
+      WidgetTester tester,
+    ) async {
+      final controller = TerminalController();
+      final terminal = xt.Terminal(maxLines: 50000);
+      var pages = 0;
+      bool onNearTop() {
+        pages++;
+        // The first two launches land (barren); the third is gated.
+        return pages < 3;
+      }
+
+      await pumpStandalonePane(
+        tester,
+        controller: controller,
+        terminal: terminal,
+        terminalId: 'paging-barren-test',
+        onNearTop: onNearTop,
+      );
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final scrollController = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      // The scrolled-up user whose page landed with no new lines.
+      scrollController.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+
+      // First landed page is barren: auto-continue with a deeper window.
+      controller.notifyHistoryPageStarted();
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 2);
+      expect(find.text('No older scrollback in reach'), findsNothing);
+
+      // Second landed page is barren too, and the deeper page is gated:
+      // report the exhausted scrollback instead of going silently inert.
+      controller.notifyHistoryPageStarted();
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 3);
+      expect(find.text('No older scrollback in reach'), findsOneWidget);
+
+      await tester.pump(const Duration(seconds: 3));
+      expect(find.text('No older scrollback in reach'), findsNothing);
+    });
+
+    testWidgets('a fruitful page neither continues nor reports', (
+      WidgetTester tester,
+    ) async {
+      final controller = TerminalController();
+      final terminal = xt.Terminal(maxLines: 50000);
+      var pages = 0;
+      bool onNearTop() {
+        pages++;
+        return true;
+      }
+
+      await pumpStandalonePane(
+        tester,
+        controller: controller,
+        terminal: terminal,
+        terminalId: 'paging-fruitful-test',
+        onNearTop: onNearTop,
+      );
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final scrollController = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      scrollController.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+
+      // The landed page grew the buffer: nothing more to do.
+      controller.notifyHistoryPageStarted();
+      terminal.write('fresh line\n' * 60);
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+      expect(find.text('No older scrollback in reach'), findsNothing);
+    });
+  });
+
   group('SessionVm exited lifecycle', () {
     test('initializes as exited when isExited flag is true', () {
       final session = SessionVm(
@@ -5526,6 +5998,7 @@ void main() {
           home: Scaffold(
             body: WorkspaceHeader(
               session: headerSession(),
+              connected: true,
               softKeyboardEnabled: enabled,
               onToggleSoftKeyboard: onToggle,
             ),
