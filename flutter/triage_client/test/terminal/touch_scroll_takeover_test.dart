@@ -10,7 +10,14 @@ void main() {
     double y, {
     double rowPx = 20,
     bool canDrive = true,
-  }) => t.onPointerMove(nowMs: nowMs, y: y, rowPx: rowPx, canDrive: canDrive);
+    bool forceDrive = false,
+  }) => t.onPointerMove(
+    nowMs: nowMs,
+    y: y,
+    rowPx: rowPx,
+    canDrive: canDrive,
+    forceDrive: forceDrive,
+  );
 
   test('first move anchors without scrolling', () {
     final t = takeover();
@@ -86,6 +93,37 @@ void main() {
     t.onPointerDown(1000);
     expect(move(t, 1010, 250), 0);
     expect(move(t, 1020, 350, rowPx: 0), 0);
+  });
+
+  test('forceDrive scrolls through a live touch stream', () {
+    final t = takeover();
+    t.onPointerDown(1000);
+    expect(move(t, 1010, 250, forceDrive: true), 0);
+    t.onTouchMove(1015);
+    // xterm owns nothing in mouse mode, so the trickle must not veto.
+    expect(move(t, 1020, 290, forceDrive: true), -2);
+    t.onTouchMove(1025);
+    expect(move(t, 1030, 330, forceDrive: true), -2);
+  });
+
+  test('forceDrive still honors canDrive', () {
+    final t = takeover();
+    t.onPointerDown(1000);
+    expect(move(t, 1010, 250, forceDrive: true), 0);
+    expect(move(t, 1020, 350, forceDrive: true, canDrive: false), 0);
+    expect(move(t, 1030, 370, forceDrive: true), -1);
+  });
+
+  test('unforced moves yield again after forced ones', () {
+    final t = takeover();
+    t.onPointerDown(1000);
+    expect(move(t, 1010, 250, forceDrive: true), 0);
+    expect(move(t, 1020, 290, forceDrive: true), -2);
+    t.onTouchMove(1025);
+    // Mode flipped off mid-gesture: xterm owns it again, carry dropped.
+    expect(move(t, 1030, 330), 0);
+    expect(move(t, 1150, 342), 0);
+    expect(move(t, 1160, 354), -1);
   });
 
   test('pointer down resets the gesture', () {

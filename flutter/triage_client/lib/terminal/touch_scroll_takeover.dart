@@ -40,16 +40,21 @@ class TouchScrollTakeover {
   /// owns the gesture, while anchoring the first move, or when [canDrive] is
   /// false (multi-touch, mouse drag-select). The anchor updates on every
   /// move either way, so a mid-gesture takeover never jumps.
+  ///
+  /// Set [forceDrive] when xterm's own touch path cannot scroll — mouse
+  /// tracking mode, where xterm ignores touches entirely — so a healthy
+  /// touch stream stops vetoing the fallback. [canDrive] still applies.
   int onPointerMove({
     required int nowMs,
     required double y,
     required double rowPx,
     required bool canDrive,
+    bool forceDrive = false,
   }) {
     final last = _lastY;
     _lastY = y;
     if (last == null || !canDrive || rowPx <= 0) return 0;
-    if (nowMs < _touchAliveUntilMs) {
+    if (!forceDrive && nowMs < _touchAliveUntilMs) {
       _carryRows = 0;
       return 0;
     }
