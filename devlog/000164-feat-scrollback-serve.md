@@ -53,7 +53,8 @@ gesture reset.
 
 ## Commits
 
-- HEAD — fix(client): take over touch scroll from pointer events when xterm's touch stream dies
+- 92bd309 — fix(client): take over touch scroll from pointer events when xterm's touch stream dies
+- HEAD — fix(client): force-drive touch scroll fallback in mouse tracking mode
 
 ## Progress
 
@@ -62,6 +63,30 @@ gesture reset.
 - Pending: commit, push, daemon rebuild (embeds the web bundle), install,
   zero-downtime reload, CDP end-to-end drag verification, user retest on
   the phone.
+- 2026-10-10T16:50-0700 User retest: still painful, several swipes per few
+  lines. IPC probe showed session-302 has mouse tracking on
+  (`?1000/1002/1003/1006h` near the tail, no disables) with a quiet stream —
+  full touch delivery plus an xterm path that ignores touches in mouse mode,
+  so the yield vetoed the fallback ~100%. Fix: `forceDrive` bypasses the
+  quiet-window yield when `term.modes.mouseTrackingMode != 'none'`
+  (proposed API, already enabled). Focused suite 13/13, full client suite
+  714 pass + 2 pre-existing skips, analyze clean.
+- Pending: rebuild/install/reload the daemon, user retest on the phone
+  (shred site data + reload first).
+- 2026-10-10T16:53-0700 Daemon rebuilt (bundle 3131364 -> 3131480 bytes),
+  installed, re-signed, zero-downtime reloaded: 68 sessions preserved
+  (15 live adopted), converged to single PID 48073 serving the new bundle.
+- Pending: user retest on the phone (shred site data + reload first),
+  then commit + push with the explicit refspec.
+- 2026-10-14T09:59-0700 Verified end-to-end over CDP against the live
+  daemon on session-302 (mouse tracking on): single-finger drag moved
+  21/23 rows smoothly across 14 sampled frames; two-finger drag moved 0
+  (gate holds). Event census gave the discriminating signature: healthy
+  touch delivery leaves the old logic yielding (~0 rows), while
+  forceDrive scrolls from the second move (pointer stream 14/14). A pen
+  drag drives the fallback, but real mouse reports still yank to the
+  bottom via the onData scrollToBottom — pre-existing, out of scope.
+- Committed and pushed the forceDrive fix with the explicit refspec.
 
 ## Research & Discoveries
 
@@ -76,6 +101,12 @@ gesture reset.
 - 2026-10-10T14:13-0700 A minimal shadow-DOM page with scripted row churn
   reproduces the truncation (3/8 moves), while the static page delivers
   8/8 — churn during the gesture is the trigger.
+- 2026-10-10T16:50-0700 xterm.js has exactly two touch listeners
+  (touchstart passive, touchmove non-passive), both no-ops in mouse
+  tracking mode, and synthesizes no mouse reports from touch — so in mouse
+  mode the pane fallback is the sole scroll driver and there is no onData
+  yank-back. `term.modes.mouseTrackingMode` (proposed API:
+  none/x10/vt200/drag/any) reports the mode without private-API reads.
 
 ## Lessons Learned
 
@@ -91,3 +122,6 @@ gesture reset.
 - Commit, push with the explicit `HEAD:refs/heads/feat/scrollback-serve`
   refspec, rebuild/install/reload the daemon, verify a span-start drag
   over CDP, then have the user retest on mobile.
+- 2026-10-14T09:59-0700 All of the above are done except the user retest
+  on mobile (shred site data + reload, then drag on the snapshot
+  session). After that: merge the PR stack.

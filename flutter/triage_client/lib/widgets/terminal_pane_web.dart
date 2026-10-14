@@ -2031,11 +2031,22 @@ class _TerminalPaneState extends State<TerminalPane>
       } catch (_) {
         return;
       }
+      // In mouse tracking mode xterm ignores touches entirely, so a healthy
+      // touch stream must not veto the fallback (else swipes scroll nothing
+      // on quiet sessions). `modes` needs the proposed API, already enabled.
+      var forceDrive = false;
+      try {
+        final modes = js_util.getProperty(term, 'modes');
+        final mouseMode =
+            js_util.getProperty(modes, 'mouseTrackingMode') as String?;
+        forceDrive = mouseMode != null && mouseMode != 'none';
+      } catch (_) {}
       final rowsToScroll = _touchScrollTakeover.onPointerMove(
         nowMs: DateTime.now().millisecondsSinceEpoch,
         y: y,
         rowPx: rowPx,
         canDrive: canDrive,
+        forceDrive: forceDrive,
       );
       if (rowsToScroll == 0) return;
       try {
