@@ -144,5 +144,42 @@ void main() {
         greaterThan(firstLines),
       );
     });
+
+    test('an unwindowed replay keeps what the held window would trim', () {
+      // 500 lines x 300 B = 150 KiB: the platform budgets (256 KiB) keep
+      // all of it, while the 64 KiB held window trims to the newest ~218
+      // lines. Server-pushed resync snapshots are served unwindowed at
+      // the full cap and must replay at the platform budgets, not the
+      // held window (see the `unwindowed` resync call site).
+      List<int> wideLines(int count) {
+        final buf = StringBuffer();
+        for (var i = 0; i < count; i++) {
+          buf.writeln('history line $i'.padRight(299));
+        }
+        return utf8.encode(buf.toString());
+      }
+
+      final windowed = _session();
+      windowed.applyHistory(
+        wideLines(500),
+        throughOutputSeq: 50,
+        rawOutputStart: 1000000,
+        windowBytes: kHistoryFirstWindowBytes,
+      );
+      windowed.noteViewFit(80, 24);
+      final windowedLines = windowed.terminal.buffer.lines.length;
+
+      final unwindowed = _session();
+      unwindowed.applyHistory(
+        wideLines(500),
+        throughOutputSeq: 50,
+        rawOutputStart: 1000000,
+      );
+      unwindowed.noteViewFit(80, 24);
+      final unwindowedLines = unwindowed.terminal.buffer.lines.length;
+
+      expect(unwindowedLines, greaterThanOrEqualTo(500));
+      expect(unwindowedLines, greaterThan(windowedLines));
+    });
   });
 }

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/widgets.dart';
 
 import '../terminal/debug_log.dart';
@@ -31,6 +33,44 @@ class NoOlderScrollbackPill extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// Whether a landed history page was barren: it added no buffer lines
+/// while the user is still near the top, so the window was a TUI
+/// redrawing in place and the pane should ask for a deeper one instead
+/// of sitting on identical content. Shared by both pane implementations
+/// (the native pane runs this in CI; the web pane cannot, so the web
+/// behavior is covered by construction plus the predicate's unit test).
+bool shouldContinuePastBarrenPage({
+  required int addedLines,
+  required bool nearTop,
+}) => addedLines <= 0 && nearTop;
+
+/// Latch behind [NoOlderScrollbackPill]: shows the pill for 3 seconds,
+/// re-arming on every exhaustion note. Shared by both pane
+/// implementations so the timer discipline cannot drift between them;
+/// each pane keeps its own platform guards at its call sites.
+mixin NoOlderScrollbackLatch<T extends StatefulWidget> on State<T> {
+  bool showNoOlderScrollback = false;
+  Timer? _noOlderScrollbackTimer;
+
+  void noteHistoryExhausted() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => showNoOlderScrollback = false);
+      }
+    });
+    if (mounted && !showNoOlderScrollback) {
+      setState(() => showNoOlderScrollback = true);
+    }
+  }
+
+  void cancelNoOlderScrollbackTimer() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = null;
+    showNoOlderScrollback = false;
   }
 }
 

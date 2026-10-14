@@ -237,6 +237,7 @@ fn compression_worker_background_processing() {
     tx.send(WorkerMessage::Job(CompressionJob {
         raw_path: raw_path.clone(),
         compressed_path: compressed_path.clone(),
+        allow_missing_raw: false,
     }))
     .expect("send job");
 
@@ -250,6 +251,139 @@ fn compression_worker_background_processing() {
     assert!(!raw_path.exists());
 
     // Drop worker and verify thread joins cleanly
+    drop(worker);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn compress_missing_source_detection() {
+    let missing: anyhow::Error =
+        std::io::Error::new(std::io::ErrorKind::NotFound, "scrollback-000000.slog").into();
+    assert!(compress_source_is_missing(&missing));
+    assert!(compress_source_is_missing(
+        &missing.context("opening raw segment")
+    ));
+    let denied: anyhow::Error =
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "segment-000001.tlog").into();
+    assert!(!compress_source_is_missing(&denied));
+    assert!(!compress_source_is_missing(&anyhow::anyhow!("boom")));
+}
+
+#[test]
+fn raw_identity_detects_append_and_delete() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join("scrollback-000000.slog");
+    fs::write(&raw_path, b"seal me").expect("seed raw");
+
+    // The seal identity re-check drops the encode when the source moved
+    // under it; the comparison wiring inside the encode window is
+    // timing-bound and stays review-only, but the sensor itself pins:
+    // stable reads equal, appends and deletes differ.
+    let before = raw_identity(&raw_path);
+    assert!(before.is_some());
+    assert_eq!(raw_identity(&raw_path), before);
+    fs::write(&raw_path, b"seal me plus an append").expect("append");
+    assert_ne!(
+        raw_identity(&raw_path),
+        before,
+        "append must change the identity"
+    );
+    fs::remove_file(&raw_path).expect("delete");
+    assert_eq!(raw_identity(&raw_path), None);
+    assert_ne!(
+        raw_identity(&raw_path),
+        before,
+        "delete must change the identity"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn seal_commit_drops_when_raw_moved_under_encode() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join("scrollback-000007.slog");
+    fs::write(&raw_path, b"seal me").expect("seed raw");
+
+    // Stable leg: nothing moved, the seal commits and unlinks the raw.
+    let sealed = temp_dir.join("scrollback-000007.slog.zst");
+    let tmp = temp_dir.join("scrollback-000007.slog.zst.tmp.seal-test");
+    let before = raw_identity(&raw_path);
+    encode_phase(&raw_path, &tmp).expect("encode");
+    let committed = commit_seal_phase(&raw_path, &tmp, &sealed, before).expect("stable commit");
+    assert!(committed > 0);
+    assert!(sealed.exists());
+    assert!(!raw_path.exists());
+
+    // Append leg: the raw gained bytes between snapshot and decision.
+    // Lengths differ, so the drop does not depend on mtime granularity.
+    fs::write(&raw_path, b"seal me plus an append").expect("reseed raw");
+    let sealed2 = temp_dir.join("scrollback-000008.slog.zst");
+    let tmp2 = temp_dir.join("scrollback-000008.slog.zst.tmp.seal-test");
+    let before = raw_identity(&raw_path);
+    encode_phase(&raw_path, &tmp2).expect("encode");
+    fs::write(&raw_path, b"seal me plus an append plus a race").expect("race");
+    assert_eq!(
+        commit_seal_phase(&raw_path, &tmp2, &sealed2, before).expect("drop, not fail"),
+        0
+    );
+    assert!(!sealed2.exists(), "stale seal must not resurrect");
+    assert!(!tmp2.exists(), "dropped tmp must be cleaned");
+
+    // Delete leg: the raw vanished between snapshot and decision.
+    fs::write(&raw_path, b"third raw").expect("reseed raw");
+    let sealed3 = temp_dir.join("scrollback-000009.slog.zst");
+    let tmp3 = temp_dir.join("scrollback-000009.slog.zst.tmp.seal-test");
+    let before = raw_identity(&raw_path);
+    encode_phase(&raw_path, &tmp3).expect("encode");
+    fs::remove_file(&raw_path).expect("race delete");
+    assert_eq!(
+        commit_seal_phase(&raw_path, &tmp3, &sealed3, before).expect("drop, not fail"),
+        0
+    );
+    assert!(!sealed3.exists(), "stale seal must not resurrect");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn compression_worker_survives_benign_missing_journal_raw() {
+    let temp_dir = unique_test_dir();
+    let missing_raw = temp_dir.join("scrollback-000000.slog");
+    let missing_zst = temp_dir.join("scrollback-000000.slog.zst");
+    let raw_path = temp_dir.join("segment-000001.tlog");
+    let compressed_path = temp_dir.join("segment-000001.tlog.zst");
+    fs::write(&raw_path, b"Worker test data").expect("write raw file");
+
+    let worker = CompressionWorker::start();
+    let tx = worker.sender().expect("sender");
+
+    // A journal seal whose raw a rebase deleted mid-queue: the worker
+    // must drop it and keep processing (the debug-vs-warn level is
+    // review-only: no log capture in this suite).
+    tx.send(WorkerMessage::Job(CompressionJob {
+        raw_path: missing_raw,
+        compressed_path: missing_zst.clone(),
+        allow_missing_raw: true,
+    }))
+    .expect("send stale job");
+    tx.send(WorkerMessage::Job(CompressionJob {
+        raw_path: raw_path.clone(),
+        compressed_path: compressed_path.clone(),
+        allow_missing_raw: false,
+    }))
+    .expect("send job");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !compressed_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert!(compressed_path.exists());
+    assert!(!raw_path.exists());
+    assert!(!missing_zst.exists());
+
     drop(worker);
 
     let _ = fs::remove_dir_all(&temp_dir);

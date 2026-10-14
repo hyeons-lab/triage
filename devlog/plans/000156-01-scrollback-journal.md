@@ -223,3 +223,33 @@ ends (no autowrap dependence).
   base (device-code pairing disabled in this environment;
   unrelated). fmt clean, clippy `-D warnings` clean, `cargo check
   --workspace` clean. Flutter untouched, suite not re-run.
+
+- 2026-10-06T17:33-0700: PR B implemented (serve path). Notes:
+  - Both serve paths (`ActorState` live, `HistoricalSession`) hold
+    only `&self`, so `read_prefix_older_than` takes `&self` and reads
+    flushed bytes only. `append` flushes every 128 records; `ingest`
+    flushes after every chunk (empty buffer = one branch, dirty =
+    one write), so the journal is current through the last chunk.
+    Without the per-chunk flush, journals under the threshold are
+    all buffer and serve nothing — caught live (session-303: 77
+    records buffered, 0-byte file, no prefix) after unit tests
+    passed by flushing explicitly. Regression pinned by reading via
+    a shared ref with no manual flush in the offset test.
+  - Unflushed records die with the process: the exiting old daemon
+    does not drop `OutputState` (303's 77 records never landed even
+    after handover). Per-chunk flush bounds loss to a killed chunk.
+  - Cap split: prefix budget = cap/2, raw floor 16 KiB, total
+    clamped to the cap; `raw_output_start` still addresses the raw
+    tail. Gated on journal presence, not non-emptiness: big-raw +
+    empty-journal is only possible for pure desert, whose tail is
+    useless anyway.
+  - Live verify (release daemon + handovers, all clean): synthetic
+    session-304 (100 markers + 680 KB desert) served 77 journaled
+    markers as a reset-led prefix ahead of 512 KiB raw
+    (served=527423, byte-identical across reload); exited 305
+    served the identical prefix after a reload (restored path).
+    Adopted 245/256 journals appending live. Probe sessions shut
+    down afterwards.
+  - Explicit shutdown deletes the session dir (no Historical);
+    exited-by-itself sessions restore as Historical. Verified via
+    the latter (305).

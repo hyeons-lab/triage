@@ -1,7 +1,7 @@
 // Live-daemon paging checks for scrollback history windows.
 //
 // Exercises the REAL daemon round trip: FlatBuffers attach windows come
-// back exact with older starts, and replaying a deeper window through a
+// back bounded by the window with older starts, and replaying a deeper
 // real SessionVm grows the terminal buffer. Skipped unless
 // TRIAGE_LIVE_WS points at a daemon (e.g. ws://100.104.160.90:7777/ws),
 // so CI stays hermetic.
@@ -60,7 +60,13 @@ void main() {
           final snap = await _window(client, 'live-probe', window);
           final raw = snap['raw_output'];
           expect(raw, isA<Uint8List>());
-          expect((raw as Uint8List).length, window);
+          final tail = raw as Uint8List;
+          // The serve splits the cap between the journaled prefix and the
+          // raw tail (overlay_raw_output_history): the raw tail is bounded
+          // by the window, with at least half the window when the log is
+          // deep enough to fill the split.
+          expect(tail.length, lessThanOrEqualTo(window));
+          expect(tail.length, greaterThanOrEqualTo(window ~/ 2));
           final start = snap['raw_output_start'] as int;
           expect(start, lessThan(olderStart));
           olderStart = start;

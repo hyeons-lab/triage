@@ -112,7 +112,8 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
-class _TerminalPaneState extends State<TerminalPane> {
+class _TerminalPaneState extends State<TerminalPane>
+    with NoOlderScrollbackLatch {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
   static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
       {};
@@ -140,8 +141,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
   DateTime? _pageAnchorAt;
-  bool _showNoOlderScrollback = false;
-  Timer? _noOlderScrollbackTimer;
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
   // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
@@ -373,9 +372,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (!identical(oldWidget.terminal, widget.terminal) ||
         oldWidget.terminalId != widget.terminalId) {
-      _noOlderScrollbackTimer?.cancel();
-      _noOlderScrollbackTimer = null;
-      _showNoOlderScrollback = false;
+      cancelNoOlderScrollbackTimer();
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -429,7 +426,9 @@ class _TerminalPaneState extends State<TerminalPane> {
       widget.controller.addClearListener(_onClear);
       widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
       widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
-      widget.controller.addHistoryPageCancelledListener(_onHistoryPageCancelled);
+      widget.controller.addHistoryPageCancelledListener(
+        _onHistoryPageCancelled,
+      );
     }
     if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
       if (_pendingBottomSnapOnPointerUp) {
@@ -477,7 +476,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
-    _noOlderScrollbackTimer?.cancel();
+    cancelNoOlderScrollbackTimer();
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
     _focusNode.dispose();
@@ -563,7 +562,10 @@ class _TerminalPaneState extends State<TerminalPane> {
       _pageAnchorAt = null;
       _pendingBottomSnapOnPointerUp = false;
       _suppressScrollSaveFor(const Duration(milliseconds: 500));
-      if (addedLines <= 0 && wasNearTop) {
+      if (shouldContinuePastBarrenPage(
+        addedLines: addedLines,
+        nearTop: wasNearTop,
+      )) {
         _continuePastBarrenPage();
         return;
       }
@@ -632,21 +634,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     scheduleMicrotask(() {
       if (!mounted || widget.terminalId != terminalId) return;
       if (widget.onNearTop?.call() == false) {
-        _noteHistoryExhausted();
+        noteHistoryExhausted();
       }
     });
-  }
-
-  void _noteHistoryExhausted() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => _showNoOlderScrollback = false);
-      }
-    });
-    if (mounted && !_showNoOlderScrollback) {
-      setState(() => _showNoOlderScrollback = true);
-    }
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
@@ -1943,7 +1933,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                     color: const Color(0xffffc857),
                   ),
                 ),
-              if (_showNoOlderScrollback)
+              if (showNoOlderScrollback)
                 const Positioned(
                   top: 8,
                   left: 0,
@@ -2073,7 +2063,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                         ),
                       ),
                     if (copyButton != null) copyButton,
-                    if (_showNoOlderScrollback)
+                    if (showNoOlderScrollback)
                       const Positioned(
                         top: 8,
                         left: 0,

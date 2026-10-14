@@ -1506,6 +1506,7 @@ mod tests {
             exited: false,
             raw_output: Vec::new(),
             raw_output_start: 0,
+            raw_output_prefix: Vec::new(),
             snippet: None,
             snippet_detail: None,
         }
