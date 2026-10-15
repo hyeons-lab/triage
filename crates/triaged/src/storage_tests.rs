@@ -318,6 +318,79 @@ fn read_segment_uncompressed_fallback_on_deleted_raw() {
 }
 
 #[test]
+fn read_segment_range_falls_back_when_raw_segment_vanishes() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join("segment-000005.tlog");
+    let compressed_path = temp_dir.join("segment-000005.tlog.zst");
+
+    fs::write(&raw_path, b"Segment content to compress").expect("write raw");
+    compress_segment_file(&raw_path, &compressed_path).expect("compress");
+
+    // Same stale listing as the uncompressed fallback test: the raw segment
+    // was replaced by its compressed twin after being listed.
+    let info = SegmentFileInfo {
+        index: 5,
+        path: raw_path,
+        is_compressed: false,
+        file_size: 27,
+    };
+
+    let slice = read_segment_range(&info, 8, 15).expect("read range fallback");
+    assert_eq!(slice, b"content");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn read_multi_segment_range_reads_exact_offsets() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-range");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    fs::write(session_dir.join(segment_file_name(1)), b"0123456789").expect("write segment 1");
+    fs::write(session_dir.join(segment_file_name(2)), b"abcdefghij").expect("write segment 2");
+
+    // Range spanning the segment boundary.
+    let (start, bytes) = read_multi_segment_range(&session_dir, 5, 15).expect("read range");
+    assert_eq!(start, 5);
+    assert_eq!(bytes, b"56789abcde");
+
+    // Range ending mid-active-segment stops at `end`, not the physical end.
+    let (start, bytes) = read_multi_segment_range(&session_dir, 0, 7).expect("read range");
+    assert_eq!(start, 0);
+    assert_eq!(bytes, b"0123456");
+
+    // Empty range, and a range the shrunken chain no longer covers: the
+    // reported start is the chain's actual total, not the caller's start.
+    let (start, bytes) = read_multi_segment_range(&session_dir, 15, 15).expect("read range");
+    assert_eq!(start, 15);
+    assert!(bytes.is_empty());
+    let (start, bytes) = read_multi_segment_range(&session_dir, 25, 30).expect("read range");
+    assert_eq!(start, 20);
+    assert!(bytes.is_empty());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn read_multi_segment_range_slices_compressed_segments() {
+    let temp_dir = unique_test_dir();
+    let session_dir = temp_dir.join("session-range-compressed");
+    fs::create_dir_all(&session_dir).expect("create session dir");
+    fs::write(session_dir.join(segment_file_name(1)), b"0123456789").expect("write segment 1");
+    let raw2 = session_dir.join(segment_file_name(2));
+    fs::write(&raw2, b"ABCDEFGHIJ").expect("write segment 2");
+    compress_segment_file(&raw2, &session_dir.join(compressed_segment_file_name(2)))
+        .expect("compress segment 2");
+
+    // The range ends inside the compressed segment.
+    let (start, bytes) = read_multi_segment_range(&session_dir, 8, 15).expect("read range");
+    assert_eq!(start, 8);
+    assert_eq!(bytes, b"89ABCDE");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn resolve_active_segment_cases() {
     let temp_dir = unique_test_dir();
     let session_dir = temp_dir.join("session-active-seg");
