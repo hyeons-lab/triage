@@ -14455,12 +14455,13 @@ mod tests {
         // transferred set keep their count for their own backstop.
         assert!(
             manager
-                .take_unrecovered_losses(&[healthy_id.clone()])
+                .take_unrecovered_losses(std::slice::from_ref(&healthy_id))
                 .is_empty(),
             "a healthy transferred session contributes no loss"
         );
 
-        let losses = manager.take_unrecovered_losses(&[degraded_id.clone(), healthy_id.clone()]);
+        let both_ids = [degraded_id.clone(), healthy_id.clone()];
+        let losses = manager.take_unrecovered_losses(&both_ids);
         assert_eq!(losses.len(), 1, "exactly the degraded session is reported");
         assert_eq!(losses[0].0, degraded_id);
         assert!(
@@ -14471,9 +14472,7 @@ mod tests {
 
         // The count is consumed: a second take finds nothing left.
         assert!(
-            manager
-                .take_unrecovered_losses(&[degraded_id.clone(), healthy_id.clone()])
-                .is_empty(),
+            manager.take_unrecovered_losses(&both_ids).is_empty(),
             "the count must be consumed by the first take"
         );
 
