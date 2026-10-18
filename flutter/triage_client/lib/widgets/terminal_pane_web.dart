@@ -1299,9 +1299,24 @@ class _TerminalPaneState extends State<TerminalPane> {
               keyCode == 13) {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
+            final shiftKey =
+                js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+            final ctrlKey =
+                js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
             final altKey =
                 js_util.getProperty(event, 'altKey') as bool? ?? false;
-            _sessionInputRouter.sendInput(sessionId, altKey ? '\x1b\r' : '\r');
+            final metaKey =
+                js_util.getProperty(event, 'metaKey') as bool? ?? false;
+            final newline = bytesForEnterKey(
+              shift: shiftKey,
+              ctrl: ctrlKey,
+              alt: altKey,
+              meta: metaKey,
+            );
+            _sessionInputRouter.sendInput(
+              sessionId,
+              newline ?? (altKey ? '\x1b\r' : '\r'),
+            );
             return false;
           }
           if (key == 'Escape' ||
@@ -2340,7 +2355,13 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
 
     if (event.code == 'NumpadEnter' || event.keyCode == 13) {
-      return '\r';
+      return bytesForEnterKey(
+            shift: event.shiftKey,
+            ctrl: event.ctrlKey,
+            alt: event.altKey,
+            meta: event.metaKey,
+          ) ??
+          '\r';
     }
     if (event.code == 'Escape' || event.keyCode == 27) {
       return '\x1b';
@@ -2377,7 +2398,13 @@ class _TerminalPaneState extends State<TerminalPane> {
 
     switch (key) {
       case 'Enter':
-        return '\r';
+        return bytesForEnterKey(
+              shift: event.shiftKey,
+              ctrl: event.ctrlKey,
+              alt: event.altKey,
+              meta: event.metaKey,
+            ) ??
+            '\r';
       case 'Backspace':
         return '\x7f';
       case 'Tab':

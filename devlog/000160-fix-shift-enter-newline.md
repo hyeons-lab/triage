@@ -1,8 +1,9 @@
-# 000160 — fix/shift-enter-newline
+# 000160: fix/shift-enter-newline
 
 ## Agent
 
-Muse Code (muse-spark) — 2026-10-04T00:42-0700.
+- Muse Code (muse-spark), 2026-10-04T00:42-0700.
+- Antigravity @ triage branch fix/shift-enter-newline, 2026-10-18T15:43-0700.
 
 ## Intent
 
@@ -19,6 +20,17 @@ the web and native panes. Stacked on `perf/lazy-history`.
   its Enter branch (Alt+Enter ESC+CR preserved).
 - Tests: helper unit tests (all modifier combos) + native widget tests
   (Shift+Enter LF, plain/Ctrl+Shift fall-through).
+- 2026-10-18T15:43-0700 Round 1 review fixes:
+  - `terminal_pane_web.dart`: routed the Enter branches in
+    `attachCustomKeyEventHandler` and `_keyboardEventToInput` through
+    `bytesForEnterKey` so all three web key translation paths agree on
+    Shift+Enter.
+  - `terminal_pane_stub.dart`: moved the shared `KeyDownEvent` /
+    `KeyRepeatEvent` guard above the `enter`/`numpadEnter` block to
+    eliminate the nested duplicate event-type check.
+  - `terminal_hardware_key_test.dart`: verified `KeyRepeatEvent`,
+    `controller.notifyInteraction()`, and `Alt+Shift+Enter` /
+    `Meta+Shift+Enter` fall-through on the native pane.
 
 ## Decisions
 
@@ -36,7 +48,8 @@ the web and native panes. Stacked on `perf/lazy-history`.
 
 ## Commits
 
-- HEAD — fix(client): shift+enter inserts a newline instead of submitting
+- bbc98b6: fix(client): shift+enter inserts a newline instead of submitting
+- HEAD: fix(client): route all web Enter paths through bytesForEnterKey and expand hardware key tests
 
 ## Progress
 

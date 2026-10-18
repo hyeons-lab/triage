@@ -1,4 +1,4 @@
-# 000160-01 — Shift+Enter sends LF
+# 000160-01: Shift+Enter sends LF
 
 ## Thinking
 
