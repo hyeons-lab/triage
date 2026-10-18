@@ -2222,18 +2222,32 @@ void main() {
   testWidgets(
     'rail reconcile converges rows and labels with no push delivered',
     (WidgetTester tester) async {
-      final client = FakeTriageWebSocketClient();
+      SharedPreferences.setMockInitialValues({});
+      final client = FakeTriageWebSocketClient()
+        ..railLayout = (
+          groupKeys: <String>[],
+          sessionIds: <String>[],
+          customLabels: {'main': 'Stale Label'},
+        );
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
-      expect(find.text('triage / main'), findsWidgets);
+      expect(find.text('Stale Label'), findsWidgets);
 
-      // The daemon's membership changes with no push delivered (a miss the
-      // client never noticed): the reconcile must add, remove, and relabel
-      // through the same paths as the pushes. The stats poll is parked so
-      // its timer cannot error into this test's async zone.
+      // The daemon's membership, contexts, and labels change with no push
+      // delivered (a miss the client never noticed): the reconcile must add
+      // (with git context enrichment), remove, relabel, and clear removed
+      // labels through the same paths as the pushes. The stats poll is parked
+      // so its timer cannot error into this test's async zone.
       client.hangDaemonStats = Completer<DaemonStatsRecord?>();
       client.initialSessions = ['main', 'reconciled-new'];
+      client.sessionContexts['reconciled-new'] = (
+        repositoryRoot: '/work/gamma',
+        worktreeRoot: '/work/gamma',
+        branch: 'feat/reconciled',
+        lastActivityMs: 4000,
+        lastInputMs: 4000,
+      );
       client.railLayout = (
         groupKeys: <String>[],
         sessionIds: <String>[],
@@ -2244,8 +2258,13 @@ void main() {
 
       expect(find.text('triage / flutter-spike'), findsNothing);
       expect(find.text('triage / websocket-session-api'), findsNothing);
+      expect(find.text('Stale Label'), findsNothing);
       expect(find.text('triage / main'), findsWidgets);
       expect(find.text('Fresh Label'), findsWidgets);
+      expect(
+        find.byKey(const ValueKey<String>('group:/work/gamma')),
+        findsOneWidget,
+      );
     },
   );
 

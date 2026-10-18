@@ -2530,4 +2530,73 @@ mod tests {
             serde_json::from_str(&terminated_json).unwrap();
         assert_eq!(terminated, terminated_deserialized);
     }
+
+    #[test]
+    fn server_message_kind_matches_serde_type_tag_for_all_variants() {
+        let sid = SessionId::new("s-1").unwrap();
+        let sub_id = SubscriptionId::new("sub-1").unwrap();
+        let samples = vec![
+            ServerMessage::Response {
+                id: None,
+                result: ServerResult::Unit,
+            },
+            ServerMessage::Error {
+                id: None,
+                error: ProtocolError::new("bad_request", "bad"),
+            },
+            ServerMessage::Event {
+                subscription_id: sub_id.clone(),
+                envelope: test_output_event(1),
+            },
+            ServerMessage::SubscriptionClosed {
+                subscription_id: sub_id,
+            },
+            ServerMessage::SessionSnippetUpdated {
+                session_id: sid.clone(),
+                snippet: "hi".to_string(),
+                detail: None,
+                output_seq: 1,
+            },
+            ServerMessage::SessionContextUpdated {
+                session_id: sid.clone(),
+                current_working_directory: None,
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            },
+            ServerMessage::UpdateAvailable {
+                current_version: "0.1.0".to_string(),
+                latest_version: "0.2.0".to_string(),
+            },
+            ServerMessage::SessionJudgePolicyUpdated {
+                session_id: sid.clone(),
+                policy: SessionJudgePolicy {
+                    explicit: None,
+                    effective: true,
+                },
+            },
+            ServerMessage::RailPinsUpdated {
+                group_keys: vec![],
+                session_ids: vec![],
+            },
+            ServerMessage::SessionCustomLabelUpdated {
+                session_id: sid.clone(),
+                custom_label: None,
+            },
+            ServerMessage::SessionStarted {
+                session_id: sid.clone(),
+                current_working_directory: None,
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+            },
+            ServerMessage::SessionTerminated { session_id: sid },
+        ];
+        for msg in samples {
+            let wire = serde_json::to_value(&msg).expect("serialize ServerMessage");
+            assert_eq!(Some(msg.kind()), wire.get("type").and_then(Value::as_str));
+        }
+    }
 }

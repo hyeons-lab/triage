@@ -1,4 +1,4 @@
-# 000162-01 — Rail anti-entropy + label cleanup
+# 000162-01: Rail anti-entropy + label cleanup
 
 ## Thinking
 
@@ -13,7 +13,7 @@ all three (insert/remove/relabel with regroup + reselect). Drain runs every
 What is actually broken:
 
 1. `shutdown_session` forgets snippet/judge/inbox/parked state but NOT the
-   custom label — session-294's `cera-gaps` survived its record and log
+   custom label: session-294's `cera-gaps` survived its record and log
    dir. Certain daemon bug, small fix.
 2. Global pushes are fire-and-forget with no replay: any miss (old
    service-worker-cached tab, a gap the client never noticed) leaves the

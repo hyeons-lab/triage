@@ -1187,6 +1187,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // course of a session, so a connect-time reading alone goes stale.
   Timer? _daemonStatsTimer;
   Timer? _railReconcileTimer;
+  bool _railReconcileInFlight = false;
   static const Duration _railReconcileInterval = Duration(seconds: 60);
   // Liveness probe for the socket; a failed beat tears the connection down
   // through the close path so a half-dead socket cannot hold a green
@@ -2465,8 +2466,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _railReconcileTimer?.cancel();
     _railReconcileTimer = Timer.periodic(_railReconcileInterval, (_) async {
       if (_disposed ||
+          _railReconcileInFlight ||
           generation != _connectGeneration ||
           serverId != _activeServerId ||
+          serverId != _sessionsServerId ||
           !_clientInitialized ||
           !_client.isConnected) {
         return;
@@ -2478,86 +2481,83 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _stopRailReconcile() {
     _railReconcileTimer?.cancel();
     _railReconcileTimer = null;
+    _railReconcileInFlight = false;
   }
 
   Future<void> _reconcileRail(int generation, String serverId) async {
+    if (_railReconcileInFlight) return;
+    _railReconcileInFlight = true;
     bool stale() =>
         _disposed ||
         generation != _connectGeneration ||
         serverId != _activeServerId ||
+        serverId != _sessionsServerId ||
         !_client.isConnected;
-    List<String> ids;
     try {
-      ids = await _client.listSessions();
-    } catch (_) {
-      return;
-    }
-    if (stale()) return;
-    final live = ids.toSet();
-    final known = <String>{};
-    for (final s in _sessions) {
-      final sid = s.remoteSessionId;
-      if (sid != null) known.add(sid);
-    }
-    // Removals first: a replaced row keeps its slot when the add lands.
-    for (final sid in known.difference(live)) {
-      _applySessionTerminated(sid);
-    }
-    final added = live.difference(known);
-    if (added.isNotEmpty) {
-      // One batch fetch for the rows' first paint, shaped like the push the
-      // application path expects. The bulk response carries no cwd; live cwd
-      // arrives via push, as on the connect-time load.
-      Map<String, SessionContextRecord> contexts;
+      List<String> ids;
       try {
-        contexts = await _client.listSessionContexts();
+        ids = await _client.listSessions();
       } catch (_) {
         return;
       }
       if (stale()) return;
-      for (final sid in added) {
-        final ctx = contexts[sid];
-        _applySessionStarted({
-          'session_id': sid,
-          'repository_root': ctx?.repositoryRoot,
-          'worktree_root': ctx?.worktreeRoot,
-          'branch': ctx?.branch,
-          'last_input_ms': ctx?.lastInputMs,
-          'last_activity_ms': ctx?.lastActivityMs,
-        }, sid);
+      final live = ids.toSet();
+      final known = <String>{};
+      for (final s in _sessions) {
+        final sid = s.remoteSessionId;
+        if (sid != null) known.add(sid);
       }
-    }
-    // Labels: the daemon wins on every key it has. A locally-known label the
-    // daemon lacks is pushed up — same rule as the connect-time load: a
-    // local-only label is a write the daemon never saw, not a remote clear
-    // to mirror.
-    Map<String, String> daemonLabels;
-    try {
-      final layout = await _client.getRailLayout();
-      if (stale()) return;
-      daemonLabels = layout?.customLabels ?? const {};
-    } catch (_) {
-      return;
-    }
-    for (final entry in daemonLabels.entries) {
-      final have =
-          _customLabels[entry.key] ?? _customLabels['triage / ${entry.key}'];
-      if (have != entry.value) {
-        _applyCustomLabelUpdated(entry.key, entry.value);
+      // Removals first: a replaced row keeps its slot when the add lands.
+      for (final sid in known.difference(live)) {
+        _applySessionTerminated(sid);
       }
-    }
-    for (final key in _customLabels.keys.toList()) {
-      final sid = key.startsWith('triage / ') ? key.substring(9) : key;
-      if (!daemonLabels.containsKey(sid) && live.contains(sid)) {
-        final label = _customLabels[key];
-        if (label != null && label.trim().isNotEmpty) {
-          unawaited(
-            _client
-                .setSessionCustomLabel(sessionId: sid, customLabel: label)
-                .catchError((_) {}),
-          );
+      final added = live.difference(known);
+      if (added.isNotEmpty) {
+        // One batch fetch for the rows' first paint, shaped like the push the
+        // application path expects. The bulk response carries no cwd; live cwd
+        // arrives via push, as on the connect-time load.
+        final contexts = await _fetchSessionContexts();
+        if (stale()) return;
+        for (final sid in added) {
+          final ctx = contexts[sid];
+          _applySessionStarted({
+            'session_id': sid,
+            'repository_root': ctx?.repositoryRoot,
+            'worktree_root': ctx?.worktreeRoot,
+            'branch': ctx?.branch,
+            'last_input_ms': ctx?.lastInputMs,
+            'last_activity_ms': ctx?.lastActivityMs,
+          }, sid);
         }
       }
+      // Labels: once connected (after `_loadDaemonSessions` has seeded any
+      // initial local-only labels to an empty daemon), a non-null
+      // `getRailLayout` response is authoritative for both label updates and
+      // label clears. A null return means the RPC failed or the daemon predates
+      // layouts, so skip label changes on that tick.
+      final RailLayoutRecord? layout;
+      try {
+        layout = await _client.getRailLayout();
+      } catch (_) {
+        return;
+      }
+      if (stale() || layout == null) return;
+      final daemonLabels = layout.customLabels;
+      for (final entry in daemonLabels.entries) {
+        if (_lookupCustomLabel(entry.key) != entry.value) {
+          _applyCustomLabelUpdated(entry.key, entry.value);
+        }
+      }
+      for (final key in _customLabels.keys.toList()) {
+        final sid = key.startsWith('triage / ')
+            ? key.substring('triage / '.length)
+            : key;
+        if (!daemonLabels.containsKey(sid)) {
+          _applyCustomLabelUpdated(sid, null);
+        }
+      }
+    } finally {
+      _railReconcileInFlight = false;
     }
   }
 
@@ -2752,10 +2752,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _daemonStats = daemonStatsFromResponse(helloRes);
       });
       _startDaemonStatsPolling(generation, serverId);
-      _startRailReconcile(generation, serverId);
       _startHeartbeat(generation);
 
       await _loadDaemonSessions();
+      if (_disposed ||
+          generation != _connectGeneration ||
+          serverId != _activeServerId) {
+        return;
+      }
+      _startRailReconcile(generation, serverId);
       _reconnectAttempt = 0;
       if (kIsWeb && !_disposed && _sessions.isNotEmpty) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -3692,7 +3697,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // this state: `cancelReorder` raises neither `onReorderEnd` nor
     // `onReorderItem`, so the drag it just ended would otherwise never clear.
     _draggingRailGroup = null;
-    _applyPins(_pins, persist: false);
+    _applyPins(_pins, persist: false, syncToDaemon: false);
   }
 
   /// Records that a header drag has begun, so the rail can show the group's rows
@@ -4413,7 +4418,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// Inserts a rail row for a session the daemon reports that this client has
-  /// no row for yet — from a `session_started` push or the rail reconcile.
+  /// no row for yet (from a `session_started` push or the rail reconcile).
   /// Idempotent: an existing row short-circuits, so a push racing the
   /// reconcile (or a redelivered push) cannot double-insert.
   void _applySessionStarted(Map<String, dynamic> message, String sessionId) {
@@ -4484,7 +4489,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
 
     var newPins = _pins;
-    if (_pins.sessionIds.contains(sessionId)) {
+    final pinRemoved = _pins.sessionIds.contains(sessionId);
+    if (pinRemoved) {
       newPins = unpin(_pins, sessionId: sessionId);
       unawaited(_persistPins(newPins));
     }
@@ -4495,7 +4501,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       unawaited(_persistCustomLabels());
     }
 
-    _applyPins(newPins, persist: false);
+    _applyPins(newPins, persist: false, syncToDaemon: pinRemoved);
 
     if (wasSelected &&
         _sessions.isNotEmpty &&

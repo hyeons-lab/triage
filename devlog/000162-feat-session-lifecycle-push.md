@@ -1,8 +1,9 @@
-# 000162 — feat/session-lifecycle-push
+# 000162: feat/session-lifecycle-push
 
 ## Agent
 
-Muse Code powered by Meta Muse Spark, session fern-metis.
+- Muse Code powered by Meta Muse Spark, session fern-metis.
+- 2026-10-18T16:44-0700: Antigravity @ triage branch feat/session-lifecycle-push
 
 ## Intent
 
@@ -17,26 +18,37 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
 ## What Changed
 
 - `crates/triaged/src/session.rs`: `shutdown_session` now forgets the custom
-  label (memory + manifest); `broadcast_to_global_senders` debug-logs dropped
-  pushes with the message kind.
-- `crates/triage-transport-ws/src/lib.rs`: `ServerMessage::kind()` helper.
+  label in memory and excludes the retiring `session_id` from `custom_labels`
+   inside `encode_manifest` across both `Live` and `Historical` teardown paths;
+  `broadcast_to_global_senders` debug-logs dropped pushes with the message kind;
+  `shutdown_session_forgets_the_custom_label` tests both live and historical
+  sessions.
+- `crates/triage-transport-ws/src/lib.rs`: `ServerMessage::kind()` helper plus
+  `server_message_kind_matches_serde_type_tag_for_all_variants` unit test.
 - `flutter/triage_client/lib/main.dart`: extracted `_applySessionStarted` /
   `_applySessionTerminated` / `_applyCustomLabelUpdated` from the push
-  branches; added a 60s `_railReconcileTimer` (generation+server guarded,
-  started/stopped with the stats poll) that diffs the rail against
-  `list_sessions` + `getRailLayout` and replays the delta through those
-  same paths.
-- `flutter/triage_client/test/widget_test.dart`: reconcile widget test.
+  branches; added a 60s `_railReconcileTimer` (in-flight, generation, and
+  server-id guarded, started after `_loadDaemonSessions` completes and stopped
+  with the stats poll) that diffs the rail against `list_sessions`,
+  `list_session_contexts` (when new sessions appear), and `getRailLayout`
+  (adding, updating, and clearing removed custom labels when non-null) and
+  replays the delta through those same paths without redundant `setRailLayout`
+  RPCs when pins did not change.
+- `flutter/triage_client/test/widget_test.dart`: reconcile widget test covering
+  row addition with context enrichment, row removal, label addition, and label
+  removal.
 
 ## Decisions
 
-- No protocol change: the push chain (broadcast → transport → decode →
+- No protocol change: the push chain (broadcast -> transport -> decode ->
   handlers) already existed and was verified live; the work is a daemon
   leak fix plus client anti-entropy for missed pushes.
 - Reconcile reuses the push application paths (no second rail-mutation
   implementation); idempotent guards make push/reconcile races safe.
-- Label conflicts resolve daemon-wins on present keys, push-local-up on
-  absent keys — same rule as the connect-time load.
+- Label conflicts in `_reconcileRail` treat a non-null `getRailLayout` as
+  authoritative for custom labels (applying present labels and clearing local
+  labels absent from the daemon's map) while skipping label mutations when
+  `getRailLayout` returns `null` (unsupported or transient failure).
 
 ## Issues
 
@@ -46,7 +58,8 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
 
 ## Commits
 
-- HEAD — feat(rail): reconcile rows and labels; forget labels on shutdown
+- 634d824: feat(rail): reconcile rows and labels; forget labels on shutdown
+- HEAD: fix(rail): harden label manifest cleanup and rail anti-entropy reconcile
 
 ## Progress
 
@@ -61,6 +74,11 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
   reloaded: 69 sessions preserved. Live-verified label forget (set=true
   before shutdown, leaked=false after) and served bundle md5. Cleared the
   session-294 ghost label; only 295 carries cera-gaps now.
+- 2026-10-18T16:44-0700: rebased onto `fix/context-list-fanout` and addressed
+  Round 1 review findings (historical session shutdown manifest rewrite, single
+  atomic manifest write excluding retiring `custom_labels`, `ServerMessage::kind`
+  serde tag pin test, and `_reconcileRail` context enrichment, label deletion,
+  in-flight guard, and `syncToDaemon` gating).
 
 ## Research & Discoveries
 
@@ -70,8 +88,11 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
 
 ## Lessons Learned
 
-- (pending)
+- Periodic anti-entropy reconcile loops must diff both additions and deletions,
+  preserve local state when an optional bulk RPC returns `null`, and enrich
+  newly discovered items with the same companion metadata (`list_session_contexts`)
+  as initial load.
 
 ## Next Steps
 
-- Discover broadcast infra + shutdown/label semantics; write plan 000162-01.
+- Complete Round 2 review on `feat/session-lifecycle-push`.
