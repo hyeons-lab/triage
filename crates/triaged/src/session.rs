@@ -12358,26 +12358,38 @@ mod tests {
     }
 
     /// The contexts batch must return one row per session in stable sort-key
-    /// order. Guards the fan-out: responses collected out of order would
-    /// file one session's context under another's id.
+    /// order, with each session carrying its own resolved context. Guards the
+    /// fan-out: responses collected out of order would file one session's
+    /// context under another's id.
     #[test]
     fn list_session_contexts_returns_every_session_in_order() {
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
         let mut ids = Vec::new();
-        for _ in 0..3 {
-            ids.push(
-                manager
-                    .start_session(StartSessionRequest::new(long_running_shell_command()))
-                    .expect("start session"),
-            );
+        let mut expected: Vec<(SessionId, Option<String>)> = Vec::new();
+        for idx in 0..3 {
+            let repo = log_dir.join(format!("repo-{idx}"));
+            std::fs::create_dir_all(&repo).expect("create repo dir");
+            let branch = format!("feat/fanout-{idx}");
+            git_test_command(&repo, &["init"]);
+            git_test_command(&repo, &["checkout", "-b", &branch]);
+            let mut request = StartSessionRequest::new(long_running_shell_command());
+            request.cwd = Some(repo);
+            let id = manager.start_session(request).expect("start session");
+            ids.push(id.clone());
+            expected.push((id, Some(branch)));
         }
 
         let rows = manager.list_session_contexts().expect("list contexts");
-        let mut expected = ids.clone();
-        expected.sort_by(|left, right| session_sort_key(left).cmp(&session_sort_key(right)));
-        let got: Vec<SessionId> = rows.iter().map(|row| row.session_id.clone()).collect();
-        assert_eq!(got, expected, "one row per session, in sort-key order");
+        expected.sort_by(|left, right| session_sort_key(&left.0).cmp(&session_sort_key(&right.0)));
+        let got: Vec<(SessionId, Option<String>)> = rows
+            .into_iter()
+            .map(|row| (row.session_id, row.context.and_then(|ctx| ctx.branch)))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "one row per session in sort-key order, each carrying its own actor's context"
+        );
 
         for id in &ids {
             let _ = manager.shutdown_session(id.clone());

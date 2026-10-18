@@ -25,7 +25,7 @@ use crate::session::run_command_with_timeout;
 const TAILSCALE_WHOIS_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a *successful* lookup is reused. Tailnet IP-to-login mappings
 /// change only when nodes or users change (rare), while reconnects are
-/// common — and each cold pair pays ~300ms for the subprocess on the load
+/// common, and each cold pair pays ~300ms for the subprocess on the load
 /// path. Five minutes keeps identity changes effective quickly while making
 /// reconnect pairs free.
 const WHOIS_CACHE_TTL: Duration = Duration::from_secs(300);
