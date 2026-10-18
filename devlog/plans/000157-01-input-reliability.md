@@ -1,4 +1,4 @@
-# 000157-01 — Input reliability: leases, parked input, heartbeat, indicator
+# 000157-01: Input reliability: leases, parked input, heartbeat, indicator
 
 ## Thinking
 
@@ -14,7 +14,7 @@ Four mechanisms drop keystrokes or lie about connectivity:
    but cannot retry what it never kept, and client-side retry is
    uncorrelatable without write acks. Fix server-side, where denial is
    known exactly: `write_input` parks denied bytes per (session, client)
-   — cap 4KB, TTL 10s, lazy sweep — and still bails unchanged so the
+   (cap 4KB, TTL 10s, lazy sweep) and still bails unchanged so the
    client re-acquires; the two acquire paths flush that client's parked
    bytes off-lock after a grant. Exactly-once by construction: denied
    means never written, flushed once, expired otherwise. Ordering holds:
@@ -33,7 +33,7 @@ Four mechanisms drop keystrokes or lie about connectivity:
    mean alive-but-unpaired and must not tear down; skip while pairing.
    No daemon-side idle timeout: ghost leases self-heal via
    takeover-plus-park. Indicator: derive the displayed session status at
-   render time — remote session + dead socket = 'disconnected' —
+   render time (remote session + dead socket = 'disconnected')
    instead of trusting the sticky string. No 'observing' state in v1:
    auto-acquire makes no-lease transient, and a flickering label would
    confuse more than it explains.
@@ -64,3 +64,12 @@ resubscribe-completed site for proactive flush, remaining
    `session.status` render site.
 7. `flutter analyze`, affected `flutter test` files, devlog, commit, push
    with explicit refspec, open PR.
+
+## Correction (2026-10-14)
+
+Steps 2's "off-lock" flush description does not match the shipped code:
+`grant_input_lease_and_flush` collects parked bytes under the sessions
+guard and sends them through the fire-and-forget actor channel
+(`request_write_input`, a bare send with no round-trip), so no off-lock
+step is needed and none exists. The plan text above is historical; this
+note is the accurate description.

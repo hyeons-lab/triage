@@ -53,5 +53,24 @@ void main() {
       expect(display.text, 'exited');
       expect(display.color, const Color(0xff7f8b8d));
     });
+
+    // The exited guard has two conjuncts (the isExited flag and the sticky
+    // 'exited' status string); construction sites set both, so each needs
+    // a leg of its own or deleting either conjunct stays green.
+    test('the isExited flag alone leaves the session alone', () {
+      final display = _session(
+        status: 'attached',
+        isExited: true,
+      ).displayStatus(connected: false);
+      expect(display.text, 'attached');
+    });
+
+    test("the 'exited' status alone leaves the session alone", () {
+      final display = _session(
+        status: 'exited',
+        statusColor: const Color(0xff7f8b8d),
+      ).displayStatus(connected: false);
+      expect(display.text, 'exited');
+    });
   });
 }

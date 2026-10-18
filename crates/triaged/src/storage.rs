@@ -220,23 +220,62 @@ pub fn compress_segment_file(raw_path: &Path, compressed_path: &Path) -> Result<
     Ok(compressed_len)
 }
 
+/// Memoized uncompressed sizes of compressed segments, keyed by
+/// (path, compressed file size). A sealed segment is immutable (the
+/// compression worker replaces the raw file with the `.zst` once and
+/// never rewrites it), so a computed size stays valid for the file's
+/// life, and a replaced file (different size) recomputes. Without this,
+/// every tail read pays the size probe for every segment in the chain,
+/// which is a full decompress-to-sink per segment whose frame carries
+/// no pledged content size.
+fn segment_size_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(PathBuf, u64), u64>>
+{
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(PathBuf, u64), u64>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Returns the uncompressed byte length of a segment.
 ///
 /// For uncompressed `.tlog` files, returns `info.file_size`.
 /// For compressed `.tlog.zst` files, inspects the zstd frame header for the pledged
 /// uncompressed frame size in O(1) time without decompressing. If the frame header
 /// does not store the content size, falls back to decoding the stream into `io::sink()`.
+/// Compressed results are memoized by `(path, file_size)` for the life of the immutable segment.
 pub fn get_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<u64> {
     if !info.is_compressed {
         return Ok(info.file_size);
     }
 
+    let cache_key = (info.path.clone(), info.file_size);
+    if let Some(size) = segment_size_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&cache_key)
+    {
+        return Ok(*size);
+    }
+    let (size, cacheable) = compressed_segment_uncompressed_size(info)?;
+    if cacheable {
+        segment_size_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(cache_key, size);
+    }
+    Ok(size)
+}
+
+/// Returns the size and whether it may be memoized: the not-found
+/// fallback reads a *different* file (the uncompressed twin mid-rotation)
+/// whose size says nothing durable about this path, so it is not cached.
+fn compressed_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<(u64, bool)> {
     let mut file = match File::open(&info.path) {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let uncompressed_path = info.path.with_file_name(segment_file_name(info.index));
             if let Ok(meta) = fs::metadata(&uncompressed_path) {
-                return Ok(meta.len());
+                return Ok((meta.len(), false));
             }
             return Err(err).with_context(|| format!("opening segment {}", info.path.display()));
         }
@@ -249,7 +288,7 @@ pub fn get_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<u64> {
     if let Ok(n) = file.read(&mut header_buf)
         && let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(&header_buf[..n])
     {
-        return Ok(size);
+        return Ok((size, true));
     }
 
     file.seek(SeekFrom::Start(0))
@@ -257,7 +296,7 @@ pub fn get_segment_uncompressed_size(info: &SegmentFileInfo) -> Result<u64> {
     let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))
         .with_context(|| format!("decoding zstd segment {}", info.path.display()))?;
     let count = std::io::copy(&mut decoder, &mut std::io::sink())?;
-    Ok(count)
+    Ok((count, true))
 }
 
 /// Reads the entire uncompressed content of a segment.

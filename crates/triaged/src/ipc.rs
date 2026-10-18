@@ -1663,6 +1663,12 @@ fn handle_handover_server(
         state.has_tcp_listener = false;
     }
 
+    // Last chance for parked input: denials parked during the extract
+    // window, after a session's own serialized entry already read the
+    // parked map, are merged in now, immediately before the state goes
+    // on the wire.
+    manager.refresh_parked_input(&mut state);
+
     let response = WireResponse::Ok(Box::new(WireSuccess::HandoverState(state)));
     let response_bytes =
         serde_json::to_vec(&response).context("serializing handover response JSON")?;

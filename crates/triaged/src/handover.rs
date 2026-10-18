@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use triage_core::session::{InputLeaseState, SessionId, SessionSize};
+use triage_core::session::{ClientId, InputLeaseState, SessionId, SessionSize};
 
 /// Non-reusable identity of a child process carried with its PTY master.
 ///
@@ -56,6 +56,15 @@ pub struct HandoverSession {
     /// for a state blob written before this field existed.
     #[serde(default)]
     pub lease: InputLeaseState,
+    /// Input bytes parked for lease-denied clients when the swap began,
+    /// as (client, bytes) pairs. Parked input lives only in daemon memory,
+    /// so without this the keystrokes a denied client typed in the seconds
+    /// before a swap are discarded with the old process even though the
+    /// lease itself survives. Adoption re-parks them with a fresh TTL
+    /// stamp. Defaults to empty for a state blob written before this field
+    /// existed.
+    #[serde(default)]
+    pub parked_input: Vec<(ClientId, Vec<u8>)>,
 }
 
 impl HandoverSession {

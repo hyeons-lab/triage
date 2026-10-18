@@ -134,6 +134,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         let original = session.clone();
 
@@ -174,6 +175,7 @@ mod tests {
                 last_input_ms: 0,
                 judge_override: None,
                 lease: InputLeaseState::default(),
+                parked_input: Vec::new(),
             })
             .collect();
         let state = crate::handover::HandoverState {
@@ -252,6 +254,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session],
@@ -340,6 +343,7 @@ mod tests {
                 last_input_ms: 0,
                 judge_override: None,
                 lease: InputLeaseState::default(),
+                parked_input: Vec::new(),
             }],
             has_tcp_listener: false,
             sends_teardown_commit: true,
@@ -596,7 +600,7 @@ mod tests {
             kind: InputControllerKind::Interactive,
         })?;
 
-        let (state, fds) = manager.serialize_active_sessions()?;
+        let SerializedHandover { state, fds } = manager.serialize_active_sessions()?;
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(
             state.sessions[0]
@@ -649,12 +653,15 @@ mod tests {
             log_path: std::path::PathBuf::from("/tmp/legacy.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 1234,
             process_identity: None,
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
             lease: triage_core::session::InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         let mut value = serde_json::to_value(crate::handover::HandoverState {
             sessions: vec![session],
@@ -819,6 +826,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],
@@ -917,6 +925,7 @@ mod tests {
                 last_input_ms: 0,
                 judge_override: None,
                 lease: InputLeaseState::default(),
+                parked_input: Vec::new(),
             })
         };
 
@@ -1049,6 +1058,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1107,6 +1117,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1171,6 +1182,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
             socket_identity,
@@ -1244,6 +1256,7 @@ mod tests {
             last_input_ms: 0,
             judge_override: None,
             lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         let snapshot = |owner_token, fd| {
             crate::handover::remember_recovered_handover_for_test(
@@ -1743,6 +1756,8 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             judge_override: None,
+            lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
         };
         assert_eq!(session.logged_output_seq(), 42);
         assert_eq!(session.logged_tail_bytes(), 16);
