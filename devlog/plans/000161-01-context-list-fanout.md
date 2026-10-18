@@ -1,4 +1,4 @@
-# 000161-01 — Fan out `list_session_contexts` actor round-trips
+# 000161-01: Fan out `list_session_contexts` actor round-trips
 
 ## Thinking
 
@@ -16,7 +16,7 @@ The fix has two independent halves, both local to this call site:
 1. Concurrency: resolve the live legs with `std::thread::scope`, one thread
    per live actor. Threads fit because the legs are blocking `recv`s and the
    surrounding API is sync; scoped threads avoid lifetime plumbing.
-2. Bound: add a `recv_timeout` variant used only here (5s — ~100x the ~40ms
+2. Bound: add a `recv_timeout` variant used only here (5s, ~100x the ~40ms
    per-leg cost measured under extreme load). Timeout, disconnect, and actor
    error all collapse to `None` context, matching the existing mid-shutdown
    behavior, so the row still renders with a fallback title.

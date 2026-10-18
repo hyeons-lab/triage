@@ -273,7 +273,9 @@ pub struct SessionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionContextRow {
     pub session_id: SessionId,
-    /// `None` when the session's working directory is outside any repository.
+    /// `None` when the session's working directory is outside any repository,
+    /// or when a live session's actor is shutting down or does not answer
+    /// within the `list_session_contexts` batch timeout.
     pub context: Option<SessionContext>,
     /// Milliseconds since the Unix epoch of the session's most recent output.
     ///
