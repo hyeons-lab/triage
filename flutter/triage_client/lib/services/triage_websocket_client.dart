@@ -133,12 +133,7 @@ DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
 ///   falling back to raw base64 bytes if uncompressed.
 /// - `List<dynamic>`: legacy uncompressed JSON integer byte arrays.
 Uint8List rawOutputFromSnapshot(Map<String, dynamic> snapshot) {
-  return historyBytesFromField(snapshot['raw_output']);
-}
-
-/// Decodes one compressed-bytes history field (snapshot tail or fetch page)
-/// from either transport encoding into raw PTY bytes.
-Uint8List historyBytesFromField(dynamic raw) {
+  final raw = snapshot['raw_output'];
   if (raw is Uint8List) return raw;
   if (raw is String) {
     if (raw.isEmpty) return Uint8List(0);

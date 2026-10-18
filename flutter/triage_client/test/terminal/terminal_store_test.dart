@@ -160,7 +160,11 @@ void main() {
   });
 
   test('full replay trims to the newest lines with a reset prologue', () {
-    final lines = List.generate(1500, (i) => 'L${i.toString().padLeft(4, '0')}');
+    expect(kHistoryReplayMaxLines, 10000);
+    final lines = List.generate(
+      kHistoryReplayMaxLines + 500,
+      (i) => 'L${i.toString().padLeft(5, '0')}',
+    );
     final payload = '${lines.join('\n')}\n';
     store.dispatch(const Attach());
     store.dispatch(HistoryBytes(b(payload), cols: 80, rows: 24));
@@ -169,6 +173,116 @@ void main() {
     expect(store.state.phase, AttachPhase.live);
     expect(store.state.scrollbackReady, isTrue);
   });
+
+  test('256 KiB paged history of 2500 lines retains the oldest line', () {
+    // Regression guard: a 256 KiB native page of ~100-byte lines is ~2,500
+    // lines; a 1,000-line cap silently dropped the older 1,500 lines on write.
+    final lines = List.generate(
+      2500,
+      (i) => 'L${i.toString().padLeft(4, '0')}-${'x' * 90}',
+    );
+    final payload = '${lines.join('\n')}\n';
+    expect(payload.length, lessThanOrEqualTo(256 * 1024));
+    store.dispatch(const Attach());
+    store.dispatch(HistoryBytes(b(payload), cols: 80, rows: 24));
+    expect(sink.written.toString(), startsWith('L0000-'));
+    expect(sink.written.toString(), contains('L2499-'));
+  });
+
+  test(
+    'history paging shadow-buffers live chunks and replays them after widened snapshot',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(
+        HistoryBytes(
+          b('tail-1\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 500,
+        ),
+      );
+      expect(store.appliedLogBytes, 507);
+      expect(store.appliedHistoryStart, 500);
+
+      // Paging begins while already in AttachPhase.live; live chunks arriving
+      // while the attachSession RPC is in flight are shadow-buffered too, and
+      // an intervening Resize does not drain the shadow buffer early.
+      store.beginHistoryPaging();
+      expect(store.isPagingHistory, isTrue);
+      store.dispatch(LiveBytes(b('in-flight-11\n'), outputSeq: 11));
+      store.dispatch(LiveBytes(b('in-flight-12\n'), outputSeq: 12));
+      store.dispatch(const Resize(90, 30));
+
+      // Daemon snapshot was captured at output_seq 11 (includes in-flight-11,
+      // does not include in-flight-12).
+      sink.written.clear();
+      store.dispatch(const Attach(preservePendingLive: true));
+      store.dispatch(
+        HistoryBytes(
+          b('older\ntail-1\nin-flight-11\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 11,
+          rawOutputStart: 400,
+        ),
+      );
+      expect(store.isPagingHistory, isFalse);
+      store.endHistoryPaging();
+
+      expect(
+        sink.written.toString(),
+        'older\r\ntail-1\r\nin-flight-11\r\nin-flight-12\r\n',
+      );
+      expect(store.appliedHistoryStart, 400);
+      expect(
+        store.appliedLogBytes,
+        400 + 'older\ntail-1\nin-flight-11\n'.length + 'in-flight-12\n'.length,
+      );
+
+      // If a later page bails out without replaying, endHistoryPaging clears
+      // the shadow buffer so a subsequent preserving page replay (which resets
+      // _appliedLiveSeq) cannot replay stale shadow entries from the bailed
+      // page, and resets isPagingHistory to false so live-14 is not shadow-queued.
+      store.beginHistoryPaging();
+      store.dispatch(LiveBytes(b('bailed-13\n'), outputSeq: 13));
+      store.endHistoryPaging();
+      expect(store.isPagingHistory, isFalse);
+      sink.written.clear();
+      store.dispatch(LiveBytes(b('live-14\n'), outputSeq: 14));
+      expect(sink.written.toString(), 'live-14\r\n');
+      sink.written.clear();
+      store.beginHistoryPaging();
+      store.dispatch(const Attach(preservePendingLive: true));
+      store.dispatch(
+        HistoryBytes(
+          b('even-older\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 12,
+          rawOutputStart: 350,
+        ),
+      );
+      store.endHistoryPaging();
+      expect(sink.written.toString(), 'even-older\r\n');
+
+      // An intervening delta-merged HistoryBytes disarms isPagingHistory so a
+      // stale in-flight page cannot wipe the terminal when it returns later.
+      store.beginHistoryPaging();
+      expect(store.isPagingHistory, isTrue);
+      store.dispatch(LiveBytes(b('live-15\n'), outputSeq: 15));
+      store.dispatch(
+        HistoryBytes(
+          b('live-15\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 15,
+          rawOutputStart: 350 + 'even-older\n'.length,
+        ),
+      );
+      expect(store.isPagingHistory, isFalse);
+    },
+  );
 
   test('small replay passes through with no reset prologue', () {
     store.dispatch(const Attach());

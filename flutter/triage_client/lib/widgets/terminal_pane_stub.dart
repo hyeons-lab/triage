@@ -137,6 +137,13 @@ class _TerminalPaneState extends State<TerminalPane> {
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
   DateTime? _pageAnchorAt;
+  int _pageJumpGeneration = 0;
+
+  void _clearPageAnchor() {
+    _pageAnchorPixels = null;
+    _pageAnchorLines = null;
+    _pageAnchorAt = null;
+  }
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
   // up, so scrollback trims don't drift their content (see TerminalScrollAnchor).
@@ -367,6 +374,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     }
     if (!identical(oldWidget.terminal, widget.terminal) ||
         oldWidget.terminalId != widget.terminalId) {
+      _clearPageAnchor();
+      _pageJumpGeneration++;
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -405,6 +414,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _scrollToCursor(requestFocus: true);
     }
     if (oldWidget.controller != widget.controller) {
+      _clearPageAnchor();
+      _pageJumpGeneration++;
       oldWidget.controller.removeFitListener(_onFit);
       oldWidget.controller.removeRefitListener(_onRefit);
       oldWidget.controller.removeClearListener(_onClear);
@@ -514,6 +525,7 @@ class _TerminalPaneState extends State<TerminalPane> {
 
   void _onClear() {
     if (!mounted) return;
+    _pageJumpGeneration++;
     _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     _scrollAnchor.clear();
     _clearSavedSessionScroll(widget.terminalId);
@@ -524,31 +536,58 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (!mounted) return;
     // A scroll-up page replayed a wider window: re-seat the viewport on
     // the same content (old pixels plus the added rows) instead of the
-    // normal bottom snap. xterm.dart parses synchronously, so the buffer
-    // is settled here and no stabilization wait is needed.
+    // normal bottom snap. Re-applied on the post-frame callback once
+    // RenderTerminal.performLayout updates maxScrollExtent for the new rows.
     if (_pageAnchorAt != null &&
         DateTime.now().difference(_pageAnchorAt!) <
             const Duration(seconds: 15) &&
         _pageAnchorPixels != null &&
         _pageAnchorLines != null &&
         _scrollController.hasClients) {
-      final addedLines = _terminal.buffer.lines.length - _pageAnchorLines!;
-      final lh = _lineHeight() ?? 2.0;
-      final position = _scrollController.position;
-      final target = (_pageAnchorPixels! + addedLines * lh).clamp(
-        0.0,
-        position.hasContentDimensions ? position.maxScrollExtent : 0.0,
-      );
-      _pageAnchorPixels = null;
-      _pageAnchorLines = null;
-      _pageAnchorAt = null;
-      _suppressScrollSaveFor(const Duration(milliseconds: 500));
-      position.jumpTo(target);
+      final anchorPixels = _pageAnchorPixels!;
+      final anchorLines = _pageAnchorLines!;
+      _clearPageAnchor();
+      _pendingBottomSnapOnPointerUp = false;
+      _lastScrollPixels = null;
+      final addedLines = _terminal.buffer.lines.length - anchorLines;
+      final jumpGeneration = ++_pageJumpGeneration;
+      void applyPagedJump() {
+        if (!mounted ||
+            jumpGeneration != _pageJumpGeneration ||
+            !_scrollController.hasClients) {
+          return;
+        }
+        final position = _scrollController.position;
+        if (!position.hasContentDimensions) return;
+        final lh = _lineHeight() ?? 2.0;
+        final target = (anchorPixels + addedLines * lh).clamp(
+          0.0,
+          position.maxScrollExtent,
+        );
+        _suppressScrollSaveFor(const Duration(milliseconds: 500));
+        final wasSuppressed = _suppressAnchorCapture;
+        _suppressAnchorCapture = true;
+        try {
+          position.jumpTo(target);
+        } finally {
+          _suppressAnchorCapture = wasSuppressed;
+          _lastScrollPixels = position.pixels;
+        }
+        _scrollAnchor.capture(
+          buffer: _terminal.buffer,
+          pixels: position.pixels,
+          maxScrollExtent: position.maxScrollExtent,
+          lineHeight: lh,
+        );
+        _saveScrollOffset(widget.terminalId, lh);
+      }
+
+      applyPagedJump();
+      WidgetsBinding.instance.addPostFrameCallback((_) => applyPagedJump());
       return;
     }
-    _pageAnchorPixels = null;
-    _pageAnchorLines = null;
-    _pageAnchorAt = null;
+    _clearPageAnchor();
+    _pageJumpGeneration++;
     final isGestureActive =
         _activePointers.isNotEmpty ||
         (_scrollController.hasClients &&
@@ -1141,7 +1180,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       final position = _scrollController.position;
       if (position.hasContentDimensions && position.maxScrollExtent > 0) {
         final lh = _lineHeight() ?? 2.0;
-        if (position.pixels <= lh * 5) {
+        if (position.pixels <= lh * 5 &&
+            position.pixels < position.maxScrollExtent - 0.5) {
           widget.onNearTop?.call();
         }
       }

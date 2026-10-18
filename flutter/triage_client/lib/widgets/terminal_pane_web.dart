@@ -312,6 +312,17 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
+
+  void _clearPageAnchor({bool cancelRestoreTimer = true}) {
+    if (cancelRestoreTimer) {
+      _pageRestoreTimer?.cancel();
+      _pageRestoreTimer = null;
+    }
+    _pageAnchorY = null;
+    _pageAnchorLen = null;
+    _pageAnchorAt = null;
+  }
+
   Timer? _suppressScrollSaveTimer;
   Timer? _jiggleRestoreTimer;
   int? _pendingJiggleCols;
@@ -1250,7 +1261,7 @@ class _TerminalPaneState extends State<TerminalPane> {
           // stop), so repeat scroll events while a page is in flight are
           // cheap. Suppressed saves (programmatic restores) return above,
           // so our own scrollToLine never retriggers.
-          if (viewportY <= 5) {
+          if (!isAtBottom && baseY > 0 && viewportY <= 5) {
             activePane.widget.onNearTop?.call();
           }
         } catch (_) {}
@@ -1454,6 +1465,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       _sessionSavedViewportY.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {
+        activePane._pageRestoreTimer?.cancel();
+        activePane._pageRestoreTimer = null;
         activePane._pendingScrollToBottomOnRelease = true;
         activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
@@ -1496,6 +1509,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// persistent write/clear listeners to [_bindPersistentSessionControllerFor].
   void _rebindViewListenersTo(TerminalController controller) {
     if (identical(_boundViewController, controller)) return;
+    _clearPageAnchor();
     final previous = _boundViewController;
     if (previous != null) _unbindControllerFrom(previous);
     _boundViewController = controller;
@@ -1550,9 +1564,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       _restorePagedScrollPosition();
       return;
     }
-    _pageAnchorY = null;
-    _pageAnchorLen = null;
-    _pageAnchorAt = null;
+    _clearPageAnchor();
     // Refit before restoring scroll: a fit that ran while the layout was
     // narrow (or whose resize-out died in the debounce) leaves a narrow grid
     // under a wide pane, and replay is the moment that mismatch turns
@@ -1567,20 +1579,16 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// length) is what re-seats the viewport on the same content.
   void _onHistoryPageStarted() {
     if (!_initialized) return;
-    _pageRestoreTimer?.cancel();
-    _pageRestoreTimer = null;
+    _clearPageAnchor();
     try {
       final buffer = js_util.getProperty(_term, 'buffer');
       final active = js_util.getProperty(buffer, 'active');
-      _pageAnchorY =
-          (js_util.getProperty(active, 'viewportY') as num?)?.toInt();
-      _pageAnchorLen =
-          (js_util.getProperty(active, 'length') as num?)?.toInt();
+      _pageAnchorY = (js_util.getProperty(active, 'viewportY') as num?)
+          ?.toInt();
+      _pageAnchorLen = (js_util.getProperty(active, 'length') as num?)?.toInt();
       _pageAnchorAt = DateTime.now();
     } catch (_) {
-      _pageAnchorY = null;
-      _pageAnchorLen = null;
-      _pageAnchorAt = null;
+      _clearPageAnchor(cancelRestoreTimer: false);
     }
   }
 
@@ -1591,11 +1599,10 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _restorePagedScrollPosition() {
     final anchorY = _pageAnchorY;
     final anchorLen = _pageAnchorLen;
-    _pageAnchorY = null;
-    _pageAnchorLen = null;
-    _pageAnchorAt = null;
+    _clearPageAnchor();
+    _pendingScrollToBottomOnRelease = false;
+    _clearPointerReleaseTimers();
     if (anchorY == null || anchorLen == null) return;
-    _pageRestoreTimer?.cancel();
     var polls = 0;
     var lastLen = -1;
     _pageRestoreTimer = Timer.periodic(const Duration(milliseconds: 50), (
@@ -2831,6 +2838,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(oldWidget.controller)} -> '
             'ctrl#${identityHashCode(widget.controller)}',
       );
+      _clearPageAnchor();
       _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);

@@ -28,7 +28,7 @@ const int kPendingLiveByteCap = 1024 * 1024;
 /// are the viewport plus scrollback the user actually sees, and live output
 /// keeps accumulating past them. Older scrollback stays in the daemon log for
 /// a future scroll-up paging pass to fetch on demand.
-const int kHistoryReplayMaxLines = 1000;
+const int kHistoryReplayMaxLines = 10000;
 const int kHistoryReplayMaxBytes = 256 * 1024;
 
 /// Web replay budget: xterm.js parses `write` payloads incrementally without
@@ -52,10 +52,12 @@ const int kHistoryLeaseProbeBytes = 1024;
 
 /// Next history window after [current] when paging older scrollback:
 /// doubling keeps the cumulative transfer near 2x the final depth,
-/// capped at [max] (the platform replay budget — the trim drops
+/// capped at [max] (the platform replay budget: the trim drops
 /// anything older anyway).
 int nextHistoryWindowBytes({required int current, required int max}) {
-  if (current <= 0) return max <= 0 ? 0 : kHistoryFirstWindowBytes.clamp(1, max);
+  if (current <= 0) {
+    return max <= 0 ? 0 : kHistoryFirstWindowBytes.clamp(1, max);
+  }
   final doubled = current * 2;
   return doubled >= max ? max : doubled;
 }
@@ -262,6 +264,11 @@ class TerminalStore extends ChangeNotifier {
   // subsequent history snapshots without clearing the terminal.
   int? _appliedLogBytes;
 
+  // Absolute log byte offset where the last full history replay started.
+  // Preserved across delta merges and ignored empty snapshots so scroll-up
+  // paging knows the true start of the buffer held in the terminal.
+  int? _appliedHistoryStart;
+
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
@@ -293,6 +300,31 @@ class TerminalStore extends ChangeNotifier {
   /// Total cumulative bytes from the host output log applied to the sink.
   int? get appliedLogBytes => _appliedLogBytes;
 
+  /// Absolute log byte offset where the last full history replay started.
+  int? get appliedHistoryStart => _appliedHistoryStart;
+
+  bool _pagingHistory = false;
+
+  /// True while a backward history page RPC is in flight and live chunks are
+  /// being shadow-buffered in `_pendingLive`.
+  bool get isPagingHistory => _pagingHistory;
+
+  /// Arms shadow-buffering of live chunks while a backward history page RPC is
+  /// in flight so chunks arriving after the daemon snapshot are replayed after
+  /// the wider history tail.
+  void beginHistoryPaging() {
+    _pagingHistory = true;
+  }
+
+  /// Disarms shadow-buffering once the backward history page RPC finishes and
+  /// drops any shadow-queued chunks if the page bailed out without replaying.
+  void endHistoryPaging() {
+    _pagingHistory = false;
+    if (_state.phase == AttachPhase.live && _state.sized) {
+      _clearPendingLive();
+    }
+  }
+
   // ---- Public API -----------------------------------------------------------
 
   void dispatch(TerminalIntent intent) {
@@ -311,14 +343,19 @@ class TerminalStore extends ChangeNotifier {
 
   TerminalState _reduce(TerminalState s, TerminalIntent intent) {
     switch (intent) {
-      case Attach():
-        // Start of a fresh attach lifecycle: drop any carries and any live
-        // chunks buffered against a prior attach so they cannot leak into this
-        // session once HistoryBytes arrives.
+      case Attach(:final preservePendingLive):
+        // Start of a fresh attach lifecycle: drop any carries and (unless
+        // preserving in-flight page live chunks) any live chunks buffered
+        // against a prior attach so they cannot leak into this session once
+        // HistoryBytes arrives.
         _resetCarries();
-        _clearPendingLive();
+        if (!preservePendingLive) {
+          _pagingHistory = false;
+          _clearPendingLive();
+        }
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
+        _appliedHistoryStart = null;
         return s.copyWith(
           phase: AttachPhase.awaitingHistory,
           exited: false,
@@ -330,6 +367,7 @@ class TerminalStore extends ChangeNotifier {
         );
 
       case Detach():
+        _pagingHistory = false;
         _closeFrameOnWire();
         return s.copyWith(phase: AttachPhase.detached);
 
@@ -345,11 +383,13 @@ class TerminalStore extends ChangeNotifier {
       case Clear():
         // Hard reset: also drop queued pre-size/await-history live so it cannot
         // later re-populate the cleared terminal.
+        _pagingHistory = false;
         _sink.clear();
         _resetCarries();
         _clearPendingLive();
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
+        _appliedHistoryStart = null;
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -398,8 +438,9 @@ class TerminalStore extends ChangeNotifier {
       next = next.copyWith(cols: cols, rows: rows, sized: true);
     }
 
-    // Now that we have a size, drain anything we buffered (only once live).
-    if (next.sized && next.phase == AttachPhase.live) {
+    // Now that we have a size, drain anything we buffered (only once live and
+    // not shadow-buffering an in-flight history page).
+    if (next.sized && next.phase == AttachPhase.live && !_pagingHistory) {
       _flushPendingLive(next.historyHighWaterSeq);
     }
 
@@ -419,6 +460,7 @@ class TerminalStore extends ChangeNotifier {
     int? throughOutputSeq, {
     int? rawOutputStart,
   }) {
+    _pagingHistory = false;
     // Replay at the client's target grid size ([cols] x [rows], the current
     // emulator/view size chosen by the caller, not the host capture size). A
     // later viewport [Resize] reflows and the live repaint self-heals.
@@ -464,7 +506,8 @@ class TerminalStore extends ChangeNotifier {
     // 3. rawStart is null, the previous snapshot is at sequence 0, the new
     //    snapshot restarts at 0/1, and the live stream has already advanced
     //    (_appliedLiveSeq > 0), indicating a daemon counter restart.
-    final isSnapshotSeqRegressed = throughSeq != null &&
+    final isSnapshotSeqRegressed =
+        throughSeq != null &&
         ((lastSnapshotSeq != null && throughSeq < lastSnapshotSeq) ||
             _isSeqEpochReset(throughSeq, _appliedLiveSeq) ||
             (rawStart == null &&
@@ -483,23 +526,22 @@ class TerminalStore extends ChangeNotifier {
     //    that trails the live baseline without regressing below the snapshot
     //    high-water stays a no-op below.
     //    An unknown sequence fails toward replay, as before.
-    final snapshotEndBytes =
-        rawStart != null ? rawStart + bytes.length : null;
-    final hasLogByteGap = rawStart != null &&
+    final snapshotEndBytes = rawStart != null ? rawStart + bytes.length : null;
+    final hasLogByteGap =
+        rawStart != null &&
         currentLogBytes != null &&
         currentLogBytes < rawStart;
-    final isSeqFresh = throughSeq != null &&
+    final isSeqFresh =
+        throughSeq != null &&
         (lastSnapshotSeq == null || throughSeq >= lastSnapshotSeq) &&
         (_appliedLiveSeq == null || throughSeq >= _appliedLiveSeq!);
-    final isLogShrunk = currentLogBytes != null &&
+    final isLogShrunk =
+        currentLogBytes != null &&
         snapshotEndBytes != null &&
         snapshotEndBytes < currentLogBytes &&
         (throughSeq == null || isSeqFresh);
 
-    final isRegressed =
-        isSnapshotSeqRegressed ||
-        hasLogByteGap ||
-        isLogShrunk;
+    final isRegressed = isSnapshotSeqRegressed || hasLogByteGap || isLogShrunk;
 
     // Delta merge: if the store already has scrollback content, is not exited,
     // and is not regressed, check whether the new snapshot overlaps with what
@@ -565,8 +607,7 @@ class TerminalStore extends ChangeNotifier {
       } else if (throughSeq != null &&
           currentSeq != null &&
           currentSeq >= throughSeq) {
-        final resolvedSeq =
-            max(next.historyHighWaterSeq ?? 0, throughSeq);
+        final resolvedSeq = max(next.historyHighWaterSeq ?? 0, throughSeq);
         _appliedLiveSeq = _appliedLiveSeq == null
             ? throughSeq
             : max(_appliedLiveSeq!, throughSeq);
@@ -615,6 +656,7 @@ class TerminalStore extends ChangeNotifier {
     }
     _writeDecoded(replayBytes);
 
+    _appliedHistoryStart = rawStart;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;
     } else {
@@ -668,6 +710,9 @@ class TerminalStore extends ChangeNotifier {
       return next;
     }
     tdbg('store.live', 'APPLY seq=$seq ${bytes.length}B');
+    if (_pagingHistory) {
+      _enqueuePendingLive(_QueuedLive(bytes, seq));
+    }
     _applyLive(bytes, seq);
     return next;
   }
@@ -797,9 +842,7 @@ class TerminalStore extends ChangeNotifier {
     // `toDecode` is only ever read (decode) or replaced (sublist copies), so
     // aliasing the input when there is no carry is safe and keeps the common
     // case zero-copy.
-    var toDecode = _utf8Carry.isEmpty
-        ? bytes
-        : <int>[..._utf8Carry, ...bytes];
+    var toDecode = _utf8Carry.isEmpty ? bytes : <int>[..._utf8Carry, ...bytes];
     _utf8Carry.clear();
     final trailing = _trailingIncompleteUtf8ByteCount(toDecode);
     if (trailing > 0) {
@@ -1064,7 +1107,8 @@ class TerminalStore extends ChangeNotifier {
         final precededByCr =
             (i > 0 && input.codeUnitAt(i - 1) == 0x0D) ||
             (i == 0 && _pendingCarriageReturn);
-        if (!precededByCr && !_isFollowedByRelativeCursorMovement(input, i + 1)) {
+        if (!precededByCr &&
+            !_isFollowedByRelativeCursorMovement(input, i + 1)) {
           needsTranslation = true;
           break;
         }
@@ -1084,7 +1128,8 @@ class TerminalStore extends ChangeNotifier {
         final precededByCr =
             (i > 0 && input.codeUnitAt(i - 1) == 0x0D) ||
             (i == 0 && _pendingCarriageReturn);
-        if (!precededByCr && !_isFollowedByRelativeCursorMovement(input, i + 1)) {
+        if (!precededByCr &&
+            !_isFollowedByRelativeCursorMovement(input, i + 1)) {
           if (i > lastFlush) {
             buffer.write(input.substring(lastFlush, i));
           }
@@ -1233,5 +1278,4 @@ bool _isUtf8ContinuationByte(int byte) => byte >= 0x80 && byte <= 0xBF;
 
 /// Schema counters are uint64: a negative is corrupt, so treat it as
 /// unknown (null) rather than letting it poison watermarks.
-int? _sanitizeCounter(int? value) =>
-    value != null && value < 0 ? null : value;
+int? _sanitizeCounter(int? value) => value != null && value < 0 ? null : value;
