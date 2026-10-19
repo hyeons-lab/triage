@@ -88,8 +88,9 @@ table SessionSnapshot {
     exited: bool;
     // Raw (untranslated) PTY output tail for client-side re-emulation — the
     // single source of truth for history. Byte-identical to the live Output
-    // stream. Empty from old hosts. raw_output_start is the byte offset of the
-    // first byte within the session's full output log (bytes_logged is the end).
+    // stream. Empty from old hosts. raw_output_start is the byte offset of
+    // the first byte of raw_output within the session's full output log
+    // (bytes_logged is the end).
     raw_output: [ubyte];
     raw_output_start: uint64;
     // Local-LLM one-line description of what this session is doing, if generated.
@@ -98,6 +99,18 @@ table SessionSnapshot {
     // Local-LLM longer-form summary (a few sentences) for the side-rail hover
     // popover and future session search. Empty/absent when not yet produced.
     snippet_detail: string;
+    // Journaled scrollback lines at or older than the raw window seam
+    // (SGR-encoded, reset-prefixed, oldest-first), for desert sessions
+    // whose raw tail replays to a single screen. A record stamped exactly
+    // raw_output_start is included: its chunk bytes lie entirely below
+    // the window. Unaddressed: NOT part of the output log and NOT covered
+    // by raw_output_start. Full replays prepend these bytes ahead of
+    // raw_output, while delta merges must ignore them and run byte
+    // accounting on raw_output alone. Empty when the journal has nothing
+    // at or below the seam, or from old hosts. Appended last: FlatBuffers
+    // field ids follow declaration order, so a mid-table insert would
+    // renumber snippet/snippet_detail and corrupt both skew directions.
+    raw_output_prefix: [ubyte];
 }
 
 table CompletedSession {

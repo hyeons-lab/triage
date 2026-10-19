@@ -15,6 +15,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
+import 'package:triage_client/terminal/touch_scroll_takeover.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 
@@ -132,7 +133,8 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
-class _TerminalPaneState extends State<TerminalPane> {
+class _TerminalPaneState extends State<TerminalPane>
+    with NoOlderScrollbackLatch {
   static final Map<String, bool> _sessionBracketedPasteModes = {};
   static final Map<String, html.Element> _sessionContainers = {};
   static final Map<String, dynamic> _sessionTerms = {};
@@ -250,11 +252,15 @@ class _TerminalPaneState extends State<TerminalPane> {
   StreamSubscription<html.MouseEvent>? _containerMouseDownSubscription;
   StreamSubscription<html.MouseEvent>? _containerClickSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchStartSubscription;
+  StreamSubscription<html.TouchEvent>? _containerTouchMoveSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchEndSubscription;
   StreamSubscription<html.TouchEvent>? _containerTouchCancelSubscription;
+  num? _touchStartY;
+  final TouchScrollTakeover _touchScrollTakeover = TouchScrollTakeover();
   StreamSubscription<html.Event>? _containerPointerDownSubscription;
   StreamSubscription<html.Event>? _containerPointerUpSubscription;
   StreamSubscription<html.Event>? _containerPointerCancelSubscription;
+  StreamSubscription<html.Event>? _containerPointerMoveSubscription;
   StreamSubscription<html.WheelEvent>? _containerWheelSubscription;
   int _activeTouchCount = 0;
   int _activePointerCount = 0;
@@ -315,9 +321,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
-  bool _showNoOlderScrollback = false;
-  Timer? _noOlderScrollbackTimer;
-
   void _clearPageAnchor({bool cancelRestoreTimer = true}) {
     if (cancelRestoreTimer) {
       _pageRestoreTimer?.cancel();
@@ -404,9 +407,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       _legacyCopyToClipboard(text);
       return;
     }
-    clipboard.writeText(text).then((_) {}, onError: (_) {
-      _legacyCopyToClipboard(text);
-    });
+    clipboard
+        .writeText(text)
+        .then(
+          (_) {},
+          onError: (_) {
+            _legacyCopyToClipboard(text);
+          },
+        );
   }
 
   void _legacyCopyToClipboard(String text) {
@@ -1495,7 +1503,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (activePane != null) {
         activePane._pageRestoreTimer?.cancel();
         activePane._pageRestoreTimer = null;
-        activePane._dismissNoOlderScrollback();
+        activePane.dismissNoOlderScrollback();
         activePane._pendingScrollToBottomOnRelease = true;
         activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
@@ -1539,7 +1547,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _rebindViewListenersTo(TerminalController controller) {
     if (identical(_boundViewController, controller)) return;
     _clearPageAnchor();
-    _dismissNoOlderScrollback();
+    dismissNoOlderScrollback();
     final previous = _boundViewController;
     if (previous != null) _unbindControllerFrom(previous);
     _boundViewController = controller;
@@ -1595,7 +1603,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       return;
     }
     _clearPageAnchor();
-    _dismissNoOlderScrollback();
+    dismissNoOlderScrollback();
     // Refit before restoring scroll: a fit that ran while the layout was
     // narrow (or whose resize-out died in the debounce) leaves a narrow grid
     // under a wide pane, and replay is the moment that mismatch turns
@@ -1641,10 +1649,12 @@ class _TerminalPaneState extends State<TerminalPane> {
     ) {
       polls++;
       var len = -1;
+      var baseY = 0;
       try {
         final buffer = js_util.getProperty(_term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         len = (js_util.getProperty(active, 'length') as num?)?.toInt() ?? -1;
+        baseY = (js_util.getProperty(active, 'baseY') as num?)?.toInt() ?? 0;
       } catch (_) {}
       if ((len >= 0 && len == lastLen) || polls >= 40) {
         timer.cancel();
@@ -1655,20 +1665,29 @@ class _TerminalPaneState extends State<TerminalPane> {
         // buffer), so reading `viewportY` after the write would see the
         // bottom of the scrollback and treat every barren page with >29
         // lines as if the user had scrolled away. Always restore the
-        // viewport to `target` first so an exhausted page does not leave
+        // viewport to `clamped` first so an exhausted page does not leave
         // the view stranded at `baseY`.
         final addedLines = len - anchorLen;
         final wasNearTop = anchorY <= 5;
         final target = math.max(anchorY + addedLines, 0);
+        final clamped = target.clamp(0, math.max(baseY, 0)).toInt();
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         try {
-          js_util.callMethod(_term, 'scrollToLine', [target]);
+          js_util.callMethod(_term, 'scrollToLine', [clamped]);
         } catch (_) {}
-        _sessionSavedViewportY[_sanitizedId] = target;
-        if (addedLines <= 0 && wasNearTop) {
+        if (clamped >= baseY) {
+          _sessionSavedViewportY.remove(_sanitizedId);
+        } else {
+          _sessionSavedViewportY[_sanitizedId] = clamped;
+        }
+        _pendingScrollToBottomOnRelease = false;
+        if (shouldContinuePastBarrenPage(
+          addedLines: addedLines,
+          nearTop: wasNearTop,
+        )) {
           _continuePastBarrenPage();
         } else if (addedLines > 0) {
-          _dismissNoOlderScrollback();
+          dismissNoOlderScrollback();
         }
       } else {
         lastLen = len;
@@ -1695,31 +1714,9 @@ class _TerminalPaneState extends State<TerminalPane> {
         return;
       }
       if (widget.onNearTop?.call() == false) {
-        _noteHistoryExhausted();
+        noteHistoryExhausted();
       }
     });
-  }
-
-  void _dismissNoOlderScrollback() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = null;
-    if (_showNoOlderScrollback && mounted) {
-      setState(() => _showNoOlderScrollback = false);
-    } else {
-      _showNoOlderScrollback = false;
-    }
-  }
-
-  void _noteHistoryExhausted() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => _showNoOlderScrollback = false);
-      }
-    });
-    if (mounted && !_showNoOlderScrollback) {
-      setState(() => _showNoOlderScrollback = true);
-    }
   }
 
   /// Heals a grid that disagrees with its own pixels.
@@ -1911,10 +1908,53 @@ class _TerminalPaneState extends State<TerminalPane> {
     });
 
     _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
+      _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
+      if (event.touches != null && event.touches!.isNotEmpty) {
+        _touchStartY = event.touches!.first.client.y;
+      }
+    });
+
+    _containerTouchMoveSubscription = _container.onTouchMove.listen((event) {
+      _touchScrollTakeover.onTouchMove(DateTime.now().millisecondsSinceEpoch);
+      if (_touchStartY != null &&
+          event.touches != null &&
+          event.touches!.isNotEmpty) {
+        final currentY = event.touches!.first.client.y;
+        final deltaY = currentY - _touchStartY!;
+        if (deltaY > 30) {
+          try {
+            final activePane = _containerEventOwners[_sanitizedId];
+            if (activePane != null && activePane.mounted) {
+              final term = _sessionTerms[_sanitizedId];
+              if (term != null) {
+                final buffer = js_util.getProperty(term, 'buffer');
+                final active = js_util.getProperty(buffer, 'active');
+                final viewportY =
+                    (js_util.getProperty(active, 'viewportY') as num?)
+                        ?.toInt() ??
+                    0;
+                if (viewportY <= 0) {
+                  _touchStartY = null;
+                  activePane.widget.onNearTop?.call();
+                } else {
+                  _touchStartY = currentY;
+                }
+              } else {
+                _touchStartY = null;
+              }
+            } else {
+              _touchStartY = null;
+            }
+          } catch (_) {
+            _touchStartY = null;
+          }
+        }
+      }
     });
 
     _containerTouchEndSubscription = _container.onTouchEnd.listen((event) {
+      _touchStartY = null;
       _activeTouchCount =
           event.touches?.length ?? math.max(0, _activeTouchCount - 1);
       _handleUserGestureEnded();
@@ -1929,6 +1969,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerTouchCancelSubscription = _container.onTouchCancel.listen((
       event,
     ) {
+      _touchStartY = null;
       _activeTouchCount =
           event.touches?.length ?? math.max(0, _activeTouchCount - 1);
       _handleUserGestureEnded();
@@ -1937,6 +1978,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerPointerDownSubscription = _container.on['pointerdown'].listen((
       event,
     ) {
+      _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activePointerCount++;
     });
 
@@ -1944,15 +1986,104 @@ class _TerminalPaneState extends State<TerminalPane> {
       event,
     ) {
       _activePointerCount = math.max(0, _activePointerCount - 1);
+      if (_activeTouchCount > _activePointerCount) {
+        _activeTouchCount = _activePointerCount;
+      }
+      if (_activeTouchCount == 0) {
+        _touchStartY = null;
+      }
       _handleUserGestureEnded();
     });
 
     _containerPointerCancelSubscription = _container.on['pointercancel'].listen(
       (event) {
         _activePointerCount = math.max(0, _activePointerCount - 1);
+        if (_activeTouchCount > _activePointerCount) {
+          _activeTouchCount = _activePointerCount;
+        }
+        if (_activeTouchCount == 0) {
+          _touchStartY = null;
+        }
         _handleUserGestureEnded();
       },
     );
+
+    // Pointer-driven fallback for touch-drag scrolling. xterm.js scrolls
+    // from its own touch handlers, but the browser drops the rest of a touch
+    // stream when live output detaches the touchstart target mid-gesture;
+    // pointermove keeps flowing with fresh hit-testing, so drive from it
+    // while xterm's path is silent (see [TouchScrollTakeover]).
+    _containerPointerMoveSubscription = _container.on['pointermove'].listen((
+      event,
+    ) {
+      if (!_initialized) return;
+      final term = _sessionTerms[_sanitizedId];
+      if (term == null) return;
+      final int buttons;
+      final String pointerType;
+      final double y;
+      try {
+        buttons = (js_util.getProperty(event, 'buttons') as num?)?.toInt() ?? 0;
+        pointerType =
+            js_util.getProperty(event, 'pointerType') as String? ?? '';
+        y = (js_util.getProperty(event, 'clientY') as num).toDouble();
+      } catch (_) {
+        return;
+      }
+      if ((buttons & 1) == 0) {
+        if (_isUserGestureActive) {
+          _activePointerCount = 0;
+          _activeTouchCount = 0;
+          _touchStartY = null;
+          _handleUserGestureEnded();
+        }
+        return;
+      }
+      if (pointerType == 'mouse') return;
+      final canDrive = pointerType == 'pen'
+          ? _activeTouchCount == 0
+          : _activeTouchCount == 1;
+      double rowPx = 0;
+      try {
+        final rows = (js_util.getProperty(term, 'rows') as num).toDouble();
+        final viewportHeight =
+            _container.querySelector('.xterm-viewport')?.clientHeight ?? 0;
+        if (rows > 0) rowPx = viewportHeight / rows;
+      } catch (_) {
+        return;
+      }
+      // In mouse tracking mode xterm ignores touches entirely, so a healthy
+      // touch stream must not veto the fallback (else swipes scroll nothing
+      // on quiet sessions). `modes` needs the proposed API, already enabled.
+      var forceDrive = false;
+      try {
+        final modes = js_util.getProperty(term, 'modes');
+        final mouseMode =
+            js_util.getProperty(modes, 'mouseTrackingMode') as String?;
+        forceDrive = mouseMode != null && mouseMode != 'none';
+      } catch (_) {}
+      final rowsToScroll = _touchScrollTakeover.onPointerMove(
+        nowMs: DateTime.now().millisecondsSinceEpoch,
+        y: y,
+        rowPx: rowPx,
+        canDrive: canDrive,
+        forceDrive: forceDrive,
+      );
+      if (rowsToScroll == 0) return;
+      try {
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+            .toInt();
+        final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+        final target = (viewportY + rowsToScroll).clamp(0, baseY);
+        if (rowsToScroll < 0 && target <= 0) {
+          _containerEventOwners[_sanitizedId]?.widget.onNearTop?.call();
+        }
+        if (target == viewportY) return;
+        js_util.callMethod(term, 'scrollToLine', [target]);
+      } catch (_) {}
+    });
 
     _containerWheelSubscription = _container.onWheel.listen((event) {
       if (_currentRoute?.isCurrent == false) {
@@ -2255,8 +2386,8 @@ class _TerminalPaneState extends State<TerminalPane> {
       final buffer = js_util.getProperty(term, 'buffer');
       final active = js_util.getProperty(buffer, 'active');
       final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-      final viewportY =
-          (js_util.getProperty(active, 'viewportY') as num).toInt();
+      final viewportY = (js_util.getProperty(active, 'viewportY') as num)
+          .toInt();
       if (_viewportIsAtBottom(container, viewportY, baseY)) {
         _sessionSavedViewportY.remove(_sanitizedId);
       } else if (viewportY >= 0) {
@@ -2296,6 +2427,9 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerClickSubscription = null;
     _containerTouchStartSubscription?.cancel();
     _containerTouchStartSubscription = null;
+    _containerTouchMoveSubscription?.cancel();
+    _containerTouchMoveSubscription = null;
+    _touchStartY = null;
     _containerTouchEndSubscription?.cancel();
     _containerTouchEndSubscription = null;
     _containerTouchCancelSubscription?.cancel();
@@ -2306,6 +2440,8 @@ class _TerminalPaneState extends State<TerminalPane> {
     _containerPointerUpSubscription = null;
     _containerPointerCancelSubscription?.cancel();
     _containerPointerCancelSubscription = null;
+    _containerPointerMoveSubscription?.cancel();
+    _containerPointerMoveSubscription = null;
     _containerWheelSubscription?.cancel();
     _containerWheelSubscription = null;
     _activeTouchCount = 0;
@@ -2934,7 +3070,8 @@ class _TerminalPaneState extends State<TerminalPane> {
         _restoreScrollPosition(requestFocus: false);
       }
     }
-    if (oldWidget.controller != widget.controller) {
+    if (oldWidget.controller != widget.controller ||
+        oldWidget.terminalId != widget.terminalId) {
       tdbg(
         'pane.didUpdate',
         '$_sanitizedId controller changed '
@@ -2942,7 +3079,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(widget.controller)}',
       );
       _clearPageAnchor();
-      _dismissNoOlderScrollback();
+      dismissNoOlderScrollback();
       _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
@@ -2984,7 +3121,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _pageRestoreTimer?.cancel();
-    _noOlderScrollbackTimer?.cancel();
+    cancelNoOlderScrollbackTimer();
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
@@ -3108,7 +3245,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                       color: Color(0xffffc857),
                     ),
                   ),
-                if (_showNoOlderScrollback)
+                if (showNoOlderScrollback)
                   const Positioned(
                     top: 8,
                     left: 0,

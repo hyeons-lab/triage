@@ -112,7 +112,8 @@ class TerminalPane extends StatefulWidget {
   State<TerminalPane> createState() => _TerminalPaneState();
 }
 
-class _TerminalPaneState extends State<TerminalPane> {
+class _TerminalPaneState extends State<TerminalPane>
+    with NoOlderScrollbackLatch {
   static final Map<String, double> _sessionSavedScrollOffsets = {};
   static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
       {};
@@ -141,8 +142,6 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorLines;
   DateTime? _pageAnchorAt;
   int _pageJumpGeneration = 0;
-  bool _showNoOlderScrollback = false;
-  Timer? _noOlderScrollbackTimer;
 
   void _clearPageAnchor() {
     _pageAnchorPixels = null;
@@ -381,7 +380,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         oldWidget.terminalId != widget.terminalId) {
       _clearPageAnchor();
       _pageJumpGeneration++;
-      _dismissNoOlderScrollback();
+      dismissNoOlderScrollback();
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -422,7 +421,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (oldWidget.controller != widget.controller) {
       _clearPageAnchor();
       _pageJumpGeneration++;
-      _dismissNoOlderScrollback();
+      dismissNoOlderScrollback();
       oldWidget.controller.removeFitListener(_onFit);
       oldWidget.controller.removeRefitListener(_onRefit);
       oldWidget.controller.removeClearListener(_onClear);
@@ -479,7 +478,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
-    _noOlderScrollbackTimer?.cancel();
+    cancelNoOlderScrollbackTimer();
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
     _focusNode.dispose();
@@ -534,7 +533,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onClear() {
     if (!mounted) return;
     _pageJumpGeneration++;
-    _dismissNoOlderScrollback();
+    dismissNoOlderScrollback();
     _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     _scrollAnchor.clear();
     _clearSavedSessionScroll(widget.terminalId);
@@ -598,16 +597,19 @@ class _TerminalPaneState extends State<TerminalPane> {
 
       applyPagedJump();
       WidgetsBinding.instance.addPostFrameCallback((_) => applyPagedJump());
-      if (addedLines <= 0 && wasNearTop) {
+      if (shouldContinuePastBarrenPage(
+        addedLines: addedLines,
+        nearTop: wasNearTop,
+      )) {
         _continuePastBarrenPage();
       } else if (addedLines > 0) {
-        _dismissNoOlderScrollback();
+        dismissNoOlderScrollback();
       }
       return;
     }
     _clearPageAnchor();
     _pageJumpGeneration++;
-    _dismissNoOlderScrollback();
+    dismissNoOlderScrollback();
     final isGestureActive =
         _activePointers.isNotEmpty ||
         (_scrollController.hasClients &&
@@ -653,33 +655,10 @@ class _TerminalPaneState extends State<TerminalPane> {
         return;
       }
       if (widget.onNearTop?.call() == false) {
-        _noteHistoryExhausted();
+        noteHistoryExhausted();
       }
     });
   }
-
-  void _dismissNoOlderScrollback() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = null;
-    if (_showNoOlderScrollback && mounted) {
-      setState(() => _showNoOlderScrollback = false);
-    } else {
-      _showNoOlderScrollback = false;
-    }
-  }
-
-  void _noteHistoryExhausted() {
-    _noOlderScrollbackTimer?.cancel();
-    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() => _showNoOlderScrollback = false);
-      }
-    });
-    if (mounted && !_showNoOlderScrollback) {
-      setState(() => _showNoOlderScrollback = true);
-    }
-  }
-
   // Remember where the current selection is anchored so a shift-click can extend
   // from it. Skipped while we are doing the extending ourselves so the anchor
   // stays pinned to the original start across repeated shift-clicks.
@@ -1973,7 +1952,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                     color: const Color(0xffffc857),
                   ),
                 ),
-              if (_showNoOlderScrollback)
+              if (showNoOlderScrollback)
                 const Positioned(
                   top: 8,
                   left: 0,
@@ -2103,7 +2082,7 @@ class _TerminalPaneState extends State<TerminalPane> {
                         ),
                       ),
                     if (copyButton != null) copyButton,
-                    if (_showNoOlderScrollback)
+                    if (showNoOlderScrollback)
                       const Positioned(
                         top: 8,
                         left: 0,

@@ -752,6 +752,7 @@ class SessionVm {
   // is loaded and paging stops.
   int? get historyStart =>
       store.appliedHistoryStart ?? _pendingHistory?.effectiveStart;
+  int get historyPrefixBytes => store.appliedHistoryPrefixBytes;
   // A scroll-up page re-attach is in flight; near-top triggers coalesce
   // behind it instead of stacking replays.
   bool pagingHistory = false;
@@ -835,13 +836,17 @@ class SessionVm {
     int? throughOutputSeq,
     int? rawOutputStart,
     int? windowBytes,
+    List<int> rawOutputPrefix = const [],
     bool isExited = false,
     bool preservePendingLive = false,
   }) {
     if (rawOutput.isEmpty &&
+        rawOutputPrefix.isEmpty &&
         !isExited &&
         !this.isExited &&
-        (_pendingHistory != null && _pendingHistory!.rawOutput.isNotEmpty)) {
+        (_pendingHistory != null &&
+            (_pendingHistory!.rawOutput.isNotEmpty ||
+                _pendingHistory!.rawOutputPrefix.isNotEmpty))) {
       return;
     }
     _pendingHistory = _PendingHistory(
@@ -849,10 +854,12 @@ class SessionVm {
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
       windowBytes: windowBytes,
+      rawOutputPrefix: rawOutputPrefix,
     );
     tdbg(
       'vm.applyHistory',
-      '$title ${rawOutput.length}B seq=$throughOutputSeq '
+      '$title ${rawOutput.length}B+${rawOutputPrefix.length}P '
+          'seq=$throughOutputSeq '
           'phase=${store.state.phase} viewReady=$_viewReady',
     );
     if (preservePendingLive ||
@@ -894,6 +901,7 @@ class SessionVm {
         throughOutputSeq: pending.throughOutputSeq,
         rawOutputStart: pending.rawOutputStart,
         windowBytes: pending.windowBytes,
+        rawOutputPrefix: pending.rawOutputPrefix,
       ),
     );
     if (isExited) {
@@ -935,23 +943,31 @@ class _PendingHistory {
     this.throughOutputSeq, {
     this.rawOutputStart,
     this.windowBytes,
+    this.rawOutputPrefix = const [],
   });
 
   final List<int> rawOutput;
   final int? throughOutputSeq;
   final int? rawOutputStart;
   final int? windowBytes;
+  final List<int> rawOutputPrefix;
 
   int? get effectiveStart {
     final start = rawOutputStart;
     if (start == null) return null;
+    final replaySource = rawOutputPrefix.isEmpty
+        ? rawOutput
+        : [...rawOutputPrefix, ...rawOutput];
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
     final trimmed = trimHistoryTailWithOffset(
-      rawOutput,
+      replaySource,
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
-    return start + trimmed.droppedBytes;
+    final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
+        ? trimmed.droppedBytes - rawOutputPrefix.length
+        : 0;
+    return start + rawDropped;
   }
 }
 
@@ -4253,7 +4269,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // replaying its empty history would clear the terminal to a blank screen.
       if (replayTargetSize != null &&
           preparedSnapshot != null &&
-          _rawOutputFromSnapshot(preparedSnapshot).isNotEmpty &&
+          snapshotCarriesHistory(preparedSnapshot) &&
           snapshot?['exited'] != true &&
           !_snapshotSizeMatches(snapshot, replayTargetSize)) {
         snapshot = preparedSnapshot;
@@ -4306,6 +4322,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
         windowBytes: kHistoryFirstWindowBytes,
+        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -4825,7 +4842,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
-          await _applySnapshotToSession(session, sessionId, snapshot);
+          // Pushed snapshots are served unwindowed at the full history
+          // cap: replay them at the platform budgets, not the held
+          // window, or the trim over-shrinks them.
+          await _applySnapshotToSession(
+            session,
+            sessionId,
+            snapshot,
+            unwindowed: true,
+          );
         }
       } else if (event.containsKey('LeaseChanged')) {
         final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
@@ -4845,6 +4870,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, dynamic> snapshot, {
     (int, int)? renderSize,
     bool replayHistory = true,
+    // True when the snapshot was served unwindowed at the full history
+    // cap (server-pushed ResyncRequired): the replay must keep the
+    // platform budgets instead of the session's narrower held window,
+    // which would over-trim the payload. A plain null windowBytes
+    // parameter cannot express this (its null would have to mean both
+    // "use held" and "use platform budgets"), so the tri-state rides a
+    // bool.
+    bool unwindowed = false,
   }) async {
     // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
     // _loadDaemonSessions) while the refresh was in flight — applying to a
@@ -4889,11 +4922,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // existing scrollback are preserved.
     if (replayHistory || !session.loaded) {
       final rawOutput = _rawOutputFromSnapshot(snapshot);
+      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
       session.applyHistory(
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
-        windowBytes: session.historyWindowBytes,
+        windowBytes: unwindowed ? null : session.historyWindowBytes,
+        rawOutputPrefix: rawOutputPrefix,
         isExited: exited,
       );
       session.loaded = true;
@@ -4959,6 +4994,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// the host did not carry history (old host, or a resize broadcast).
   Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) =>
       rawOutputFromSnapshot(snapshot);
+
+  Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
+      rawOutputPrefixFromSnapshot(snapshot);
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.
@@ -5328,18 +5366,30 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-      if (snapshot == null) return;
+      if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
       final rawOutput = _rawOutputFromSnapshot(snapshot);
+      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
       final rawOutputStart = snapshot['raw_output_start'] as int?;
       if (rawOutputStart == null) return;
+      final replaySource = rawOutputPrefix.isEmpty
+          ? rawOutput
+          : [...rawOutputPrefix, ...rawOutput];
       final budgets = historyTrimBudgetsForWindow(nextWindow, web: kIsWeb);
       final trimmed = trimHistoryTailWithOffset(
-        rawOutput,
+        replaySource,
         maxLines: budgets.maxLines,
         maxBytes: budgets.maxBytes,
       );
-      final effectiveStart = rawOutputStart + trimmed.droppedBytes;
-      if (rawOutput.isEmpty || effectiveStart >= currentStart) {
+      final retainedPrefixBytes = rawOutputPrefix.length > trimmed.droppedBytes
+          ? rawOutputPrefix.length - trimmed.droppedBytes
+          : 0;
+      final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
+          ? trimmed.droppedBytes - rawOutputPrefix.length
+          : 0;
+      final effectiveStart = rawOutputStart + rawDropped;
+      if ((rawOutput.isEmpty && rawOutputPrefix.isEmpty) ||
+          (effectiveStart >= currentStart &&
+              retainedPrefixBytes <= session.historyPrefixBytes)) {
         session.historyWindowBytes = max(
           session.historyWindowBytes,
           nextWindow,
@@ -5361,6 +5411,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         throughOutputSeq: snapshot['output_seq'] as int?,
         rawOutputStart: rawOutputStart,
         windowBytes: nextWindow,
+        rawOutputPrefix: rawOutputPrefix,
         isExited:
             (snapshot['exited'] == true) ||
             session.isExited ||
@@ -5807,6 +5858,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             throughOutputSeq: outputSeq,
             rawOutputStart: rawOutputStart,
             windowBytes: kHistoryFirstWindowBytes,
+            rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
             isExited: exited,
           );
 
