@@ -5749,6 +5749,7 @@ type ActorResult<T> = Result<T>;
 
 /// Output of `SessionManager::serialize_active_sessions`: the wire handover
 /// state plus the PTY master descriptors to transfer.
+#[cfg(unix)]
 pub struct SerializedHandover {
     pub state: crate::handover::HandoverState,
     pub fds: Vec<std::os::unix::io::RawFd>,

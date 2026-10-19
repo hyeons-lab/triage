@@ -30,7 +30,9 @@ use triage_core::session::{
     SubscribeSessionEventsRequest, WriteInputRequest,
 };
 
-use crate::session::{SerializedHandover, SessionManager};
+#[cfg(unix)]
+use crate::session::SerializedHandover;
+use crate::session::SessionManager;
 
 const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 

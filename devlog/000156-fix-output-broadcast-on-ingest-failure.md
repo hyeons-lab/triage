@@ -96,6 +96,7 @@ writer (child not draining stdin).
   short (non-erroring) tail read now also claims no coverage (clamped read +
   overlay short-tail arm); the compressed clamp-and-slice is one helper.
   Suite: 354 passed, same 8 pre-existing pairing failures.
+- 2026-10-19T06:17-0700 (agent-review-check-ci): gate `SerializedHandover` in `crates/triaged/src/session.rs` and its import in `crates/triaged/src/ipc.rs` with `#[cfg(unix)]` so Windows builds (`Test (windows-latest)`) do not fail with `E0433: cannot find unix in os` on `std::os::unix::io::RawFd` or emit an unused-import warning on `SerializedHandover`.
 
 ## Decisions
 
@@ -128,10 +129,11 @@ writer (child not draining stdin).
 
 ## Commits
 
-- a469c91 — fix(daemon): keep broadcasting PTY output when the log write fails
-- eb56815 — fix(triaged): review findings from ingest failure audit
-- ab9cdc0 — fix(triaged): complete ingest-failure review hardening
-- HEAD — docs(devlog): record ingest-failure review rounds 2-8
+- a469c91: fix(daemon): keep broadcasting PTY output when the log write fails
+- eb56815: fix(triaged): review findings from ingest failure audit
+- ab9cdc0: fix(triaged): complete ingest-failure review hardening
+- a4498b7: docs(devlog): record ingest-failure review rounds 2-8
+- HEAD: fix(triaged): gate SerializedHandover behind cfg(unix) for Windows builds
 
 ## Progress
 
