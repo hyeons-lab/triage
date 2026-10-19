@@ -690,7 +690,9 @@ impl ScrollbackJournal {
             if !name.starts_with("scrollback-") || name.contains(".tmp.") {
                 continue;
             }
-            let len = entry.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+            let len = std::fs::metadata(entry.path())
+                .map(|m| m.len())
+                .unwrap_or(u64::MAX);
             layout.push((name, len));
         }
         layout.sort();

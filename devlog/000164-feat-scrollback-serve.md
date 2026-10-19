@@ -28,6 +28,7 @@ gesture reset.
 - Clear `_activeTouchCount` and `_touchStartY` on `pointerup`, `pointercancel`, and unpressed `pointermove` so detached `touchstart` targets do not leave `_isUserGestureActive` wedged after release; invoke `onNearTop` during pointer takeover when pulling down at `viewportY == 0`.
 - Account for `rawOutputPrefix` in `SessionVm.applyHistory` pre-fit guards, `TerminalStore._reduceHistory` delta-merge checks, and `_pageHistoryUp` barren-page detection (`appliedHistoryPrefixBytes`).
 - Snapshot directory layout at the top of `rebase_attempt`, retry `sealed_path` on `NotFound` in `journal_file_is_future`, return `Peek::Future` early in `peek_stream_head`, ignore `NotFound` on inline `drain_pending_seals`, and unlink `.slog` before `.slog.zst` in `enforce_retention`, `rebase_attempt`, and `purge_journal_files`.
+- 2026-10-19T06:58-0700 (agent-review-check-ci): use `std::fs::metadata(entry.path())` instead of `entry.metadata()` in `journal_layout_snapshot` (`crates/triaged/src/scrollback.rs`) so peer-write detection across a rebase collect queries the live NTFS file control block on Windows rather than the cached directory entry size.
 
 ## Decisions
 
@@ -59,7 +60,8 @@ gesture reset.
 - 5e116dc: feat(triaged): serve journaled scrollback prefix (PR B)
 - e601e19: fix(client): take over touch scroll from pointer events when xterm's touch stream dies
 - 71cfb79: fix(client): force-drive touch scroll fallback in mouse tracking mode
-- HEAD: fix(scrollback,client): harden prefix replay, journal rebase/seals, and touch takeover release
+- d11a2c1: fix(scrollback,client): harden prefix replay, journal rebase/seals, and touch takeover release
+- HEAD: fix(scrollback): stat journal paths directly in layout snapshots on Windows
 
 ## Progress
 
