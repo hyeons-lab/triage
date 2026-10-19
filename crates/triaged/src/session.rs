@@ -14418,8 +14418,10 @@ mod tests {
                 history_bytes: Some(6),
             })
             .expect("attach live session with cap");
-        assert_eq!(capped_live.snapshot.raw_output, b"abcdef");
+        assert_eq!(capped_live.snapshot.raw_output.len(), 6);
         assert!(capped_live.snapshot.raw_output_start >= 10);
+        #[cfg(not(windows))]
+        assert_eq!(capped_live.snapshot.raw_output, b"abcdef");
 
         let zero_cap_live = manager
             .attach_session(AttachSessionRequest {
@@ -14433,8 +14435,22 @@ mod tests {
             zero_cap_live
                 .snapshot
                 .raw_output
+                .windows(16)
+                .any(|w| w == b"0123456789abcdef"),
+            "Some(0) must fall back to the default tail cap"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            zero_cap_live
+                .snapshot
+                .raw_output
                 .ends_with(b"0123456789abcdef"),
             "Some(0) must fall back to the default tail cap"
+        );
+        let live_start = capped_live.snapshot.raw_output_start as usize;
+        assert_eq!(
+            &zero_cap_live.snapshot.raw_output[live_start..live_start + 6],
+            capped_live.snapshot.raw_output.as_slice()
         );
         assert_eq!(zero_cap_live.snapshot.raw_output_start, 0);
 
@@ -14447,8 +14463,10 @@ mod tests {
                 history_bytes: Some(6),
             })
             .expect("attach historical session with cap");
-        assert_eq!(capped_historical.snapshot.raw_output, b"abcdef");
+        assert_eq!(capped_historical.snapshot.raw_output.len(), 6);
         assert!(capped_historical.snapshot.raw_output_start >= 10);
+        #[cfg(not(windows))]
+        assert_eq!(capped_historical.snapshot.raw_output, b"abcdef");
 
         let zero_cap_historical = reloaded
             .attach_session(AttachSessionRequest {
@@ -14462,8 +14480,22 @@ mod tests {
             zero_cap_historical
                 .snapshot
                 .raw_output
+                .windows(16)
+                .any(|w| w == b"0123456789abcdef"),
+            "Some(0) on historical session must fall back to default tail cap"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            zero_cap_historical
+                .snapshot
+                .raw_output
                 .ends_with(b"0123456789abcdef"),
             "Some(0) on historical session must fall back to default tail cap"
+        );
+        let hist_start = capped_historical.snapshot.raw_output_start as usize;
+        assert_eq!(
+            &zero_cap_historical.snapshot.raw_output[hist_start..hist_start + 6],
+            capped_historical.snapshot.raw_output.as_slice()
         );
         assert_eq!(zero_cap_historical.snapshot.raw_output_start, 0);
 

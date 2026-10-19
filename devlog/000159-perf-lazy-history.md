@@ -84,6 +84,7 @@ page and re-emulates from the oldest loaded byte. Stacked on
     with a preserving `Attach(preservePendingLive: true)` and `HistoryBytes` at
     `throughOutputSeq: 12` so removing `_clearPendingLive()` from
     `endHistoryPaging()` fails the assertion.
+- 2026-10-19T06:57-0700 (agent-review-check-ci): in `attach_history_cap_limits_the_served_tail` (`crates/triaged/src/session.rs`), assert that the 6-byte capped live/historical attach equals the `[start..start + 6]` slice of the `Some(0)` full-tail attach on all platforms while gating the exact `b"abcdef"` suffix check on `#[cfg(not(windows))]` (since Windows ConPTY appends VT cursor-visibility sequences after the child's `printf` output).
 
 ## Decisions
 
@@ -118,7 +119,8 @@ page and re-emulates from the oldest loaded byte. Stacked on
 
 - b9d1070: perf(client,daemon): lazy history paging via windowed attach
 - f5c6e29: fix(daemon): omit null history_bytes from attach JSON
-- HEAD: fix(client,daemon): harden lazy history paging watermarks, line cap, and shadow live buffer
+- 14b6ff6: fix(client,daemon): harden lazy history paging watermarks, line cap, and shadow live buffer
+- HEAD: test(triaged): make attach history cap test ConPTY-tolerant on Windows
 
 ## Progress
 
