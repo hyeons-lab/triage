@@ -112,10 +112,13 @@ class TerminalPane extends StatefulWidget {
     pane?._rebindViewListenersTo(controller);
   }
 
-  /// Live grid size as (rows, cols); null when unknown or below minimum.
+  /// Live grid size as (rows, cols); null when unknown, unfitted, or below minimum.
   /// Rows-first: destructure rows as $1, cols as $2.
   static (int, int)? getCachedTerminalSize(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    if (!_TerminalPaneState._sessionInitialFitCompleted.contains(sanitizedId)) {
+      return null;
+    }
     final term = _TerminalPaneState._sessionTerms[sanitizedId];
     if (term != null) {
       try {
@@ -128,6 +131,11 @@ class TerminalPane extends StatefulWidget {
     }
     return null;
   }
+
+  /// Last fitted workspace grid size as (rows, cols) across sessions; null
+  /// until at least one session in the workspace has fitted.
+  static (int, int)? getLastFittedWorkspaceSize() =>
+      _TerminalPaneState._lastWorkspaceFittedSize;
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -144,6 +152,51 @@ class _TerminalPaneState extends State<TerminalPane>
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
+  static final Set<String> _sessionInitialFitCompleted = {};
+  static (int, int)? _lastWorkspaceFittedSize;
+  static String? _cachedXtermCssText;
+
+  static String? _extractXtermCssText() {
+    if (_cachedXtermCssText != null) return _cachedXtermCssText;
+    try {
+      final sheets = js_util.getProperty(html.document, 'styleSheets');
+      if (sheets != null) {
+        final length =
+            (js_util.getProperty(sheets, 'length') as num?)?.toInt() ?? 0;
+        for (var i = 0; i < length; i++) {
+          final sheet = js_util.callMethod(sheets, 'item', [i]);
+          if (sheet == null) continue;
+          final href = js_util.getProperty(sheet, 'href') as String?;
+          if (href != null && href.contains('xterm.css')) {
+            final rules = js_util.getProperty(sheet, 'cssRules');
+            if (rules != null) {
+              final rulesLen =
+                  (js_util.getProperty(rules, 'length') as num?)?.toInt() ?? 0;
+              if (rulesLen > 0) {
+                final buf = StringBuffer();
+                for (var j = 0; j < rulesLen; j++) {
+                  final rule = js_util.callMethod(rules, 'item', [j]);
+                  if (rule != null) {
+                    final cssText =
+                        js_util.getProperty(rule, 'cssText') as String?;
+                    if (cssText != null) {
+                      buf.writeln(cssText);
+                    }
+                  }
+                }
+                final result = buf.toString();
+                if (result.isNotEmpty) {
+                  _cachedXtermCssText = result;
+                  return result;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
 
   static bool _viewportIsAtBottom(
     html.Element container,
@@ -169,6 +222,9 @@ class _TerminalPaneState extends State<TerminalPane>
   static final Map<String, void Function(String)>
   _sessionPersistentWriteListeners = {};
   static final Map<String, VoidCallback> _sessionPersistentClearListeners = {};
+  static final Map<String, StringBuffer> _sessionPendingWriteBuffer = {};
+  static final Map<String, bool> _sessionPendingClear = {};
+  static final Set<String> _sessionFlushScheduled = {};
   static final TerminalSessionInputRouter _sessionInputRouter =
       TerminalSessionInputRouter();
   static final Set<String> _registeredViewTypes = {};
@@ -189,10 +245,14 @@ class _TerminalPaneState extends State<TerminalPane>
   static _TerminalPaneState? _currentMountedPane;
 
   static void _discardCachedSession(String sanitizedId) {
+    _TerminalPaneState._sessionInitialFitCompleted.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
     _TerminalPaneState._sessionAutoSpace.remove(sanitizedId);
+    _TerminalPaneState._sessionPendingWriteBuffer.remove(sanitizedId);
+    _TerminalPaneState._sessionPendingClear.remove(sanitizedId);
+    _TerminalPaneState._sessionFlushScheduled.remove(sanitizedId);
     _unbindPersistentSessionController(sanitizedId);
     // Dropped alongside the container it refers to. A pane still mounted over a
     // destroyed session unbinds itself when it goes, so leaving the entry here
@@ -269,6 +329,7 @@ class _TerminalPaneState extends State<TerminalPane>
   bool get _isUserGestureActive =>
       _activeTouchCount > 0 || _activePointerCount > 0;
   void Function(html.Event)? _containerPasteListener;
+  void Function(html.Event)? _containerScrollCaptureListener;
   void Function(html.Event)? _textareaBeforeInputListener;
   void Function(html.Event)? _textareaInputListener;
   void Function(html.Event)? _textareaCompositionEndListener;
@@ -318,11 +379,83 @@ class _TerminalPaneState extends State<TerminalPane>
   Timer? _forceFinalizeTimer;
   Timer? _scrollToCursorTimer;
   Timer? _pageRestoreTimer;
+  Timer? _replayMaskTimer;
+
+  /// Masks [_terminalWrapper] with `opacity: 0` (leaving `.xterm-helper-textarea`
+  /// focusable and layout metrics intact while showing [_container]'s `#0d1113`
+  /// background) across a clear+replay batch until xterm.js finishes parsing
+  /// the batched write and the scroll position is restored.
+  void _maskTerminalForReplay() {
+    _replayMaskTimer?.cancel();
+    _terminalWrapper.style.opacity = '0';
+    _replayMaskTimer = Timer(const Duration(milliseconds: 400), () {
+      _unmaskTerminalAfterReplay();
+    });
+  }
+
+  void _unmaskTerminalAfterReplay() {
+    _replayMaskTimer?.cancel();
+    _replayMaskTimer = null;
+    try {
+      if (_terminalWrapper.style.opacity == '0') {
+        _terminalWrapper.style.opacity = '';
+      }
+    } catch (_) {}
+  }
+
+  /// Synchronizes `.xterm-viewport.scrollTop` and xterm's internal
+  /// `Viewport._lastScrollTop` with `buffer.active.viewportY`.
+  ///
+  /// When `HtmlElementView` unmounts and remounts a cached container, the
+  /// browser resets `.xterm-viewport.scrollTop` to 0 while xterm's internal
+  /// `ydisp` and `_lastScrollTop` still reflect the previous position (e.g.
+  /// `baseY`). Because `term.scrollToBottom()` / `term.scrollToLine(ydisp)`
+  /// compute `delta = target - ydisp == 0`, they become no-ops and leave
+  /// `.xterm-viewport.scrollTop` at 0; the next browser `scroll` event on
+  /// `.xterm-viewport` then causes xterm's `Viewport._handleScroll` to see
+  /// `scrollTop == 0` and yank `ydisp` to line 0 (top of scrollback).
+  void _syncTermViewportDomScroll([dynamic termObj]) {
+    try {
+      final term = termObj ?? _term;
+      if (term == null) return;
+      final core = js_util.getProperty(term, '_core');
+      if (core == null) return;
+      final viewport = js_util.getProperty(core, 'viewport');
+      if (viewport == null) return;
+      try {
+        js_util.callMethod(viewport, '_refresh', [true]);
+      } catch (_) {
+        js_util.callMethod(viewport, 'syncScrollArea', [true]);
+      }
+      final viewportElem =
+          js_util.getProperty(viewport, '_viewportElement') as html.Element? ??
+          _container.querySelector('.xterm-viewport');
+      final rowHeight =
+          (js_util.getProperty(viewport, '_currentRowHeight') as num?)
+              ?.toDouble() ??
+          0.0;
+      final buffer = js_util.getProperty(term, 'buffer');
+      final active = js_util.getProperty(buffer, 'active');
+      final viewportY =
+          (js_util.getProperty(active, 'viewportY') as num?)?.toInt() ?? 0;
+      if (viewportElem != null && rowHeight > 0) {
+        final expectedScrollTop = (viewportY * rowHeight).round();
+        if ((viewportElem.scrollTop - expectedScrollTop).abs() > 1) {
+          js_util.setProperty(viewport, '_ignoreNextScrollEvent', true);
+          viewportElem.scrollTop = expectedScrollTop;
+        }
+        js_util.setProperty(viewport, '_lastScrollTop', viewportElem.scrollTop);
+      }
+    } catch (_) {}
+  }
+
+  int _scrollRestoreGeneration = 0;
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
   void _clearPageAnchor({bool cancelRestoreTimer = true}) {
     if (cancelRestoreTimer) {
+      _scrollRestoreGeneration++;
       _pageRestoreTimer?.cancel();
       _pageRestoreTimer = null;
     }
@@ -332,6 +465,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   Timer? _suppressScrollSaveTimer;
+  DateTime? _suppressScrollSaveUntil;
   Timer? _jiggleRestoreTimer;
   int? _pendingJiggleCols;
   int? _pendingJiggleRows;
@@ -373,8 +507,18 @@ class _TerminalPaneState extends State<TerminalPane>
 
   void _suppressScrollSaveFor(Duration duration) {
     _suppressScrollSave = true;
+    final now = DateTime.now();
+    final targetUntil = now.add(duration);
+    final existingUntil = _suppressScrollSaveUntil;
+    if (existingUntil != null &&
+        existingUntil.isAfter(targetUntil) &&
+        (_suppressScrollSaveTimer?.isActive ?? false)) {
+      return;
+    }
+    _suppressScrollSaveUntil = targetUntil;
     _suppressScrollSaveTimer?.cancel();
     _suppressScrollSaveTimer = Timer(duration, () {
+      _suppressScrollSaveUntil = null;
       if (mounted) {
         _suppressScrollSave = false;
       }
@@ -473,11 +617,19 @@ class _TerminalPaneState extends State<TerminalPane>
       _terminalWrapper =
           _container.children.firstWhere((el) => el is html.DivElement)
               as html.DivElement;
+      _unmaskTerminalAfterReplay();
       _term = cachedTerm;
       _fitAddon = cachedFitAddon;
       _initialized = true;
-      _initialContentWritten = true;
+      _initialContentWritten = _sessionInitialFitCompleted.contains(
+        sanitizedId,
+      );
       _styleSheetLoaded = true;
+      // Re-inserting a cached DOM container via HtmlElementView resets
+      // `.xterm-viewport.scrollTop` to 0 in all browsers; suppress scroll saves
+      // across the remount so that synthetic `scrollTop == 0` event does not
+      // poison `_sessionSavedViewportY` with line 0.
+      _suppressScrollSaveFor(const Duration(milliseconds: 1000));
       try {
         final rowsNum = js_util.getProperty(_term, 'rows') as num?;
         final colsNum = js_util.getProperty(_term, 'cols') as num?;
@@ -490,14 +642,14 @@ class _TerminalPaneState extends State<TerminalPane>
       _bindTerminalSubscriptions();
       _bindContainerEvents();
       _setupResizeObserver();
-      if (_lastFittedCols != null && _lastFittedRows != null) {
+      _syncTermViewportDomScroll(_term);
+      if (_initialContentWritten &&
+          _lastFittedCols != null &&
+          _lastFittedRows != null) {
         _writeInitialContent(
           overrideCols: _lastFittedCols,
           overrideRows: _lastFittedRows,
         );
-      }
-      if (widget.focusCursorRevision > 0) {
-        _restoreScrollPosition(requestFocus: true);
       }
     } else {
       _container = html.DivElement()
@@ -507,34 +659,22 @@ class _TerminalPaneState extends State<TerminalPane>
         ..style.backgroundColor = '#0d1113'
         ..style.overflow = 'hidden';
 
-      // Inject xterm.css directly inside the container so it penetrates the Flutter Web platform view Shadow DOM
-      final link = html.LinkElement()
-        ..rel = 'stylesheet'
-        ..href = 'xterm.css';
-      link.onLoad.listen((_) {
-        if (mounted) {
-          // Wait for the browser to parse CSS and apply font styles to the Shadow DOM
-          Timer(const Duration(milliseconds: 150), () {
-            if (mounted) {
-              _styleSheetLoaded = true;
-              try {
-                _stableWidth = null;
-                _stableHeight = null;
-                _forceFinalizeTimer?.cancel();
-                _forceFinalizeTimer = null;
-                _triggerFitWithDelayedRetries();
-              } catch (_) {}
-            }
-          });
-        }
-      });
-      _container.append(link);
-
-      // Safety fallback in case stylesheet onLoad fails or is slow
-      Timer(const Duration(milliseconds: 600), () {
-        if (mounted && !_styleSheetLoaded) {
-          _styleSheetLoaded = true;
-          if (_initialized) {
+      // Inject xterm.css synchronously via an inline <style> copied from the
+      // document-level xterm.css stylesheet loaded in index.html so the
+      // Flutter Web platform view Shadow DOM has final font/layout styles on
+      // frame 0 without waiting for an async <link> fetch.
+      final inlineCss = _extractXtermCssText();
+      if (inlineCss != null && inlineCss.isNotEmpty) {
+        final style = html.StyleElement()..text = inlineCss;
+        _container.append(style);
+        _styleSheetLoaded = true;
+      } else {
+        final link = html.LinkElement()
+          ..rel = 'stylesheet'
+          ..href = 'xterm.css';
+        link.onLoad.listen((_) {
+          if (mounted) {
+            _styleSheetLoaded = true;
             try {
               _stableWidth = null;
               _stableHeight = null;
@@ -543,8 +683,25 @@ class _TerminalPaneState extends State<TerminalPane>
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
-        }
-      });
+        });
+        _container.append(link);
+
+        // Safety fallback in case stylesheet onLoad fails or is slow
+        Timer(const Duration(milliseconds: 600), () {
+          if (mounted && !_styleSheetLoaded) {
+            _styleSheetLoaded = true;
+            if (_initialized) {
+              try {
+                _stableWidth = null;
+                _stableHeight = null;
+                _forceFinalizeTimer?.cancel();
+                _forceFinalizeTimer = null;
+                _triggerFitWithDelayedRetries();
+              } catch (_) {}
+            }
+          }
+        });
+      }
 
       final marginPx = _isMobile ? 8 : 16;
       _terminalWrapper = html.DivElement()
@@ -565,8 +722,8 @@ class _TerminalPaneState extends State<TerminalPane>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
-          _writeInitialContent();
-          _onFit();
+          _triggerFitWithDelayedRetries();
+          _restoreScrollPosition(requestFocus: widget.focusCursorRevision > 0);
         }
         _activateTerminal();
         _scheduleFocusRetries();
@@ -1047,6 +1204,15 @@ class _TerminalPaneState extends State<TerminalPane>
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
       js_util.setProperty(options, 'allowProposedApi', true);
+      final workspaceSize = _lastWorkspaceFittedSize;
+      if (workspaceSize != null &&
+          workspaceSize.$1 >= 5 &&
+          workspaceSize.$2 >= 10) {
+        js_util.setProperty(options, 'rows', workspaceSize.$1);
+        js_util.setProperty(options, 'cols', workspaceSize.$2);
+        _lastFittedRows = workspaceSize.$1;
+        _lastFittedCols = workspaceSize.$2;
+      }
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
@@ -1459,21 +1625,11 @@ class _TerminalPaneState extends State<TerminalPane>
     final sessionId = sanitizedId;
 
     void onWrite(String data) {
-      final term = _sessionTerms[sessionId];
-      if (term != null) {
-        try {
-          js_util.callMethod(term, 'write', [data]);
-          tdbg(
-            'pane.onWrite',
-            '$sessionId -> xterm.js ok; '
-                '${tdbgPreview(data)}',
-          );
-        } catch (error, stack) {
-          // Was `catch (_) {}`: an xterm.js write that threw left the pane
-          // blank and the console clean, which is indistinguishable from bytes
-          // that never arrived.
-          tdbg('pane.onWrite', '$sessionId -> xterm.js THREW: $error\n$stack');
-        }
+      if (_sessionTerms.containsKey(sessionId)) {
+        _sessionPendingWriteBuffer
+            .putIfAbsent(sessionId, StringBuffer.new)
+            .write(data);
+        _scheduleSessionWriteFlush(sessionId);
         return;
       }
       final activePane = _containerEventOwners[sessionId];
@@ -1499,10 +1655,14 @@ class _TerminalPaneState extends State<TerminalPane>
     void onClear() {
       _sessionAutoSpace[sessionId]?.reset();
       _sessionSavedViewportY.remove(sessionId);
+      _sessionPendingWriteBuffer.remove(sessionId);
       final activePane = _containerEventOwners[sessionId];
       if (activePane != null) {
+        activePane._scrollRestoreGeneration++;
         activePane._pageRestoreTimer?.cancel();
         activePane._pageRestoreTimer = null;
+        activePane._scrollToCursorTimer?.cancel();
+        activePane._scrollToCursorTimer = null;
         activePane.dismissNoOlderScrollback();
         activePane._pendingScrollToBottomOnRelease = true;
         activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
@@ -1510,15 +1670,9 @@ class _TerminalPaneState extends State<TerminalPane>
           activePane._pendingLiveWriteBuffer.clear();
         }
       }
-      final term = _sessionTerms[sessionId];
-      if (term != null) {
-        try {
-          js_util.callMethod(term, 'clear', []);
-          // Exit alternate screen buffer if active, home cursor, and wipe display.
-          js_util.callMethod(term, 'write', [
-            '\x1b[?1049l\x1b[H\x1b[2J\x1b[3J',
-          ]);
-        } catch (_) {}
+      if (_sessionTerms.containsKey(sessionId)) {
+        _sessionPendingClear[sessionId] = true;
+        _scheduleSessionWriteFlush(sessionId);
       }
     }
 
@@ -1526,6 +1680,77 @@ class _TerminalPaneState extends State<TerminalPane>
     _sessionPersistentClearListeners[sessionId] = onClear;
     controller.addWriteListener(onWrite);
     controller.addClearListener(onClear);
+  }
+
+  static void _scheduleSessionWriteFlush(String sessionId) {
+    if (_sessionFlushScheduled.contains(sessionId)) return;
+    _sessionFlushScheduled.add(sessionId);
+    scheduleMicrotask(() {
+      _sessionFlushScheduled.remove(sessionId);
+      _flushSessionWrites(sessionId);
+    });
+  }
+
+  static void _flushSessionWrites(
+    String sessionId, {
+    void Function()? onComplete,
+  }) {
+    final term = _sessionTerms[sessionId];
+    final needsClear = _sessionPendingClear.remove(sessionId) ?? false;
+    final buffer = _sessionPendingWriteBuffer.remove(sessionId);
+    final hasPayload = buffer != null && buffer.isNotEmpty;
+    if (term == null) {
+      if (onComplete != null) {
+        Future.delayed(Duration.zero, onComplete);
+      }
+      return;
+    }
+    if (!needsClear && !hasPayload) {
+      if (onComplete != null) {
+        try {
+          js_util.callMethod(term, 'write', [
+            '',
+            js_util.allowInterop(onComplete),
+          ]);
+        } catch (_) {
+          Future.delayed(Duration.zero, onComplete);
+        }
+      }
+      return;
+    }
+    if (needsClear) {
+      try {
+        js_util.callMethod(term, 'clear', []);
+      } catch (_) {}
+    }
+    final payload = needsClear
+        ? (hasPayload
+              ? '\x1b[?1049l\x1b[H\x1b[2J\x1b[3J${buffer.toString()}'
+              : '\x1b[?1049l\x1b[H\x1b[2J\x1b[3J')
+        : buffer!.toString();
+    try {
+      if (onComplete != null) {
+        js_util.callMethod(term, 'write', [
+          payload,
+          js_util.allowInterop(onComplete),
+        ]);
+      } else {
+        js_util.callMethod(term, 'write', [payload]);
+      }
+      tdbg(
+        'pane.onWrite',
+        '$sessionId -> xterm.js ok (${payload.length} chars, clear=$needsClear); '
+            '${tdbgPreview(payload)}',
+      );
+    } catch (error, stack) {
+      // Was `catch (_) {}`: an xterm.js write that threw left the pane
+      // blank and the console clean, which is indistinguishable from bytes
+      // that never arrived.
+      tdbg('pane.onWrite', '$sessionId -> xterm.js THREW: $error\n$stack');
+      if (onComplete != null) {
+        Future.delayed(Duration.zero, onComplete);
+      }
+    }
   }
 
   static void _unbindPersistentSessionController(String sanitizedId) {
@@ -1593,6 +1818,29 @@ class _TerminalPaneState extends State<TerminalPane>
 
   void _onHistoryReplayed() {
     if (!_initialized) return;
+    // Refit before flushing the coalesced clear+replay buffer: a fit that ran
+    // while the layout was narrow (or whose resize-out died in the debounce)
+    // leaves a narrow grid under a wide pane, and sizing the grid before
+    // `term.write` parses the replay payload avoids reflowing half-written
+    // lines.
+    _reconcileGridWithPixels();
+    try {
+      final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt() ?? 0;
+      final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt() ?? 0;
+      if (_styleSheetLoaded && cols >= 10 && rows >= 5) {
+        _stabilityTimer?.cancel();
+        _forceFinalizeTimer?.cancel();
+        _forceFinalizeTimer = null;
+        _initialContentWritten = true;
+        _sessionInitialFitCompleted.add(_sanitizedId);
+        _lastFittedCols = cols;
+        _lastFittedRows = rows;
+        _lastWorkspaceFittedSize = (rows, cols);
+      }
+    } catch (_) {}
+    if (_sessionPendingClear[_sanitizedId] == true) {
+      _maskTerminalForReplay();
+    }
     // A scroll-up page replayed a wider window: restore the stashed anchor
     // adjusted by the added rows instead of the normal saved-Y restore,
     // which would land mid-window on the same numeric line.
@@ -1604,12 +1852,6 @@ class _TerminalPaneState extends State<TerminalPane>
     }
     _clearPageAnchor();
     dismissNoOlderScrollback();
-    // Refit before restoring scroll: a fit that ran while the layout was
-    // narrow (or whose resize-out died in the debounce) leaves a narrow grid
-    // under a wide pane, and replay is the moment that mismatch turns
-    // visible. A resize reflows rows, so the scroll restore below must land
-    // after it, not before.
-    _reconcileGridWithPixels();
     _afterReplayContentWritten(initialReplay: true);
   }
 
@@ -1631,23 +1873,39 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
-  /// Restore the stashed page anchor once the widened replay has settled.
-  /// xterm.js parses `write` incrementally, so the buffer length right
-  /// after the replay undercounts; poll until it stabilizes (or 2s
-  /// elapse) and scroll to the old line plus the added rows.
+  /// Restore the stashed page anchor once the widened replay has been parsed
+  /// by xterm.js. Flushing the coalesced clear+replay payload in a single
+  /// `term.write(payload, callback)` invokes the callback as soon as xterm.js
+  /// finishes parsing the entire replay, so we can adjust `scrollToLine` and
+  /// unmask before the next browser paint.
   void _restorePagedScrollPosition() {
     final anchorY = _pageAnchorY;
     final anchorLen = _pageAnchorLen;
     _clearPageAnchor();
+    final restoreGen = ++_scrollRestoreGeneration;
     _pendingScrollToBottomOnRelease = false;
     _clearPointerReleaseTimers();
-    if (anchorY == null || anchorLen == null) return;
-    var polls = 0;
-    var lastLen = -1;
-    _pageRestoreTimer = Timer.periodic(const Duration(milliseconds: 50), (
-      timer,
-    ) {
-      polls++;
+    if (anchorY == null || anchorLen == null) {
+      _flushSessionWrites(
+        _sanitizedId,
+        onComplete: () {
+          if (restoreGen == _scrollRestoreGeneration) {
+            _unmaskTerminalAfterReplay();
+          }
+        },
+      );
+      return;
+    }
+    var finished = false;
+    void finishRestore() {
+      if (finished || restoreGen != _scrollRestoreGeneration) return;
+      finished = true;
+      _pageRestoreTimer?.cancel();
+      _pageRestoreTimer = null;
+      if (!mounted || !_initialized) {
+        _unmaskTerminalAfterReplay();
+        return;
+      }
       var len = -1;
       var baseY = 0;
       try {
@@ -1656,43 +1914,52 @@ class _TerminalPaneState extends State<TerminalPane>
         len = (js_util.getProperty(active, 'length') as num?)?.toInt() ?? -1;
         baseY = (js_util.getProperty(active, 'baseY') as num?)?.toInt() ?? 0;
       } catch (_) {}
-      if ((len >= 0 && len == lastLen) || polls >= 40) {
-        timer.cancel();
-        _pageRestoreTimer = null;
-        if (!mounted || !_initialized || len < 0) return;
-        // Measure near-top from the pre-replay anchor: `onClear()` and
-        // `term.write()` reset `active.viewportY` to `baseY` (bottom of
-        // buffer), so reading `viewportY` after the write would see the
-        // bottom of the scrollback and treat every barren page with >29
-        // lines as if the user had scrolled away. Always restore the
-        // viewport to `clamped` first so an exhausted page does not leave
-        // the view stranded at `baseY`.
-        final addedLines = len - anchorLen;
-        final wasNearTop = anchorY <= 5;
-        final target = math.max(anchorY + addedLines, 0);
-        final clamped = target.clamp(0, math.max(baseY, 0)).toInt();
-        _suppressScrollSaveFor(const Duration(milliseconds: 500));
-        try {
-          js_util.callMethod(_term, 'scrollToLine', [clamped]);
-        } catch (_) {}
-        if (clamped >= baseY) {
-          _sessionSavedViewportY.remove(_sanitizedId);
-        } else {
-          _sessionSavedViewportY[_sanitizedId] = clamped;
-        }
-        _pendingScrollToBottomOnRelease = false;
-        if (shouldContinuePastBarrenPage(
-          addedLines: addedLines,
-          nearTop: wasNearTop,
-        )) {
-          _continuePastBarrenPage();
-        } else if (addedLines > 0) {
-          dismissNoOlderScrollback();
-        }
-      } else {
-        lastLen = len;
+      if (len < 0) {
+        _unmaskTerminalAfterReplay();
+        return;
       }
-    });
+      // Measure near-top from the pre-replay anchor: `onClear()` and
+      // `term.write()` reset `active.viewportY` to `baseY` (bottom of
+      // buffer), so reading `viewportY` after the write would see the
+      // bottom of the scrollback and treat every barren page with >29
+      // lines as if the user had scrolled away. Always restore the
+      // viewport to `clamped` first so an exhausted page does not leave
+      // the view stranded at `baseY`.
+      final addedLines = len - anchorLen;
+      final wasNearTop = anchorY <= 5;
+      final target = math.max(anchorY + addedLines, 0);
+      final clamped = target.clamp(0, math.max(baseY, 0)).toInt();
+      _suppressScrollSaveFor(const Duration(milliseconds: 500));
+      try {
+        js_util.callMethod(_term, 'scrollToLine', [clamped]);
+        _syncTermViewportDomScroll();
+      } catch (_) {}
+      _unmaskTerminalAfterReplay();
+      if (clamped >= baseY) {
+        _sessionSavedViewportY.remove(_sanitizedId);
+      } else {
+        _sessionSavedViewportY[_sanitizedId] = clamped;
+      }
+      _pendingScrollToBottomOnRelease = false;
+      if (shouldContinuePastBarrenPage(
+        addedLines: addedLines,
+        nearTop: wasNearTop,
+      )) {
+        _continuePastBarrenPage();
+      } else if (addedLines > 0) {
+        dismissNoOlderScrollback();
+      }
+    }
+
+    _pageRestoreTimer?.cancel();
+    _pageRestoreTimer = null;
+    _flushSessionWrites(_sanitizedId, onComplete: finishRestore);
+    if (!finished && restoreGen == _scrollRestoreGeneration) {
+      _pageRestoreTimer = Timer(
+        const Duration(milliseconds: 600),
+        finishRestore,
+      );
+    }
   }
 
   /// A page landed with no new buffer lines while the user is still near
@@ -2111,6 +2378,39 @@ class _TerminalPaneState extends State<TerminalPane>
 
     _containerPasteListener = pasteListener;
     _container.addEventListener('paste', pasteListener, true);
+
+    void scrollCaptureListener(html.Event event) {
+      if (!_suppressScrollSave || _isUserGestureActive) return;
+      final target = event.target;
+      if (target is! html.Element ||
+          !target.classes.contains('xterm-viewport')) {
+        return;
+      }
+      if (target.scrollTop != 0) return;
+      try {
+        final term = _term ?? _sessionTerms[_sanitizedId];
+        if (term == null) return;
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final baseY =
+            (js_util.getProperty(active, 'baseY') as num?)?.toInt() ?? 0;
+        final savedY = _sessionSavedViewportY[_sanitizedId];
+        final desiredLine = (savedY != null && savedY >= 0 && savedY < baseY)
+            ? savedY
+            : baseY;
+        if (desiredLine <= 0) return;
+        event.stopImmediatePropagation();
+        if (savedY != null && savedY >= 0 && savedY < baseY) {
+          js_util.callMethod(term, 'scrollToLine', [savedY]);
+        } else {
+          js_util.callMethod(term, 'scrollToBottom', []);
+        }
+        _syncTermViewportDomScroll(term);
+      } catch (_) {}
+    }
+
+    _containerScrollCaptureListener = scrollCaptureListener;
+    _container.addEventListener('scroll', scrollCaptureListener, true);
     _bindTextareaEvents();
   }
 
@@ -2407,7 +2707,11 @@ class _TerminalPaneState extends State<TerminalPane>
           (js_util.getProperty(container, 'isConnected') as bool? ?? true) &&
           container.clientWidth > 0;
       final term = _sessionTerms[_sanitizedId];
-      if (term != null && isConnected) {
+      if (term != null &&
+          isConnected &&
+          !_suppressScrollSave &&
+          _sessionPendingClear[_sanitizedId] != true &&
+          !_sessionPendingWriteBuffer.containsKey(_sanitizedId)) {
         final buffer = js_util.getProperty(term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
@@ -2450,6 +2754,11 @@ class _TerminalPaneState extends State<TerminalPane>
     if (pasteListener != null) {
       _container.removeEventListener('paste', pasteListener, true);
       _containerPasteListener = null;
+    }
+    final scrollCaptureListener = _containerScrollCaptureListener;
+    if (scrollCaptureListener != null) {
+      _container.removeEventListener('scroll', scrollCaptureListener, true);
+      _containerScrollCaptureListener = null;
     }
     _unbindTextareaEvents();
   }
@@ -2752,9 +3061,15 @@ class _TerminalPaneState extends State<TerminalPane>
     _forceFinalizeTimer?.cancel();
     _forceFinalizeTimer = null;
     _initialContentWritten = true;
+    _sessionInitialFitCompleted.add(_sanitizedId);
+    _lastFittedCols = fittedCols;
+    _lastFittedRows = fittedRows;
+    _lastWorkspaceFittedSize = (fittedRows, fittedCols);
     _writeInitialContent(overrideCols: fittedCols, overrideRows: fittedRows);
     _flushPendingLiveWrites();
-    _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
+    if (widget.onViewFit == null) {
+      _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
+    }
   }
 
   /// Sends a debounced resize-out now instead of letting it die with this
@@ -2780,50 +3095,38 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _flushPendingLiveWrites() {
-    if (_pendingLiveWriteBuffer.isEmpty) {
-      return;
-    }
-    tdbg(
-      'pane.flush',
-      '$_sanitizedId flushing '
-          '${_pendingLiveWriteBuffer.length} buffered chunks '
-          '(term=${_sessionTerms[_sanitizedId] != null})',
-    );
-    final pendingWrites = List<String>.from(_pendingLiveWriteBuffer);
-    _pendingLiveWriteBuffer.clear();
-    final term = _term ?? _sessionTerms[_sanitizedId];
-    if (term != null) {
-      for (final data in pendingWrites) {
-        try {
-          js_util.callMethod(term, 'write', [data]);
-        } catch (_) {}
+    if (_pendingLiveWriteBuffer.isNotEmpty) {
+      tdbg(
+        'pane.flush',
+        '$_sanitizedId flushing '
+            '${_pendingLiveWriteBuffer.length} buffered chunks '
+            '(term=${_sessionTerms[_sanitizedId] != null})',
+      );
+      final buf = _sessionPendingWriteBuffer.putIfAbsent(
+        _sanitizedId,
+        StringBuffer.new,
+      );
+      for (final data in _pendingLiveWriteBuffer) {
+        buf.write(data);
       }
+      _pendingLiveWriteBuffer.clear();
     }
+    _flushSessionWrites(_sanitizedId);
   }
 
   void _onFit() {
-    if (!_initialized) return;
+    if (!mounted || !_initialized) return;
+    if (!_initialContentWritten && !_styleSheetLoaded) return;
     try {
       final width = _terminalWrapper.clientWidth;
       final height = _terminalWrapper.clientHeight;
       if (width > 0 && height > 0) {
-        bool wasAtBottom = true;
-        int? viewportY;
-        final term = _term;
-        if (term != null) {
-          try {
-            final buffer = js_util.getProperty(term, 'buffer');
-            final active = js_util.getProperty(buffer, 'active');
-            final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
-            viewportY = (js_util.getProperty(active, 'viewportY') as num)
-                .toInt();
-            wasAtBottom = _viewportIsAtBottom(_container, viewportY, baseY);
-          } catch (_) {
-            wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
-          }
-        } else {
-          wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
-        }
+        // Consult `_sessionSavedViewportY` (which `onScroll` maintains only on
+        // genuine user scrolls) rather than querying `.xterm-viewport.scrollTop`:
+        // DOM remounts via `HtmlElementView` and in-progress async writes
+        // transiently reset `scrollTop` to 0, which would otherwise look like a
+        // scrolled-up viewport and poison `_sessionSavedViewportY` with line 0.
+        final wasAtBottom = !_sessionSavedViewportY.containsKey(_sanitizedId);
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         js_util.callMethod(_fitAddon, 'fit', []);
         _activateTerminal();
@@ -2844,14 +3147,15 @@ class _TerminalPaneState extends State<TerminalPane>
           } else {
             try {
               js_util.callMethod(_term, 'scrollToBottom', []);
+              _syncTermViewportDomScroll();
             } catch (_) {}
           }
         } else {
-          final savedY = _sessionSavedViewportY[_sanitizedId] ?? viewportY;
+          final savedY = _sessionSavedViewportY[_sanitizedId];
           if (savedY != null) {
-            _sessionSavedViewportY[_sanitizedId] = savedY;
             try {
               js_util.callMethod(_term, 'scrollToLine', [savedY]);
+              _syncTermViewportDomScroll();
             } catch (_) {}
           }
         }
@@ -2861,6 +3165,8 @@ class _TerminalPaneState extends State<TerminalPane>
               _lastFittedRows != fittedRows || _lastFittedCols != fittedCols;
           _lastFittedRows = fittedRows;
           _lastFittedCols = fittedCols;
+          final hadPriorWorkspaceFit = _lastWorkspaceFittedSize != null;
+          _lastWorkspaceFittedSize = (fittedRows, fittedCols);
           if (sizeChanged && _initialContentWritten) {
             _resizeDebounceTimer?.cancel();
             _pendingResizeOutCols = fittedCols;
@@ -2879,11 +3185,8 @@ class _TerminalPaneState extends State<TerminalPane>
           }
 
           if (!_initialContentWritten) {
-            if (!_styleSheetLoaded) {
-              return;
-            }
-            if (fittedCols < 10) {
-              // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
+            if (hadPriorWorkspaceFit) {
+              _finishInitialContent(fittedCols, fittedRows);
               return;
             }
             // Backstop: arm once now that we have a valid sized fit. The
@@ -2908,7 +3211,7 @@ class _TerminalPaneState extends State<TerminalPane>
               _stableWidth = dWidth;
               _stableHeight = dHeight;
               _stabilityTimer?.cancel();
-              _stabilityTimer = Timer(const Duration(milliseconds: 250), () {
+              _stabilityTimer = Timer(const Duration(milliseconds: 50), () {
                 if (mounted && !_initialContentWritten) {
                   _finishInitialContent(fittedCols, fittedRows);
                 }
@@ -2942,6 +3245,16 @@ class _TerminalPaneState extends State<TerminalPane>
     if (initialReplay || shouldFocus) {
       _focusCursorAfterReplay = false;
       _restoreScrollPosition(requestFocus: true);
+    } else {
+      final restoreGen = ++_scrollRestoreGeneration;
+      _flushSessionWrites(
+        _sanitizedId,
+        onComplete: () {
+          if (restoreGen == _scrollRestoreGeneration) {
+            _unmaskTerminalAfterReplay();
+          }
+        },
+      );
     }
   }
 
@@ -2951,18 +3264,33 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _restoreScrollPosition({required bool requestFocus}) {
+    final restoreGen = ++_scrollRestoreGeneration;
+    _scrollToCursorTimer?.cancel();
+    _scrollToCursorTimer = null;
     if (_isUserGestureActive) {
       if (!_sessionSavedViewportY.containsKey(_sanitizedId)) {
         _pendingScrollToBottomOnRelease = true;
       }
+      _flushSessionWrites(
+        _sanitizedId,
+        onComplete: () {
+          if (restoreGen == _scrollRestoreGeneration) {
+            _unmaskTerminalAfterReplay();
+          }
+        },
+      );
       return;
     }
     var jumped = false;
     void jump() {
-      if (jumped || !mounted || !_initialized) return;
+      if (jumped || restoreGen != _scrollRestoreGeneration) return;
       jumped = true;
       _scrollToCursorTimer?.cancel();
       _scrollToCursorTimer = null;
+      if (!mounted || !_initialized) {
+        _unmaskTerminalAfterReplay();
+        return;
+      }
       _suppressScrollSave = true;
       final savedY = _sessionSavedViewportY[_sanitizedId];
       try {
@@ -2980,25 +3308,33 @@ class _TerminalPaneState extends State<TerminalPane>
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);
         }
+        _syncTermViewportDomScroll();
       } catch (_) {}
+      _unmaskTerminalAfterReplay();
       if (requestFocus) {
         _activateTerminal();
       }
       _suppressScrollSaveFor(const Duration(milliseconds: 1000));
     }
 
-    try {
-      js_util.callMethod(_term, 'write', [
-        '',
-        js_util.allowInterop(() {
-          jump();
-        }),
-      ]);
-    } catch (_) {
-      Future.delayed(Duration.zero, jump);
+    if (_replayMaskTimer == null &&
+        _sessionPendingClear[_sanitizedId] != true) {
+      _suppressScrollSave = true;
+      final savedY = _sessionSavedViewportY[_sanitizedId];
+      try {
+        if (savedY != null && savedY >= 0) {
+          js_util.callMethod(_term, 'scrollToLine', [savedY]);
+        } else {
+          js_util.callMethod(_term, 'scrollToBottom', []);
+        }
+        _syncTermViewportDomScroll();
+      } catch (_) {}
     }
-    _scrollToCursorTimer?.cancel();
-    _scrollToCursorTimer = Timer(const Duration(milliseconds: 600), jump);
+
+    _flushSessionWrites(_sanitizedId, onComplete: jump);
+    if (!jumped && restoreGen == _scrollRestoreGeneration) {
+      _scrollToCursorTimer = Timer(const Duration(milliseconds: 600), jump);
+    }
   }
 
   void _updateCursorOptions() {
@@ -3066,47 +3402,57 @@ class _TerminalPaneState extends State<TerminalPane>
     }
     if (oldWidget.isLoading != widget.isLoading) {
       _syncPointerEvents();
-      if (!widget.isLoading) {
+      if (!widget.isLoading && _replayMaskTimer == null) {
         _restoreScrollPosition(requestFocus: false);
       }
     }
     if (oldWidget.controller != widget.controller ||
         oldWidget.terminalId != widget.terminalId) {
+      final alreadyRebound =
+          oldWidget.terminalId == widget.terminalId &&
+          identical(_boundViewController, widget.controller) &&
+          identical(_sessionBoundControllers[_sanitizedId], widget.controller);
       tdbg(
         'pane.didUpdate',
         '$_sanitizedId controller changed '
             'ctrl#${identityHashCode(oldWidget.controller)} -> '
-            'ctrl#${identityHashCode(widget.controller)}',
+            'ctrl#${identityHashCode(widget.controller)} '
+            '(alreadyRebound=$alreadyRebound)',
       );
-      _clearPageAnchor();
-      dismissNoOlderScrollback();
-      _flushPendingJiggleRestore();
-      _unbindControllerFrom(oldWidget.controller);
-      _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
-      _inputRouteToken = _sessionInputRouter.bind(
-        _sanitizedId,
-        widget.controller,
-      );
-      _bindController();
-      _containerEventOwners[_sanitizedId] = this;
-      if (_initialized) {
-        final fittedRows =
-            ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
-            _lastFittedRows ??
-            24);
-        final fittedCols =
-            ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
-            _lastFittedCols ??
-            80);
-        widget.onViewFit?.call(fittedCols, fittedRows);
-        if (fittedRows >= 5 && fittedCols >= 10) {
-          _sessionInputRouter.sendResizeOut(
-            _sanitizedId,
-            fittedCols,
-            fittedRows,
-          );
+      if (!alreadyRebound) {
+        _unmaskTerminalAfterReplay();
+        _clearPageAnchor();
+        _scrollToCursorTimer?.cancel();
+        _scrollToCursorTimer = null;
+        dismissNoOlderScrollback();
+        _flushPendingJiggleRestore();
+        _unbindControllerFrom(oldWidget.controller);
+        _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
+        _inputRouteToken = _sessionInputRouter.bind(
+          _sanitizedId,
+          widget.controller,
+        );
+        _bindController();
+        _containerEventOwners[_sanitizedId] = this;
+        if (_initialized) {
+          if (_initialContentWritten) {
+            final fittedRows =
+                ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
+                _lastFittedRows ??
+                24);
+            final fittedCols =
+                ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
+                _lastFittedCols ??
+                80);
+            widget.onViewFit?.call(fittedCols, fittedRows);
+          }
+          _onFit();
         }
-        _onFit();
+      } else {
+        _containerEventOwners[_sanitizedId] = this;
+        if (_initialized && !_initialContentWritten) {
+          _onFit();
+        }
       }
       _activateTerminal(force: true);
       _scheduleFocusRetries(force: true);
@@ -3116,7 +3462,9 @@ class _TerminalPaneState extends State<TerminalPane>
 
   @override
   void dispose() {
+    _scrollRestoreGeneration++;
     _flushPendingLiveWrites();
+    _unmaskTerminalAfterReplay();
     _stabilityTimer?.cancel();
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
