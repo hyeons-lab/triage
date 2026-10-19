@@ -933,6 +933,9 @@ void main() {
                 updateAvailable: true,
                 latestVersion: '1.0.0',
                 tailscalePairingAvailable: true,
+                cpuPercent: 37,
+                batteryPercent: 82,
+                batteryState: fbs.BatteryState.Charging,
               ),
             ),
           ).toBytes(),
@@ -945,8 +948,49 @@ void main() {
         expect(result['update_available'], isTrue);
         expect(result['latest_version'], equals('1.0.0'));
         expect(result['tailscale_pairing_available'], isTrue);
+        expect(result['cpu_percent'], equals(37));
+        expect(result['battery_percent'], equals(82));
+        expect(result['battery_state'], equals('charging'));
       },
     );
+
+    test('getDaemonStats decodes FlatBuffers DaemonStatsResult', () async {
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-flatbuffers',
+      );
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await client.connect();
+
+      final future = client.getDaemonStats();
+      channel.addIncoming(
+        fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.DaemonStatsResult,
+            result: fbs.DaemonStatsResultObjectBuilder(
+              diskFreeBytes: 12345,
+              diskTotalBytes: 67890,
+              cpuPercent: 19,
+              batteryPercent: 64,
+              batteryState: fbs.BatteryState.Discharging,
+            ),
+          ),
+        ).toBytes(),
+      );
+
+      final stats = await future;
+      expect(stats, isNotNull);
+      expect(stats!.diskFreeBytes, equals(12345));
+      expect(stats.diskTotalBytes, equals(67890));
+      expect(stats.cpuPercent, equals(19));
+      expect(stats.batteryPercent, equals(64));
+      expect(stats.batteryState, equals('discharging'));
+    });
 
     test('hello omits latest_version until a release check has run', () async {
       final channel = FakeWebSocketChannel(
@@ -1436,17 +1480,50 @@ void main() {
       expect(stats.batteryState, 'unknown');
     });
 
-    test('normalizes sentinel, clamp, and bad state', () {
+    test('normalizes sentinel, clamp, non-finite numbers, and bad state', () {
       final stats = daemonStatsFromResponse({
-        'disk_free_bytes': 50,
-        'disk_total_bytes': 100,
+        'disk_free_bytes': double.nan,
+        'disk_total_bytes': double.infinity,
         'cpu_percent': -1,
         'battery_percent': 101,
         'battery_state': 'calibrating',
       });
+      expect(stats.diskFreeBytes, 0);
+      expect(stats.diskTotalBytes, 0);
       expect(stats.cpuPercent, isNull);
       expect(stats.batteryPercent, 100);
       expect(stats.batteryState, 'unknown');
+    });
+
+    test('mergeDaemonStats retains previous legs when incoming legs are unknown', () {
+      const previous = (
+        diskFreeBytes: 40,
+        diskTotalBytes: 100,
+        cpuPercent: 18,
+        batteryPercent: 75,
+        batteryState: 'discharging',
+      );
+      final afterZeroDiskAndNullHost = mergeDaemonStats(previous, (
+        diskFreeBytes: 0,
+        diskTotalBytes: 0,
+        cpuPercent: null,
+        batteryPercent: null,
+        batteryState: 'unknown',
+      ));
+      expect(afterZeroDiskAndNullHost, equals(previous));
+
+      final afterPartialUpdate = mergeDaemonStats(previous, (
+        diskFreeBytes: 35,
+        diskTotalBytes: 100,
+        cpuPercent: null,
+        batteryPercent: 80,
+        batteryState: 'charging',
+      ));
+      expect(afterPartialUpdate.diskFreeBytes, 35);
+      expect(afterPartialUpdate.diskTotalBytes, 100);
+      expect(afterPartialUpdate.cpuPercent, 18);
+      expect(afterPartialUpdate.batteryPercent, 80);
+      expect(afterPartialUpdate.batteryState, 'charging');
     });
   });
 

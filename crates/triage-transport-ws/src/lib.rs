@@ -137,8 +137,19 @@ fn current_disk_bytes() -> (u64, u64) {
     }
 }
 
-fn current_host_stats() -> triage_core::host::HostStats {
-    triage_core::host::daemon_host_stats()
+/// Live host probe as `(cpu_percent, battery_percent, battery_state)`,
+/// defaulting an absent battery to [`triage_core::host::BatteryState::Unknown`]
+/// so `Hello` and `GetDaemonStats` share one mapping.
+fn current_host_stats() -> (Option<u8>, Option<u8>, triage_core::host::BatteryState) {
+    let host = triage_core::host::daemon_host_stats();
+    (
+        host.cpu_percent,
+        host.battery.map(|battery| battery.percent),
+        host.battery
+            .map_or(triage_core::host::BatteryState::Unknown, |battery| {
+                battery.state
+            }),
+    )
 }
 
 #[derive(Debug)]
@@ -345,7 +356,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
 
                 let update = self.api.server_update_info();
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
-                let host = current_host_stats();
+                let (cpu_percent, battery_percent, battery_state) = current_host_stats();
                 Ok(ServerResult::Hello {
                     protocol_version: PROTOCOL_VERSION.to_string(),
                     authenticated,
@@ -355,12 +366,9 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     disk_free_bytes,
                     disk_total_bytes,
                     tailscale_pairing_available: self.authenticator.tailscale_pairing_available(),
-                    cpu_percent: host.cpu_percent,
-                    battery_percent: host.battery.map(|battery| battery.percent),
-                    battery_state: host
-                        .battery
-                        .map(|battery| battery.state)
-                        .unwrap_or(triage_core::host::BatteryState::Unknown),
+                    cpu_percent,
+                    battery_percent,
+                    battery_state,
                 })
             }
             ClientRequest::PairingChallenge { client_id } => {
@@ -549,16 +557,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             }
             ClientRequest::GetDaemonStats => {
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
-                let host = current_host_stats();
+                let (cpu_percent, battery_percent, battery_state) = current_host_stats();
                 Ok(ServerResult::DaemonStats {
                     disk_free_bytes,
                     disk_total_bytes,
-                    cpu_percent: host.cpu_percent,
-                    battery_percent: host.battery.map(|battery| battery.percent),
-                    battery_state: host
-                        .battery
-                        .map(|battery| battery.state)
-                        .unwrap_or(triage_core::host::BatteryState::Unknown),
+                    cpu_percent,
+                    battery_percent,
+                    battery_state,
                 })
             }
             ClientRequest::SetRailPins {
@@ -1916,6 +1921,46 @@ mod tests {
         // invariant, not exact bytes.
         assert_disk_invariant(hello.disk_free_bytes(), hello.disk_total_bytes());
         assert!(!hello.tailscale_pairing_available());
+    }
+
+    #[test]
+    fn flatbuffers_hello_host_stats_roundtrip() {
+        let msg = ServerMessage::Response {
+            id: Some(json!("hello-fb")),
+            result: ServerResult::Hello {
+                protocol_version: "1".to_string(),
+                authenticated: true,
+                server_version: "0.3.0".to_string(),
+                update_available: false,
+                latest_version: None,
+                disk_free_bytes: 12_345,
+                disk_total_bytes: 67_890,
+                tailscale_pairing_available: false,
+                cpu_percent: Some(33),
+                battery_percent: Some(76),
+                battery_state: triage_core::host::BatteryState::Discharging,
+            },
+        };
+        let bytes = flatbuffers_proto::serialize_server_message(&msg);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("hello-fb"),
+                result: flatbuffers_proto::ServerResultBorrowed::Hello {
+                    protocol_version: "1",
+                    authenticated: true,
+                    server_version: "0.3.0",
+                    update_available: false,
+                    latest_version: None,
+                    disk_free_bytes: 12_345,
+                    disk_total_bytes: 67_890,
+                    tailscale_pairing_available: false,
+                    cpu_percent: Some(33),
+                    battery_percent: Some(76),
+                    battery_state: triage_core::host::BatteryState::Discharging,
+                },
+            }
+        );
     }
 
     #[test]

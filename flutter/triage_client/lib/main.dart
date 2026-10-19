@@ -2443,10 +2443,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           !isUsableDaemonStats(stats)) {
         return;
       }
-      // A null or zero-total read is a failed poll (or a daemon predating
-      // stats): keep the last reading rather than flickering the line in
-      // and out.
-      setState(() => _daemonStats = stats);
+      // Merge per leg so a transient unknown on one probe (0/0 disk, zero-delta
+      // CPU, or failed battery read) keeps its last good reading rather than
+      // flickering that line or segment out.
+      setState(() => _daemonStats = mergeDaemonStats(_daemonStats, stats!));
     });
   }
 

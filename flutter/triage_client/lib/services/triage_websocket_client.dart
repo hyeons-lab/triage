@@ -125,6 +125,27 @@ bool isUsableDaemonStats(DaemonStatsRecord? stats) {
           stats.batteryPercent != null);
 }
 
+/// Merges [incoming] over [previous] per leg so a transient unknown on one
+/// probe (e.g. a 0/0 disk read, a zero-delta CPU sample, or a failed battery
+/// read) keeps that leg's last good reading instead of flickering its line or
+/// segment out when a sibling leg succeeds.
+DaemonStatsRecord mergeDaemonStats(
+  DaemonStatsRecord? previous,
+  DaemonStatsRecord incoming,
+) {
+  if (previous == null) return incoming;
+  final hasDisk = incoming.diskTotalBytes > 0;
+  final hasBattery = incoming.batteryPercent != null;
+  return (
+    diskFreeBytes: hasDisk ? incoming.diskFreeBytes : previous.diskFreeBytes,
+    diskTotalBytes: hasDisk ? incoming.diskTotalBytes : previous.diskTotalBytes,
+    cpuPercent: incoming.cpuPercent ?? previous.cpuPercent,
+    batteryPercent:
+        hasBattery ? incoming.batteryPercent : previous.batteryPercent,
+    batteryState: hasBattery ? incoming.batteryState : previous.batteryState,
+  );
+}
+
 /// Reads daemon stats out of a `hello` or `get_daemon_stats` response map.
 /// Both carry the same keys; absent disk keys read as unknown (0/0), so a
 /// hello from a daemon predating stats degrades to hidden lines. Host
@@ -132,19 +153,23 @@ bool isUsableDaemonStats(DaemonStatsRecord? stats) {
 /// unknown sentinel) reads as null, above 100 clamps, and an unrecognized
 /// battery state reads as unknown.
 DaemonStatsRecord daemonStatsFromResponse(Map<String, dynamic> response) {
-  int? legiblePercent(String key) {
+  int? legibleInt(String key) {
     final raw = response[key];
-    if (raw is! num) return null;
-    final value = raw.toInt();
-    if (value < 0) return null;
+    if (raw is! num || !raw.isFinite) return null;
+    return raw.toInt();
+  }
+
+  int? legiblePercent(String key) {
+    final value = legibleInt(key);
+    if (value == null || value < 0) return null;
     return value > 100 ? 100 : value;
   }
 
   final rawState = response['battery_state']?.toString().toLowerCase();
   const knownStates = {'unknown', 'charging', 'discharging', 'full'};
   return (
-    diskFreeBytes: (response['disk_free_bytes'] as num?)?.toInt() ?? 0,
-    diskTotalBytes: (response['disk_total_bytes'] as num?)?.toInt() ?? 0,
+    diskFreeBytes: legibleInt('disk_free_bytes') ?? 0,
+    diskTotalBytes: legibleInt('disk_total_bytes') ?? 0,
     cpuPercent: legiblePercent('cpu_percent'),
     batteryPercent: legiblePercent('battery_percent'),
     batteryState: knownStates.contains(rawState) ? rawState! : 'unknown',

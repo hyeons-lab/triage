@@ -1382,6 +1382,27 @@ void main() {
         find.text('CPU 12% · Battery 87% (charging)'),
         findsOneWidget,
       );
+
+      // A follow-up poll where disk and battery transiently return unknown
+      // while CPU updates must retain the prior disk and battery legs rather
+      // than flickering them out.
+      final partialPoll = Completer<DaemonStatsRecord?>();
+      client.hangDaemonStats = partialPoll;
+      await tester.pump(const Duration(seconds: 61));
+      partialPoll.complete((
+        diskFreeBytes: 0,
+        diskTotalBytes: 0,
+        cpuPercent: 25,
+        batteryPercent: null,
+        batteryState: 'unknown',
+      ));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('free ('), findsOneWidget);
+      expect(
+        find.text('CPU 25% · Battery 87% (charging)'),
+        findsOneWidget,
+      );
     },
   );
 

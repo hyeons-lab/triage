@@ -1,4 +1,4 @@
-# 000163-01 — Host CPU + battery in the daemon selector
+# 000163-01: Host CPU + battery in the daemon selector
 
 ## Thinking
 
@@ -22,7 +22,7 @@ Gathering (new `triage_core::host`, mirroring `disk.rs`, zero new deps):
   Desktops (no battery) report unknown and the client hides the segment.
 
 Protocol: append `cpu_percent` / `battery_percent` (`int16`, default
--1 = unknown — 0 is a valid reading, so the disk 0/0 convention cannot
+-1 = unknown: 0 is a valid reading, so the disk 0/0 convention cannot
 apply) and a `BatteryState` byte enum to `DaemonStatsResult` and to
 `HelloResult`'s appended stats, with explicit FBS defaults so new-client
 + old-daemon reads unknown instead of 0. JSON: null/absent = unknown.
