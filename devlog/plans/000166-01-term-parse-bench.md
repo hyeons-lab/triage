@@ -1,4 +1,4 @@
-# 000155-01 — Phase −1 parse benchmark
+# 000166-01: Phase −1 parse benchmark
 
 ## Thinking
 
@@ -7,7 +7,7 @@ Pixel for the xterm 4.0 fork vs xterm2 5.2.0. Proceed with the Rust crate only
 if xterm2 misses the frame budget or consistency demands it.
 
 Both packages export a flutter-free core (`package:xterm/core.dart`,
-`package:xterm2/core.dart` — verify the latter), so the headless comparison can
+`package:xterm2/core.dart`, verify the latter), so the headless comparison can
 run under plain `dart`, JIT and AOT. Different package names mean both deps
 coexist in one pubspec: hosted `xterm2: ^5.2.0` next to the `xterm` git
 override. No dep swap needed.

@@ -8,6 +8,7 @@ import 'package:integration_test/integration_test_driver.dart';
 
 Future<void> main() => integrationDriver(
   responseDataCallback: (data) async {
+    final missing = <String>[];
     for (final key in [
       'xterm4_replay_256k_a',
       'xterm2_replay_256k_a',
@@ -15,16 +16,18 @@ Future<void> main() => integrationDriver(
       'xterm4_replay_256k_b',
     ]) {
       final raw = data?[key];
-      if (raw == null) {
+      if (raw is! Map<String, dynamic>) {
         print('MISSING_TIMELINE: $key (keys: ${data?.keys.toList()})');
+        missing.add(key);
         continue;
       }
-      final summary = TimelineSummary.summarize(
-        Timeline.fromJson(raw as Map<String, dynamic>),
-      );
+      final summary = TimelineSummary.summarize(Timeline.fromJson(raw));
       await summary.writeTimelineToFile(key, pretty: true);
       print('=== $key ===');
       print(const JsonEncoder.withIndent('  ').convert(summary.summaryJson));
+    }
+    if (missing.isNotEmpty) {
+      throw StateError('Missing benchmark timelines: ${missing.join(', ')}');
     }
   },
 );

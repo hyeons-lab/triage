@@ -24,26 +24,29 @@ Future<void> _benchArm(
 ) async {
   await tester.pumpWidget(MaterialApp(home: Scaffold(body: buildView())));
   await tester.pumpAndSettle();
-  await binding.traceAction(() async {
-    final sw = Stopwatch()..start();
-    write();
-    sw.stop();
-    // ignore: avoid_print
-    print('$reportKey ui_thread_write_ms=${sw.elapsedMicroseconds / 1000.0}');
+  try {
+    await binding.traceAction(() async {
+      final sw = Stopwatch()..start();
+      write();
+      sw.stop();
+      // ignore: avoid_print
+      print('$reportKey ui_thread_write_ms=${sw.elapsedMicroseconds / 1000.0}');
+      await tester.pumpAndSettle();
+    }, reportKey: reportKey);
+  } finally {
+    // Tear down so the next arm starts from a clean tree even if traceAction fails.
+    await tester.pumpWidget(const MaterialApp(home: Scaffold()));
     await tester.pumpAndSettle();
-  }, reportKey: reportKey);
-  // Tear down so the next arm starts from a clean tree.
-  await tester.pumpWidget(const MaterialApp(home: Scaffold()));
-  await tester.pumpAndSettle();
+  }
 }
 
-Widget _sizedView(Widget child) => Center(
-  child: SizedBox(width: 800, height: 600, child: child),
-);
+Widget _sizedView(Widget child) =>
+    Center(child: SizedBox(width: 800, height: 600, child: child));
 
 void main() {
   final binding = IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   final payload = buildBenchPayload(kPayloadBytes);
+  final warmupPayload = buildBenchPayload(65536);
 
   testWidgets('warmup', (tester) async {
     // Unmeasured: pay font/shader/first-frame costs once, outside the traces.
@@ -53,7 +56,7 @@ void main() {
         home: Scaffold(body: _sizedView(xterm4.TerminalView(terminal))),
       ),
     );
-    terminal.write(payload.substring(0, 65536));
+    terminal.write(warmupPayload);
     await tester.pumpAndSettle();
     await tester.pumpWidget(const MaterialApp(home: Scaffold()));
     await tester.pumpAndSettle();

@@ -28,14 +28,32 @@ String buildBenchPayload(int targetBytes) {
         '\x1b[2m${rng.nextInt(9000) + 1000} insertions\x1b[0m\r\n',
       );
     } else if (kind == 2) {
-      buf.write('\x1b[31m-\x1b[0m obsolete line with \x1b[3mtrailing detail\x1b[0m │ box ── 中文\r\n');
+      buf.write(
+        '\x1b[31m-\x1b[0m obsolete line with \x1b[3mtrailing detail\x1b[0m │ box ── 中文\r\n',
+      );
     } else if (kind == 3) {
-      buf.write('\x1b[38;5;214mwarning\x1b[0m: unused import `foo` [${plain[i % plain.length]}]\r\n');
+      buf.write(
+        '\x1b[38;5;214mwarning\x1b[0m: unused import `foo` [${plain[i % plain.length]}]\r\n',
+      );
     } else {
       buf.write('${plain[i % plain.length]} #${rng.nextInt(1 << 30)}\r\n');
     }
     i++;
   }
   final s = buf.toString();
-  return s.length <= targetBytes ? s : s.substring(0, targetBytes);
+  if (s.length <= targetBytes) {
+    return s;
+  }
+  const trailer = '\x1b[0m\r\n';
+  if (targetBytes <= trailer.length) {
+    return s.substring(0, targetBytes);
+  }
+  var cut = targetBytes - trailer.length;
+  // Avoid cutting inside an ESC sequence so the trailing SGR reset is parsed
+  // as a complete CSI rather than swallowed as a parameter byte.
+  final lastEsc = s.lastIndexOf('\x1b', cut - 1);
+  if (lastEsc >= 0 && cut - lastEsc < 16) {
+    cut = lastEsc;
+  }
+  return '${s.substring(0, cut)}$trailer';
 }

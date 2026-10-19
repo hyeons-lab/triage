@@ -758,7 +758,7 @@ packages:
     source: git
     version: "4.0.0"
   xterm2:
-    dependency: "direct main"
+    dependency: "direct dev"
     description:
       name: xterm2
       sha256: "0b62e7510b414329dfb6ce7dbcffcfe97cc5109033573cf0f4abca568dac8149"

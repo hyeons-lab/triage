@@ -5,6 +5,7 @@
 // Payload mimics daemon replay bytes: SGR-heavy agent output with CRLF line
 // endings, 256-color segments, box drawing, and occasional wide chars.
 // ignore_for_file: avoid_print
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:xterm/core.dart' as xterm4;
@@ -25,11 +26,11 @@ double _median(List<double> xs) {
 
 void _runArm({
   required String label,
-  required String payload,
+  required int payloadUtf8Bytes,
   required int Function() makeTerminalAndWrite,
   required int rounds,
 }) {
-  // Warmup (JIT + first-trim paths), then interleaved-by-caller rounds.
+  // Warmup (JIT + first-trim paths), followed by measured rounds.
   makeTerminalAndWrite();
   final times = <double>[];
   for (var r = 0; r < rounds; r++) {
@@ -40,7 +41,7 @@ void _runArm({
     times.add(sw.elapsedMicroseconds / 1000.0);
   }
   final med = _median(times);
-  final mibPerSec = (payload.length / (1024 * 1024)) / (med / 1000.0);
+  final mibPerSec = (payloadUtf8Bytes / (1024 * 1024)) / (med / 1000.0);
   print(
     '$label: median ${med.toStringAsFixed(1)} ms '
     '(${mibPerSec.toStringAsFixed(1)} MiB/s) over $rounds rounds',
@@ -49,10 +50,14 @@ void _runArm({
 
 void _benchSize(int sizeBytes, int rounds) {
   final payload = buildBenchPayload(sizeBytes);
-  print('--- ${(sizeBytes / 1024).round()} KiB payload (${payload.length} chars) ---');
+  final payloadUtf8Bytes = utf8.encode(payload).length;
+  print(
+    '--- ${(sizeBytes / 1024).round()} KiB target '
+    '(${payload.length} chars, $payloadUtf8Bytes UTF-8 bytes) ---',
+  );
   _runArm(
     label: 'xterm4 one-shot ',
-    payload: payload,
+    payloadUtf8Bytes: payloadUtf8Bytes,
     rounds: rounds,
     makeTerminalAndWrite: () {
       final t = xterm4.Terminal(maxLines: kMaxLines);
@@ -62,7 +67,7 @@ void _benchSize(int sizeBytes, int rounds) {
   );
   _runArm(
     label: 'xterm2 one-shot ',
-    payload: payload,
+    payloadUtf8Bytes: payloadUtf8Bytes,
     rounds: rounds,
     makeTerminalAndWrite: () {
       final t = xterm2.Terminal(maxLines: kMaxLines);
@@ -72,7 +77,7 @@ void _benchSize(int sizeBytes, int rounds) {
   );
   _runArm(
     label: 'xterm4 chunked  ',
-    payload: payload,
+    payloadUtf8Bytes: payloadUtf8Bytes,
     rounds: rounds,
     makeTerminalAndWrite: () {
       final t = xterm4.Terminal(maxLines: kMaxLines);
@@ -85,7 +90,7 @@ void _benchSize(int sizeBytes, int rounds) {
   );
   _runArm(
     label: 'xterm2 chunked  ',
-    payload: payload,
+    payloadUtf8Bytes: payloadUtf8Bytes,
     rounds: rounds,
     makeTerminalAndWrite: () {
       final t = xterm2.Terminal(maxLines: kMaxLines);
