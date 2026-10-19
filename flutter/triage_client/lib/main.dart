@@ -356,6 +356,7 @@ class SessionVm {
     this.cwd,
     this.isRemote = false,
     this.isExited = false,
+    this.loaded = false,
   }) : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
        // so the field must stay mutable no matter what a caller passes —
        // a lazy placeholder seeds an immutable empty list.
@@ -741,6 +742,18 @@ class SessionVm {
   // True once this remote session has been subscribed/attached (lazy-loaded).
   // Non-selected sessions stay unloaded until the user opens them.
   bool loaded = false;
+  // History window currently held, in raw bytes requested from the daemon.
+  // Starts at the first-page window and doubles toward the platform replay
+  // budget as the user pages older scrollback (see `_pageHistoryUp`).
+  int historyWindowBytes = kHistoryFirstWindowBytes;
+  // Absolute log offset of the oldest byte held in the terminal (or staged for
+  // first view fit). Null until the first history lands; 0 means the log start
+  // is loaded and paging stops.
+  int? get historyStart =>
+      store.appliedHistoryStart ?? _pendingHistory?.rawOutputStart;
+  // A scroll-up page re-attach is in flight; near-top triggers coalesce
+  // behind it instead of stacking replays.
+  bool pagingHistory = false;
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
@@ -821,7 +834,14 @@ class SessionVm {
     int? throughOutputSeq,
     int? rawOutputStart,
     bool isExited = false,
+    bool preservePendingLive = false,
   }) {
+    if (rawOutput.isEmpty &&
+        !isExited &&
+        !this.isExited &&
+        (_pendingHistory != null && _pendingHistory!.rawOutput.isNotEmpty)) {
+      return;
+    }
     _pendingHistory = _PendingHistory(
       rawOutput,
       throughOutputSeq,
@@ -832,8 +852,10 @@ class SessionVm {
       '$title ${rawOutput.length}B seq=$throughOutputSeq '
           'phase=${store.state.phase} viewReady=$_viewReady',
     );
-    if (!store.state.scrollbackReady || store.appliedLogBytes == null) {
-      store.dispatch(const Attach());
+    if (preservePendingLive ||
+        !store.state.scrollbackReady ||
+        store.appliedLogBytes == null) {
+      store.dispatch(Attach(preservePendingLive: preservePendingLive));
     }
     this.isExited = isExited;
     if (_viewReady) {
@@ -2214,6 +2236,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'InteractiveController',
+        // Lease-only: the snapshot is discarded, so probe with the minimum
+        // window instead of shipping a megabyte tail to throw away.
+        historyBytes: kHistoryLeaseProbeBytes,
       );
       // A disconnect in between resets leases: a zombie `true` here would
       // bypass the buffer-and-acquire path and drop input.
@@ -3492,8 +3517,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   int _nextLocalActivityStamp() {
     var newest = 0;
     for (final session in _sessions) {
-      if (session.lastInteractionMs > newest)
+      if (session.lastInteractionMs > newest) {
         newest = session.lastInteractionMs;
+      }
     }
     return newest + 1;
   }
@@ -4062,10 +4088,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Observer: loading a session to look at it must not steal the input
       // lease from another client (or agent) typing there. The first
       // keystroke acquires it through the buffer-and-flush path instead.
+      // First-page window: first paint waits on the viewport, and
+      // scrolling near the top re-attaches with a doubling window.
       final attachRes = await _client.attachSession(
         sessionId: sid,
         clientId: _clientId,
         mode: 'Observer',
+        historyBytes: kHistoryFirstWindowBytes,
       );
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
@@ -4669,7 +4698,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // and forth.
     final fittedCols = renderSize?.$2 ?? cols;
     final fittedRows = renderSize?.$1 ?? rowsVal;
-    final rawOutput = _rawOutputFromSnapshot(snapshot);
     final snapshotOutputSeq = snapshot['output_seq'] as int?;
     final snapshotRawOutputStart = snapshot['raw_output_start'] as int?;
     final exited = snapshot['exited'] as bool? ?? false;
@@ -4687,12 +4715,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // session, avoid clearing and re-emulating the buffer so scroll position and
     // existing scrollback are preserved.
     if (replayHistory || !session.loaded) {
+      final rawOutput = _rawOutputFromSnapshot(snapshot);
       session.applyHistory(
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
         isExited: exited,
       );
+      session.loaded = true;
     } else if (exited != session.isExited) {
       session.isExited = exited;
       if (exited) {
@@ -4981,6 +5011,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 sessionId: sid,
                 clientId: _clientId,
                 mode: 'Observer',
+                // Lease-only resync: the snapshot is discarded.
+                historyBytes: kHistoryLeaseProbeBytes,
               )
               .then((attachRes) {
                 if (_isStale(leaseGeneration)) return;
@@ -5049,6 +5081,98 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
+  /// Page older scrollback after a near-top scroll: re-attach with a
+  /// doubling history window (up to the platform replay budget) and replay
+  /// the wider tail. Stops at the log start (`historyStart == 0`) and
+  /// coalesces triggers behind one in-flight page.
+  Future<void> _pageHistoryUp(SessionVm session) async {
+    if (!_client.isConnected || !session.isRemote || !session.loaded) return;
+    if (session.pagingHistory) return;
+    final start = session.historyStart;
+    if (start == null || start <= 0) return;
+    final maxWindow = kIsWeb
+        ? kHistoryReplayWebMaxBytes
+        : kHistoryReplayMaxBytes;
+    final appliedBytes = session.store.appliedLogBytes;
+    final heldSpan = (appliedBytes != null && appliedBytes > start)
+        ? appliedBytes - start
+        : session.historyWindowBytes;
+    final currentWindow = max(session.historyWindowBytes, heldSpan);
+    final nextWindow = nextHistoryWindowBytes(
+      current: currentWindow,
+      max: maxWindow,
+    );
+    if (nextWindow <= currentWindow) return;
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    final generation = _connectGeneration;
+    session.pagingHistory = true;
+    session.store.beginHistoryPaging();
+    try {
+      // Observer: paging must not steal the lease from whoever is typing.
+      final attachRes = await _client.attachSession(
+        sessionId: sessionId,
+        clientId: _clientId,
+        mode: 'Observer',
+        historyBytes: nextWindow,
+      );
+      if (_isStale(generation) ||
+          _disposed ||
+          !_sessions.contains(session) ||
+          !session.store.isPagingHistory) {
+        return;
+      }
+      session.hasInputLease =
+          !session.isExited &&
+          !session.store.state.exited &&
+          _attachGrantsInputLease(attachRes);
+      final currentStart = session.historyStart;
+      if (currentStart == null || currentStart <= 0) {
+        return;
+      }
+      final responseObj = attachRes['response'] as Map<String, dynamic>?;
+      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      if (snapshot == null) return;
+      final rawOutput = _rawOutputFromSnapshot(snapshot);
+      if (rawOutput.isEmpty) return;
+      final rawOutputStart = snapshot['raw_output_start'] as int?;
+      if (rawOutputStart == null || rawOutputStart >= currentStart) {
+        if (rawOutputStart != null) {
+          session.historyWindowBytes = max(
+            session.historyWindowBytes,
+            nextWindow,
+          );
+        }
+        return;
+      }
+      session.terminalController.notifyHistoryPageStarted();
+      // Full replay, not a delta merge: the wider window extends backward,
+      // which the store's same-end branch would no-op. Reset the lifecycle
+      // inside applyHistory with preservePendingLive so the wider tail replays
+      // from its older start while live chunks buffered during the page RPC
+      // stay in _pendingLive (covered chunks drop as duplicates and newer
+      // chunks flush afterward).
+      session.historyWindowBytes = max(session.historyWindowBytes, nextWindow);
+      session.applyHistory(
+        rawOutput,
+        throughOutputSeq: snapshot['output_seq'] as int?,
+        rawOutputStart: rawOutputStart,
+        isExited:
+            (snapshot['exited'] == true) ||
+            session.isExited ||
+            session.store.state.exited,
+        preservePendingLive: true,
+      );
+    } on TriageAuthException {
+      _routeStaleAuthFailure(generation);
+    } catch (e) {
+      tdbg('history.page', 'page up failed for $sessionId: $e');
+    } finally {
+      session.store.endHistoryPaging();
+      session.pagingHistory = false;
+    }
+  }
+
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
     bool includeHistory = false,
@@ -5074,10 +5198,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
     try {
       // Observer: a refresh must not steal the lease from whoever is typing.
+      // Only fetch the held history window when the snapshot will actually be
+      // replayed; metadata-only refreshes (initial view-fit and rail switches
+      // onto an already-loaded live session) use the 1 KiB probe so they do
+      // not ship or gunzip discarded scrollback.
+      final needsHistory =
+          includeHistory ||
+          !session.loaded ||
+          session.isExited ||
+          session.store.state.exited;
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'Observer',
+        historyBytes: needsHistory
+            ? session.historyWindowBytes
+            : kHistoryLeaseProbeBytes,
       );
       // The purge or reconnect may have landed during the attach: returning
       // before the restore/resize branches keeps those writes off the new
@@ -5140,6 +5276,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               sessionId: sessionId,
               clientId: _clientId,
               mode: 'Observer',
+              historyBytes: session.historyWindowBytes,
             );
             if (_isStale(owningGeneration)) return;
             session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
@@ -5416,6 +5553,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             sessionId: sessionId,
             clientId: _clientId,
             mode: 'InteractiveController',
+            // Freshly spawned: no history yet, first-page window suffices.
+            historyBytes: kHistoryFirstWindowBytes,
           );
           // The daemon changed under us: this snapshot belongs to the one
           // we left, and the tile below must not land on the new rail.
@@ -5449,6 +5588,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 : plainRows,
             isRemote: true,
             isExited: exited,
+            loaded: true,
           );
           session.hasInputLease = _attachGrantsInputLease(attachRes);
           session.snippet = snapshot?['snippet'] as String?;
@@ -6077,6 +6217,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
+              onNearTop: () => _pageHistoryUp(currentSession),
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
@@ -10598,6 +10739,7 @@ class SessionWorkspace extends StatelessWidget {
     required this.connected,
     this.onCloseSession,
     this.onViewFit,
+    this.onNearTop,
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
@@ -10609,6 +10751,9 @@ class SessionWorkspace extends StatelessWidget {
   final bool connected;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
+  // The terminal scrolled near the top of its scrollback: page older
+  // history by re-attaching with a wider window.
+  final VoidCallback? onNearTop;
   // Mobile only: opens the session rail overlay from the workspace header.
   final VoidCallback? onOpenRail;
   // Re-asserts this device's terminal size on the shared PTY.
@@ -10647,6 +10792,7 @@ class SessionWorkspace extends StatelessWidget {
               session.noteViewFit(cols, rows);
               onViewFit?.call(cols, rows);
             },
+            onNearTop: onNearTop,
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',

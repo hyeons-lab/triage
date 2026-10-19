@@ -931,9 +931,15 @@ class TriageWebSocketClient {
     required String sessionId,
     required String clientId,
     String mode = 'InteractiveController',
+    int? historyBytes,
   }) async {
     return _send('attach_session', {
-      'request': {'session_id': sessionId, 'client_id': clientId, 'mode': mode},
+      'request': {
+        'session_id': sessionId,
+        'client_id': clientId,
+        'mode': mode,
+        if (historyBytes != null) 'history_bytes': historyBytes,
+      },
     });
   }
 
@@ -1708,6 +1714,7 @@ class TriageWebSocketClient {
           sessionId: request?['session_id'] as String?,
           clientId: request?['client_id'] as String?,
           mode: mode,
+          historyBytes: (request?['history_bytes'] as num?)?.toInt(),
         );
         break;
 

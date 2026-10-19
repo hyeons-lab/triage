@@ -1464,13 +1464,14 @@ mod tests {
     fn attach_request_can_use_interactive_controller_mode() {
         let request = ClientRequest::AttachSession {
             request: AttachSessionRequest {
+                history_bytes: None,
                 session_id: SessionId::new("session-1").unwrap(),
                 client_id: ClientId::new("client-1").unwrap(),
                 mode: AttachMode::InteractiveController,
             },
         };
 
-        let encoded = serde_json::to_value(request).unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
 
         assert_eq!(
             encoded,
@@ -1483,6 +1484,54 @@ mod tests {
                 },
             })
         );
+        let decoded_none: ClientRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded_none, request);
+
+        let fb_none = flatbuffers_proto::serialize_client_message(&ClientMessage {
+            id: Some(json!("req-none")),
+            request: request.clone(),
+        });
+        let root_none = ::flatbuffers::root::<
+            triage_core::generated::triage::generated::ClientMessage,
+        >(&fb_none)
+        .unwrap();
+        let parsed_fb_none = flatbuffers_proto::parse_client_message(root_none).unwrap();
+        assert_eq!(parsed_fb_none.request, request);
+
+        let capped_request = ClientRequest::AttachSession {
+            request: AttachSessionRequest {
+                history_bytes: Some(65_536),
+                session_id: SessionId::new("session-1").unwrap(),
+                client_id: ClientId::new("client-1").unwrap(),
+                mode: AttachMode::Observer,
+            },
+        };
+        let encoded_capped = serde_json::to_value(&capped_request).unwrap();
+        assert_eq!(
+            encoded_capped,
+            json!({
+                "type": "attach_session",
+                "request": {
+                    "session_id": "session-1",
+                    "client_id": "client-1",
+                    "mode": "Observer",
+                    "history_bytes": 65536,
+                },
+            })
+        );
+        let decoded_capped: ClientRequest = serde_json::from_value(encoded_capped).unwrap();
+        assert_eq!(decoded_capped, capped_request);
+
+        let fb_capped = flatbuffers_proto::serialize_client_message(&ClientMessage {
+            id: Some(json!("req-cap")),
+            request: capped_request.clone(),
+        });
+        let root_capped = ::flatbuffers::root::<
+            triage_core::generated::triage::generated::ClientMessage,
+        >(&fb_capped)
+        .unwrap();
+        let parsed_fb_capped = flatbuffers_proto::parse_client_message(root_capped).unwrap();
+        assert_eq!(parsed_fb_capped.request, capped_request);
     }
 
     struct FakeAuthenticator {

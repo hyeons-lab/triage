@@ -26,6 +26,11 @@ import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
+import 'package:triage_client/terminal/terminal_store.dart'
+    show
+        kHistoryFirstWindowBytes,
+        kHistoryLeaseProbeBytes,
+        kHistoryReplayMaxBytes;
 import 'package:triage_client/widgets/terminal_pane.dart';
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
@@ -108,6 +113,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> attachSessionCalls = [];
   // Parallel to [attachSessionCalls]: the attach mode per call.
   final List<String> attachSessionModes = [];
+  // Parallel to [attachSessionCalls]: the requested history_bytes cap per call.
+  final List<int?> attachSessionHistoryBytes = [];
+  Map<String, dynamic>? Function(String sessionId, int? historyBytes)?
+  attachSnapshotBuilder;
   // Lease holder the fake reports for Observer attaches, per session. Absent
   // means nobody holds it. Interactive attaches always grant to the caller,
   // mirroring the daemon's steal-on-attach.
@@ -256,9 +265,20 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required String sessionId,
     required String clientId,
     String mode = 'InteractiveController',
+    int? historyBytes,
   }) async {
     attachSessionCalls.add(sessionId);
     attachSessionModes.add(mode);
+    attachSessionHistoryBytes.add(historyBytes);
+    final customSnapshot = attachSnapshotBuilder?.call(sessionId, historyBytes);
+    if (customSnapshot != null) {
+      return {
+        'response': {
+          'snapshot': customSnapshot,
+          'lease': _attachLeaseFor(sessionId, clientId, mode),
+        },
+      };
+    }
     final attachCompleter = attachCompleters[sessionId];
     if (attachCompleter != null) {
       return attachCompleter.future;
@@ -5562,5 +5582,168 @@ void main() {
       expect(find.byIcon(Icons.keyboard), findsNothing);
       expect(find.byIcon(Icons.keyboard_hide), findsNothing);
     });
+  });
+
+  group('Lazy history attach & paging', () {
+    testWidgets(
+      'initial attach uses first-page cap, loaded re-select probes lease cap, and near-top paging doubles window until log start',
+      (WidgetTester tester) async {
+        const totalLogged = 100000;
+        final client = FakeTriageWebSocketClient();
+        client.attachSnapshotBuilder = (sessionId, historyBytes) {
+          final cap = historyBytes ?? totalLogged;
+          final rawStart = totalLogged > cap ? totalLogged - cap : 0;
+          return {
+            'context': {
+              'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
+            },
+            'size': {'rows': 24, 'cols': 80},
+            'exited': false,
+            'output_seq': 1,
+            'raw_output_start': rawStart,
+            'bytes_logged': totalLogged,
+            'raw_output': utf8.encode('line from $sessionId\r\n'),
+            'visible_rows': ['line from $sessionId'],
+          };
+        };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        // First attach for 'flutter-spike' requests the 64 KiB first window.
+        expect(client.attachSessionCalls, ['flutter-spike']);
+        expect(client.attachSessionHistoryBytes, [kHistoryFirstWindowBytes]);
+
+        // Switching to 'main' loads it for the first time with 64 KiB.
+        await tester.tap(find.text('triage / main').first);
+        await tester.pumpAndSettle();
+        expect(client.attachSessionCalls.last, 'main');
+        expect(client.attachSessionHistoryBytes.last, kHistoryFirstWindowBytes);
+
+        // Switching back to already-loaded 'flutter-spike' issues only the
+        // 1 KiB lease/metadata probe (both the select lease probe and the
+        // metadata-only refresh use kHistoryLeaseProbeBytes).
+        final callsBeforeReselect = client.attachSessionHistoryBytes.length;
+        await tester.tap(find.text('experiment/flutter-spike').first);
+        await tester.pumpAndSettle();
+        final reselectCaps = client.attachSessionHistoryBytes.sublist(
+          callsBeforeReselect,
+        );
+        expect(reselectCaps, isNotEmpty);
+        expect(
+          reselectCaps.every((cap) => cap == kHistoryLeaseProbeBytes),
+          isTrue,
+        );
+
+        // Triggering near-top paging doubles the window (64 KiB -> 128 KiB),
+        // which reaches raw_output_start == 0 for a 100 KB log.
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onNearTop!();
+        await tester.pumpAndSettle();
+        expect(client.attachSessionCalls.last, 'flutter-spike');
+        expect(
+          client.attachSessionHistoryBytes.last,
+          kHistoryFirstWindowBytes * 2,
+        );
+
+        // Once raw_output_start reaches 0, subsequent near-top triggers stop
+        // issuing further attaches.
+        final callsAtLogStart = client.attachSessionCalls.length;
+        pane.onNearTop!();
+        await tester.pumpAndSettle();
+        expect(client.attachSessionCalls.length, callsAtLogStart);
+      },
+    );
+
+    testWidgets(
+      'near-top paging sizes next window from live-grown heldSpan, bails when raw_output_start does not move backward, and preserves in-flight live chunks',
+      (WidgetTester tester) async {
+        const initialTotalLogged = 500000;
+        var nextSnapshotStart = initialTotalLogged - kHistoryFirstWindowBytes;
+        var nextSnapshotSeq = 1;
+        var nextSnapshotText = 'initial-page\r\n';
+        final client = FakeTriageWebSocketClient();
+        client.attachSnapshotBuilder = (sessionId, historyBytes) {
+          return {
+            'context': {'branch': sessionId},
+            'size': {'rows': 24, 'cols': 80},
+            'exited': false,
+            'output_seq': nextSnapshotSeq,
+            'raw_output_start': nextSnapshotStart,
+            'bytes_logged': initialTotalLogged,
+            'raw_output': utf8.encode(nextSnapshotText),
+            'visible_rows': ['row'],
+          };
+        };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+        expect(client.attachSessionHistoryBytes, [kHistoryFirstWindowBytes]);
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Stream live output so heldSpan (appliedLogBytes - start = 96 KiB)
+        // exceeds session.historyWindowBytes (64 KiB) while leaving headroom
+        // below kHistoryReplayMaxBytes (256 KiB) for a second page.
+        final initialTailLen = utf8.encode(nextSnapshotText).length;
+        final liveGrowthBytes = (96 * 1024) - initialTailLen;
+        client.emitOutput('flutter-spike', 'a' * liveGrowthBytes, outputSeq: 2);
+        await tester.pump();
+
+        // First near-top page: daemon returns the same raw_output_start (non-progressing),
+        // so the guard must bail without clearing or regressing the window, while
+        // requesting 2 * heldSpan (2 * 96 KiB = 192 KiB, not 2 * 64 KiB = 128 KiB).
+        pane.onNearTop!();
+        await tester.pumpAndSettle();
+        expect(client.attachSessionHistoryBytes.last, 192 * 1024);
+
+        // Second near-top page (192 KiB -> 256 KiB): gate attachSession on a Completer
+        // so we can inject a live Output chunk (seq 4) while the RPC is in flight.
+        client.attachSnapshotBuilder = null;
+        final attachCompleter = Completer<Map<String, dynamic>>();
+        client.attachCompleters['flutter-spike'] = attachCompleter;
+
+        pane.onNearTop!();
+        await tester.pump();
+        expect(client.attachSessionHistoryBytes.last, kHistoryReplayMaxBytes);
+
+        // Live chunk seq 4 arrives while attachSession (snapshot at seq 3) is in flight.
+        client.emitOutput(
+          'flutter-spike',
+          'live-during-page-flight\r\n',
+          outputSeq: 4,
+        );
+        await tester.pump();
+
+        attachCompleter.complete({
+          'response': {
+            'lease': {
+              'holder': {'client_id': 'test-client'},
+              'generation': 0,
+            },
+            'snapshot': {
+              'context': {'branch': 'flutter-spike'},
+              'size': {'rows': 24, 'cols': 80},
+              'exited': false,
+              'output_seq': 3,
+              'raw_output_start': 100000,
+              'bytes_logged': initialTotalLogged,
+              'raw_output': utf8.encode('paged-older-history\r\n'),
+              'visible_rows': ['row'],
+            },
+          },
+        });
+        await tester.pumpAndSettle();
+
+        final lines = pane.terminal.buffer.lines;
+        final bufferText = [
+          for (var i = 0; i < lines.length; i++) lines[i].toString(),
+        ].join('\n');
+        expect(bufferText, contains('paged-older-history'));
+        expect(bufferText, contains('live-during-page-flight'));
+      },
+    );
   });
 }

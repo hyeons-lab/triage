@@ -70,7 +70,12 @@ final class UserInput extends TerminalIntent {
 
 /// Session attach started; the store enters `awaitingHistory`.
 final class Attach extends TerminalIntent {
-  const Attach();
+  const Attach({this.preservePendingLive = false});
+
+  /// When true (used by backward history paging), retains live chunks buffered
+  /// while the widened attach RPC was in flight so post-snapshot chunks flush
+  /// after the wider tail replays.
+  final bool preservePendingLive;
 }
 
 /// Session detached; live/history writes stop until the next [Attach].
