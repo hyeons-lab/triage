@@ -5526,6 +5526,7 @@ void main() {
           home: Scaffold(
             body: WorkspaceHeader(
               session: headerSession(),
+              connected: true,
               softKeyboardEnabled: enabled,
               onToggleSoftKeyboard: onToggle,
             ),

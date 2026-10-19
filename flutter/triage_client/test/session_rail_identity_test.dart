@@ -592,7 +592,9 @@ void main() {
       // The two must actually differ, or the guard proves nothing.
       expect(session.displayTitle, isNot(session.railTitle));
 
-      await tester.pumpWidget(host(WorkspaceHeader(session: session)));
+      await tester.pumpWidget(
+        host(WorkspaceHeader(session: session, connected: true)),
+      );
       await tester.pump();
 
       // Not asserting railTitle's absence: the header also shows the branch in
@@ -616,6 +618,7 @@ void main() {
                 width: 360,
                 child: WorkspaceHeader(
                   session: session,
+                  connected: true,
                   onOpenRail: () {},
                   onToggleJudge: () {},
                   onRefit: () {},
@@ -651,6 +654,7 @@ void main() {
                 width: 800,
                 child: WorkspaceHeader(
                   session: session,
+                  connected: true,
                   onOpenRail: () {},
                   onToggleJudge: () {},
                   onRefit: () {},
@@ -805,6 +809,7 @@ void main() {
             showShellMenu: false,
             connectionStatus: 'connected',
             connectionStatusColor: const Color(0xff7fd1c7),
+            connected: true,
             onOpenSettings: () {},
             isCollapsed: false,
             onToggleCollapse: () {},
@@ -936,6 +941,7 @@ void main() {
             showShellMenu: false,
             connectionStatus: 'connected',
             connectionStatusColor: const Color(0xff7fd1c7),
+            connected: true,
             onOpenSettings: () {},
             isCollapsed: true,
             onToggleCollapse: () {},
@@ -969,6 +975,7 @@ void main() {
             showShellMenu: false,
             connectionStatus: 'connected',
             connectionStatusColor: const Color(0xff7fd1c7),
+            connected: true,
             onOpenSettings: () {},
             isCollapsed: false,
             onToggleCollapse: () {},
@@ -1086,6 +1093,7 @@ void main() {
               showShellMenu: false,
               connectionStatus: 'connected',
               connectionStatusColor: const Color(0xff7fd1c7),
+              connected: true,
               onOpenSettings: () {},
               isCollapsed: false,
               onToggleCollapse: () {},

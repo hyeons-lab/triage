@@ -1368,4 +1368,36 @@ void main() {
       );
     });
   });
+
+  group('millisSinceLastInbound', () {
+    test('is zero before connect, grows with silence, resets on traffic',
+        () async {
+      final sink = RecordingWebSocketSink();
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-json',
+      );
+      final client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      expect(client.millisSinceLastInbound, 0);
+
+      await client.connect();
+      final fresh = client.millisSinceLastInbound;
+      expect(fresh, lessThan(60000));
+
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+      final silent = client.millisSinceLastInbound;
+      expect(silent, greaterThan(fresh));
+
+      channel.addIncoming(jsonEncode({'type': 'session_started'}));
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(client.millisSinceLastInbound, lessThan(silent));
+
+      await client.disconnect();
+      expect(client.millisSinceLastInbound, 0);
+    });
+  });
 }

@@ -391,6 +391,78 @@ fn read_multi_segment_range_slices_compressed_segments() {
 }
 
 #[test]
+fn compressed_segment_size_is_memoized_per_file() {
+    let temp_dir = unique_test_dir();
+    let raw_path = temp_dir.join(segment_file_name(1));
+    let compressed_path = temp_dir.join(compressed_segment_file_name(1));
+
+    fs::write(&raw_path, b"0123456789").expect("write raw segment");
+    let compressed_len =
+        compress_segment_file(&raw_path, &compressed_path).expect("compress segment");
+    let info = SegmentFileInfo {
+        index: 1,
+        path: compressed_path.clone(),
+        is_compressed: true,
+        file_size: compressed_len,
+    };
+    assert_eq!(
+        get_segment_uncompressed_size(&info).expect("size"),
+        10,
+        "first read computes the size"
+    );
+    // Remove the on-disk `.zst` so the second read can only succeed if it
+    // hits `segment_size_cache()` rather than re-reading the file.
+    fs::remove_file(&compressed_path).expect("remove compressed segment");
+    assert_eq!(
+        get_segment_uncompressed_size(&info).expect("size"),
+        10,
+        "second read serves the memoized size without touching disk"
+    );
+
+    // A replaced file (different compressed size) must recompute, not
+    // serve the stale memoized value.
+    fs::write(&raw_path, b"0123456789ABCDEFGHIJ0123456789").expect("rewrite raw segment");
+    let new_len = compress_segment_file(&raw_path, &compressed_path).expect("recompress");
+    assert_ne!(new_len, compressed_len);
+    let info = SegmentFileInfo {
+        file_size: new_len,
+        ..info
+    };
+    assert_eq!(get_segment_uncompressed_size(&info).expect("size"), 30);
+
+    // Mid-rotation NotFound fallback: when `.tlog.zst` is absent on disk
+    // and the raw `.tlog` twin is read instead, that fallback size must
+    // not be cached under the `.zst` key.
+    let raw2 = temp_dir.join(segment_file_name(2));
+    let compressed2 = temp_dir.join(compressed_segment_file_name(2));
+    fs::write(&raw2, b"0123456789ABCDEFGHIJ").expect("write raw2");
+    let comp2_len = compress_segment_file(&raw2, &compressed2).expect("compress seg2");
+    let saved_zst = fs::read(&compressed2).expect("read compressed2");
+    fs::remove_file(&compressed2).expect("remove compressed2 for fallback");
+    fs::write(&raw2, b"short").expect("write short raw twin");
+    let info2 = SegmentFileInfo {
+        index: 2,
+        path: compressed2.clone(),
+        is_compressed: true,
+        file_size: comp2_len,
+    };
+    assert_eq!(
+        get_segment_uncompressed_size(&info2).expect("fallback size"),
+        5,
+        "missing .zst falls back to the raw .tlog twin"
+    );
+    fs::remove_file(&raw2).expect("remove raw twin");
+    fs::write(&compressed2, &saved_zst).expect("restore compressed2");
+    assert_eq!(
+        get_segment_uncompressed_size(&info2).expect("real zst size"),
+        20,
+        "the fallback read must not poison the .zst cache entry"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn resolve_active_segment_cases() {
     let temp_dir = unique_test_dir();
     let session_dir = temp_dir.join("session-active-seg");
