@@ -96,7 +96,13 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
         let file_name_str = file_name.to_string_lossy();
         if let Some((index, is_compressed)) = parse_segment_index(&file_name_str) {
             let path = entry.path();
-            let file_size = match entry.metadata() {
+            // Stat the file path directly rather than `entry.metadata()`: on
+            // Windows NTFS, `DirEntry::metadata()` returns the parent
+            // directory entry's cached size from `FindFirstFileW`, which stays
+            // at the last handle-close size while the active segment's writer
+            // handle is open. `fs::metadata(&path)` queries the file control
+            // block and observes live appends.
+            let file_size = match fs::metadata(&path) {
                 Ok(m) => m.len(),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {

@@ -97,6 +97,7 @@ writer (child not draining stdin).
   overlay short-tail arm); the compressed clamp-and-slice is one helper.
   Suite: 354 passed, same 8 pre-existing pairing failures.
 - 2026-10-19T06:17-0700 (agent-review-check-ci): gate `SerializedHandover` in `crates/triaged/src/session.rs` and its import in `crates/triaged/src/ipc.rs` with `#[cfg(unix)]` so Windows builds (`Test (windows-latest)`) do not fail with `E0433: cannot find unix in os` on `std::os::unix::io::RawFd` or emit an unused-import warning on `SerializedHandover`.
+- 2026-10-19T06:55-0700 (agent-review-check-ci): use `fs::metadata(&path)` instead of `entry.metadata()` in `list_session_segments` (`crates/triaged/src/storage.rs`) so `read_multi_segment_range` observes live appends to an open active segment file on Windows NTFS rather than the stale parent directory entry size returned by `DirEntry::metadata()`.
 
 ## Decisions
 
@@ -133,7 +134,8 @@ writer (child not draining stdin).
 - eb56815: fix(triaged): review findings from ingest failure audit
 - ab9cdc0: fix(triaged): complete ingest-failure review hardening
 - a4498b7: docs(devlog): record ingest-failure review rounds 2-8
-- HEAD: fix(triaged): gate SerializedHandover behind cfg(unix) for Windows builds
+- 9f68cc2: fix(triaged): gate SerializedHandover behind cfg(unix) for Windows builds
+- HEAD: fix(triaged): stat segment paths directly for live NTFS file sizes
 
 ## Progress
 
