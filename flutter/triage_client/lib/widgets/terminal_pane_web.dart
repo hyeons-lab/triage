@@ -112,10 +112,13 @@ class TerminalPane extends StatefulWidget {
     pane?._rebindViewListenersTo(controller);
   }
 
-  /// Live grid size as (rows, cols); null when unknown or below minimum.
+  /// Live grid size as (rows, cols); null when unknown, unfitted, or below minimum.
   /// Rows-first: destructure rows as $1, cols as $2.
   static (int, int)? getCachedTerminalSize(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    if (!_TerminalPaneState._sessionInitialFitCompleted.contains(sanitizedId)) {
+      return null;
+    }
     final term = _TerminalPaneState._sessionTerms[sanitizedId];
     if (term != null) {
       try {
@@ -128,6 +131,11 @@ class TerminalPane extends StatefulWidget {
     }
     return null;
   }
+
+  /// Last fitted workspace grid size as (rows, cols) across sessions; null
+  /// until at least one session in the workspace has fitted.
+  static (int, int)? getLastFittedWorkspaceSize() =>
+      _TerminalPaneState._lastWorkspaceFittedSize;
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -144,6 +152,51 @@ class _TerminalPaneState extends State<TerminalPane>
   static final Map<String, dynamic> _sessionOnScrollSubscriptions = {};
   static final Map<String, int> _sessionSavedViewportY = {};
   static final Map<String, TerminalController> _sessionBoundControllers = {};
+  static final Set<String> _sessionInitialFitCompleted = {};
+  static (int, int)? _lastWorkspaceFittedSize;
+  static String? _cachedXtermCssText;
+
+  static String? _extractXtermCssText() {
+    if (_cachedXtermCssText != null) return _cachedXtermCssText;
+    try {
+      final sheets = js_util.getProperty(html.document, 'styleSheets');
+      if (sheets != null) {
+        final length =
+            (js_util.getProperty(sheets, 'length') as num?)?.toInt() ?? 0;
+        for (var i = 0; i < length; i++) {
+          final sheet = js_util.callMethod(sheets, 'item', [i]);
+          if (sheet == null) continue;
+          final href = js_util.getProperty(sheet, 'href') as String?;
+          if (href != null && href.contains('xterm.css')) {
+            final rules = js_util.getProperty(sheet, 'cssRules');
+            if (rules != null) {
+              final rulesLen =
+                  (js_util.getProperty(rules, 'length') as num?)?.toInt() ?? 0;
+              if (rulesLen > 0) {
+                final buf = StringBuffer();
+                for (var j = 0; j < rulesLen; j++) {
+                  final rule = js_util.callMethod(rules, 'item', [j]);
+                  if (rule != null) {
+                    final cssText =
+                        js_util.getProperty(rule, 'cssText') as String?;
+                    if (cssText != null) {
+                      buf.writeln(cssText);
+                    }
+                  }
+                }
+                final result = buf.toString();
+                if (result.isNotEmpty) {
+                  _cachedXtermCssText = result;
+                  return result;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
 
   static bool _viewportIsAtBottom(
     html.Element container,
@@ -192,6 +245,7 @@ class _TerminalPaneState extends State<TerminalPane>
   static _TerminalPaneState? _currentMountedPane;
 
   static void _discardCachedSession(String sanitizedId) {
+    _TerminalPaneState._sessionInitialFitCompleted.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlArmed.remove(sanitizedId);
     _TerminalPaneState._sessionCtrlRebuild.remove(sanitizedId);
     _TerminalPaneState._sessionSavedViewportY.remove(sanitizedId);
@@ -275,6 +329,7 @@ class _TerminalPaneState extends State<TerminalPane>
   bool get _isUserGestureActive =>
       _activeTouchCount > 0 || _activePointerCount > 0;
   void Function(html.Event)? _containerPasteListener;
+  void Function(html.Event)? _containerScrollCaptureListener;
   void Function(html.Event)? _textareaBeforeInputListener;
   void Function(html.Event)? _textareaInputListener;
   void Function(html.Event)? _textareaCompositionEndListener;
@@ -333,7 +388,7 @@ class _TerminalPaneState extends State<TerminalPane>
   void _maskTerminalForReplay() {
     _replayMaskTimer?.cancel();
     _terminalWrapper.style.opacity = '0';
-    _replayMaskTimer = Timer(const Duration(milliseconds: 250), () {
+    _replayMaskTimer = Timer(const Duration(milliseconds: 400), () {
       _unmaskTerminalAfterReplay();
     });
   }
@@ -344,6 +399,52 @@ class _TerminalPaneState extends State<TerminalPane>
     try {
       if (_terminalWrapper.style.opacity == '0') {
         _terminalWrapper.style.opacity = '';
+      }
+    } catch (_) {}
+  }
+
+  /// Synchronizes `.xterm-viewport.scrollTop` and xterm's internal
+  /// `Viewport._lastScrollTop` with `buffer.active.viewportY`.
+  ///
+  /// When `HtmlElementView` unmounts and remounts a cached container, the
+  /// browser resets `.xterm-viewport.scrollTop` to 0 while xterm's internal
+  /// `ydisp` and `_lastScrollTop` still reflect the previous position (e.g.
+  /// `baseY`). Because `term.scrollToBottom()` / `term.scrollToLine(ydisp)`
+  /// compute `delta = target - ydisp == 0`, they become no-ops and leave
+  /// `.xterm-viewport.scrollTop` at 0; the next browser `scroll` event on
+  /// `.xterm-viewport` then causes xterm's `Viewport._handleScroll` to see
+  /// `scrollTop == 0` and yank `ydisp` to line 0 (top of scrollback).
+  void _syncTermViewportDomScroll([dynamic termObj]) {
+    try {
+      final term = termObj ?? _term;
+      if (term == null) return;
+      final core = js_util.getProperty(term, '_core');
+      if (core == null) return;
+      final viewport = js_util.getProperty(core, 'viewport');
+      if (viewport == null) return;
+      try {
+        js_util.callMethod(viewport, '_refresh', [true]);
+      } catch (_) {
+        js_util.callMethod(viewport, 'syncScrollArea', [true]);
+      }
+      final viewportElem =
+          js_util.getProperty(viewport, '_viewportElement') as html.Element? ??
+          _container.querySelector('.xterm-viewport');
+      final rowHeight =
+          (js_util.getProperty(viewport, '_currentRowHeight') as num?)
+              ?.toDouble() ??
+          0.0;
+      final buffer = js_util.getProperty(term, 'buffer');
+      final active = js_util.getProperty(buffer, 'active');
+      final viewportY =
+          (js_util.getProperty(active, 'viewportY') as num?)?.toInt() ?? 0;
+      if (viewportElem != null && rowHeight > 0) {
+        final expectedScrollTop = (viewportY * rowHeight).round();
+        if ((viewportElem.scrollTop - expectedScrollTop).abs() > 1) {
+          js_util.setProperty(viewport, '_ignoreNextScrollEvent', true);
+          viewportElem.scrollTop = expectedScrollTop;
+        }
+        js_util.setProperty(viewport, '_lastScrollTop', viewportElem.scrollTop);
       }
     } catch (_) {}
   }
@@ -520,7 +621,9 @@ class _TerminalPaneState extends State<TerminalPane>
       _term = cachedTerm;
       _fitAddon = cachedFitAddon;
       _initialized = true;
-      _initialContentWritten = true;
+      _initialContentWritten = _sessionInitialFitCompleted.contains(
+        sanitizedId,
+      );
       _styleSheetLoaded = true;
       // Re-inserting a cached DOM container via HtmlElementView resets
       // `.xterm-viewport.scrollTop` to 0 in all browsers; suppress scroll saves
@@ -539,7 +642,10 @@ class _TerminalPaneState extends State<TerminalPane>
       _bindTerminalSubscriptions();
       _bindContainerEvents();
       _setupResizeObserver();
-      if (_lastFittedCols != null && _lastFittedRows != null) {
+      _syncTermViewportDomScroll(_term);
+      if (_initialContentWritten &&
+          _lastFittedCols != null &&
+          _lastFittedRows != null) {
         _writeInitialContent(
           overrideCols: _lastFittedCols,
           overrideRows: _lastFittedRows,
@@ -553,34 +659,22 @@ class _TerminalPaneState extends State<TerminalPane>
         ..style.backgroundColor = '#0d1113'
         ..style.overflow = 'hidden';
 
-      // Inject xterm.css directly inside the container so it penetrates the Flutter Web platform view Shadow DOM
-      final link = html.LinkElement()
-        ..rel = 'stylesheet'
-        ..href = 'xterm.css';
-      link.onLoad.listen((_) {
-        if (mounted) {
-          // Wait for the browser to parse CSS and apply font styles to the Shadow DOM
-          Timer(const Duration(milliseconds: 150), () {
-            if (mounted) {
-              _styleSheetLoaded = true;
-              try {
-                _stableWidth = null;
-                _stableHeight = null;
-                _forceFinalizeTimer?.cancel();
-                _forceFinalizeTimer = null;
-                _triggerFitWithDelayedRetries();
-              } catch (_) {}
-            }
-          });
-        }
-      });
-      _container.append(link);
-
-      // Safety fallback in case stylesheet onLoad fails or is slow
-      Timer(const Duration(milliseconds: 600), () {
-        if (mounted && !_styleSheetLoaded) {
-          _styleSheetLoaded = true;
-          if (_initialized) {
+      // Inject xterm.css synchronously via an inline <style> copied from the
+      // document-level xterm.css stylesheet loaded in index.html so the
+      // Flutter Web platform view Shadow DOM has final font/layout styles on
+      // frame 0 without waiting for an async <link> fetch.
+      final inlineCss = _extractXtermCssText();
+      if (inlineCss != null && inlineCss.isNotEmpty) {
+        final style = html.StyleElement()..text = inlineCss;
+        _container.append(style);
+        _styleSheetLoaded = true;
+      } else {
+        final link = html.LinkElement()
+          ..rel = 'stylesheet'
+          ..href = 'xterm.css';
+        link.onLoad.listen((_) {
+          if (mounted) {
+            _styleSheetLoaded = true;
             try {
               _stableWidth = null;
               _stableHeight = null;
@@ -589,8 +683,25 @@ class _TerminalPaneState extends State<TerminalPane>
               _triggerFitWithDelayedRetries();
             } catch (_) {}
           }
-        }
-      });
+        });
+        _container.append(link);
+
+        // Safety fallback in case stylesheet onLoad fails or is slow
+        Timer(const Duration(milliseconds: 600), () {
+          if (mounted && !_styleSheetLoaded) {
+            _styleSheetLoaded = true;
+            if (_initialized) {
+              try {
+                _stableWidth = null;
+                _stableHeight = null;
+                _forceFinalizeTimer?.cancel();
+                _forceFinalizeTimer = null;
+                _triggerFitWithDelayedRetries();
+              } catch (_) {}
+            }
+          }
+        });
+      }
 
       final marginPx = _isMobile ? 8 : 16;
       _terminalWrapper = html.DivElement()
@@ -611,7 +722,6 @@ class _TerminalPaneState extends State<TerminalPane>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _initialized) {
         if (cachedContainer != null) {
-          _writeInitialContent();
           _triggerFitWithDelayedRetries();
           _restoreScrollPosition(requestFocus: widget.focusCursorRevision > 0);
         }
@@ -1094,6 +1204,15 @@ class _TerminalPaneState extends State<TerminalPane>
       js_util.setProperty(options, 'cursorInactiveStyle', 'block');
       js_util.setProperty(options, 'cursorBlink', !widget.isExited);
       js_util.setProperty(options, 'allowProposedApi', true);
+      final workspaceSize = _lastWorkspaceFittedSize;
+      if (workspaceSize != null &&
+          workspaceSize.$1 >= 5 &&
+          workspaceSize.$2 >= 10) {
+        js_util.setProperty(options, 'rows', workspaceSize.$1);
+        js_util.setProperty(options, 'cols', workspaceSize.$2);
+        _lastFittedRows = workspaceSize.$1;
+        _lastFittedCols = workspaceSize.$2;
+      }
 
       final terminalConstructor = js_util.getProperty(html.window, 'Terminal');
       _term = js_util.callConstructor(terminalConstructor, [options]);
@@ -1705,6 +1824,20 @@ class _TerminalPaneState extends State<TerminalPane>
     // `term.write` parses the replay payload avoids reflowing half-written
     // lines.
     _reconcileGridWithPixels();
+    try {
+      final cols = (js_util.getProperty(_term, 'cols') as num?)?.toInt() ?? 0;
+      final rows = (js_util.getProperty(_term, 'rows') as num?)?.toInt() ?? 0;
+      if (_styleSheetLoaded && cols >= 10 && rows >= 5) {
+        _stabilityTimer?.cancel();
+        _forceFinalizeTimer?.cancel();
+        _forceFinalizeTimer = null;
+        _initialContentWritten = true;
+        _sessionInitialFitCompleted.add(_sanitizedId);
+        _lastFittedCols = cols;
+        _lastFittedRows = rows;
+        _lastWorkspaceFittedSize = (rows, cols);
+      }
+    } catch (_) {}
     if (_sessionPendingClear[_sanitizedId] == true) {
       _maskTerminalForReplay();
     }
@@ -1799,6 +1932,7 @@ class _TerminalPaneState extends State<TerminalPane>
       _suppressScrollSaveFor(const Duration(milliseconds: 500));
       try {
         js_util.callMethod(_term, 'scrollToLine', [clamped]);
+        _syncTermViewportDomScroll();
       } catch (_) {}
       _unmaskTerminalAfterReplay();
       if (clamped >= baseY) {
@@ -2244,6 +2378,39 @@ class _TerminalPaneState extends State<TerminalPane>
 
     _containerPasteListener = pasteListener;
     _container.addEventListener('paste', pasteListener, true);
+
+    void scrollCaptureListener(html.Event event) {
+      if (!_suppressScrollSave || _isUserGestureActive) return;
+      final target = event.target;
+      if (target is! html.Element ||
+          !target.classes.contains('xterm-viewport')) {
+        return;
+      }
+      if (target.scrollTop != 0) return;
+      try {
+        final term = _term ?? _sessionTerms[_sanitizedId];
+        if (term == null) return;
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        final baseY =
+            (js_util.getProperty(active, 'baseY') as num?)?.toInt() ?? 0;
+        final savedY = _sessionSavedViewportY[_sanitizedId];
+        final desiredLine = (savedY != null && savedY >= 0 && savedY < baseY)
+            ? savedY
+            : baseY;
+        if (desiredLine <= 0) return;
+        event.stopImmediatePropagation();
+        if (savedY != null && savedY >= 0 && savedY < baseY) {
+          js_util.callMethod(term, 'scrollToLine', [savedY]);
+        } else {
+          js_util.callMethod(term, 'scrollToBottom', []);
+        }
+        _syncTermViewportDomScroll(term);
+      } catch (_) {}
+    }
+
+    _containerScrollCaptureListener = scrollCaptureListener;
+    _container.addEventListener('scroll', scrollCaptureListener, true);
     _bindTextareaEvents();
   }
 
@@ -2588,6 +2755,11 @@ class _TerminalPaneState extends State<TerminalPane>
       _container.removeEventListener('paste', pasteListener, true);
       _containerPasteListener = null;
     }
+    final scrollCaptureListener = _containerScrollCaptureListener;
+    if (scrollCaptureListener != null) {
+      _container.removeEventListener('scroll', scrollCaptureListener, true);
+      _containerScrollCaptureListener = null;
+    }
     _unbindTextareaEvents();
   }
 
@@ -2889,9 +3061,15 @@ class _TerminalPaneState extends State<TerminalPane>
     _forceFinalizeTimer?.cancel();
     _forceFinalizeTimer = null;
     _initialContentWritten = true;
+    _sessionInitialFitCompleted.add(_sanitizedId);
+    _lastFittedCols = fittedCols;
+    _lastFittedRows = fittedRows;
+    _lastWorkspaceFittedSize = (fittedRows, fittedCols);
     _writeInitialContent(overrideCols: fittedCols, overrideRows: fittedRows);
     _flushPendingLiveWrites();
-    _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
+    if (widget.onViewFit == null) {
+      _sessionInputRouter.sendResizeOut(_sanitizedId, fittedCols, fittedRows);
+    }
   }
 
   /// Sends a debounced resize-out now instead of letting it die with this
@@ -2938,6 +3116,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
   void _onFit() {
     if (!mounted || !_initialized) return;
+    if (!_initialContentWritten && !_styleSheetLoaded) return;
     try {
       final width = _terminalWrapper.clientWidth;
       final height = _terminalWrapper.clientHeight;
@@ -2968,6 +3147,7 @@ class _TerminalPaneState extends State<TerminalPane>
           } else {
             try {
               js_util.callMethod(_term, 'scrollToBottom', []);
+              _syncTermViewportDomScroll();
             } catch (_) {}
           }
         } else {
@@ -2975,6 +3155,7 @@ class _TerminalPaneState extends State<TerminalPane>
           if (savedY != null) {
             try {
               js_util.callMethod(_term, 'scrollToLine', [savedY]);
+              _syncTermViewportDomScroll();
             } catch (_) {}
           }
         }
@@ -2984,6 +3165,8 @@ class _TerminalPaneState extends State<TerminalPane>
               _lastFittedRows != fittedRows || _lastFittedCols != fittedCols;
           _lastFittedRows = fittedRows;
           _lastFittedCols = fittedCols;
+          final hadPriorWorkspaceFit = _lastWorkspaceFittedSize != null;
+          _lastWorkspaceFittedSize = (fittedRows, fittedCols);
           if (sizeChanged && _initialContentWritten) {
             _resizeDebounceTimer?.cancel();
             _pendingResizeOutCols = fittedCols;
@@ -3002,11 +3185,8 @@ class _TerminalPaneState extends State<TerminalPane>
           }
 
           if (!_initialContentWritten) {
-            if (!_styleSheetLoaded) {
-              return;
-            }
-            if (fittedCols < 10) {
-              // Wait until the layout has expanded to a reasonable size to prevent premature narrow wrapping
+            if (hadPriorWorkspaceFit) {
+              _finishInitialContent(fittedCols, fittedRows);
               return;
             }
             // Backstop: arm once now that we have a valid sized fit. The
@@ -3031,7 +3211,7 @@ class _TerminalPaneState extends State<TerminalPane>
               _stableWidth = dWidth;
               _stableHeight = dHeight;
               _stabilityTimer?.cancel();
-              _stabilityTimer = Timer(const Duration(milliseconds: 250), () {
+              _stabilityTimer = Timer(const Duration(milliseconds: 50), () {
                 if (mounted && !_initialContentWritten) {
                   _finishInitialContent(fittedCols, fittedRows);
                 }
@@ -3128,12 +3308,27 @@ class _TerminalPaneState extends State<TerminalPane>
         } else {
           js_util.callMethod(_term, 'scrollToBottom', []);
         }
+        _syncTermViewportDomScroll();
       } catch (_) {}
       _unmaskTerminalAfterReplay();
       if (requestFocus) {
         _activateTerminal();
       }
       _suppressScrollSaveFor(const Duration(milliseconds: 1000));
+    }
+
+    if (_replayMaskTimer == null &&
+        _sessionPendingClear[_sanitizedId] != true) {
+      _suppressScrollSave = true;
+      final savedY = _sessionSavedViewportY[_sanitizedId];
+      try {
+        if (savedY != null && savedY >= 0) {
+          js_util.callMethod(_term, 'scrollToLine', [savedY]);
+        } else {
+          js_util.callMethod(_term, 'scrollToBottom', []);
+        }
+        _syncTermViewportDomScroll();
+      } catch (_) {}
     }
 
     _flushSessionWrites(_sanitizedId, onComplete: jump);
@@ -3207,50 +3402,57 @@ class _TerminalPaneState extends State<TerminalPane>
     }
     if (oldWidget.isLoading != widget.isLoading) {
       _syncPointerEvents();
-      if (!widget.isLoading) {
+      if (!widget.isLoading && _replayMaskTimer == null) {
         _restoreScrollPosition(requestFocus: false);
       }
     }
     if (oldWidget.controller != widget.controller ||
         oldWidget.terminalId != widget.terminalId) {
+      final alreadyRebound =
+          oldWidget.terminalId == widget.terminalId &&
+          identical(_boundViewController, widget.controller) &&
+          identical(_sessionBoundControllers[_sanitizedId], widget.controller);
       tdbg(
         'pane.didUpdate',
         '$_sanitizedId controller changed '
             'ctrl#${identityHashCode(oldWidget.controller)} -> '
-            'ctrl#${identityHashCode(widget.controller)}',
+            'ctrl#${identityHashCode(widget.controller)} '
+            '(alreadyRebound=$alreadyRebound)',
       );
-      _unmaskTerminalAfterReplay();
-      _clearPageAnchor();
-      _scrollToCursorTimer?.cancel();
-      _scrollToCursorTimer = null;
-      dismissNoOlderScrollback();
-      _flushPendingJiggleRestore();
-      _unbindControllerFrom(oldWidget.controller);
-      _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
-      _inputRouteToken = _sessionInputRouter.bind(
-        _sanitizedId,
-        widget.controller,
-      );
-      _bindController();
-      _containerEventOwners[_sanitizedId] = this;
-      if (_initialized) {
-        final fittedRows =
-            ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
-            _lastFittedRows ??
-            24);
-        final fittedCols =
-            ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
-            _lastFittedCols ??
-            80);
-        widget.onViewFit?.call(fittedCols, fittedRows);
-        if (fittedRows >= 5 && fittedCols >= 10) {
-          _sessionInputRouter.sendResizeOut(
-            _sanitizedId,
-            fittedCols,
-            fittedRows,
-          );
+      if (!alreadyRebound) {
+        _unmaskTerminalAfterReplay();
+        _clearPageAnchor();
+        _scrollToCursorTimer?.cancel();
+        _scrollToCursorTimer = null;
+        dismissNoOlderScrollback();
+        _flushPendingJiggleRestore();
+        _unbindControllerFrom(oldWidget.controller);
+        _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
+        _inputRouteToken = _sessionInputRouter.bind(
+          _sanitizedId,
+          widget.controller,
+        );
+        _bindController();
+        _containerEventOwners[_sanitizedId] = this;
+        if (_initialized) {
+          if (_initialContentWritten) {
+            final fittedRows =
+                ((js_util.getProperty(_term, 'rows') as num?)?.toInt() ??
+                _lastFittedRows ??
+                24);
+            final fittedCols =
+                ((js_util.getProperty(_term, 'cols') as num?)?.toInt() ??
+                _lastFittedCols ??
+                80);
+            widget.onViewFit?.call(fittedCols, fittedRows);
+          }
+          _onFit();
         }
-        _onFit();
+      } else {
+        _containerEventOwners[_sanitizedId] = this;
+        if (_initialized && !_initialContentWritten) {
+          _onFit();
+        }
       }
       _activateTerminal(force: true);
       _scheduleFocusRetries(force: true);

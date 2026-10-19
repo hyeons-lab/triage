@@ -4079,7 +4079,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.worktreeRoot ??= oldSession.worktreeRoot;
         }
         regrouped = session.repoRoot != oldSession.repoRoot;
-        final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+        oldSession.dispose();
+        if (oldSession.title != session.title) {
+          TerminalPane.destroySession(oldSession.title);
+        }
+        _sessions[existingIndex] = session;
+        // Rebind the mounted pane to the replacement's TerminalController
+        // BEFORE `noteViewFit` flushes staged history so the pane's
+        // `_onHistoryReplayed` listener receives the notification, masks the
+        // terminal during `term.write`, and jumps directly to bottom before
+        // unmasking.
+        TerminalPane.rebindSessionController(
+          session.title,
+          session.terminalController,
+        );
+        final cachedSize =
+            TerminalPane.getCachedTerminalSize(session.title) ??
+            TerminalPane.getLastFittedWorkspaceSize();
         if (cachedSize != null) {
           session.hasFitted = true;
           session.lastFittedRows = cachedSize.$1;
@@ -4109,20 +4125,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
           }
         }
-        oldSession.dispose();
-        if (oldSession.title != session.title) {
-          TerminalPane.destroySession(oldSession.title);
-        }
-        _sessions[existingIndex] = session;
-        // The replacement carries its own TerminalController. A pane that is
-        // already mounted for this session is not necessarily rebuilt by this
-        // setState, and without a rebuild it never sees the swap — it keeps
-        // listening to the placeholder's controller while the store writes to
-        // the new one, so the emulator exists and decodes nothing to screen.
-        TerminalPane.rebindSessionController(
-          session.title,
-          session.terminalController,
-        );
       });
       if (regrouped) _regroupRail();
       _drainPendingEvents(sid);
@@ -4151,7 +4153,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             }
           } catch (_) {}
         }());
-        session.terminalController.refit();
+        session.terminalController.fit();
       }
     } on TriageAuthException {
       // The daemon refused the attach: this client is no longer paired. Painting
@@ -4205,7 +4207,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         (s) => s?.remoteSessionId == sid,
         orElse: () => null,
       );
-      final cachedSize = TerminalPane.getCachedTerminalSize('triage / $sid');
+      final cachedSize =
+          TerminalPane.getCachedTerminalSize('triage / $sid') ??
+          TerminalPane.getLastFittedWorkspaceSize();
       final knownFittedRows =
           cachedSize?.$1 ?? existing?.ownFittedRows ?? existing?.lastFittedRows;
       final knownFittedCols =
@@ -4217,7 +4221,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       final replayTargetSize =
           knownTargetSize ??
-          (includeHistory
+          (includeHistory && (!kIsWeb || preAttachSnapshot['exited'] == true)
               ? _estimatedTerminalRestoreSize(
                   preAttachSnapshot['size'] as Map<String, dynamic>?,
                 )
@@ -4434,7 +4438,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     SessionVm session,
     Map<String, dynamic>? fallbackSize,
   ) {
-    final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+    final cachedSize =
+        TerminalPane.getCachedTerminalSize(session.title) ??
+        TerminalPane.getLastFittedWorkspaceSize();
     final cols =
         cachedSize?.$2 ?? session.ownFittedCols ?? session.lastFittedCols;
     final rows =
@@ -5196,7 +5202,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.noteViewFit(cols, rows);
     if (!session.hasFitted) {
       session.hasFitted = true;
-      if (session.isRemote && _client.isConnected) {
+      if (session.loaded && session.isRemote && _client.isConnected) {
         unawaited(
           _refreshSessionSnapshot(
             session,
@@ -5204,6 +5210,27 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             owningGeneration: _connectGeneration,
           ),
         );
+      }
+    } else if (kIsWeb &&
+        session.loaded &&
+        session.isRemote &&
+        !session.isExited &&
+        _clientForeground &&
+        _client.isConnected &&
+        (session.hostSizeCols != cols || session.hostSizeRows != rows)) {
+      final sid = session.remoteSessionId;
+      if (sid != null) {
+        final generation = _connectGeneration;
+        unawaited(() async {
+          if (_isStale(generation)) return;
+          try {
+            await _client.resizeSession(sessionId: sid, cols: cols, rows: rows);
+            if (!_isStale(generation)) {
+              session.hostSizeCols = cols;
+              session.hostSizeRows = rows;
+            }
+          } catch (_) {}
+        }());
       }
     }
   }

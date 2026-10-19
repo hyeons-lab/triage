@@ -108,6 +108,9 @@ class TerminalPane extends StatefulWidget {
         _TerminalPaneState._sessionLastGridSize[terminalId];
   }
 
+  /// Last fitted workspace grid size as (rows, cols) on web; null on native.
+  static (int, int)? getLastFittedWorkspaceSize() => null;
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }
@@ -659,6 +662,7 @@ class _TerminalPaneState extends State<TerminalPane>
       }
     });
   }
+
   // Remember where the current selection is anchored so a shift-click can extend
   // from it. Skipped while we are doing the extending ourselves so the anchor
   // stays pinned to the original start across repeated shift-clicks.
