@@ -28,7 +28,7 @@ const int kPendingLiveByteCap = 1024 * 1024;
 /// are the viewport plus scrollback the user actually sees, and live output
 /// keeps accumulating past them. Older scrollback stays in the daemon log for
 /// a future scroll-up paging pass to fetch on demand.
-const int kHistoryReplayMaxLines = 10000;
+const int kHistoryReplayMaxLines = 1000;
 const int kHistoryReplayMaxBytes = 256 * 1024;
 
 /// Web replay budget: xterm.js parses `write` payloads incrementally without
@@ -62,25 +62,62 @@ int nextHistoryWindowBytes({required int current, required int max}) {
   return doubled >= max ? max : doubled;
 }
 
-/// Trims a full-replay history payload to its newest complete lines.
+/// Both emulators' scrollback capacity in lines (xterm.dart `maxLines` and
+/// the xterm.js `scrollback` option): the backstop the scaled line budget
+/// below can never exceed.
+const int kEmulatorMaxScrollbackLines = 50000;
+
+/// Replay-trim budgets for a served history window, in
+/// ([maxLines], [maxBytes]) kept newest-first by [trimHistoryTail].
+///
+/// The line budget scales with the window so each deeper page emulates
+/// strictly more than the last: trimming every page to the first-page
+/// budget replays the same suffix of the same log end over and over and
+/// the buffer never grows. The byte budget is the window itself, so a
+/// page never parses more than it asked for. A null window (local seeds
+/// and other replays that were never windowed) keeps the platform
+/// budgets, exactly as before.
+({int maxLines, int maxBytes}) historyTrimBudgetsForWindow(
+  int? windowBytes, {
+  required bool web,
+}) {
+  final platformLines = web ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines;
+  final platformBytes = web ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+  if (windowBytes == null || windowBytes <= 0) {
+    return (maxLines: platformLines, maxBytes: platformBytes);
+  }
+  final scaledLines =
+      platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
+  return (
+    maxLines: scaledLines.clamp(platformLines, kEmulatorMaxScrollbackLines),
+    maxBytes: min(windowBytes, platformBytes),
+  );
+}
+
+/// Trims a full-replay history payload to its newest complete lines and
+/// reports how many leading raw bytes were dropped (`droppedBytes`).
 ///
 /// xterm is append-only, so a replay must still arrive oldest-first; this keeps
 /// the last [maxLines] lines (a trailing newline terminates the last line
 /// rather than starting an empty one) and at most [maxBytes] bytes, so first
 /// paint waits on the viewport instead of the whole tail. A trimmed payload is
 /// prefixed with an SGR reset so rendition state set before the cut cannot
-/// bleed into it; an untrimmed payload — including empty, which the caller
-/// treats as a no-op — is returned untouched.
+/// bleed into it; an untrimmed payload (including empty, which the caller
+/// treats as a no-op) is returned untouched.
 ///
-/// Baselines are the caller's job: trimming drops a prefix, so the log end
-/// offset stays `rawStart + original.length`, never the trimmed length.
-List<int> trimHistoryTail(
+/// `droppedBytes` measures the exact cut offset in the caller's input [bytes]
+/// so `rawStart + droppedBytes` is the true log offset of the oldest retained
+/// byte, while the log end offset stays `rawStart + original.length`.
+({List<int> bytes, int droppedBytes}) trimHistoryTailWithOffset(
   List<int> bytes, {
   required int maxLines,
   required int maxBytes,
 }) {
   if (bytes.isEmpty || maxLines <= 0 || maxBytes <= 0) {
-    return bytes.isEmpty ? bytes : const <int>[];
+    return (
+      bytes: bytes.isEmpty ? bytes : const <int>[],
+      droppedBytes: bytes.length,
+    );
   }
   var end = bytes.length;
   if (bytes[end - 1] == 0x0a) end--;
@@ -123,10 +160,26 @@ List<int> trimHistoryTail(
       }
     }
   }
-  if (start <= 0) return bytes;
+  if (start <= 0) {
+    return (bytes: bytes, droppedBytes: 0);
+  }
   const reset = <int>[0x1b, 0x5b, 0x30, 0x6d]; // ESC [ 0 m
-  return [...reset, ...bytes.sublist(start)];
+  return (
+    bytes: [...reset, ...bytes.sublist(start)],
+    droppedBytes: start,
+  );
 }
+
+List<int> trimHistoryTail(
+  List<int> bytes, {
+  required int maxLines,
+  required int maxBytes,
+}) =>
+    trimHistoryTailWithOffset(
+      bytes,
+      maxLines: maxLines,
+      maxBytes: maxBytes,
+    ).bytes;
 
 /// How far below the dedup baseline an `output_seq` may fall and still be a
 /// re-delivery rather than a fresh numbering epoch.
@@ -409,6 +462,7 @@ class TerminalStore extends ChangeNotifier {
         :final rows,
         :final throughOutputSeq,
         :final rawOutputStart,
+        :final windowBytes,
       ):
         return _reduceHistory(
           s,
@@ -417,6 +471,7 @@ class TerminalStore extends ChangeNotifier {
           rows,
           throughOutputSeq,
           rawOutputStart: rawOutputStart,
+          windowBytes: windowBytes,
         );
 
       case LiveBytes(:final bytes, :final outputSeq):
@@ -459,6 +514,7 @@ class TerminalStore extends ChangeNotifier {
     int rows,
     int? throughOutputSeq, {
     int? rawOutputStart,
+    int? windowBytes,
   }) {
     _pagingHistory = false;
     // Replay at the client's target grid size ([cols] x [rows], the current
@@ -640,23 +696,30 @@ class TerminalStore extends ChangeNotifier {
     _beginHostInputSuppression();
     // Viewport-first: replay only the newest lines so a megabyte tail doesn't
     // stall first paint; the baseline below still uses the original end offset
-    // (trimming drops a prefix) so delta merges stay anchored.
+    // (trimming drops a prefix) so delta merges stay anchored. The budgets
+    // scale with the served window so each deeper page emulates more than
+    // the last instead of replaying the same trimmed suffix.
     // `kIsWeb` selects the xterm.js sink exactly: every other target parses
     // through package:xterm on the UI thread.
-    final replayBytes = trimHistoryTail(
+    final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
+    final trimmed = trimHistoryTailWithOffset(
       bytes,
-      maxLines: kIsWeb ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines,
-      maxBytes: kIsWeb ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes,
+      maxLines: budgets.maxLines,
+      maxBytes: budgets.maxBytes,
     );
+    final replayBytes = trimmed.bytes;
     if (!identical(replayBytes, bytes)) {
       tdbg(
         'store.history',
-        'TRIMMED replay ${bytes.length}B -> ${replayBytes.length}B',
+        'TRIMMED replay ${bytes.length}B -> ${replayBytes.length}B '
+            '(dropped=${trimmed.droppedBytes}B)',
       );
     }
     _writeDecoded(replayBytes);
 
-    _appliedHistoryStart = rawStart;
+    _appliedHistoryStart = rawStart != null
+        ? rawStart + trimmed.droppedBytes
+        : null;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;
     } else {

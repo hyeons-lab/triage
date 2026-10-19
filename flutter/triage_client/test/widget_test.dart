@@ -32,6 +32,12 @@ import 'package:triage_client/terminal/terminal_store.dart'
         kHistoryLeaseProbeBytes,
         kHistoryReplayMaxBytes;
 import 'package:triage_client/widgets/terminal_pane.dart';
+import 'package:xterm/xterm.dart' as xt;
+
+/// One history window a test serves for a session: the raw tail bytes, the
+/// absolute log offset they start at, and the output sequence they run
+/// through. Pages over the same log end share [seq] with an older [start].
+typedef FakeHistoryWindow = ({List<int> bytes, int start, int seq});
 
 class FakeTriageWebSocketClient extends TriageWebSocketClient {
   FakeTriageWebSocketClient({
@@ -117,6 +123,24 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<int?> attachSessionHistoryBytes = [];
   Map<String, dynamic>? Function(String sessionId, int? historyBytes)?
   attachSnapshotBuilder;
+  // History served per session per requested window. When a session has an
+  // entry, its attach snapshots carry raw_output/raw_output_start for the
+  // requested window (falling back to the first entry when the exact window
+  // is not keyed); sessions without one attach history-less, as before.
+  final Map<String, Map<int, FakeHistoryWindow>> attachHistoryWindows = {};
+
+  Map<String, dynamic> _historyKeysFor(String sessionId, int? window) {
+    final byWindow = attachHistoryWindows[sessionId];
+    if (byWindow == null || byWindow.isEmpty) return const {};
+    final served =
+        byWindow[window] ?? byWindow.entries.first.value;
+    return {
+      'raw_output': served.bytes,
+      'raw_output_start': served.start,
+      'bytes_logged': served.start + served.bytes.length,
+      'output_seq': served.seq,
+    };
+  }
   // Lease holder the fake reports for Observer attaches, per session. Absent
   // means nobody holds it. Interactive attaches always grant to the caller,
   // mirroring the daemon's steal-on-attach.
@@ -300,6 +324,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           'snapshot': {
             'size': _snapshotSize,
             'exited': exitedSessionIds.contains(sessionId),
+            ..._historyKeysFor(sessionId, historyBytes),
             'visible_rows': visibleRows,
             'styled_rows': visibleRows
                 .map(
@@ -331,6 +356,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       'response': {
         'lease': _attachLeaseFor(sessionId, clientId, mode),
         'snapshot': {
+          ..._historyKeysFor(sessionId, historyBytes),
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
             // Normally absent, matching a daemon that reports only the branch on
@@ -5525,6 +5551,307 @@ void main() {
     );
   });
 
+  group('history paging', () {
+    List<int> historyLines(int from, int to) {
+      final buf = StringBuffer();
+      for (var i = from; i < to; i++) {
+        buf.writeln('history line $i');
+      }
+      return utf8.encode(buf.toString());
+    }
+
+    List<StyledRow> fallbackRows(int count) => List.generate(
+      count,
+      (i) => StyledRow(
+        spans: [
+          StyledSpan(text: 'Log line $i', style: const TerminalStyle()),
+        ],
+      ),
+    );
+
+    List<int?> windowsFor(FakeTriageWebSocketClient client, String sid) => [
+      for (var i = 0; i < client.attachSessionCalls.length; i++)
+        if (client.attachSessionCalls[i] == sid &&
+            client.attachSessionHistoryBytes[i] != kHistoryLeaseProbeBytes)
+          client.attachSessionHistoryBytes[i],
+    ];
+
+    testWidgets(
+      'scrolling to the top re-attaches with a doubled window and grows buffer past 1000 lines',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        // 1,200 lines in the first window trims to the 1,000-line first-page
+        // budget; 2,000 lines in the 128 KiB window scales the budget to 2,000
+        // lines and grows the terminal buffer past 1,500 lines.
+        final first = historyLines(800, 2000);
+        final second = historyLines(0, 2000);
+        client.attachHistoryWindows['flutter-spike'] = {
+          65536: (bytes: first, start: 100000, seq: 7),
+          131072: (
+            bytes: second,
+            start: 100000 - (second.length - first.length),
+            seq: 7,
+          ),
+        };
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(milliseconds: 1600));
+
+        expect(windowsFor(client, 'flutter-spike'), [65536]);
+        final firstLines = pane.terminal.buffer.lines.length;
+        expect(firstLines, greaterThanOrEqualTo(1000));
+        expect(firstLines, lessThan(1100));
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        controller.jumpTo(0);
+        await tester.pumpAndSettle();
+
+        expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
+        expect(
+          pane.terminal.buffer.lines.length,
+          greaterThan(firstLines + 500),
+        );
+      },
+    );
+
+    testWidgets(
+      'scrolling to the top when raw_output_start is 0 but first-page line trim dropped lines still pages 128 KiB and stops once all lines are retained',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        // 1,800 lines (~31 KiB) fits inside the first 64 KiB byte window so
+        // the daemon reports raw_output_start == 0 on both 64 KiB and 128 KiB,
+        // while the 1,000-line first-page trim drops the oldest 800 lines.
+        final payload = historyLines(0, 1800);
+        expect(payload.length, lessThan(65536));
+        client.attachHistoryWindows['flutter-spike'] = {
+          65536: (bytes: payload, start: 0, seq: 7),
+          131072: (bytes: payload, start: 0, seq: 7),
+        };
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(milliseconds: 1600));
+
+        expect(windowsFor(client, 'flutter-spike'), [65536]);
+        final firstLines = pane.terminal.buffer.lines.length;
+        expect(firstLines, greaterThanOrEqualTo(1000));
+        expect(firstLines, lessThan(1100));
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        controller.jumpTo(0);
+        await tester.pumpAndSettle();
+
+        expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
+        expect(
+          pane.terminal.buffer.lines.length,
+          greaterThan(firstLines + 700),
+        );
+
+        // Once all 1,800 lines are retained at raw_output_start == 0,
+        // effectiveStart is 0 and a subsequent scroll-to-top does not page.
+        await tester.pump(const Duration(milliseconds: 1600));
+        controller.jumpTo(0);
+        await tester.pumpAndSettle();
+        expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
+      },
+    );
+
+    testWidgets(
+      'barren pages in TriageClientApp auto-continue through max window, show NoOlderScrollbackPill, and auto-dismiss after 3 seconds',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Log line $i',
+        );
+        final barrenBytes = historyLines(0, 100);
+        // Compaction floor at raw_output_start == 100000: widening the window
+        // from 64 KiB -> 128 KiB -> 256 KiB returns the same start and bytes.
+        client.attachHistoryWindows['flutter-spike'] = {
+          65536: (bytes: barrenBytes, start: 100000, seq: 7),
+          131072: (bytes: barrenBytes, start: 100000, seq: 7),
+          262144: (bytes: barrenBytes, start: 100000, seq: 7),
+        };
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(milliseconds: 1600));
+        expect(windowsFor(client, 'flutter-spike'), [65536]);
+
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final controller = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        controller.jumpTo(0);
+        // Pump frames to let 128 KiB and 256 KiB auto-continue and exhaust at
+        // 256 KiB without advancing past the 3-second pill auto-hide timer.
+        for (var i = 0; i < 6; i++) {
+          await tester.pump(const Duration(milliseconds: 20));
+        }
+
+        expect(
+          windowsFor(client, 'flutter-spike'),
+          [65536, 131072, 262144],
+        );
+        expect(find.text('No older scrollback in reach'), findsOneWidget);
+
+        await tester.pump(const Duration(seconds: 3));
+        expect(find.text('No older scrollback in reach'), findsNothing);
+      },
+    );
+
+    Future<void> pumpStandalonePane(
+      WidgetTester tester, {
+      required TerminalController controller,
+      required xt.Terminal terminal,
+      required String terminalId,
+      bool Function()? onNearTop,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TerminalPane(
+              terminalId: terminalId,
+              controller: controller,
+              terminal: terminal,
+              fallbackRows: fallbackRows(100),
+              onTerminalResizeBind: (_) {},
+              focusCursorRevision: 0,
+              onNearTop: onNearTop,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a barren page auto-continues, then reports no older scrollback', (
+      WidgetTester tester,
+    ) async {
+      final controller = TerminalController();
+      final terminal = xt.Terminal(maxLines: 50000);
+      var pages = 0;
+      bool onNearTop() {
+        pages++;
+        // The first two launches land (barren); the third is gated.
+        return pages < 3;
+      }
+
+      await pumpStandalonePane(
+        tester,
+        controller: controller,
+        terminal: terminal,
+        terminalId: 'paging-barren-test',
+        onNearTop: onNearTop,
+      );
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final scrollController = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      // The scrolled-up user whose page landed with no new lines.
+      scrollController.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+
+      // First landed page is barren: auto-continue with a deeper window.
+      controller.notifyHistoryPageStarted();
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 2);
+      expect(find.text('No older scrollback in reach'), findsNothing);
+
+      // Second landed page is barren too, and the deeper page is gated:
+      // report the exhausted scrollback instead of going silently inert.
+      controller.notifyHistoryPageStarted();
+      controller.notifyHistoryReplayed();
+      await tester.pump();
+      await tester.pump();
+      expect(pages, 3);
+      expect(find.text('No older scrollback in reach'), findsOneWidget);
+
+      // A subsequent fruitful page dismisses the pill immediately.
+      controller.notifyHistoryPageStarted();
+      terminal.write('older line\n' * 30);
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(find.text('No older scrollback in reach'), findsNothing);
+    });
+
+    testWidgets('a fruitful page neither continues nor reports', (
+      WidgetTester tester,
+    ) async {
+      final controller = TerminalController();
+      final terminal = xt.Terminal(maxLines: 50000);
+      var pages = 0;
+      bool onNearTop() {
+        pages++;
+        return true;
+      }
+
+      await pumpStandalonePane(
+        tester,
+        controller: controller,
+        terminal: terminal,
+        terminalId: 'paging-fruitful-test',
+        onNearTop: onNearTop,
+      );
+      final scrollViewFinder = find.descendant(
+        of: find.byType(TerminalPane),
+        matching: find.byType(SingleChildScrollView),
+      );
+      final scrollController = tester
+          .widget<SingleChildScrollView>(scrollViewFinder)
+          .controller!;
+      scrollController.jumpTo(0);
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+
+      // The landed page grew the buffer: nothing more to do.
+      controller.notifyHistoryPageStarted();
+      terminal.write('fresh line\n' * 60);
+      controller.notifyHistoryReplayed();
+      await tester.pumpAndSettle();
+      expect(pages, 1);
+      expect(find.text('No older scrollback in reach'), findsNothing);
+    });
+  });
+
   group('SessionVm exited lifecycle', () {
     test('initializes as exited when isExited flag is true', () {
       final session = SessionVm(
@@ -5765,8 +6092,15 @@ void main() {
         var nextSnapshotStart = initialTotalLogged - kHistoryFirstWindowBytes;
         var nextSnapshotSeq = 1;
         var nextSnapshotText = 'initial-page\r\n';
+        final attachCompleter = Completer<Map<String, dynamic>>();
         final client = FakeTriageWebSocketClient();
+        client.attachCompleters['flutter-spike'] = attachCompleter;
         client.attachSnapshotBuilder = (sessionId, historyBytes) {
+          // Gate the 256 KiB page on attachCompleter so the test can inject a
+          // live Output chunk while that attach RPC is in flight.
+          if (historyBytes == kHistoryReplayMaxBytes) {
+            return null;
+          }
           return {
             'context': {'branch': sessionId},
             'size': {'rows': 24, 'cols': 80},
@@ -5795,22 +6129,24 @@ void main() {
         client.emitOutput('flutter-spike', 'a' * liveGrowthBytes, outputSeq: 2);
         await tester.pump();
 
-        // First near-top page: daemon returns the same raw_output_start (non-progressing),
-        // so the guard must bail without clearing or regressing the window, while
-        // requesting 2 * heldSpan (2 * 96 KiB = 192 KiB, not 2 * 64 KiB = 128 KiB).
-        pane.onNearTop!();
-        await tester.pumpAndSettle();
-        expect(client.attachSessionHistoryBytes.last, 192 * 1024);
-
-        // Second near-top page (192 KiB -> 256 KiB): gate attachSession on a Completer
-        // so we can inject a live Output chunk (seq 4) while the RPC is in flight.
-        client.attachSnapshotBuilder = null;
-        final attachCompleter = Completer<Map<String, dynamic>>();
-        client.attachCompleters['flutter-spike'] = attachCompleter;
-
+        // First near-top page requests 2 * heldSpan (2 * 96 KiB = 192 KiB, not
+        // 2 * 64 KiB = 128 KiB). Because the daemon returns the same
+        // raw_output_start (non-progressing), the store is not cleared,
+        // historyWindowBytes advances to 192 KiB, and the barren-page
+        // continuation immediately launches the next page at
+        // kHistoryReplayMaxBytes (256 KiB), which waits on attachCompleter.
         pane.onNearTop!();
         await tester.pump();
-        expect(client.attachSessionHistoryBytes.last, kHistoryReplayMaxBytes);
+        await tester.pump();
+        expect(
+          client.attachSessionHistoryBytes,
+          [
+            kHistoryFirstWindowBytes,
+            kHistoryLeaseProbeBytes,
+            192 * 1024,
+            kHistoryReplayMaxBytes,
+          ],
+        );
 
         // Live chunk seq 4 arrives while attachSession (snapshot at seq 3) is in flight.
         client.emitOutput(

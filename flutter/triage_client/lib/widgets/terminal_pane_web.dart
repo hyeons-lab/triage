@@ -40,7 +40,10 @@ class TerminalPane extends StatefulWidget {
   final String terminalId;
   final TerminalController controller;
   final dynamic terminal;
-  final VoidCallback? onNearTop;
+  // Paging request, reporting back whether a page launched (see
+  // SessionWorkspace.onNearTop). The trigger ignores the answer; the
+  // history-replayed handler uses it to auto-continue or report.
+  final bool Function()? onNearTop;
   final bool bracketedPasteEnabled;
 
   /// Plain rows; unused by the live web view but kept for parity with native.
@@ -312,6 +315,8 @@ class _TerminalPaneState extends State<TerminalPane> {
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
+  bool _showNoOlderScrollback = false;
+  Timer? _noOlderScrollbackTimer;
 
   void _clearPageAnchor({bool cancelRestoreTimer = true}) {
     if (cancelRestoreTimer) {
@@ -1490,6 +1495,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (activePane != null) {
         activePane._pageRestoreTimer?.cancel();
         activePane._pageRestoreTimer = null;
+        activePane._dismissNoOlderScrollback();
         activePane._pendingScrollToBottomOnRelease = true;
         activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
@@ -1533,6 +1539,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _rebindViewListenersTo(TerminalController controller) {
     if (identical(_boundViewController, controller)) return;
     _clearPageAnchor();
+    _dismissNoOlderScrollback();
     final previous = _boundViewController;
     if (previous != null) _unbindControllerFrom(previous);
     _boundViewController = controller;
@@ -1588,6 +1595,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       return;
     }
     _clearPageAnchor();
+    _dismissNoOlderScrollback();
     // Refit before restoring scroll: a fit that ran while the layout was
     // narrow (or whose resize-out died in the debounce) leaves a narrow grid
     // under a wide pane, and replay is the moment that mismatch turns
@@ -1642,16 +1650,76 @@ class _TerminalPaneState extends State<TerminalPane> {
         timer.cancel();
         _pageRestoreTimer = null;
         if (!mounted || !_initialized || len < 0) return;
-        final target = anchorY + (len - anchorLen);
+        // Measure near-top from the pre-replay anchor: `onClear()` and
+        // `term.write()` reset `active.viewportY` to `baseY` (bottom of
+        // buffer), so reading `viewportY` after the write would see the
+        // bottom of the scrollback and treat every barren page with >29
+        // lines as if the user had scrolled away. Always restore the
+        // viewport to `target` first so an exhausted page does not leave
+        // the view stranded at `baseY`.
+        final addedLines = len - anchorLen;
+        final wasNearTop = anchorY <= 5;
+        final target = math.max(anchorY + addedLines, 0);
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         try {
-          js_util.callMethod(_term, 'scrollToLine', [math.max(target, 0)]);
+          js_util.callMethod(_term, 'scrollToLine', [target]);
         } catch (_) {}
-        _sessionSavedViewportY[_sanitizedId] = math.max(target, 0);
+        _sessionSavedViewportY[_sanitizedId] = target;
+        if (addedLines <= 0 && wasNearTop) {
+          _continuePastBarrenPage();
+        } else if (addedLines > 0) {
+          _dismissNoOlderScrollback();
+        }
       } else {
         lastLen = len;
       }
     });
+  }
+
+  /// A page landed with no new buffer lines while the user is still near
+  /// the top: the window was barren (a TUI redrawing in place), so ask for
+  /// a deeper one instead of sitting on identical content. When no deeper
+  /// window is available the scrollback is genuinely exhausted and the
+  /// pill says so, rather than leaving the top silently inert.
+  void _continuePastBarrenPage() {
+    final terminalId = widget.terminalId;
+    final controller = _boundViewController ?? widget.controller;
+    // Deferred like the native pane's (this can run inside the landed
+    // page's own single-flight window), and guarded against a session
+    // or controller swap landing between the poll and now.
+    scheduleMicrotask(() {
+      if (!mounted ||
+          !_initialized ||
+          widget.terminalId != terminalId ||
+          !identical(_boundViewController ?? widget.controller, controller)) {
+        return;
+      }
+      if (widget.onNearTop?.call() == false) {
+        _noteHistoryExhausted();
+      }
+    });
+  }
+
+  void _dismissNoOlderScrollback() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = null;
+    if (_showNoOlderScrollback && mounted) {
+      setState(() => _showNoOlderScrollback = false);
+    } else {
+      _showNoOlderScrollback = false;
+    }
+  }
+
+  void _noteHistoryExhausted() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => _showNoOlderScrollback = false);
+      }
+    });
+    if (mounted && !_showNoOlderScrollback) {
+      setState(() => _showNoOlderScrollback = true);
+    }
   }
 
   /// Heals a grid that disagrees with its own pixels.
@@ -2874,6 +2942,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(widget.controller)}',
       );
       _clearPageAnchor();
+      _dismissNoOlderScrollback();
       _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);
@@ -2915,6 +2984,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     _forceFinalizeTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _pageRestoreTimer?.cancel();
+    _noOlderScrollbackTimer?.cancel();
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
@@ -3037,6 +3107,13 @@ class _TerminalPaneState extends State<TerminalPane> {
                       backgroundColor: Colors.transparent,
                       color: Color(0xffffc857),
                     ),
+                  ),
+                if (_showNoOlderScrollback)
+                  const Positioned(
+                    top: 8,
+                    left: 0,
+                    right: 0,
+                    child: Center(child: NoOlderScrollbackPill()),
                   ),
               ],
             ),

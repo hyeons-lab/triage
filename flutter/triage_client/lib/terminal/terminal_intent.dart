@@ -44,6 +44,7 @@ final class HistoryBytes extends TerminalIntent {
     required this.rows,
     this.throughOutputSeq,
     this.rawOutputStart,
+    this.windowBytes,
   });
 
   final List<int> bytes;
@@ -51,6 +52,10 @@ final class HistoryBytes extends TerminalIntent {
   final int rows;
   final int? throughOutputSeq;
   final int? rawOutputStart;
+  // The history window this payload was served for, sizing the replay
+  // trim (see historyTrimBudgetsForWindow in terminal_store.dart). Null
+  // for replays that were never windowed, which keep the platform budgets.
+  final int? windowBytes;
 }
 
 /// The view's measured viewport changed (debounced fit detection).

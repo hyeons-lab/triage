@@ -751,7 +751,7 @@ class SessionVm {
   // first view fit). Null until the first history lands; 0 means the log start
   // is loaded and paging stops.
   int? get historyStart =>
-      store.appliedHistoryStart ?? _pendingHistory?.rawOutputStart;
+      store.appliedHistoryStart ?? _pendingHistory?.effectiveStart;
   // A scroll-up page re-attach is in flight; near-top triggers coalesce
   // behind it instead of stacking replays.
   bool pagingHistory = false;
@@ -834,6 +834,7 @@ class SessionVm {
     List<int> rawOutput, {
     int? throughOutputSeq,
     int? rawOutputStart,
+    int? windowBytes,
     bool isExited = false,
     bool preservePendingLive = false,
   }) {
@@ -847,6 +848,7 @@ class SessionVm {
       rawOutput,
       throughOutputSeq,
       rawOutputStart: rawOutputStart,
+      windowBytes: windowBytes,
     );
     tdbg(
       'vm.applyHistory',
@@ -891,6 +893,7 @@ class SessionVm {
         rows: _viewRows,
         throughOutputSeq: pending.throughOutputSeq,
         rawOutputStart: pending.rawOutputStart,
+        windowBytes: pending.windowBytes,
       ),
     );
     if (isExited) {
@@ -931,11 +934,25 @@ class _PendingHistory {
     this.rawOutput,
     this.throughOutputSeq, {
     this.rawOutputStart,
+    this.windowBytes,
   });
 
   final List<int> rawOutput;
   final int? throughOutputSeq;
   final int? rawOutputStart;
+  final int? windowBytes;
+
+  int? get effectiveStart {
+    final start = rawOutputStart;
+    if (start == null) return null;
+    final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
+    final trimmed = trimHistoryTailWithOffset(
+      rawOutput,
+      maxLines: budgets.maxLines,
+      maxBytes: budgets.maxBytes,
+    );
+    return start + trimmed.droppedBytes;
+  }
 }
 
 /// Aborts a session load whose daemon changed mid-flight.
@@ -4288,6 +4305,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         _rawOutputFromSnapshot(snapshot ?? const {}),
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
+        windowBytes: kHistoryFirstWindowBytes,
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -4875,6 +4893,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
+        windowBytes: session.historyWindowBytes,
         isExited: exited,
       );
       session.loaded = true;
@@ -5239,15 +5258,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Page older scrollback after a near-top scroll: re-attach with a
-  /// doubling history window (up to the platform replay budget) and replay
-  /// the wider tail. Stops at the log start (`historyStart == 0`) and
-  /// coalesces triggers behind one in-flight page.
-  Future<void> _pageHistoryUp(SessionVm session) async {
-    if (!_client.isConnected || !session.isRemote || !session.loaded) return;
-    if (session.pagingHistory) return;
+  /// Computes the next scroll-up history page for [session], or `null` when
+  /// paging is gated (disconnected, local/unloaded session, page already in
+  /// flight, log start already reached, or platform replay budget exhausted).
+  ({String sessionId, int nextWindow})? _nextHistoryPage(SessionVm session) {
+    if (!_client.isConnected || !session.isRemote || !session.loaded) {
+      return null;
+    }
+    if (session.pagingHistory) return null;
     final start = session.historyStart;
-    if (start == null || start <= 0) return;
+    if (start == null || start <= 0) return null;
     final maxWindow = kIsWeb
         ? kHistoryReplayWebMaxBytes
         : kHistoryReplayMaxBytes;
@@ -5260,9 +5280,27 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       current: currentWindow,
       max: maxWindow,
     );
-    if (nextWindow <= currentWindow) return;
+    if (nextWindow <= currentWindow) return null;
     final sessionId = _sessionIdFor(session);
-    if (sessionId == null) return;
+    if (sessionId == null) return null;
+    return (sessionId: sessionId, nextWindow: nextWindow);
+  }
+
+  /// Whether a scroll-up page would launch for [session] right now: all of
+  /// [_pageHistoryUp]'s gates, synchronously answerable so the `onNearTop`
+  /// callback can report back whether it launched a page (the pane
+  /// auto-continues through barren pages on `true`, and reports exhausted
+  /// scrollback on `false`).
+  bool _canPageHistory(SessionVm session) => _nextHistoryPage(session) != null;
+
+  /// Page older scrollback after a near-top scroll: re-attach with a
+  /// doubling history window (up to the platform replay budget) and replay
+  /// the wider tail. Stops at the log start (`historyStart == 0`) and
+  /// coalesces triggers behind one in-flight page.
+  Future<void> _pageHistoryUp(SessionVm session) async {
+    final target = _nextHistoryPage(session);
+    if (target == null) return;
+    final (:sessionId, :nextWindow) = target;
     final generation = _connectGeneration;
     session.pagingHistory = true;
     session.store.beginHistoryPaging();
@@ -5292,15 +5330,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot == null) return;
       final rawOutput = _rawOutputFromSnapshot(snapshot);
-      if (rawOutput.isEmpty) return;
       final rawOutputStart = snapshot['raw_output_start'] as int?;
-      if (rawOutputStart == null || rawOutputStart >= currentStart) {
-        if (rawOutputStart != null) {
-          session.historyWindowBytes = max(
-            session.historyWindowBytes,
-            nextWindow,
-          );
-        }
+      if (rawOutputStart == null) return;
+      final budgets = historyTrimBudgetsForWindow(nextWindow, web: kIsWeb);
+      final trimmed = trimHistoryTailWithOffset(
+        rawOutput,
+        maxLines: budgets.maxLines,
+        maxBytes: budgets.maxBytes,
+      );
+      final effectiveStart = rawOutputStart + trimmed.droppedBytes;
+      if (rawOutput.isEmpty || effectiveStart >= currentStart) {
+        session.historyWindowBytes = max(
+          session.historyWindowBytes,
+          nextWindow,
+        );
+        session.terminalController.notifyHistoryPageStarted();
+        session.terminalController.notifyHistoryReplayed();
         return;
       }
       session.terminalController.notifyHistoryPageStarted();
@@ -5315,6 +5360,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutput,
         throughOutputSeq: snapshot['output_seq'] as int?,
         rawOutputStart: rawOutputStart,
+        windowBytes: nextWindow,
         isExited:
             (snapshot['exited'] == true) ||
             session.isExited ||
@@ -5760,6 +5806,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             _rawOutputFromSnapshot(snapshot ?? const {}),
             throughOutputSeq: outputSeq,
             rawOutputStart: rawOutputStart,
+            windowBytes: kHistoryFirstWindowBytes,
             isExited: exited,
           );
 
@@ -6382,7 +6429,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
-              onNearTop: () => _pageHistoryUp(currentSession),
+              onNearTop: () {
+                final session = currentSession;
+                if (!_canPageHistory(session)) return false;
+                unawaited(_pageHistoryUp(session));
+                return true;
+              },
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
@@ -10935,8 +10987,10 @@ class SessionWorkspace extends StatelessWidget {
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
   // The terminal scrolled near the top of its scrollback: page older
-  // history by re-attaching with a wider window.
-  final VoidCallback? onNearTop;
+  // history by re-attaching with a wider window. Returns whether a page
+  // was launched, so the pane can auto-continue through barren pages or
+  // report exhausted scrollback when no deeper window is available.
+  final bool Function()? onNearTop;
   // Mobile only: opens the session rail overlay from the workspace header.
   final VoidCallback? onOpenRail;
   // Re-asserts this device's terminal size on the shared PTY.
