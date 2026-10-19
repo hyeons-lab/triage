@@ -1,6 +1,4 @@
-# 000164 — feat/scrollback-serve (mobile touch-scroll follow-up)
-
-**Agent:** Muse Code @ triage branch feat/scrollback-serve
+# 000164: feat/scrollback-serve (mobile touch-scroll follow-up)
 
 ## Intent
 
@@ -10,21 +8,26 @@ this branch, since the scrollback feature is unusable on mobile without it.
 
 ## What Changed
 
-2026-10-10T14:13-0700 flutter/triage_client/lib/terminal/touch_scroll_takeover.dart (new) —
+2026-10-10T14:13-0700 flutter/triage_client/lib/terminal/touch_scroll_takeover.dart (new):
 DOM-free per-gesture decision unit: tracks the pointer anchor and yields to
 xterm.js while its touch path is alive (120ms quiet window), otherwise
 converts pointer travel into signed scroll rows with fractional carry.
 
-2026-10-10T14:13-0700 flutter/triage_client/lib/widgets/terminal_pane_web.dart —
+2026-10-10T14:13-0700 flutter/triage_client/lib/widgets/terminal_pane_web.dart:
 binds a `pointermove` listener on the terminal container that drives
 `scrollToLine` from the takeover unit for single-touch/pen drags (mouse
 excluded so drag-select is untouched); feeds touchmove observations and
 pointer/touch-down resets from the existing handlers; unbinds with the rest.
 
-2026-10-10T14:13-0700 flutter/triage_client/test/terminal/touch_scroll_takeover_test.dart (new) —
+2026-10-10T14:13-0700 flutter/triage_client/test/terminal/touch_scroll_takeover_test.dart (new):
 10 unit tests: direction, sub-row accumulation, yield-while-alive, quiet
 takeover with no jump, carry reset, canDrive gating, degenerate row height,
 gesture reset.
+
+2026-10-18T21:23-0700 crates/triaged/src/scrollback.rs, flutter/triage_client/lib/main.dart, flutter/triage_client/lib/terminal/terminal_store.dart, flutter/triage_client/lib/widgets/terminal_pane_web.dart:
+- Clear `_activeTouchCount` and `_touchStartY` on `pointerup`, `pointercancel`, and unpressed `pointermove` so detached `touchstart` targets do not leave `_isUserGestureActive` wedged after release; invoke `onNearTop` during pointer takeover when pulling down at `viewportY == 0`.
+- Account for `rawOutputPrefix` in `SessionVm.applyHistory` pre-fit guards, `TerminalStore._reduceHistory` delta-merge checks, and `_pageHistoryUp` barren-page detection (`appliedHistoryPrefixBytes`).
+- Snapshot directory layout at the top of `rebase_attempt`, retry `sealed_path` on `NotFound` in `journal_file_is_future`, return `Peek::Future` early in `peek_stream_head`, ignore `NotFound` on inline `drain_pending_seals`, and unlink `.slog` before `.slog.zst` in `enforce_retention`, `rebase_attempt`, and `purge_journal_files`.
 
 ## Decisions
 
@@ -44,7 +47,7 @@ gesture reset.
 - 2026-10-10T14:13-0700 Root cause (browser-side, verified in headless
   Brave over CDP against the live daemon): xterm.js scrolls from its own
   touchmove handler, but the browser silently drops the rest of a touch
-  stream — no further moves, end, or cancel — when the touchstart target, a
+  stream (no further moves, end, or cancel) when the touchstart target, a
   DOM-renderer text span, is detached by live-output re-rendering
   mid-gesture. Drags starting on empty row areas usually survive; drags
   starting on text on a streaming session almost always die after ~1 move.
@@ -53,8 +56,10 @@ gesture reset.
 
 ## Commits
 
-- 92bd309 — fix(client): take over touch scroll from pointer events when xterm's touch stream dies
-- HEAD — fix(client): force-drive touch scroll fallback in mouse tracking mode
+- 5e116dc: feat(triaged): serve journaled scrollback prefix (PR B)
+- e601e19: fix(client): take over touch scroll from pointer events when xterm's touch stream dies
+- 71cfb79: fix(client): force-drive touch scroll fallback in mouse tracking mode
+- HEAD: fix(scrollback,client): harden prefix replay, journal rebase/seals, and touch takeover release
 
 ## Progress
 
@@ -65,7 +70,7 @@ gesture reset.
   the phone.
 - 2026-10-10T16:50-0700 User retest: still painful, several swipes per few
   lines. IPC probe showed session-302 has mouse tracking on
-  (`?1000/1002/1003/1006h` near the tail, no disables) with a quiet stream —
+  (`?1000/1002/1003/1006h` near the tail, no disables) with a quiet stream:
   full touch delivery plus an xterm path that ignores touches in mouse mode,
   so the yield vetoed the fallback ~100%. Fix: `forceDrive` bypasses the
   quiet-window yield when `term.modes.mouseTrackingMode != 'none'`
@@ -85,14 +90,14 @@ gesture reset.
   touch delivery leaves the old logic yielding (~0 rows), while
   forceDrive scrolls from the second move (pointer stream 14/14). A pen
   drag drives the fallback, but real mouse reports still yank to the
-  bottom via the onData scrollToBottom — pre-existing, out of scope.
+  bottom via the onData scrollToBottom (pre-existing, out of scope).
 - Committed and pushed the forceDrive fix with the explicit refspec.
 
 ## Research & Discoveries
 
 - 2026-10-10T14:13-0700 Attached to live sessions over IPC as observer:
   session-302 serves 32KB raw + 32KB prefix on a 64KB window and
-  524KB + 524KB on a 1MB window — the daemon side was exonerated first.
+  524KB + 524KB on a 1MB window; the daemon side was exonerated first.
 - 2026-10-10T14:13-0700 `window.activeTerm` plus CDP `Input.dispatchTouchEvent`
   reproduces mobile drags deterministically; a stack-spy on the viewport's
   `scrollTop` setter proved xterm's `handleTouchMove` is the sole writer
@@ -100,10 +105,10 @@ gesture reset.
   listener swallows the moves.
 - 2026-10-10T14:13-0700 A minimal shadow-DOM page with scripted row churn
   reproduces the truncation (3/8 moves), while the static page delivers
-  8/8 — churn during the gesture is the trigger.
+  8/8; churn during the gesture is the trigger.
 - 2026-10-10T16:50-0700 xterm.js has exactly two touch listeners
   (touchstart passive, touchmove non-passive), both no-ops in mouse
-  tracking mode, and synthesizes no mouse reports from touch — so in mouse
+  tracking mode, and synthesizes no mouse reports from touch, so in mouse
   mode the pane fallback is the sole scroll driver and there is no onData
   yank-back. `term.modes.mouseTrackingMode` (proposed API:
   none/x10/vt200/drag/any) reports the mode without private-API reads.

@@ -1,8 +1,8 @@
 /// Takeover logic for touch-drag scrolling on web.
 ///
 /// xterm.js scrolls its viewport from its own touch handlers, but the browser
-/// silently drops the rest of a touch stream when the touchstart target — a
-/// DOM-renderer text span — is detached by live-output re-rendering
+/// silently drops the rest of a touch stream when the touchstart target (a
+/// DOM-renderer text span) is detached by live-output re-rendering
 /// mid-gesture. Pointer events keep flowing with fresh hit-testing in exactly
 /// those cases, so the pane drives scrolling from pointermove while xterm's
 /// own touch path is silent for the gesture.
@@ -41,8 +41,8 @@ class TouchScrollTakeover {
   /// false (multi-touch, mouse drag-select). The anchor updates on every
   /// move either way, so a mid-gesture takeover never jumps.
   ///
-  /// Set [forceDrive] when xterm's own touch path cannot scroll — mouse
-  /// tracking mode, where xterm ignores touches entirely — so a healthy
+  /// Set [forceDrive] when xterm's own touch path cannot scroll (mouse
+  /// tracking mode, where xterm ignores touches entirely) so a healthy
   /// touch stream stops vetoing the fallback. [canDrive] still applies.
   int onPointerMove({
     required int nowMs,

@@ -231,7 +231,7 @@ ends (no autowrap dependence).
     flushes after every chunk (empty buffer = one branch, dirty =
     one write), so the journal is current through the last chunk.
     Without the per-chunk flush, journals under the threshold are
-    all buffer and serve nothing — caught live (session-303: 77
+    all buffer and serve nothing: caught live (session-303: 77
     records buffered, 0-byte file, no prefix) after unit tests
     passed by flushing explicitly. Regression pinned by reading via
     a shared ref with no manual flush in the offset test.

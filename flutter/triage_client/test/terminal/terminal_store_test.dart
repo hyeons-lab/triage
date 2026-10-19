@@ -1201,15 +1201,16 @@ void main() {
     );
     expect(store.appliedLogBytes, initialText.length);
 
-    // Empty raw tail with a nonempty prefix: the early-return guard must
-    // not swallow it (a prefix-only snapshot still paints).
+    // Empty raw tail with a nonempty prefix and rawOutputStart: 0: neither
+    // the early-return guard nor the delta-merge branch may swallow it.
     final prefixText = 'journaled old line\r\n';
     store.dispatch(
       HistoryBytes(
         const [],
         cols: 80,
         rows: 24,
-        throughOutputSeq: 15,
+        throughOutputSeq: 10,
+        rawOutputStart: 0,
         rawOutputPrefix: b(prefixText),
       ),
     );

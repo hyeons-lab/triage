@@ -325,6 +325,9 @@ class TerminalStore extends ChangeNotifier {
   // paging knows the true start of the buffer held in the terminal.
   int? _appliedHistoryStart;
 
+  // Number of journaled prefix bytes retained by the last full history replay.
+  int _appliedHistoryPrefixBytes = 0;
+
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
@@ -358,6 +361,9 @@ class TerminalStore extends ChangeNotifier {
 
   /// Absolute log byte offset where the last full history replay started.
   int? get appliedHistoryStart => _appliedHistoryStart;
+
+  /// Number of journaled prefix bytes retained by the last full history replay.
+  int get appliedHistoryPrefixBytes => _appliedHistoryPrefixBytes;
 
   bool _pagingHistory = false;
 
@@ -412,6 +418,7 @@ class TerminalStore extends ChangeNotifier {
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
         _appliedHistoryStart = null;
+        _appliedHistoryPrefixBytes = 0;
         return s.copyWith(
           phase: AttachPhase.awaitingHistory,
           exited: false,
@@ -609,6 +616,10 @@ class TerminalStore extends ChangeNotifier {
 
     final isRegressed = isSnapshotSeqRegressed || hasLogByteGap || isLogShrunk;
 
+    final needsInitialPrefixReplay =
+        rawOutputPrefix.isNotEmpty &&
+        (bytes.isEmpty || _appliedHistoryPrefixBytes == 0);
+
     // Delta merge: if the store already has scrollback content, is not exited,
     // and is not regressed, check whether the new snapshot overlaps with what
     // we already applied.
@@ -616,6 +627,7 @@ class TerminalStore extends ChangeNotifier {
     // so the viewport stays and both panes follow the tail on live writes.
     if (!s.exited &&
         !isRegressed &&
+        !needsInitialPrefixReplay &&
         s.scrollbackReady &&
         (currentSeq != null || currentLogBytes != null)) {
       if (rawStart != null &&
@@ -738,9 +750,13 @@ class TerminalStore extends ChangeNotifier {
     }
     _writeDecoded(replayBytes);
 
+    final retainedPrefixBytes = rawOutputPrefix.length > trimmed.droppedBytes
+        ? rawOutputPrefix.length - trimmed.droppedBytes
+        : 0;
     final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
         ? trimmed.droppedBytes - rawOutputPrefix.length
         : 0;
+    _appliedHistoryPrefixBytes = retainedPrefixBytes;
     _appliedHistoryStart = rawStart != null ? rawStart + rawDropped : null;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;

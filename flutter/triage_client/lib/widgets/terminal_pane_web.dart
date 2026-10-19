@@ -1986,12 +1986,24 @@ class _TerminalPaneState extends State<TerminalPane>
       event,
     ) {
       _activePointerCount = math.max(0, _activePointerCount - 1);
+      if (_activeTouchCount > _activePointerCount) {
+        _activeTouchCount = _activePointerCount;
+      }
+      if (_activeTouchCount == 0) {
+        _touchStartY = null;
+      }
       _handleUserGestureEnded();
     });
 
     _containerPointerCancelSubscription = _container.on['pointercancel'].listen(
       (event) {
         _activePointerCount = math.max(0, _activePointerCount - 1);
+        if (_activeTouchCount > _activePointerCount) {
+          _activeTouchCount = _activePointerCount;
+        }
+        if (_activeTouchCount == 0) {
+          _touchStartY = null;
+        }
         _handleUserGestureEnded();
       },
     );
@@ -2018,7 +2030,16 @@ class _TerminalPaneState extends State<TerminalPane>
       } catch (_) {
         return;
       }
-      if ((buttons & 1) == 0 || pointerType == 'mouse') return;
+      if ((buttons & 1) == 0) {
+        if (_isUserGestureActive) {
+          _activePointerCount = 0;
+          _activeTouchCount = 0;
+          _touchStartY = null;
+          _handleUserGestureEnded();
+        }
+        return;
+      }
+      if (pointerType == 'mouse') return;
       final canDrive = pointerType == 'pen'
           ? _activeTouchCount == 0
           : _activeTouchCount == 1;
@@ -2056,6 +2077,9 @@ class _TerminalPaneState extends State<TerminalPane>
             .toInt();
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
         final target = (viewportY + rowsToScroll).clamp(0, baseY);
+        if (rowsToScroll < 0 && target <= 0) {
+          _containerEventOwners[_sanitizedId]?.widget.onNearTop?.call();
+        }
         if (target == viewportY) return;
         js_util.callMethod(term, 'scrollToLine', [target]);
       } catch (_) {}

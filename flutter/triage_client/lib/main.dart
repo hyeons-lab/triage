@@ -752,6 +752,7 @@ class SessionVm {
   // is loaded and paging stops.
   int? get historyStart =>
       store.appliedHistoryStart ?? _pendingHistory?.effectiveStart;
+  int get historyPrefixBytes => store.appliedHistoryPrefixBytes;
   // A scroll-up page re-attach is in flight; near-top triggers coalesce
   // behind it instead of stacking replays.
   bool pagingHistory = false;
@@ -840,9 +841,12 @@ class SessionVm {
     bool preservePendingLive = false,
   }) {
     if (rawOutput.isEmpty &&
+        rawOutputPrefix.isEmpty &&
         !isExited &&
         !this.isExited &&
-        (_pendingHistory != null && _pendingHistory!.rawOutput.isNotEmpty)) {
+        (_pendingHistory != null &&
+            (_pendingHistory!.rawOutput.isNotEmpty ||
+                _pendingHistory!.rawOutputPrefix.isNotEmpty))) {
       return;
     }
     _pendingHistory = _PendingHistory(
@@ -5376,12 +5380,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         maxLines: budgets.maxLines,
         maxBytes: budgets.maxBytes,
       );
+      final retainedPrefixBytes = rawOutputPrefix.length > trimmed.droppedBytes
+          ? rawOutputPrefix.length - trimmed.droppedBytes
+          : 0;
       final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
           ? trimmed.droppedBytes - rawOutputPrefix.length
           : 0;
       final effectiveStart = rawOutputStart + rawDropped;
       if ((rawOutput.isEmpty && rawOutputPrefix.isEmpty) ||
-          (effectiveStart >= currentStart && rawOutputPrefix.isEmpty)) {
+          (effectiveStart >= currentStart &&
+              retainedPrefixBytes <= session.historyPrefixBytes)) {
         session.historyWindowBytes = max(
           session.historyWindowBytes,
           nextWindow,

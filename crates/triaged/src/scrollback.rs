@@ -302,17 +302,26 @@ pub fn purge_journal_files(session_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(session_dir) else {
         return;
     };
+    let mut deferred = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if is_journal_artifact(&name) {
-            let _ = std::fs::remove_file(entry.path());
+        if !is_journal_artifact(&name) {
+            continue;
         }
+        if name.ends_with(".slog") {
+            let _ = std::fs::remove_file(entry.path());
+        } else {
+            deferred.push(entry.path());
+        }
+    }
+    for path in deferred {
+        let _ = std::fs::remove_file(path);
     }
 }
 
 fn is_journal_artifact(file_name: &str) -> bool {
-    parse_journal_file_name(file_name).is_some()
+    ScrollbackJournal::parse_journal_index(file_name).is_some()
         || (file_name.starts_with("scrollback-") && file_name.contains(".tmp."))
 }
 
@@ -492,23 +501,38 @@ impl ScrollbackJournal {
     /// stay undecoded. Missing or unreadable files are not future.
     fn journal_file_is_future(&self, index: u32) -> bool {
         let sealed = self.sealed_path(index);
-        if sealed.exists() {
-            let Ok(file) = File::open(&sealed) else {
+        let read_sealed_future = |path: &Path| -> bool {
+            let Ok(file) = File::open(path) else {
                 return false;
             };
             let Ok(mut decoder) = zstd::stream::Decoder::new(BufReader::new(file)) else {
                 return false;
             };
             let mut head = [0u8; JOURNAL_HEADER_LEN];
-            return decoder.read_exact(&mut head).is_ok() && file_header_len(&head).is_none();
+            decoder.read_exact(&mut head).is_ok() && file_header_len(&head).is_none()
+        };
+        match File::open(&sealed) {
+            Ok(file) => {
+                let Ok(mut decoder) = zstd::stream::Decoder::new(BufReader::new(file)) else {
+                    return false;
+                };
+                let mut head = [0u8; JOURNAL_HEADER_LEN];
+                decoder.read_exact(&mut head).is_ok() && file_header_len(&head).is_none()
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut head = [0u8; JOURNAL_HEADER_LEN];
+                match File::open(self.active_path(index)) {
+                    Ok(mut f) => {
+                        f.read_exact(&mut head).is_ok() && file_header_len(&head).is_none()
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        read_sealed_future(&sealed)
+                    }
+                    Err(_) => false,
+                }
+            }
+            Err(_) => false,
         }
-        let mut head = [0u8; JOURNAL_HEADER_LEN];
-        File::open(self.active_path(index))
-            .and_then(|mut f| {
-                f.read_exact(&mut head)
-                    .map(|_| file_header_len(&head).is_none())
-            })
-            .unwrap_or(false)
     }
 
     fn parse_journal_index(file_name: &str) -> Option<(u32, bool)> {
@@ -798,10 +822,21 @@ impl ScrollbackJournal {
                 continue;
             }
             // No worker, or it is gone: seal inline. A failed seal
-            // degrades exactly like the old inline rotation did.
+            // degrades exactly like the old inline rotation did, except
+            // a raw file already removed by retention or rebase is benign.
+            if !raw_path.exists() {
+                continue;
+            }
             if let Err(err) = crate::storage::compress_segment_file(&raw_path, &sealed_path) {
-                self.note_broken(&err);
-                return;
+                let missing = err.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                });
+                if !missing {
+                    self.note_broken(&err);
+                    return;
+                }
             }
         }
     }
@@ -818,12 +853,19 @@ impl ScrollbackJournal {
             }
         }
         files.sort_unstable();
+        let mut evicted: Vec<u32> = Vec::new();
         while files.len() > JOURNAL_RETAINED_FILES {
             let oldest = files.remove(0);
-            let _ = std::fs::remove_file(self.sealed_path(oldest));
+            let active = self.active_path(oldest);
+            self.pending_seals.retain(|(raw, _)| raw != &active);
             if oldest != self.active_index {
-                let _ = std::fs::remove_file(self.active_path(oldest));
+                let _ = std::fs::remove_file(&active);
             }
+            let _ = std::fs::remove_file(self.sealed_path(oldest));
+            evicted.push(oldest);
+        }
+        if !evicted.is_empty() {
+            self.remove_sealed_twins(&evicted);
         }
         Ok(())
     }
@@ -936,6 +978,9 @@ impl ScrollbackJournal {
                 Ok(0) => break,
                 Ok(n) => {
                     filled += n;
+                    if filled >= JOURNAL_HEADER_LEN && file_header_len(&head[..filled]).is_none() {
+                        return Peek::Future;
+                    }
                     if !parse_records(&head[..filled]).is_empty() {
                         break;
                     }
@@ -1008,6 +1053,7 @@ impl ScrollbackJournal {
     /// dropped and every original untouched when the layout moved under
     /// the attempt, so the caller can retry. Hard errors propagate.
     fn rebase_attempt(&mut self, cut: u64) -> anyhow::Result<bool> {
+        let before = Self::journal_layout_snapshot(&self.dir);
         // Collect oldest-first across every file, then rewrite compacted.
         let mut indices = self.sealed_and_active_newest_first();
         indices.reverse();
@@ -1040,7 +1086,6 @@ impl ScrollbackJournal {
                 _ => None,
             })
             .collect();
-        let before = Self::journal_layout_snapshot(&self.dir);
         let mut survivors: Vec<JournalRecord> = Vec::new();
         // Proved-journaled flags for the early return below: the collect
         // is the only witness distinguishing an empty journal from one
@@ -1161,8 +1206,8 @@ impl ScrollbackJournal {
         }
         std::fs::rename(&staging, self.active_path(fresh))?;
         for index in &indices {
-            let _ = std::fs::remove_file(self.sealed_path(*index));
             let _ = std::fs::remove_file(self.active_path(*index));
+            let _ = std::fs::remove_file(self.sealed_path(*index));
         }
         // Defense in depth: a worker seal that passed its identity
         // re-check before the deletes above may still land after them,
@@ -2599,8 +2644,7 @@ mod tests {
         let dir = unique_journal_dir("purge");
         std::fs::write(dir.join("scrollback-000000.slog"), b"raw").expect("write slog");
         std::fs::write(dir.join("scrollback-000001.slog.zst"), b"zst").expect("write zst");
-        std::fs::write(dir.join("scrollback-000001.slog.zst.tmp.9999"), b"tmp")
-            .expect("write tmp");
+        std::fs::write(dir.join("scrollback-000001.slog.zst.tmp.9999"), b"tmp").expect("write tmp");
         std::fs::write(dir.join("segment-000000.log"), b"keep").expect("write segment");
 
         purge_journal_files(&dir);

@@ -108,6 +108,23 @@ void main() {
         expect(session.historyStart, 2048);
       },
     );
+
+    test(
+      'prefix-only snapshot before noteViewFit survives empty refresh and replaces prior staging',
+      () {
+        final session = _session();
+        session.applyHistory(
+          const [],
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+          rawOutputPrefix: utf8.encode('prefix line\r\n'),
+        );
+        // An empty refresh before noteViewFit must not clobber the staged prefix.
+        session.applyHistory(const [], throughOutputSeq: 1, rawOutputStart: 0);
+        session.noteViewFit(80, 24);
+        expect(session.historyPrefixBytes, greaterThan(0));
+      },
+    );
   });
 
   group('history trim budgets', () {
