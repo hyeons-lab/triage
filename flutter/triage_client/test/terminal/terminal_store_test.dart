@@ -119,26 +119,33 @@ void main() {
     // not replay the identical trimmed suffix (which left paging stuck
     // showing the same content on every page).
     final lines = List.generate(2000, (i) => 'line $i\n').join();
+    final expectedDroppedAt64k = b(
+      List.generate(1000, (i) => 'line $i\n').join(),
+    ).length;
     store.dispatch(const Attach());
     store.dispatch(
       HistoryBytes(
         b(lines),
         cols: 80,
         rows: 24,
+        rawOutputStart: 0,
         windowBytes: kHistoryFirstWindowBytes,
       ),
     );
     final firstReplay = sink.written.toString();
+    expect(store.appliedHistoryStart, expectedDroppedAt64k);
     store.dispatch(const Attach());
     store.dispatch(
       HistoryBytes(
         b(lines),
         cols: 80,
         rows: 24,
+        rawOutputStart: 0,
         windowBytes: kHistoryFirstWindowBytes * 2,
       ),
     );
     final secondReplay = sink.written.toString().substring(firstReplay.length);
+    expect(store.appliedHistoryStart, 0);
     // The write path normalizes LF to CRLF; match the replayed form.
     expect(firstReplay, isNot(contains('line 0\r\n')));
     expect(firstReplay, contains('line 1999\r\n'));

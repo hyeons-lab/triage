@@ -1495,6 +1495,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       if (activePane != null) {
         activePane._pageRestoreTimer?.cancel();
         activePane._pageRestoreTimer = null;
+        activePane._dismissNoOlderScrollback();
         activePane._pendingScrollToBottomOnRelease = true;
         activePane._suppressScrollSaveFor(const Duration(milliseconds: 1500));
         if (!activePane._initialContentWritten) {
@@ -1538,6 +1539,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _rebindViewListenersTo(TerminalController controller) {
     if (identical(_boundViewController, controller)) return;
     _clearPageAnchor();
+    _dismissNoOlderScrollback();
     final previous = _boundViewController;
     if (previous != null) _unbindControllerFrom(previous);
     _boundViewController = controller;
@@ -1593,6 +1595,7 @@ class _TerminalPaneState extends State<TerminalPane> {
       return;
     }
     _clearPageAnchor();
+    _dismissNoOlderScrollback();
     // Refit before restoring scroll: a fit that ran while the layout was
     // narrow (or whose resize-out died in the debounce) leaves a narrow grid
     // under a wide pane, and replay is the moment that mismatch turns
@@ -1647,30 +1650,26 @@ class _TerminalPaneState extends State<TerminalPane> {
         timer.cancel();
         _pageRestoreTimer = null;
         if (!mounted || !_initialized || len < 0) return;
-        // A page that added no lines while the user is still near the top
-        // is a barren window (a TUI redrawing in place): ask for a deeper
-        // one instead of re-seating on identical content, so one gesture
-        // skips the desert. The viewport is re-read here (not trusted
-        // from the anchor): the parse the poll waited out took long
-        // enough for the user to scroll away.
-        var stillNearTop = false;
-        try {
-          final buffer = js_util.getProperty(_term, 'buffer');
-          final active = js_util.getProperty(buffer, 'active');
-          final viewportY =
-              (js_util.getProperty(active, 'viewportY') as num?)?.toInt();
-          stillNearTop = viewportY != null && viewportY <= 5;
-        } catch (_) {}
-        if (len - anchorLen <= 0 && stillNearTop) {
-          _continuePastBarrenPage();
-          return;
-        }
-        final target = anchorY + (len - anchorLen);
+        // Measure near-top from the pre-replay anchor: `onClear()` and
+        // `term.write()` reset `active.viewportY` to `baseY` (bottom of
+        // buffer), so reading `viewportY` after the write would see the
+        // bottom of the scrollback and treat every barren page with >29
+        // lines as if the user had scrolled away. Always restore the
+        // viewport to `target` first so an exhausted page does not leave
+        // the view stranded at `baseY`.
+        final addedLines = len - anchorLen;
+        final wasNearTop = anchorY <= 5;
+        final target = math.max(anchorY + addedLines, 0);
         _suppressScrollSaveFor(const Duration(milliseconds: 500));
         try {
-          js_util.callMethod(_term, 'scrollToLine', [math.max(target, 0)]);
+          js_util.callMethod(_term, 'scrollToLine', [target]);
         } catch (_) {}
-        _sessionSavedViewportY[_sanitizedId] = math.max(target, 0);
+        _sessionSavedViewportY[_sanitizedId] = target;
+        if (addedLines <= 0 && wasNearTop) {
+          _continuePastBarrenPage();
+        } else if (addedLines > 0) {
+          _dismissNoOlderScrollback();
+        }
       } else {
         lastLen = len;
       }
@@ -1684,19 +1683,31 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// pill says so, rather than leaving the top silently inert.
   void _continuePastBarrenPage() {
     final terminalId = widget.terminalId;
+    final controller = _boundViewController ?? widget.controller;
     // Deferred like the native pane's (this can run inside the landed
     // page's own single-flight window), and guarded against a session
-    // swap landing between the poll and now.
+    // or controller swap landing between the poll and now.
     scheduleMicrotask(() {
       if (!mounted ||
           !_initialized ||
-          widget.terminalId != terminalId) {
+          widget.terminalId != terminalId ||
+          !identical(_boundViewController ?? widget.controller, controller)) {
         return;
       }
       if (widget.onNearTop?.call() == false) {
         _noteHistoryExhausted();
       }
     });
+  }
+
+  void _dismissNoOlderScrollback() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = null;
+    if (_showNoOlderScrollback && mounted) {
+      setState(() => _showNoOlderScrollback = false);
+    } else {
+      _showNoOlderScrollback = false;
+    }
   }
 
   void _noteHistoryExhausted() {
@@ -2931,6 +2942,7 @@ class _TerminalPaneState extends State<TerminalPane> {
             'ctrl#${identityHashCode(widget.controller)}',
       );
       _clearPageAnchor();
+      _dismissNoOlderScrollback();
       _flushPendingJiggleRestore();
       _unbindControllerFrom(oldWidget.controller);
       _sessionInputRouter.unbind(_sanitizedId, _inputRouteToken);

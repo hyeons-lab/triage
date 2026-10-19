@@ -89,30 +89,35 @@ const int kEmulatorMaxScrollbackLines = 50000;
   final scaledLines =
       platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
   return (
-    maxLines: min(scaledLines, kEmulatorMaxScrollbackLines),
+    maxLines: scaledLines.clamp(platformLines, kEmulatorMaxScrollbackLines),
     maxBytes: min(windowBytes, platformBytes),
   );
 }
 
-/// Trims a full-replay history payload to its newest complete lines.
+/// Trims a full-replay history payload to its newest complete lines and
+/// reports how many leading raw bytes were dropped (`droppedBytes`).
 ///
 /// xterm is append-only, so a replay must still arrive oldest-first; this keeps
 /// the last [maxLines] lines (a trailing newline terminates the last line
 /// rather than starting an empty one) and at most [maxBytes] bytes, so first
 /// paint waits on the viewport instead of the whole tail. A trimmed payload is
 /// prefixed with an SGR reset so rendition state set before the cut cannot
-/// bleed into it; an untrimmed payload — including empty, which the caller
-/// treats as a no-op — is returned untouched.
+/// bleed into it; an untrimmed payload (including empty, which the caller
+/// treats as a no-op) is returned untouched.
 ///
-/// Baselines are the caller's job: trimming drops a prefix, so the log end
-/// offset stays `rawStart + original.length`, never the trimmed length.
-List<int> trimHistoryTail(
+/// `droppedBytes` measures the exact cut offset in the caller's input [bytes]
+/// so `rawStart + droppedBytes` is the true log offset of the oldest retained
+/// byte, while the log end offset stays `rawStart + original.length`.
+({List<int> bytes, int droppedBytes}) trimHistoryTailWithOffset(
   List<int> bytes, {
   required int maxLines,
   required int maxBytes,
 }) {
   if (bytes.isEmpty || maxLines <= 0 || maxBytes <= 0) {
-    return bytes.isEmpty ? bytes : const <int>[];
+    return (
+      bytes: bytes.isEmpty ? bytes : const <int>[],
+      droppedBytes: bytes.length,
+    );
   }
   var end = bytes.length;
   if (bytes[end - 1] == 0x0a) end--;
@@ -155,10 +160,26 @@ List<int> trimHistoryTail(
       }
     }
   }
-  if (start <= 0) return bytes;
+  if (start <= 0) {
+    return (bytes: bytes, droppedBytes: 0);
+  }
   const reset = <int>[0x1b, 0x5b, 0x30, 0x6d]; // ESC [ 0 m
-  return [...reset, ...bytes.sublist(start)];
+  return (
+    bytes: [...reset, ...bytes.sublist(start)],
+    droppedBytes: start,
+  );
 }
+
+List<int> trimHistoryTail(
+  List<int> bytes, {
+  required int maxLines,
+  required int maxBytes,
+}) =>
+    trimHistoryTailWithOffset(
+      bytes,
+      maxLines: maxLines,
+      maxBytes: maxBytes,
+    ).bytes;
 
 /// How far below the dedup baseline an `output_seq` may fall and still be a
 /// re-delivery rather than a fresh numbering epoch.
@@ -681,20 +702,24 @@ class TerminalStore extends ChangeNotifier {
     // `kIsWeb` selects the xterm.js sink exactly: every other target parses
     // through package:xterm on the UI thread.
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
-    final replayBytes = trimHistoryTail(
+    final trimmed = trimHistoryTailWithOffset(
       bytes,
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
+    final replayBytes = trimmed.bytes;
     if (!identical(replayBytes, bytes)) {
       tdbg(
         'store.history',
-        'TRIMMED replay ${bytes.length}B -> ${replayBytes.length}B',
+        'TRIMMED replay ${bytes.length}B -> ${replayBytes.length}B '
+            '(dropped=${trimmed.droppedBytes}B)',
       );
     }
     _writeDecoded(replayBytes);
 
-    _appliedHistoryStart = rawStart;
+    _appliedHistoryStart = rawStart != null
+        ? rawStart + trimmed.droppedBytes
+        : null;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;
     } else {

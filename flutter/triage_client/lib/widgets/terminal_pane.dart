@@ -8,7 +8,7 @@ import 'terminal_pane_stub.dart'
 /// Transient pill shown at the top of the terminal when scrollback paging
 /// exhausts without yielding older lines: a TUI redrawing in place (or the
 /// platform window maxed on barren output) means the loaded scrollback is
-/// genuinely all there is in reach — the view is not stuck, there is
+/// genuinely all there is in reach: the view is not stuck, there is
 /// nothing older to load. Shared by both pane implementations so the
 /// wording cannot drift between them.
 class NoOlderScrollbackPill extends StatelessWidget {

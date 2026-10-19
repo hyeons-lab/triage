@@ -3,7 +3,7 @@
 // Exercises the REAL daemon round trip: FlatBuffers attach windows come
 // back exact with older starts, and replaying a deeper window through a
 // real SessionVm grows the terminal buffer. Skipped unless
-// TRIAGE_LIVE_WS points at a daemon (e.g. ws://100.104.160.90:7777/ws),
+// TRIAGE_LIVE_WS points at a daemon (e.g. ws://<host>:7777/ws),
 // so CI stays hermetic.
 //
 // Run: `TRIAGE_LIVE_WS=ws://<host>:7777/ws flutter test
@@ -23,13 +23,19 @@ String? get _liveWs {
   return Platform.environment['TRIAGE_LIVE_WS'];
 }
 
+String get _liveSession {
+  const session = String.fromEnvironment('TRIAGE_LIVE_SESSION');
+  if (session.isNotEmpty) return session;
+  return Platform.environment['TRIAGE_LIVE_SESSION'] ?? 'session-255';
+}
+
 Future<Map<String, dynamic>> _window(
   TriageWebSocketClient client,
   String clientId,
   int bytes,
 ) async {
   final res = await client.attachSession(
-    sessionId: 'session-255',
+    sessionId: _liveSession,
     clientId: clientId,
     mode: 'Observer',
     historyBytes: bytes,
@@ -78,8 +84,8 @@ void main() {
         final w128 = await _window(client, 'live-probe2', 131072);
 
         final session = SessionVm(
-          title: 'triage / session-255',
-          sessionId: 'session-255',
+          title: 'triage / $_liveSession',
+          sessionId: _liveSession,
           status: 'attached',
           statusColor: const Color(0xff7fd1c7),
           icon: Icons.terminal,

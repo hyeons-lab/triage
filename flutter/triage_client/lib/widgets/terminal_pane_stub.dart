@@ -381,6 +381,7 @@ class _TerminalPaneState extends State<TerminalPane> {
         oldWidget.terminalId != widget.terminalId) {
       _clearPageAnchor();
       _pageJumpGeneration++;
+      _dismissNoOlderScrollback();
       _saveScrollOffset(oldWidget.terminalId);
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
@@ -421,6 +422,7 @@ class _TerminalPaneState extends State<TerminalPane> {
     if (oldWidget.controller != widget.controller) {
       _clearPageAnchor();
       _pageJumpGeneration++;
+      _dismissNoOlderScrollback();
       oldWidget.controller.removeFitListener(_onFit);
       oldWidget.controller.removeRefitListener(_onRefit);
       oldWidget.controller.removeClearListener(_onClear);
@@ -532,6 +534,7 @@ class _TerminalPaneState extends State<TerminalPane> {
   void _onClear() {
     if (!mounted) return;
     _pageJumpGeneration++;
+    _dismissNoOlderScrollback();
     _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     _scrollAnchor.clear();
     _clearSavedSessionScroll(widget.terminalId);
@@ -597,11 +600,14 @@ class _TerminalPaneState extends State<TerminalPane> {
       WidgetsBinding.instance.addPostFrameCallback((_) => applyPagedJump());
       if (addedLines <= 0 && wasNearTop) {
         _continuePastBarrenPage();
+      } else if (addedLines > 0) {
+        _dismissNoOlderScrollback();
       }
       return;
     }
     _clearPageAnchor();
     _pageJumpGeneration++;
+    _dismissNoOlderScrollback();
     final isGestureActive =
         _activePointers.isNotEmpty ||
         (_scrollController.hasClients &&
@@ -631,16 +637,35 @@ class _TerminalPaneState extends State<TerminalPane> {
   /// pill says so, rather than leaving the top silently inert.
   void _continuePastBarrenPage() {
     final terminalId = widget.terminalId;
+    final terminal = widget.terminal;
+    final controller = widget.controller;
+    final jumpGeneration = _pageJumpGeneration;
     // Deferred: this handler runs inside the landed page's own
     // single-flight window (the replay lands before `_pageHistoryUp`
     // releases it), so a synchronous re-request would read as already in
     // flight and wrongly report exhaustion.
     scheduleMicrotask(() {
-      if (!mounted || widget.terminalId != terminalId) return;
+      if (!mounted ||
+          widget.terminalId != terminalId ||
+          !identical(widget.terminal, terminal) ||
+          !identical(widget.controller, controller) ||
+          jumpGeneration != _pageJumpGeneration) {
+        return;
+      }
       if (widget.onNearTop?.call() == false) {
         _noteHistoryExhausted();
       }
     });
+  }
+
+  void _dismissNoOlderScrollback() {
+    _noOlderScrollbackTimer?.cancel();
+    _noOlderScrollbackTimer = null;
+    if (_showNoOlderScrollback && mounted) {
+      setState(() => _showNoOlderScrollback = false);
+    } else {
+      _showNoOlderScrollback = false;
+    }
   }
 
   void _noteHistoryExhausted() {
