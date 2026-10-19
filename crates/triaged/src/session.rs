@@ -482,6 +482,10 @@ fn broadcast_to_global_senders(senders: &GlobalSenders, message: ServerMessage) 
         // resend (context updates won't otherwise be re-emitted).
         Err(TrySendError::Full(_)) => {
             delivered_to_all = false;
+            tracing::debug!(
+                kind = message.kind(),
+                "global push channel full; dropping push for a slow client"
+            );
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
@@ -607,11 +611,23 @@ fn encode_manifest(
         persisted_sessions.push(session.persisted(session_id.clone()));
     }
     persisted_sessions.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    let filtered_labels;
+    let labels_ref = match excluded {
+        Some(ex) if custom_labels.contains_key(ex.as_str()) => {
+            filtered_labels = custom_labels
+                .iter()
+                .filter(|(k, _)| k.as_str() != ex.as_str())
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            &filtered_labels
+        }
+        _ => custom_labels,
+    };
     serde_json::to_vec_pretty(&SessionManifestBorrowed {
         version: 1,
         sessions: persisted_sessions,
         pins,
-        custom_labels,
+        custom_labels: labels_ref,
     })
     .context("encoding session manifest")
 }
@@ -1164,6 +1180,18 @@ impl SessionManager {
         if let Ok(mut inboxes) = self.inboxes.lock() {
             inboxes.remove(session_id);
         }
+    }
+
+    /// Drops a session's custom label in memory on shutdown/removal (the
+    /// shutdown manifest commit already excludes the removed session's label on
+    /// disk). The label map is keyed by session id, not by record membership,
+    /// so without this a removed session's label outlives it and a later
+    /// session reusing the name collides with a ghost row.
+    fn forget_custom_label(&self, session_id: &SessionId) {
+        self.custom_labels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id.as_str());
     }
 
     /// Installs the tool-call approval judge. Cheap: the rule tables are pure
@@ -4028,13 +4056,15 @@ impl SessionApi for SessionManager {
                 ManagedSession::Historical { session, .. } => {
                     let completed = session.completed_session();
                     let log_path = session.persisted.log_path.clone();
-                    let Some(removed) = sessions.remove(&session_id) else {
-                        bail!("historical session {session_id} disappeared during shutdown");
-                    };
-                    if let Err(error) = self.persist_manifest(&sessions) {
-                        sessions.insert(session_id.clone(), removed);
+                    let temp_path = self.prepare_shutdown_manifest(&sessions, &session_id)?;
+                    if let Err(error) = replace_manifest(&temp_path, &self.config.manifest_path()) {
+                        let _ = fs::remove_file(&temp_path);
                         return Err(error);
                     }
+                    let Some(_removed) = sessions.remove(&session_id) else {
+                        bail!("historical session {session_id} disappeared during shutdown");
+                    };
+                    self.forget_custom_label(&session_id);
                     ShutdownTarget::Historical {
                         completed,
                         log_path,
@@ -4085,6 +4115,9 @@ impl SessionApi for SessionManager {
                         .and_then(|temp_path| {
                             replace_manifest(&temp_path, &self.config.manifest_path())
                         });
+                    if rewrite_result.is_err() {
+                        let _ = fs::remove_file(&prepared_manifest);
+                    }
                     let removed = sessions.remove(&session_id).with_context(|| {
                         format!("session {session_id} disappeared during shutdown")
                     })?;
@@ -4114,6 +4147,8 @@ impl SessionApi for SessionManager {
                             error = ?error,
                             "session stopped, but committing its manifest removal failed"
                         );
+                    } else {
+                        self.forget_custom_label(&session_id);
                     }
                     (actor, rewrite_result)
                 };
@@ -4127,6 +4162,7 @@ impl SessionApi for SessionManager {
         self.forget_judge_override(&session_id);
         self.forget_inbox(&session_id);
         self.forget_parked_input(&session_id);
+        self.forget_custom_label(&session_id);
         // Only after the actor has shut down, so nothing is still writing to it.
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
@@ -17283,6 +17319,81 @@ mod tests {
         assert_eq!(
             layout2.custom_labels.get("session-1"),
             Some(&"Worker Node".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Shutdown must take the session's custom label with it: the label map
+    /// is keyed by id, not by record membership, so without an explicit
+    /// forget a removed session's label outlives it (in memory and on disk)
+    /// and a later session reusing the name collides with a ghost row.
+    #[test]
+    fn shutdown_session_forgets_the_custom_label() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let config = SessionManagerConfig::new(log_dir.clone());
+        let manager = SessionManager::new(config.clone());
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        manager
+            .set_session_custom_label(session_id.clone(), Some("doomed".to_string()))
+            .expect("set label");
+        assert!(
+            manager
+                .get_rail_layout()
+                .expect("layout")
+                .custom_labels
+                .contains_key(session_id.as_str())
+        );
+
+        manager
+            .shutdown_session(session_id.clone())
+            .expect("shutdown");
+
+        let layout = manager.get_rail_layout().expect("layout after shutdown");
+        assert!(
+            !layout.custom_labels.contains_key(session_id.as_str()),
+            "label must not outlive its session"
+        );
+
+        // Nor on disk: a cold restart must not resurrect it.
+        let manager2 = SessionManager::new(config.clone());
+        let layout2 = manager2.get_rail_layout().expect("layout after restart");
+        assert!(!layout2.custom_labels.contains_key(session_id.as_str()));
+
+        // Historical sessions shut down through the same contract: start a
+        // session, persist its label, cold-restart into `Historical` state,
+        // and verify `shutdown_session` drops the label in memory and on disk.
+        let hist_id = manager2
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start historical target");
+        manager2
+            .set_session_custom_label(hist_id.clone(), Some("doomed-hist".to_string()))
+            .expect("set historical label");
+        drop(manager2);
+
+        let manager3 = SessionManager::new(config.clone());
+        manager3
+            .shutdown_session(hist_id.clone())
+            .expect("shutdown historical session");
+        assert!(
+            !manager3
+                .get_rail_layout()
+                .expect("layout after historical shutdown")
+                .custom_labels
+                .contains_key(hist_id.as_str()),
+            "historical shutdown must also forget custom label in memory"
+        );
+        let manager4 = SessionManager::new(config);
+        assert!(
+            !manager4
+                .get_rail_layout()
+                .expect("layout after historical restart")
+                .custom_labels
+                .contains_key(hist_id.as_str()),
+            "historical shutdown must also omit custom label from persisted manifest"
         );
 
         let _ = std::fs::remove_dir_all(&log_dir);

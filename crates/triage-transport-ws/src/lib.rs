@@ -830,6 +830,27 @@ pub enum ServerMessage {
     },
 }
 
+impl ServerMessage {
+    /// Short stable name for logs and metrics. Matches the serde tag so a
+    /// logged kind greps the same on both sides of the wire.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ServerMessage::Response { .. } => "response",
+            ServerMessage::Error { .. } => "error",
+            ServerMessage::Event { .. } => "event",
+            ServerMessage::SubscriptionClosed { .. } => "subscription_closed",
+            ServerMessage::SessionSnippetUpdated { .. } => "session_snippet_updated",
+            ServerMessage::SessionContextUpdated { .. } => "session_context_updated",
+            ServerMessage::UpdateAvailable { .. } => "update_available",
+            ServerMessage::SessionJudgePolicyUpdated { .. } => "session_judge_policy_updated",
+            ServerMessage::RailPinsUpdated { .. } => "rail_pins_updated",
+            ServerMessage::SessionCustomLabelUpdated { .. } => "session_custom_label_updated",
+            ServerMessage::SessionStarted { .. } => "session_started",
+            ServerMessage::SessionTerminated { .. } => "session_terminated",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum ServerResult {
@@ -2508,5 +2529,74 @@ mod tests {
         let terminated_deserialized: ServerMessage =
             serde_json::from_str(&terminated_json).unwrap();
         assert_eq!(terminated, terminated_deserialized);
+    }
+
+    #[test]
+    fn server_message_kind_matches_serde_type_tag_for_all_variants() {
+        let sid = SessionId::new("s-1").unwrap();
+        let sub_id = SubscriptionId::new("sub-1").unwrap();
+        let samples = vec![
+            ServerMessage::Response {
+                id: None,
+                result: ServerResult::Unit,
+            },
+            ServerMessage::Error {
+                id: None,
+                error: ProtocolError::new("bad_request", "bad"),
+            },
+            ServerMessage::Event {
+                subscription_id: sub_id.clone(),
+                envelope: test_output_event(1),
+            },
+            ServerMessage::SubscriptionClosed {
+                subscription_id: sub_id,
+            },
+            ServerMessage::SessionSnippetUpdated {
+                session_id: sid.clone(),
+                snippet: "hi".to_string(),
+                detail: None,
+                output_seq: 1,
+            },
+            ServerMessage::SessionContextUpdated {
+                session_id: sid.clone(),
+                current_working_directory: None,
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+            },
+            ServerMessage::UpdateAvailable {
+                current_version: "0.1.0".to_string(),
+                latest_version: "0.2.0".to_string(),
+            },
+            ServerMessage::SessionJudgePolicyUpdated {
+                session_id: sid.clone(),
+                policy: SessionJudgePolicy {
+                    explicit: None,
+                    effective: true,
+                },
+            },
+            ServerMessage::RailPinsUpdated {
+                group_keys: vec![],
+                session_ids: vec![],
+            },
+            ServerMessage::SessionCustomLabelUpdated {
+                session_id: sid.clone(),
+                custom_label: None,
+            },
+            ServerMessage::SessionStarted {
+                session_id: sid.clone(),
+                current_working_directory: None,
+                repository_root: None,
+                worktree_root: None,
+                branch: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+            },
+            ServerMessage::SessionTerminated { session_id: sid },
+        ];
+        for msg in samples {
+            let wire = serde_json::to_value(&msg).expect("serialize ServerMessage");
+            assert_eq!(Some(msg.kind()), wire.get("type").and_then(Value::as_str));
+        }
     }
 }
