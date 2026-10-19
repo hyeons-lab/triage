@@ -204,5 +204,104 @@ void main() {
       }
     });
   });
+
+  group('TerminalPane Shift+Enter newline', () {
+    Future<List<String>> pumpPane(
+      WidgetTester tester, {
+      VoidCallback? onInteraction,
+    }) async {
+      final terminal = Terminal();
+      final controller = TerminalController();
+      final inputs = <String>[];
+      controller.addInputListener((data) {
+        inputs.add(data);
+      });
+      if (onInteraction != null) {
+        controller.addInteractionListener(onInteraction);
+      }
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: TerminalPane(
+              terminalId: 'test-session',
+              terminal: terminal,
+              controller: controller,
+              fallbackRows: const [],
+              onTerminalResizeBind: (_) {},
+              focusCursorRevision: 0,
+              bracketedPasteEnabled: false,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      return inputs;
+    }
+
+    testWidgets('Shift+Enter sends LF instead of submitting', (tester) async {
+      var interactions = 0;
+      final inputs = await pumpPane(
+        tester,
+        onInteraction: () => interactions++,
+      );
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyRepeatEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.enter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+
+      expect(inputs, ['\n', '\n']);
+      expect(interactions, 2);
+    });
+
+    testWidgets('Shift+numpadEnter sends LF', (tester) async {
+      final inputs = await pumpPane(tester);
+
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.numpadEnter);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+      await tester.pump();
+
+      expect(inputs, ['\n']);
+    });
+
+    testWidgets('plain Enter is left to the emulator default', (
+      tester,
+    ) async {
+      final inputs = await pumpPane(tester);
+
+      // Our layer sends nothing: xterm's own handler owns plain Enter (CR)
+      // in production. (The fallback view mounts no TerminalView, so there
+      // is no emulator echo to observe here.)
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pump();
+
+      expect(inputs, isEmpty);
+    });
+
+    for (final (label, modifier) in [
+      ('Ctrl', LogicalKeyboardKey.controlLeft),
+      ('Alt', LogicalKeyboardKey.altLeft),
+      ('Meta', LogicalKeyboardKey.metaLeft),
+    ]) {
+      testWidgets('$label+Shift+Enter is left to the default path', (
+        tester,
+      ) async {
+        final inputs = await pumpPane(tester);
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyDownEvent(modifier);
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.sendKeyUpEvent(modifier);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.pump();
+
+        expect(inputs, isEmpty);
+      });
+    }
+  });
 }
 
