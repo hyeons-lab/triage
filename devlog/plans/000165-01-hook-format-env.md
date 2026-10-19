@@ -1,4 +1,4 @@
-# 000155-01 — Hermetic hook format detection
+# 000165-01: Hermetic hook format detection
 
 ## Thinking
 
@@ -15,7 +15,7 @@ Scrubbing the vars in the tests is the small diff but the wrong fix: env
 mutation is process-global and racy under parallel tests, and it silently
 breaks when a future test needs the vars set. Splitting the env read from
 the decision keeps production behavior identical (one call site builds the
-env snapshot) while tests drive the pure function with explicit env —
+env snapshot) while tests drive the pure function with explicit env,
 hermetic under any ambient environment, with no new dependencies.
 
 ## Plan

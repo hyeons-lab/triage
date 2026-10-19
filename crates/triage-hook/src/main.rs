@@ -329,12 +329,29 @@ struct FormatEnv {
 
 impl FormatEnv {
     fn from_process() -> Self {
+        Self::from_os_parts(std::env::args_os(), |key| std::env::var_os(key))
+    }
+
+    fn from_os_parts<I, F>(args: I, mut get_env: F) -> Self
+    where
+        I: IntoIterator<Item = std::ffi::OsString>,
+        F: FnMut(&str) -> Option<std::ffi::OsString>,
+    {
+        let has_nonempty_env = |get: &mut F, key: &str| get(key).is_some_and(|v| !v.is_empty());
+        let env_format = get_env("TRIAGE_HOOK_FORMAT")
+            .and_then(|v| v.into_string().ok())
+            .filter(|s| !s.trim().is_empty());
+        let claude_env = has_nonempty_env(&mut get_env, "CLAUDE_CODE_VERSION")
+            || has_nonempty_env(&mut get_env, "CLAUDE_PROJECT_DIR");
+        let muse_env = has_nonempty_env(&mut get_env, "MUSE_TOOL_USE_ID");
         Self {
-            argv: std::env::args().collect(),
-            env_format: std::env::var("TRIAGE_HOOK_FORMAT").ok(),
-            claude_env: std::env::var("CLAUDE_CODE_VERSION").is_ok()
-                || std::env::var("CLAUDE_PROJECT_DIR").is_ok(),
-            muse_env: std::env::var("MUSE_TOOL_USE_ID").is_ok(),
+            argv: args
+                .into_iter()
+                .filter_map(|a| a.into_string().ok())
+                .collect(),
+            env_format,
+            claude_env,
+            muse_env,
         }
     }
 }
@@ -2033,6 +2050,46 @@ mod tests {
             detect_format_with_env(&agy_shaped, &bogus),
             AgentFormat::Antigravity
         );
+    }
+
+    #[test]
+    fn format_env_from_os_parts_ignores_empty_vars_and_tolerates_non_utf8() {
+        use std::ffi::OsString;
+
+        let empty_env =
+            FormatEnv::from_os_parts(vec![OsString::from("triage-hook")], |key| match key {
+                "TRIAGE_HOOK_FORMAT" => Some(OsString::from("   ")),
+                "CLAUDE_CODE_VERSION" => Some(OsString::from("")),
+                "CLAUDE_PROJECT_DIR" => Some(OsString::from("")),
+                "MUSE_TOOL_USE_ID" => Some(OsString::from("")),
+                _ => None,
+            });
+        assert_eq!(empty_env.env_format, None);
+        assert!(!empty_env.claude_env);
+        assert!(!empty_env.muse_env);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_utf8 = OsString::from_vec(vec![0xff, 0xfe]);
+            let env = FormatEnv::from_os_parts(
+                vec![
+                    OsString::from("triage-hook"),
+                    non_utf8.clone(),
+                    OsString::from("--format=muse"),
+                ],
+                |key| match key {
+                    "CLAUDE_PROJECT_DIR" => Some(non_utf8.clone()),
+                    _ => None,
+                },
+            );
+            assert_eq!(
+                env.argv,
+                vec!["triage-hook".to_string(), "--format=muse".to_string()]
+            );
+            assert!(env.claude_env);
+            assert!(!env.muse_env);
+        }
     }
 
     #[test]
