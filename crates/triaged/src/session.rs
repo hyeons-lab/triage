@@ -41,30 +41,45 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::summarizer::{SnippetResult, SummarizeJob, Summarizer, build_prompt_text};
 
-/// How long `serialize_active_sessions` will spend, in total, waiting for actors to
-/// hand over their PTY descriptors and counters.
+/// How long a bounded actor fan-out during handover will spend, in total,
+/// waiting for its actors to answer. Two fan-outs share it: the extract in
+/// `serialize_active_sessions` (before the commit) and the unrecovered-loss
+/// take in `take_unrecovered_losses` (after it).
 ///
-/// The only bounded actor round-trip in this file, and deliberately so: everywhere
-/// else a deadline would turn a slow-but-healthy session into a spurious error, while
-/// here the wait is all-or-nothing for a whole handover. An actor that cannot answer
-/// within it is parked in `write_all` on a session whose child stopped reading, and
-/// waiting on it forever abandons every *other* session to this daemon's exit.
+/// The only bounded actor round-trips in this file, and deliberately so:
+/// everywhere else a deadline would turn a slow-but-healthy session into a
+/// spurious error, while here the wait is all-or-nothing for a whole
+/// handover. An actor that cannot answer within it is parked in `write_all`
+/// on a session whose child stopped reading, and waiting on it forever
+/// abandons every *other* session to this daemon's exit.
 ///
-/// A single budget for the whole loop rather than one deadline per actor, because the
-/// bound that actually matters belongs to the successor: it gives up on the entire
-/// Phase-1 response after [`crate::handover::HANDOVER_TRANSFER_TIMEOUT`]. Per-actor
-/// deadlines would sum past that as soon as a second session was parked, so the swap
-/// would fail wholesale in exactly the case this bound exists to survive. Comfortably
-/// under that limit, and unreachable for a healthy daemon, where each answer is a
-/// descriptor dup and three counters.
+/// A single budget for the whole loop rather than one deadline per actor,
+/// because the bound that actually matters belongs to the successor — but
+/// it is a different successor wait for each fan-out. The extract runs
+/// before the state is sent, so it eats into the successor's Phase-1 read
+/// of that state ([`crate::handover::HANDOVER_TRANSFER_TIMEOUT`]); the take
+/// runs after the commit byte and before the done byte, so it eats into
+/// the successor's Phase-3 teardown wait
+/// ([`crate::handover::HANDOVER_TEARDOWN_TIMEOUT`]). Per-actor deadlines
+/// would sum past either bound as soon as a second session was parked, so
+/// the swap would fail wholesale in exactly the case this bound exists to
+/// survive. Comfortably under both limits, and unreachable for a healthy
+/// daemon, where each answer is a descriptor dup and three counters.
 #[cfg(unix)]
-const HANDOVER_EXTRACT_BUDGET: Duration = Duration::from_secs(4);
+const HANDOVER_ACTOR_BUDGET: Duration = Duration::from_secs(4);
 
 #[cfg(unix)]
 const _: () = assert!(
-    HANDOVER_EXTRACT_BUDGET.as_secs() * 2 < crate::handover::HANDOVER_TRANSFER_TIMEOUT.as_secs(),
-    "the extract budget must leave the successor's Phase-1 read deadline room for the transfer \
-     itself, or a parked session turns into a failed swap"
+    HANDOVER_ACTOR_BUDGET.as_secs() * 2 < crate::handover::HANDOVER_TRANSFER_TIMEOUT.as_secs(),
+    "the handover actor budget must leave the successor's Phase-1 read deadline room for the \
+     transfer itself, or a parked session turns into a failed swap"
+);
+
+#[cfg(unix)]
+const _: () = assert!(
+    HANDOVER_ACTOR_BUDGET.as_secs() < crate::handover::HANDOVER_TEARDOWN_TIMEOUT.as_secs(),
+    "the post-commit loss take must fit inside the successor's teardown wait, with room \
+     left for the detach and exit that follow it"
 );
 
 const EVENT_SUBSCRIBER_BUFFER: usize = 64;
@@ -1943,12 +1958,7 @@ impl SessionManager {
     }
 
     #[cfg(unix)]
-    pub fn serialize_active_sessions(
-        &self,
-    ) -> Result<(
-        crate::handover::HandoverState,
-        Vec<std::os::unix::io::RawFd>,
-    )> {
+    pub fn serialize_active_sessions(&self) -> Result<SerializedHandover> {
         // Snapshot what each live session needs under the lock, then do the actor
         // round-trips off it. This is the same OFF-LOCK discipline as
         // `request_write_input`, and it matters most here of all: this is the call a
@@ -2013,8 +2023,8 @@ impl SessionManager {
             .collect();
 
         // One budget for every actor, not one deadline each: see
-        // `HANDOVER_EXTRACT_BUDGET`. A healthy daemon spends microseconds of it.
-        let extract_deadline = Instant::now() + HANDOVER_EXTRACT_BUDGET;
+        // `HANDOVER_ACTOR_BUDGET`. A healthy daemon spends microseconds of it.
+        let extract_deadline = Instant::now() + HANDOVER_ACTOR_BUDGET;
 
         for (id, rx, launch, stamps) in inflight {
             // Bounded, unlike every other actor round-trip in this file. An actor that
@@ -2033,7 +2043,7 @@ impl SessionManager {
                 Err(RecvTimeoutError::Timeout) => {
                     tracing::error!(
                         session_id = %id,
-                        budget_secs = HANDOVER_EXTRACT_BUDGET.as_secs(),
+                        budget_secs = HANDOVER_ACTOR_BUDGET.as_secs(),
                         "actor did not answer the handover extract before the budget ran out; \
                          handing over without this session, which will not survive this daemon's \
                          exit"
@@ -2071,6 +2081,8 @@ impl SessionManager {
                 log_path: ext.log_path,
                 output_seq: ext.output_seq,
                 bytes_logged: ext.bytes_logged,
+                logged_output_seq: Some(ext.logged_output_seq),
+                logged_tail_bytes: Some(ext.logged_tail_bytes),
                 pid: ext.pid,
                 process_identity: ext.process_identity,
                 last_activity_ms: stamps.activity_ms,
@@ -2128,7 +2140,102 @@ impl SessionManager {
             custom_labels,
         };
 
-        Ok((state, fds))
+        Ok(SerializedHandover { state, fds })
+    }
+
+    /// Consumes the unrecovered log-loss count of each transferred live
+    /// session. Called by the handover handler only after the transfer
+    /// commits: taking the counts there (rather than copying them at
+    /// extraction) keeps the report exactly-once, because an actor that
+    /// already reported at its own exit answers zero, and one that has not
+    /// yet reported finds its backstop count consumed.
+    ///
+    /// Only sessions in `transferred` (the set `serialize_active_sessions`
+    /// actually put on the wire) are taken from: a session skipped at
+    /// extraction keeps its count for its own backstop instead of being
+    /// reported here as handed over. Sessions whose actor does not answer
+    /// within the shared budget likewise keep their count for the backstop;
+    /// every non-answer is logged, because the handler detaches and exits
+    /// right after this call, so an unlogged miss would be a loss report
+    /// lost with no trace.
+    #[cfg(unix)]
+    pub(crate) fn take_unrecovered_losses(
+        &self,
+        transferred: &[SessionId],
+    ) -> Vec<(SessionId, u64)> {
+        // Snapshot the actor senders under the lock, then do the sends and
+        // the waits off it — the same off-lock round-trip discipline as
+        // `serialize_active_sessions`, so a parked actor cannot stall every
+        // other manager operation behind this diagnostic take.
+        let transferred: HashSet<SessionId> = transferred.iter().cloned().collect();
+        let senders: Vec<(SessionId, Sender<ActorCommand>)> = match self.sessions() {
+            Ok(sessions) => sessions
+                .iter()
+                .filter_map(|(id, managed)| {
+                    let ManagedSession::Live { actor, .. } = managed else {
+                        return None;
+                    };
+                    transferred
+                        .contains(id)
+                        .then(|| (id.clone(), actor.tx.clone()))
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "could not lock the session map to take unrecovered log-loss counts \
+                     after the handover commit; unreported counts stay with the actors' \
+                     backstop reports"
+                );
+                return Vec::new();
+            }
+        };
+
+        // Ask everyone first, then collect, for the same reason as the
+        // extract fan-out: one shared budget then costs the slowest actor
+        // rather than the sum of all of them.
+        let mut pending: Vec<(SessionId, Receiver<u64>)> = Vec::new();
+        for (id, cmd_tx) in senders {
+            let (tx, rx) = mpsc::channel();
+            match cmd_tx.send(ActorCommand::TakeUnrecoveredLoss { response: tx }) {
+                Ok(()) => pending.push((id, rx)),
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        ?error,
+                        "failed to ask the actor for its unrecovered log-loss count after \
+                         the handover commit"
+                    );
+                }
+            }
+        }
+
+        let deadline = Instant::now() + HANDOVER_ACTOR_BUDGET;
+        let mut losses = Vec::new();
+        for (id, rx) in pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(bytes) if bytes > 0 => losses.push((id, bytes)),
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        budget_secs = HANDOVER_ACTOR_BUDGET.as_secs(),
+                        "actor did not answer the unrecovered-loss take before the budget \
+                         ran out; its count stays with its backstop report, which this \
+                         daemon's exit may pre-empt"
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        "actor stopped before answering the unrecovered-loss take; any \
+                         unreported loss is recorded only by its backstop report"
+                    );
+                }
+            }
+        }
+        losses
     }
 
     /// Detaches every live session from this daemon for a process handover:
@@ -2854,6 +2961,13 @@ fn spawn_adopted_pty_runtime(
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: h_sess.bytes_logged,
         output_seq: h_sess.output_seq,
+        logged_output_seq: h_sess.logged_output_seq(),
+        logged_tail_bytes: h_sess.logged_tail_bytes(),
+        log_write_failing: false,
+        stat_error_reported: false,
+        cache_reseed_pending: false,
+        cache_reseed_attempts: 0,
+        unlogged_bytes: 0,
         log_cache: None,
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
@@ -2865,6 +2979,11 @@ fn spawn_adopted_pty_runtime(
     } else {
         let cwd = output.replay_tail(replay_len, &replay)?;
         output.output_seq = h_sess.output_seq;
+        // The replay restored the sequences as if every byte were logged;
+        // adoption must keep the outgoing daemon's persistence watermarks,
+        // whose log may be missing bytes its live sequence advanced past.
+        output.logged_output_seq = h_sess.logged_output_seq();
+        output.logged_tail_bytes = h_sess.logged_tail_bytes().min(output.bytes_logged);
         cwd
     };
     let current_working_directory = adopted_session_cwd(
@@ -5083,7 +5202,8 @@ impl HistoricalSession {
         overlay_raw_output_history(
             self.snapshot(),
             &self.persisted.log_path,
-            self.output.bytes_logged,
+            self.output.logged_tail_bytes,
+            self.output.logged_output_seq,
         )
     }
 
@@ -5460,6 +5580,14 @@ struct PtyRuntime {
     current_working_directory: Option<PathBuf>,
 }
 
+// Test seam: when armed, `OutputState::log_metadata` fails as if the log's
+// stat failed, which no live `File` handle can be made to do portably.
+// Thread-local so parallel tests cannot arm each other.
+#[cfg(test)]
+thread_local! {
+    static FAIL_LOG_METADATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct OutputState {
     log: File,
     /// Path of `log`, retained so the log can be trimmed or rotated once it outgrows
@@ -5481,6 +5609,35 @@ struct OutputState {
     cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
     output_seq: u64,
+    /// Sequence of the most recent chunk confirmed fully persisted in the
+    /// log. History-bearing snapshots stamp this rather than `output_seq`:
+    /// `output_seq` also advances for chunks a failed write dropped, and a
+    /// snapshot claiming those sequences tells clients the missing bytes are
+    /// covered by the history tail, so their dedup would drop the live copies
+    /// queued during attach. Lags `output_seq` only while the tail chunks of
+    /// a write-failure episode are unpersisted.
+    logged_output_seq: u64,
+    /// Byte offset (in `bytes_logged` terms) of the end of the last fully
+    /// persisted chunk. The history tail is served only up to this offset:
+    /// a partially persisted chunk's prefix sits in the file past it, and
+    /// serving that prefix under the previous chunk's sequence would pair
+    /// it with the queued live copy of the whole chunk, painting the prefix
+    /// twice. Equals `bytes_logged` whenever no partial persist is pending.
+    logged_tail_bytes: u64,
+    /// A log write is currently failing; set on the first failure of an
+    /// episode so the failure diagnostics latch instead of firing per chunk.
+    log_write_failing: bool,
+    /// The stat-failure diagnostic has fired for the current episode.
+    stat_error_reported: bool,
+    /// The log cache was dropped by a write failure and should be re-seeded
+    /// on a later successful write.
+    cache_reseed_pending: bool,
+    /// Failed re-seed attempts in the current episode; bounds the retry so a
+    /// persistent mismatch cannot turn every chunk into a full cache read.
+    cache_reseed_attempts: u8,
+    /// Bytes the failed writes of the current episode did not persist;
+    /// reported and reset when writes recover.
+    unlogged_bytes: u64,
     log_cache: Option<Vec<u8>>,
     pending_carriage_return: bool,
     pending_escape_buffer: Vec<u8>,
@@ -5554,6 +5711,12 @@ enum ActorCommand {
     Shutdown {
         response: Sender<ActorResult<CompletedSession>>,
     },
+    /// Consume the unrecovered log-loss count; the handover handler takes
+    /// it after the transfer commits so the actor's own exit report stays
+    /// a backstop instead of double-reporting the same episode.
+    TakeUnrecoveredLoss {
+        response: Sender<u64>,
+    },
     #[cfg(unix)]
     ExtractHandoverState {
         response: Sender<ActorResult<ExtractedHandover>>,
@@ -5578,9 +5741,19 @@ pub struct ExtractedHandover {
     pub log_path: PathBuf,
     pub output_seq: u64,
     pub bytes_logged: u64,
+    pub logged_output_seq: u64,
+    pub logged_tail_bytes: u64,
 }
 
 type ActorResult<T> = Result<T>;
+
+/// Output of `SessionManager::serialize_active_sessions`: the wire handover
+/// state plus the PTY master descriptors to transfer.
+#[cfg(unix)]
+pub struct SerializedHandover {
+    pub state: crate::handover::HandoverState,
+    pub fds: Vec<std::os::unix::io::RawFd>,
+}
 type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 fn run_actor(
@@ -5633,6 +5806,16 @@ fn run_actor(
             }
         }
     }
+    // Terminal reporting point for exits that never pass through a command
+    // (manager detach for handover, dropped channels): reporting consumes
+    // the count, so an episode already reported at output end or shutdown
+    // is not reported twice. Review-only call site: by the time this runs
+    // the actor's channels are gone, so no test can observe the consumption
+    // from outside; it is the sole reporter for detach/channel-drop exits,
+    // which is why it must stay despite being unpinnable.
+    state
+        .output
+        .report_unrecovered_loss("session actor stopped before log writes recovered");
 }
 
 impl ActorState {
@@ -5663,6 +5846,8 @@ impl ActorState {
             log_path: self.output.log_path.clone(),
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
+            logged_output_seq: self.output.logged_output_seq,
+            logged_tail_bytes: self.output.logged_tail_bytes,
         })
     }
 
@@ -5900,6 +6085,8 @@ impl ActorState {
                 if let Err(error) = result {
                     tracing::warn!(error = ?error, "PTY output reader closed with error");
                 }
+                self.output
+                    .report_unrecovered_loss("session output ended before log writes recovered");
                 self.output_closed = true;
                 self.mark_exited();
                 self.broadcast_exit();
@@ -5988,9 +6175,13 @@ impl ActorState {
             ActorCommand::ExtractHandoverState { response } => {
                 // A response nobody receives closes its descriptor on drop, which is
                 // routine rather than exceptional here: the caller bounds this wait
-                // (`HANDOVER_EXTRACT_BUDGET`) and gives up on a parked actor. See
+                // (`HANDOVER_ACTOR_BUDGET`) and gives up on a parked actor. See
                 // `ExtractedHandover::fd`.
                 let _ = response.send(self.extract_handover_state());
+                false
+            }
+            ActorCommand::TakeUnrecoveredLoss { response } => {
+                let _ = response.send(std::mem::take(&mut self.output.unlogged_bytes));
                 false
             }
         }
@@ -6057,7 +6248,8 @@ impl ActorState {
         overlay_raw_output_history(
             self.snapshot(),
             &self.output.log_path,
-            self.output.bytes_logged,
+            self.output.logged_tail_bytes,
+            self.output.logged_output_seq,
         )
     }
 
@@ -6097,6 +6289,13 @@ impl ActorState {
         }
         self.drain_shutdown_output(command_rx, output_rx);
         self.reap_child();
+        // Review-only call site: if this report were deleted, the terminal
+        // point in `run_actor` would fire the same count under its own
+        // context, so no test can tell the two apart without capturing
+        // daemon logs. It stays because shutdown is the truthful context
+        // for this exit, and the consuming helper keeps it exactly-once.
+        self.output
+            .report_unrecovered_loss("session shutdown before log writes recovered");
         if let Err(error) = self.output.log.flush() {
             // The child is already terminated. Reporting an error here would
             // make the manager retain this actor as live even though retrying
@@ -6426,6 +6625,15 @@ fn translate_newlines(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     translate_newlines_with_state(bytes, false)
 }
 
+/// Outcome of a log-cache re-seed attempt: seeded, permanently inapplicable
+/// to this log (segmented or over budget), or retryable on a later write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheReseedOutcome {
+    Seeded,
+    Inapplicable,
+    RetryLater,
+}
+
 impl OutputState {
     fn advance_translated_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() && self.pending_escape_buffer.is_empty() {
@@ -6485,27 +6693,264 @@ impl OutputState {
     }
 
     fn ingest(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
-        self.log
-            .write_all(bytes)
-            .context("writing PTY output log")?;
-        self.bytes_logged += bytes.len() as u64;
-        self.active_segment_bytes += bytes.len() as u64;
+        // `Result` is retained deliberately: no step below can currently
+        // fail, but this is the seam where log persistence used to surface
+        // errors, and the callers' `Err` arms stay the single place a future
+        // fallible step reports — growing a parallel channel instead would
+        // strand them.
+        let mut chunk_logged = false;
+        match self.log.write_all(bytes) {
+            Ok(()) => {
+                if self.log_write_failing {
+                    // This chunk is on disk now; reconcile against the
+                    // on-disk length (which includes it) so partial persists
+                    // a failed stat left unaccounted mid-episode catch up.
+                    // The chunk counts as logged only if the reconcile could
+                    // credit the counters: sequence, byte counters, and the
+                    // served tail end must advance together or not at all.
+                    let report_stat_error = !self.stat_error_reported;
+                    if self
+                        .reconcile_log_counters(u64::MAX, report_stat_error)
+                        .is_some()
+                    {
+                        chunk_logged = true;
+                        self.log_write_failing = false;
+                        self.stat_error_reported = false;
+                        // An outage must not consume the trim latch forever:
+                        // a trim that failed mid-episode gets its next
+                        // attempt now that writes work again.
+                        self.trim_disabled = false;
+                        if self.unlogged_bytes > 0 {
+                            tracing::info!(
+                                log_path = %self.log_path.display(),
+                                unlogged_bytes = self.unlogged_bytes,
+                                "PTY output log writes recovered; \
+                                 the counted bytes were never persisted"
+                            );
+                            self.unlogged_bytes = 0;
+                        }
+                    } else if report_stat_error {
+                        self.stat_error_reported = true;
+                    }
+                } else {
+                    self.note_persisted(bytes.len() as u64);
+                    chunk_logged = true;
+                }
+                // Bounds wait for credited counters: while a stat failure
+                // keeps the episode open, trim/rotation would act on stale
+                // lengths (and trim could consume its latch mid-episode).
+                if !self.log_write_failing {
+                    self.enforce_log_bounds();
+                }
+                // A reseeded cache already ends with this chunk (it was read
+                // from the file the chunk was just written to); extending it
+                // again would double the chunk.
+                // Only attempt with credited counters: while a stat failure
+                // keeps the episode open, the on-disk length necessarily
+                // disagrees with the counters, so the read is guaranteed
+                // wasted and would burn the bounded retry budget.
+                let mut cache_reseeded = false;
+                if self.cache_reseed_pending && self.log_cache.is_none() && !self.log_write_failing
+                {
+                    match self.reseed_log_cache() {
+                        CacheReseedOutcome::Seeded => {
+                            self.cache_reseed_pending = false;
+                            self.cache_reseed_attempts = 0;
+                            cache_reseeded = true;
+                        }
+                        CacheReseedOutcome::Inapplicable => {
+                            self.cache_reseed_pending = false;
+                            self.cache_reseed_attempts = 0;
+                        }
+                        CacheReseedOutcome::RetryLater => {
+                            self.cache_reseed_attempts =
+                                self.cache_reseed_attempts.saturating_add(1);
+                            if self.cache_reseed_attempts >= CACHE_RESEED_MAX_ATTEMPTS {
+                                self.cache_reseed_pending = false;
+                                self.cache_reseed_attempts = 0;
+                                tracing::warn!(
+                                    log_path = %self.log_path.display(),
+                                    attempts = CACHE_RESEED_MAX_ATTEMPTS,
+                                    "giving up re-seeding the log cache; \
+                                     the file length persistently disagrees with the byte counters"
+                                );
+                            }
+                        }
+                    }
+                }
+                if !cache_reseeded && let Some(cache) = &mut self.log_cache {
+                    if cache.len() + bytes.len() <= LOG_CACHE_MAX_BYTES as usize {
+                        cache.extend_from_slice(bytes);
+                    } else {
+                        self.log_cache = None;
+                    }
+                }
+            }
+            Err(error) => {
+                // A failed log write (full disk) degrades history, not
+                // liveness: the chunk still advances the terminal and the
+                // output sequence below, so callers broadcast it instead of
+                // freezing every attached client. `write_all` may have
+                // persisted a prefix before failing, so reconcile the
+                // counters with the on-disk length rather than trust either.
+                //
+                // The write itself is still attempted on every chunk: it
+                // fails fast on a full disk and doubles as the recovery
+                // probe, so bytes that could persist are never skipped. What
+                // latches per episode is the diagnostic — a formatted warning
+                // per 8 KiB chunk would flood the actor thread and the very
+                // disk that is full.
+                let first_failure = !self.log_write_failing;
+                if first_failure {
+                    tracing::warn!(
+                        log_path = %self.log_path.display(),
+                        error = ?error,
+                        "failed to write PTY output log; continuing live-only \
+                         (further failures suppressed until recovery)"
+                    );
+                }
+                let persisted = self
+                    .reconcile_log_counters(bytes.len() as u64, false)
+                    .unwrap_or(0);
+                self.unlogged_bytes += (bytes.len() as u64).saturating_sub(persisted);
+                self.log_cache = None;
+                self.cache_reseed_pending = true;
+                if first_failure {
+                    // The retry budget is per-episode: later failures of the
+                    // same episode must not re-arm it.
+                    self.cache_reseed_attempts = 0;
+                }
+                // Bound enforcement is episode-aware. Rotation is attempted
+                // once, as the episode opens, so a partially persisting sink
+                // cannot grow the active segment without limit; further
+                // attempts defer to the recovery write. Trimming defers for
+                // the whole episode: an in-place rewrite on the failing disk
+                // would only consume the permanent trim latch mid-outage.
+                if first_failure && self.is_segmented_log() {
+                    self.rotate_segment_if_oversized();
+                }
+                self.log_write_failing = true;
+            }
+        }
         self.output_seq += 1;
+        if chunk_logged {
+            self.mark_fully_persisted();
+        }
+        let current_working_directory = self.extract_current_working_directory(bytes);
+        self.advance_translated_bytes(bytes);
+        Ok(current_working_directory)
+    }
+
+    fn note_persisted(&mut self, n: u64) {
+        self.bytes_logged += n;
+        self.active_segment_bytes += n;
+    }
+
+    /// Advances the fully-persisted watermark pair together: the logged
+    /// sequence and the served tail end it pairs with in snapshots. The two
+    /// must never move separately, or the snapshot coverage claim and the
+    /// tail bytes disagree.
+    fn mark_fully_persisted(&mut self) {
+        self.logged_output_seq = self.output_seq;
+        self.logged_tail_bytes = self.bytes_logged;
+    }
+
+    fn log_metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(test)]
+        if FAIL_LOG_METADATA.with(|flag| flag.get()) {
+            return Err(std::io::Error::other("injected log metadata failure"));
+        }
+        self.log.metadata()
+    }
+
+    /// Emits the accumulated unlogged-byte count when the session leaves
+    /// this daemon (output end, shutdown, handover) with an episode still
+    /// open, so a degraded history stays distinguishable from a complete
+    /// one after the fact. Reporting consumes the count, so one episode is
+    /// reported exactly once across the lifecycle; the count also resets on
+    /// recovery, so a nonzero value here means the loss was never reconciled.
+    fn report_unrecovered_loss(&mut self, context: &str) {
+        let unlogged_bytes = std::mem::take(&mut self.unlogged_bytes);
+        if unlogged_bytes > 0 {
+            tracing::warn!(
+                log_path = %self.log_path.display(),
+                unlogged_bytes,
+                "{context}; the counted bytes were never persisted"
+            );
+        }
+    }
+
+    /// Enforces the log size bounds after a successful write: segment
+    /// rotation for segmented logs, in-place trim otherwise.
+    fn enforce_log_bounds(&mut self) {
         if self.is_segmented_log() {
             self.rotate_segment_if_oversized();
         } else {
             self.trim_log_if_oversized();
         }
-        if let Some(cache) = &mut self.log_cache {
-            if cache.len() + bytes.len() <= 1024 * 1024 {
-                cache.extend_from_slice(bytes);
-            } else {
-                self.log_cache = None;
+    }
+
+    /// Reconciles the byte counters with the active log file's on-disk
+    /// length after a write that may have persisted only a prefix, crediting
+    /// at most `attempted` new bytes. Returns the newly credited count, or
+    /// `None` when the file could not be statted — the counters then stay at
+    /// their baseline and the next successful write reconciles again.
+    ///
+    /// The baseline is the active segment's length for segmented logs, where
+    /// `bytes_logged` is cumulative across segments. A file that shrank under
+    /// the counters (e.g. trimmed by the outgoing daemon during handover)
+    /// rebases both counters down by the shrink, so history readers never
+    /// seek from a length the file no longer has.
+    fn reconcile_log_counters(&mut self, attempted: u64, report_stat_error: bool) -> Option<u64> {
+        let baseline = if self.is_segmented_log() {
+            self.active_segment_bytes
+        } else {
+            self.bytes_logged
+        };
+        let on_disk = match self.log_metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                if report_stat_error {
+                    tracing::warn!(
+                        log_path = %self.log_path.display(),
+                        error = ?error,
+                        "failed to stat PTY output log; byte counters left at their baseline"
+                    );
+                }
+                return None;
             }
+        };
+        if on_disk >= baseline {
+            let persisted = on_disk.saturating_sub(baseline).min(attempted);
+            self.note_persisted(persisted);
+            Some(persisted)
+        } else {
+            let shrink = baseline - on_disk;
+            self.bytes_logged = self.bytes_logged.saturating_sub(shrink);
+            self.active_segment_bytes = self.active_segment_bytes.saturating_sub(shrink);
+            self.logged_tail_bytes = self.logged_tail_bytes.min(self.bytes_logged);
+            Some(0)
         }
-        let current_working_directory = self.extract_current_working_directory(bytes);
-        self.advance_translated_bytes(bytes);
-        Ok(current_working_directory)
+    }
+
+    /// Rebuilds the in-memory log cache after a write-failure episode dropped
+    /// it, when the whole log fits the cache budget. Segmented logs are
+    /// skipped: their history already reads through the segment chain, and
+    /// the cache mirrors the single-file append stream.
+    fn reseed_log_cache(&mut self) -> CacheReseedOutcome {
+        if self.log_cache.is_some() {
+            return CacheReseedOutcome::Inapplicable;
+        }
+        if self.is_segmented_log() || self.bytes_logged > LOG_CACHE_MAX_BYTES {
+            return CacheReseedOutcome::Inapplicable;
+        }
+        if let Ok(bytes) = fs::read(&self.log_path)
+            && bytes.len() as u64 == self.bytes_logged
+        {
+            self.log_cache = Some(bytes);
+            return CacheReseedOutcome::Seeded;
+        }
+        CacheReseedOutcome::RetryLater
     }
 
     fn is_segmented_log(&self) -> bool {
@@ -6517,6 +6962,14 @@ impl OutputState {
     }
 
     fn rotate_segment_if_oversized(&mut self) {
+        // While log writes are failing, rotation would only try to create a
+        // segment on the failing disk and warn per chunk. The failure path
+        // attempts rotation once as an episode opens (before the latch is
+        // set, so this guard passes); every later attempt defers to the
+        // first write that recovers.
+        if self.log_write_failing {
+            return;
+        }
         if self.segment_size_bytes == 0 || self.active_segment_bytes < self.segment_size_bytes {
             return;
         }
@@ -6663,8 +7116,11 @@ impl OutputState {
     fn replay(&mut self, bytes: &[u8]) -> Result<Option<PathBuf>> {
         self.bytes_logged += bytes.len() as u64;
         self.output_seq += 1;
+        // Replayed bytes are read from the log, so they are persisted by
+        // construction.
+        self.mark_fully_persisted();
         if let Some(cache) = &mut self.log_cache {
-            if cache.len() + bytes.len() <= 1024 * 1024 {
+            if cache.len() + bytes.len() <= LOG_CACHE_MAX_BYTES as usize {
                 cache.extend_from_slice(bytes);
             } else {
                 self.log_cache = None;
@@ -6692,6 +7148,10 @@ impl OutputState {
         }
         self.bytes_logged = total_len;
         self.output_seq = original_output_seq;
+        // Every byte of the log is on disk, so the restored sequence is
+        // fully logged by construction. (Adoption overrides both stamps
+        // with the outgoing daemon's after this returns.)
+        self.mark_fully_persisted();
         Ok(current_working_directory)
     }
 
@@ -6922,6 +7382,13 @@ fn spawn_pty_runtime(
                     cwd_sequence_buffer: Vec::new(),
                     bytes_logged: 0,
                     output_seq: 0,
+                    logged_output_seq: 0,
+                    log_write_failing: false,
+                    logged_tail_bytes: 0,
+                    stat_error_reported: false,
+                    cache_reseed_pending: false,
+                    cache_reseed_attempts: 0,
+                    unlogged_bytes: 0,
                     log_cache: Some(Vec::new()),
                     pending_carriage_return: false,
                     pending_escape_buffer: Vec::new(),
@@ -6963,6 +7430,13 @@ fn spawn_pty_runtime(
                 cwd_sequence_buffer: Vec::new(),
                 bytes_logged: 0,
                 output_seq: 0,
+                logged_output_seq: 0,
+                log_write_failing: false,
+                logged_tail_bytes: 0,
+                stat_error_reported: false,
+                cache_reseed_pending: false,
+                cache_reseed_attempts: 0,
+                unlogged_bytes: 0,
                 log_cache: Some(Vec::new()),
                 pending_carriage_return: false,
                 pending_escape_buffer: Vec::new(),
@@ -7076,6 +7550,13 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: 0,
         output_seq: 0,
+        logged_output_seq: 0,
+        log_write_failing: false,
+        logged_tail_bytes: 0,
+        stat_error_reported: false,
+        cache_reseed_pending: false,
+        cache_reseed_attempts: 0,
+        unlogged_bytes: 0,
         log_cache: Some(Vec::new()),
         pending_carriage_return: false,
         pending_escape_buffer: Vec::new(),
@@ -7134,6 +7615,14 @@ fn snapshot_from_output(
 /// motivated the cap.
 const MAX_SESSION_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Maximum bytes held by the in-memory log cache (`OutputState::log_cache`).
+/// Past this the cache is dropped and history reads go to the file.
+const LOG_CACHE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Maximum cache re-seed attempts after a write-failure episode before the
+/// pending flag is given up (and the mismatch left to file reads).
+const CACHE_RESEED_MAX_ATTEMPTS: u8 = 3;
+
 /// Bytes of log kept when [`MAX_SESSION_LOG_BYTES`] is exceeded. The gap between
 /// the two bounds is what makes trimming amortised: one rewrite buys
 /// `MAX_SESSION_LOG_BYTES - SESSION_LOG_RETAIN_BYTES` of further output.
@@ -7190,11 +7679,35 @@ const _: () = assert!(
 fn overlay_raw_output_history(
     mut snapshot: SessionSnapshot,
     log_path: &Path,
-    bytes_logged: u64,
+    logged_tail_bytes: u64,
+    logged_output_seq: u64,
 ) -> SessionSnapshot {
-    let (start, raw) = read_raw_output_tail(log_path, bytes_logged, RAW_OUTPUT_TAIL_CAP);
-    snapshot.raw_output = raw;
-    snapshot.raw_output_start = start;
+    // The tail is served only to the end of the last fully persisted chunk:
+    // bytes a partially persisted chunk left past that offset stay unserved
+    // until a fully persisted chunk covers the stream again, so the tail
+    // always ends exactly at the stamped sequence's chunk boundary.
+    match read_raw_output_tail(log_path, logged_tail_bytes, RAW_OUTPUT_TAIL_CAP) {
+        Some((start, raw)) if start + raw.len() as u64 >= logged_tail_bytes => {
+            snapshot.raw_output = raw;
+            snapshot.raw_output_start = start;
+            // The sequence paired with the tail must be the last one fully
+            // persisted, not the live sequence: `output_seq` also advances for
+            // chunks a failed write dropped, and claiming those tells clients the
+            // missing bytes are covered by this tail, so their dedup drops the live
+            // copies queued during attach.
+            snapshot.output_seq = logged_output_seq;
+        }
+        Some(_) | None => {
+            // Claim no coverage at all: a short read (the log shrank behind
+            // the counters) cannot back the coverage claim, and neither can
+            // a failed read — a failed read is not an empty history. Either
+            // way, queued live chunks must be applied rather than deduped
+            // away against bytes this snapshot does not actually carry.
+            snapshot.raw_output = Vec::new();
+            snapshot.raw_output_start = 0;
+            snapshot.output_seq = 0;
+        }
+    }
     snapshot
 }
 
@@ -7240,19 +7753,29 @@ fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Reads the last `cap` bytes of the raw output log, returning the byte offset of
-/// the first returned byte (`raw_output_start`) and the bytes. These are the
-/// untranslated PTY bytes, byte-identical to the live Output stream, so client
-/// history and live writes are consistent and de-duplicate cleanly by
-/// `output_seq`. `File` writes are unbuffered, so the on-disk tail is current.
-fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, Vec<u8>) {
-    if bytes_logged == 0 {
-        return (0, Vec::new());
+/// Reads the last `cap` bytes of the raw output log ending at `end` (an
+/// offset in `bytes_logged` terms, normally the end of the last fully
+/// persisted chunk), returning the byte offset of the first returned byte
+/// (`raw_output_start`) and the bytes, or `None` when the read itself fails
+/// (so callers never pair a coverage claim with a tail they do not have).
+/// These are the untranslated PTY bytes
+/// as persisted: identical to the live Output stream while log writes are
+/// healthy, so client history and live writes are consistent and
+/// de-duplicate cleanly by `output_seq` at the tail end — history-bearing
+/// snapshots stamp the last fully persisted chunk's sequence for exactly
+/// this pairing. Bytes past `end` (a partially persisted chunk's prefix)
+/// stay unserved. A write-failure episode leaves a permanent gap in the
+/// middle of the stream (the failed bytes exist nowhere on disk). `File`
+/// writes are unbuffered, so the on-disk tail is current.
+fn read_raw_output_tail(log_path: &Path, end: u64, cap: u64) -> Option<(u64, Vec<u8>)> {
+    if end == 0 {
+        return Some((0, Vec::new()));
     }
 
     if let Some(session_dir) = resolve_segment_session_dir(log_path) {
-        return match crate::storage::read_multi_segment_tail(&session_dir, bytes_logged, cap) {
-            Ok(tail) => tail,
+        let start = end.saturating_sub(cap);
+        return match crate::storage::read_multi_segment_range(&session_dir, start, end) {
+            Ok(tail) => Some(tail),
             // Falling back to the legacy single-log read below would be wrong:
             // migration renamed that file to `*.log.migrated`, so it would report
             // "no history" for a session whose segments are intact. Log loudly
@@ -7264,28 +7787,34 @@ fn read_raw_output_tail(log_path: &Path, bytes_logged: u64, cap: u64) -> (u64, V
                     ?err,
                     "failed to read segmented output tail; serving empty history"
                 );
-                (0, Vec::new())
+                None
             }
         };
     }
 
-    let start = bytes_logged.saturating_sub(cap);
-    let read = (|| -> std::io::Result<Vec<u8>> {
+    let read = (|| -> std::io::Result<(u64, Vec<u8>)> {
         let mut file = File::open(log_path)?;
+        // Clamp to the file's actual length: a log truncated behind the
+        // counters must serve a short tail ending at the real EOF, never a
+        // seek past it paired with the full coverage claim.
+        let effective_end = end.min(file.metadata()?.len());
+        let start = effective_end.saturating_sub(cap);
         file.seek(SeekFrom::Start(start))?;
         let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        Ok(buf)
+        std::io::Read::by_ref(&mut file)
+            .take(effective_end - start)
+            .read_to_end(&mut buf)?;
+        Ok((start, buf))
     })();
     match read {
-        Ok(buf) => (start, buf),
+        Ok(tail) => Some(tail),
         Err(error) => {
             tracing::warn!(
                 log_path = %log_path.display(),
                 ?error,
                 "failed to read raw output tail; sending empty history"
             );
-            (0, Vec::new())
+            None
         }
     }
 }
@@ -7643,6 +8172,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         }
         ActorCommand::Shutdown { response } => {
             let _ = response.send(Err(error));
+        }
+        ActorCommand::TakeUnrecoveredLoss { response } => {
+            let _ = response.send(0);
         }
         #[cfg(unix)]
         ActorCommand::ExtractHandoverState { response } => {
@@ -8798,6 +9330,8 @@ mod tests {
             log_path: seg1,
             output_seq: 42,
             bytes_logged: 16,
+            logged_output_seq: Some(40),
+            logged_tail_bytes: Some(8),
             last_activity_ms: 0,
             last_input_ms: 0,
             pid: std::process::id(),
@@ -8825,6 +9359,15 @@ mod tests {
         assert_eq!(
             runtime.output.output_seq, 42,
             "adopted runtime must preserve output_seq without incrementing on tail replay"
+        );
+        assert_eq!(
+            runtime.output.logged_output_seq, 40,
+            "adopted runtime must keep the outgoing daemon's logged sequence, \
+             not claim the live one"
+        );
+        assert_eq!(
+            runtime.output.logged_tail_bytes, 8,
+            "adopted runtime must keep the outgoing daemon's logged tail end"
         );
         std::fs::remove_dir_all(&temp).ok();
     }
@@ -8943,6 +9486,8 @@ mod tests {
                         log_path: log_path.clone(),
                         output_seq: 0,
                         bytes_logged: 0,
+                        logged_output_seq: None,
+                        logged_tail_bytes: None,
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
@@ -9985,6 +10530,8 @@ mod tests {
                         log_path: log_path.clone(),
                         output_seq: 0,
                         bytes_logged: 0,
+                        logged_output_seq: None,
+                        logged_tail_bytes: None,
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
@@ -12664,6 +13211,13 @@ mod tests {
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
+            logged_output_seq: 0,
+            log_write_failing: false,
+            logged_tail_bytes: 0,
+            stat_error_reported: false,
+            cache_reseed_pending: false,
+            cache_reseed_attempts: 0,
+            unlogged_bytes: 0,
             log_cache: Some(Vec::new()),
             pending_carriage_return: false,
             pending_escape_buffer: Vec::new(),
@@ -12724,25 +13278,77 @@ mod tests {
         std::fs::write(&path, b"0123456789").unwrap(); // 10 bytes
 
         // cap larger than the log -> whole log from offset 0.
-        let (start, bytes) = read_raw_output_tail(&path, 10, 1024);
+        let (start, bytes) = read_raw_output_tail(&path, 10, 1024).expect("read tail");
         assert_eq!(start, 0);
         assert_eq!(bytes, b"0123456789");
 
         // cap smaller than the log -> last `cap` bytes, offset advanced.
-        let (start, bytes) = read_raw_output_tail(&path, 10, 4);
+        let (start, bytes) = read_raw_output_tail(&path, 10, 4).expect("read tail");
         assert_eq!(start, 6);
         assert_eq!(bytes, b"6789");
 
         // empty session -> empty, no read.
-        let (start, bytes) = read_raw_output_tail(&path, 0, 1024);
+        let (start, bytes) = read_raw_output_tail(&path, 0, 1024).expect("read tail");
         assert_eq!(start, 0);
         assert!(bytes.is_empty());
 
-        // missing log -> empty, no panic.
+        // A missing log is a failed read, distinguishable from an empty one.
         let _ = std::fs::remove_file(&path);
-        let (start, bytes) = read_raw_output_tail(&path, 10, 1024);
-        assert_eq!(start, 0);
-        assert!(bytes.is_empty());
+        assert!(read_raw_output_tail(&path, 10, 1024).is_none());
+    }
+
+    /// A failed tail read must not be paired with a coverage claim: the
+    /// snapshot carries no history and sequence 0, so clients apply queued
+    /// live chunks instead of deduping them away.
+    #[test]
+    fn history_snapshot_claims_nothing_when_tail_read_fails() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"live\r\n").expect("baseline ingest");
+        let missing = path.with_extension("missing");
+        // Start from a snapshot that genuinely claims coverage, so the
+        // failure arm's zeroing is observable rather than vacuous.
+        let mut claimed = snapshot_from_output(&output, &SessionSize::default(), None, None, false);
+        assert_eq!(claimed.output_seq, 1);
+        claimed.raw_output = b"stale".to_vec();
+        claimed.raw_output_start = 5;
+        let snapshot = overlay_raw_output_history(claimed, &missing, 10, 7);
+        assert_eq!(snapshot.output_seq, 0);
+        assert!(snapshot.raw_output.is_empty());
+        assert_eq!(snapshot.raw_output_start, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_snapshot_claims_nothing_when_tail_is_short() {
+        // The log was truncated behind the persisted counters (an external
+        // cleanup raced the session): the tail read comes back short of
+        // `logged_tail_bytes`, so it cannot be paired with the logged
+        // sequence and the snapshot must claim no coverage, exactly like
+        // the failed-read case above.
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        let log_file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen log for truncation");
+        log_file.set_len(3).expect("truncate log");
+        drop(log_file);
+
+        let claimed = snapshot_from_output(&output, &SessionSize::default(), None, None, false);
+        assert_eq!(claimed.output_seq, 1);
+        let snapshot = overlay_raw_output_history(
+            claimed,
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(snapshot.output_seq, 0);
+        assert!(snapshot.raw_output.is_empty());
+        assert_eq!(snapshot.raw_output_start, 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The attach/resync path serves history through [`RAW_OUTPUT_TAIL_CAP`]:
@@ -12757,7 +13363,8 @@ mod tests {
         let snapshot = overlay_raw_output_history(
             snapshot_from_output(&output, &SessionSize::default(), None, None, false),
             &path,
-            output.bytes_logged,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
         );
         assert_eq!(snapshot.raw_output.len(), RAW_OUTPUT_TAIL_CAP as usize);
         assert_eq!(
@@ -12825,10 +13432,15 @@ mod tests {
         output.replay_tail(10, b"6789").expect("replay tail");
 
         assert_eq!(output.bytes_logged, 10);
+        // The watermark pair must describe the restored state, not the
+        // transient replay: restored sequence, full-log tail end.
+        assert_eq!(output.logged_output_seq, output.output_seq);
+        assert_eq!(output.logged_tail_bytes, output.bytes_logged);
         // A partial replay invalidates the cache, so history reads hit the file.
         assert!(output.log_cache.is_none());
 
-        let (start, bytes) = read_raw_output_tail(&path, output.bytes_logged, 4);
+        let (start, bytes) =
+            read_raw_output_tail(&path, output.bytes_logged, 4).expect("read tail");
         assert_eq!(start, 6);
         assert_eq!(bytes, b"6789");
 
@@ -12845,6 +13457,8 @@ mod tests {
         output.replay_tail(10, b"0123456789").expect("replay tail");
 
         assert_eq!(output.bytes_logged, 10);
+        assert_eq!(output.logged_output_seq, output.output_seq);
+        assert_eq!(output.logged_tail_bytes, output.bytes_logged);
         assert_eq!(output.log_cache.as_deref(), Some(&b"0123456789"[..]));
 
         let _ = fs::remove_file(&path);
@@ -12901,6 +13515,976 @@ mod tests {
         assert!(output.bytes_logged > logged, "trimming must stay disabled");
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// Recovery re-arms a trim latch consumed before the episode: an outage
+    /// must not leave the log growing past its bound forever.
+    #[cfg(not(windows))]
+    #[test]
+    fn recovery_rearms_a_latched_trim() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.max_log_bytes = 8;
+        output.retain_log_bytes = 4;
+
+        // Consume the latch the same way the latch test does.
+        fs::remove_file(&path).expect("remove log");
+        output.ingest(b"0123456789").expect("ingest past the bound");
+        assert!(output.trim_disabled, "the failed trim must latch");
+
+        // Recreate the log, then open a write-failure episode on it.
+        fs::write(&path, b"0123456789").expect("recreate log");
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"x")
+            .expect("ingest must survive a log write failure");
+
+        // Recovery over the bound must trim again.
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output.ingest(b"q").expect("resumed ingest");
+        assert!(!output.trim_disabled, "recovery must re-arm the trim");
+        assert_eq!(output.bytes_logged, 4, "the recovery write must trim");
+        assert_eq!(fs::read(&path).expect("read log"), b"789q");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A failed log write (full disk) must degrade history, not liveness:
+    /// the chunk still advances the terminal and the output sequence, so the
+    /// actor's Ok path broadcasts it instead of freezing every attached
+    /// client. The failure is forced portably by swapping in a read-only
+    /// handle, whose writes fail with EBADF on every platform.
+    #[test]
+    fn ingest_failure_still_advances_terminal_and_sequence() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+        output
+            .ingest(b"third\r\n")
+            .expect("consecutive failures must also survive");
+
+        assert_eq!(
+            output.output_seq, 3,
+            "failed chunks still advance the output sequence monotonically"
+        );
+        assert_eq!(
+            output.bytes_logged, 7,
+            "counters must stay synced to the on-disk length across failures"
+        );
+        assert_eq!(
+            output.active_segment_bytes, 7,
+            "the paired segment counter must track bytes_logged"
+        );
+        assert_eq!(
+            output.logged_output_seq, 1,
+            "only the persisted chunk may count as logged"
+        );
+        assert!(
+            output.log_write_failing,
+            "the episode latch must be set while writes fail"
+        );
+        assert_eq!(
+            output.unlogged_bytes, 15,
+            "both failed chunks must be counted as unlogged"
+        );
+        assert!(
+            output.log_cache.is_none(),
+            "a failed write invalidates the log cache"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\n",
+            "unlogged chunks must not corrupt on-disk content"
+        );
+        let rows = visible_rows(&output.terminal);
+        assert!(
+            rows.iter().any(|row| row.contains("second")),
+            "the terminal must advance past a failed write: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("third")),
+            "the terminal must advance past consecutive failed writes: {rows:?}"
+        );
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output
+            .ingest(b"fourth\r\n")
+            .expect("resumed write must succeed");
+        assert_eq!(output.output_seq, 4);
+        assert_eq!(output.bytes_logged, 7 + 8);
+        assert_eq!(output.active_segment_bytes, 7 + 8);
+        assert_eq!(
+            output.logged_output_seq, 4,
+            "a successful write must count as logged again"
+        );
+        assert!(
+            !output.log_write_failing,
+            "the episode latch must clear on recovery"
+        );
+        assert_eq!(
+            output.unlogged_bytes, 0,
+            "the unlogged count must reset once reported on recovery"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"first\r\nfourth\r\n",
+            "resumed writes must append cleanly after skipped chunks"
+        );
+        assert_eq!(
+            output.log_cache.as_deref(),
+            Some(&b"first\r\nfourth\r\n"[..]),
+            "recovery must re-seed the log cache from the on-disk content"
+        );
+
+        drop(output);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The partial-persist arithmetic is the riskiest new computation in the
+    /// failure path, and the read-only-handle fixture above can only ever
+    /// exercise it at zero persisted bytes. Drive `reconcile_log_counters`
+    /// directly: a failed `write_all` that persisted a prefix presents as
+    /// exactly this — the file longer than the counters by the prefix.
+    #[test]
+    fn reconcile_log_counters_credits_only_the_persisted_prefix() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"0123456789").expect("baseline ingest");
+
+        // Three more bytes landed before the write failed.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for append")
+            .write_all(b"abc")
+            .expect("append persisted prefix");
+        assert_eq!(output.reconcile_log_counters(8, false), Some(3));
+        assert_eq!(output.bytes_logged, 13);
+        assert_eq!(output.active_segment_bytes, 13);
+
+        // The attempted cap bounds what one chunk can be credited with; the
+        // remainder is credited by the next reconcile.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for append")
+            .write_all(b"de")
+            .expect("append persisted prefix");
+        assert_eq!(output.reconcile_log_counters(1, false), Some(1));
+        assert_eq!(output.bytes_logged, 14);
+        assert_eq!(output.reconcile_log_counters(8, false), Some(1));
+        assert_eq!(output.bytes_logged, 15);
+        assert_eq!(output.active_segment_bytes, 15);
+
+        // A file that shrank under the counters (trimmed by the outgoing
+        // daemon during handover) rebases both counters onto the real
+        // length instead of leaving them past EOF.
+        output.log.set_len(6).expect("shrink log");
+        assert_eq!(output.reconcile_log_counters(8, false), Some(0));
+        assert_eq!(output.bytes_logged, 6);
+        assert_eq!(output.active_segment_bytes, 6);
+        assert_eq!(
+            output.logged_tail_bytes, 6,
+            "the served tail end must clamp to the shrunken log"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// For segmented logs the reconcile baseline is the active segment's
+    /// length, not the cumulative `bytes_logged`: crediting against the
+    /// cumulative counter would clamp every partial persist to zero (or, on
+    /// the shrink leg, rebase by the wrong amount).
+    #[test]
+    fn reconcile_log_counters_uses_the_active_segment_baseline() {
+        let dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create segment dir");
+        let path = dir.join(crate::storage::segment_file_name(1));
+        let mut output = test_output_state(&path, SessionSize::default());
+        assert!(output.is_segmented_log(), "fixture must be segmented");
+        // Earlier segments account for 100 bytes; the active segment is empty.
+        output.bytes_logged = 100;
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open segment for append")
+            .write_all(b"1234567")
+            .expect("append persisted prefix");
+        assert_eq!(output.reconcile_log_counters(8, false), Some(7));
+        assert_eq!(output.bytes_logged, 107);
+        assert_eq!(output.active_segment_bytes, 7);
+
+        // Shrink of the active segment rebases the cumulative counter by the
+        // segment's shrink, not by the whole cumulative amount.
+        output.logged_tail_bytes = 107;
+        output.log.set_len(5).expect("shrink segment");
+        assert_eq!(output.reconcile_log_counters(8, false), Some(0));
+        assert_eq!(output.bytes_logged, 105);
+        assert_eq!(output.active_segment_bytes, 5);
+        assert_eq!(
+            output.logged_tail_bytes, 105,
+            "the served tail end must clamp by the segment shrink"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed ingest on a segmented log must leave both counters exactly
+    /// where they were: the cumulative counter must not be mistaken for the
+    /// active segment's baseline.
+    #[test]
+    fn ingest_failure_keeps_counters_for_segmented_logs() {
+        let dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create segment dir");
+        let path = dir.join(crate::storage::segment_file_name(1));
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+        // Pretend earlier segments hold 93 more bytes.
+        output.bytes_logged = 100;
+
+        output.log = File::open(&path).expect("reopen segment read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+
+        assert_eq!(output.output_seq, 2);
+        assert_eq!(output.logged_output_seq, 1);
+        assert_eq!(
+            output.bytes_logged, 100,
+            "cumulative counter must not move on a zero-persist failure"
+        );
+        assert_eq!(
+            output.active_segment_bytes, 7,
+            "active segment counter must not move on a zero-persist failure"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A history-bearing snapshot must never claim a sequence whose bytes
+    /// are not in the log: clients drop queued live chunks at or below the
+    /// snapshot's sequence as already covered by the tail, so claiming an
+    /// unlogged chunk would delete its only copy from the client's screen.
+    #[test]
+    fn history_snapshot_never_claims_unlogged_sequences() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+        assert_eq!(output.output_seq, 2);
+
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(
+            snapshot.output_seq, 1,
+            "history must not claim the unlogged chunk"
+        );
+        assert_eq!(snapshot.raw_output, b"first\r\n");
+        assert_eq!(snapshot.raw_output_start, 0);
+
+        // Once writes recover, the successful chunk's sequence is claimed
+        // again and the tail ends with it.
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output.ingest(b"third\r\n").expect("resumed ingest");
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(snapshot.output_seq, 3);
+        assert_eq!(snapshot.raw_output, b"first\r\nthird\r\n");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A partially persisted chunk must not leak its prefix into the served
+    /// history under the previous chunk's sequence: the client holds the
+    /// whole chunk as a queued live copy and would paint the prefix twice.
+    /// The persisted prefix is credited to the byte counters (and to the
+    /// unlogged-byte accounting, by subtraction), but the served tail stops
+    /// at the last fully persisted chunk until a whole chunk lands again.
+    #[test]
+    fn ingest_partial_persist_serves_tail_only_to_the_last_whole_chunk() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        // Seven bytes of the next chunk reach the disk before its write
+        // fails (a second handle stands in for the persisted prefix).
+        output.log = File::open(&path).expect("reopen log read-only");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for append")
+            .write_all(b"PREFIX!")
+            .expect("persist prefix");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+
+        assert_eq!(output.bytes_logged, 14, "the prefix must be credited");
+        assert_eq!(
+            output.unlogged_bytes, 1,
+            "only the unpersisted suffix counts as lost"
+        );
+        assert_eq!(output.logged_tail_bytes, 7);
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(snapshot.output_seq, 1);
+        assert_eq!(
+            snapshot.raw_output, b"first\r\n",
+            "the served tail must stop at the last whole chunk"
+        );
+
+        // Recovery: the next whole chunk re-covers the stream end.
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output.ingest(b"third\r\n").expect("resumed ingest");
+        assert_eq!(output.logged_tail_bytes, output.bytes_logged);
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(snapshot.output_seq, 3);
+        assert_eq!(snapshot.raw_output, b"first\r\nPREFIX!third\r\n");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// When the recovery write succeeds but its counter stat fails, nothing
+    /// is stamped as logged: sequence, byte counters, and tail end stay at
+    /// their pre-episode values until a later reconcile succeeds. The failed
+    /// re-seed caused by the stale counters is retried on that later write.
+    #[test]
+    fn recovery_with_failed_stat_stamps_nothing_and_reseeds_on_retry() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        {
+            let _metadata_failure = FailLogMetadataGuard::arm();
+            output.ingest(b"third\r\n").expect("recovery write");
+        }
+        assert_eq!(output.output_seq, 3);
+        assert_eq!(
+            output.logged_output_seq, 1,
+            "a stat-failed recovery must not stamp the chunk as logged"
+        );
+        assert_eq!(output.bytes_logged, 7);
+        assert_eq!(output.logged_tail_bytes, 7);
+        assert!(output.log_write_failing, "the episode must stay open");
+        assert!(
+            output.log_cache.is_none(),
+            "a length-mismatched re-seed must be refused"
+        );
+        assert!(output.cache_reseed_pending, "the re-seed must stay pending");
+
+        output
+            .ingest(b"fourth\r\n")
+            .expect("later successful write");
+        assert_eq!(output.logged_output_seq, 4);
+        assert_eq!(output.bytes_logged, 22);
+        assert_eq!(output.logged_tail_bytes, 22);
+        assert_eq!(
+            output.log_cache.as_deref(),
+            Some(&b"first\r\nthird\r\nfourth\r\n"[..]),
+            "the retried re-seed must restore exactly the on-disk bytes"
+        );
+        assert!(!output.cache_reseed_pending);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A stat-failed recovery write must not run the deferred trim either:
+    /// bounds wait for credited counters, then the first reconciled write
+    /// enforces them.
+    #[test]
+    fn stat_failed_recovery_write_defers_trim() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.max_log_bytes = 8;
+        output.retain_log_bytes = 4;
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen log read-only");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for append")
+            .write_all(b"PREFIX!!")
+            .expect("persist prefix");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+        assert_eq!(output.bytes_logged, 15);
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        {
+            let _metadata_failure = FailLogMetadataGuard::arm();
+            output.ingest(b"x").expect("stat-failed recovery write");
+        }
+        assert_eq!(
+            output.bytes_logged, 15,
+            "trim must not fire on uncredited counters"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("stat log").len(),
+            16,
+            "the file must stay untrimmed while the stat fails"
+        );
+
+        output.ingest(b"y").expect("reconciled write");
+        assert_eq!(output.bytes_logged, 4, "recovery must enforce the bound");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Unrecovered-loss reporting consumes the count: one episode is
+    /// reported exactly once no matter how many lifecycle exits observe it.
+    #[test]
+    fn unrecovered_loss_report_consumes_the_count() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.unlogged_bytes = 9;
+        output.report_unrecovered_loss("test exit");
+        assert_eq!(output.unlogged_bytes, 0, "reporting must consume the count");
+        output.report_unrecovered_loss("test exit");
+        assert_eq!(output.unlogged_bytes, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The re-seed refuses a file whose length disagrees with the counters,
+    /// reporting a retryable outcome instead of caching misaligned bytes.
+    #[test]
+    fn reseed_log_cache_refuses_length_mismatch() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+        output.log_cache = None;
+        output.bytes_logged = 999;
+        assert_eq!(output.reseed_log_cache(), CacheReseedOutcome::RetryLater);
+        assert!(output.log_cache.is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A segmented history snapshot must stop at the last whole chunk too:
+    /// this is the production log shape clients actually attach against.
+    #[test]
+    fn segmented_history_snapshot_stops_at_last_whole_chunk() {
+        let dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create segment dir");
+        let path = dir.join(crate::storage::segment_file_name(1));
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen segment read-only");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open segment for append")
+            .write_all(b"PREFIX!")
+            .expect("persist prefix");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(snapshot.output_seq, 1);
+        assert_eq!(snapshot.raw_output, b"first\r\n");
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen segment writable");
+        output.ingest(b"third\r\n").expect("resumed ingest");
+        let snapshot = overlay_raw_output_history(
+            snapshot_from_output(&output, &SessionSize::default(), None, None, false),
+            &path,
+            output.logged_tail_bytes,
+            output.logged_output_seq,
+        );
+        assert_eq!(snapshot.output_seq, 3);
+        assert_eq!(snapshot.raw_output, b"first\r\nPREFIX!third\r\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Trimming defers for the whole failure episode — an in-place rewrite
+    /// against the failing disk would only consume the permanent trim latch
+    /// mid-outage — and the first successful write enforces the bound.
+    #[test]
+    fn bound_enforcement_defers_trim_until_recovery() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.max_log_bytes = 8;
+        output.retain_log_bytes = 4;
+        output.ingest(b"0123").expect("baseline ingest");
+
+        output.log = File::open(&path).expect("reopen log read-only");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for append")
+            .write_all(b"456789AB")
+            .expect("grow log past the bound");
+        output
+            .ingest(b"zzzzzzzz")
+            .expect("ingest must survive a log write failure");
+        assert_eq!(
+            output.bytes_logged, 12,
+            "a partial persist may cross the bound mid-episode"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read log"),
+            b"0123456789AB",
+            "the trim must not fire while writes are failing"
+        );
+
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output.ingest(b"q").expect("resumed ingest");
+        assert_eq!(
+            output.bytes_logged, 4,
+            "the recovery write must enforce the bound"
+        );
+        assert_eq!(fs::read(&path).expect("read log"), b"9ABq");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Rotation is attempted once as an episode opens (so a partially
+    /// persisting sink cannot grow the active segment without limit), then
+    /// defers until the recovery write.
+    #[test]
+    fn rotation_is_attempted_once_per_episode() {
+        let dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create segment dir");
+        let seg = |idx: u32| dir.join(crate::storage::segment_file_name(idx));
+        let mut output = test_output_state(&seg(1), SessionSize::default());
+        output.ingest(&[b'x'; 40]).expect("baseline ingest");
+        output.segment_size_bytes = 16;
+
+        // First failure of the episode: rotation is attempted and succeeds,
+        // moving the session onto a fresh segment.
+        output.log = File::open(seg(1)).expect("reopen segment read-only");
+        output
+            .ingest(b"nope")
+            .expect("ingest must survive a log write failure");
+        assert_eq!(output.log_path, seg(2), "episode start must rotate once");
+        assert_eq!(output.active_segment_bytes, 0);
+
+        // The episode is still open (the new segment's handle was swapped
+        // back to read-only): no second rotation attempt, even oversized.
+        output.log = File::open(seg(2)).expect("reopen segment read-only");
+        OpenOptions::new()
+            .append(true)
+            .open(seg(2))
+            .expect("open segment for append")
+            .write_all(&[b'y'; 100])
+            .expect("grow segment past the bound");
+        output.bytes_logged = 140;
+        output.active_segment_bytes = 100;
+        output
+            .ingest(b"nope")
+            .expect("ingest must survive a log write failure");
+        assert_eq!(output.log_path, seg(2), "rotation must defer mid-episode");
+        assert!(!seg(3).exists(), "no third segment may appear mid-episode");
+
+        // Recovery enforces the bound again.
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(seg(2))
+            .expect("reopen segment writable");
+        output.ingest(b"w").expect("resumed ingest");
+        assert_eq!(output.log_path, seg(3), "recovery must rotate again");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The cache reseed stays skipped where it cannot mirror the log:
+    /// segmented logs (history reads through the segment chain) and logs
+    /// past the cache budget.
+    #[test]
+    fn cache_reseed_skips_segmented_and_oversized_logs() {
+        let dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create segment dir");
+        let seg_path = dir.join(crate::storage::segment_file_name(1));
+        let mut output = test_output_state(&seg_path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+        output.log = File::open(&seg_path).expect("reopen segment read-only");
+        output
+            .ingest(b"x")
+            .expect("ingest must survive a log write failure");
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&seg_path)
+            .expect("reopen segment writable");
+        output.ingest(b"y").expect("resumed ingest");
+        assert!(
+            output.log_cache.is_none(),
+            "a segmented log must not reseed the single-file cache"
+        );
+        assert!(
+            !output.cache_reseed_pending,
+            "an inapplicable re-seed must clear the pending flag"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output
+            .ingest(&vec![b'x'; LOG_CACHE_MAX_BYTES as usize + 1])
+            .expect("over-budget ingest");
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"x")
+            .expect("ingest must survive a log write failure");
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+        output.ingest(b"y").expect("resumed ingest");
+        assert!(
+            output.log_cache.is_none(),
+            "an over-budget log must not be reseeded into the cache"
+        );
+        assert!(
+            !output.cache_reseed_pending,
+            "an inapplicable re-seed must clear the pending flag"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A persistently failing re-seed gives up at the attempt bound instead
+    /// of re-reading the log on every subsequent chunk forever.
+    #[test]
+    fn cache_reseed_gives_up_after_bounded_attempts() {
+        let path = unique_log_path();
+        let mut output = test_output_state(&path, SessionSize::default());
+        output.ingest(b"first\r\n").expect("baseline ingest");
+        output.log = File::open(&path).expect("reopen log read-only");
+        output
+            .ingest(b"second\r\n")
+            .expect("ingest must survive a log write failure");
+
+        // Reads of the re-seed target fail retryably (it is a directory)
+        // while the real log handle keeps accepting writes.
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create reseed target dir");
+        output.log_path = dir.clone();
+        output.log = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen log writable");
+
+        output.ingest(b"third\r\n").expect("first write");
+        assert!(output.cache_reseed_pending, "one failure must stay pending");
+        output.ingest(b"fourth\r\n").expect("second write");
+        assert!(
+            output.cache_reseed_pending,
+            "two failures must stay pending"
+        );
+        output.ingest(b"fifth\r\n").expect("third write");
+        assert!(
+            !output.cache_reseed_pending,
+            "the pending flag must clear at the attempt bound"
+        );
+        assert!(output.log_cache.is_none());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Actor-level pin for the failure path: with the log sink failing on
+    /// every chunk (/dev/full accepts no bytes), output must still reach
+    /// subscribers with an advancing sequence instead of freezing them.
+    /// Linux-only because /dev/full is the portable always-failing sink and
+    /// it does not exist on macOS or Windows; CI runs this on Ubuntu.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_is_broadcast_when_log_writes_fail() {
+        let session_id = SessionId::new("session-full-disk").expect("session id");
+        let mut config = SessionConfig::new("/bin/sh", PathBuf::from("/dev/full"));
+        config.args = vec![
+            "-c".to_string(),
+            "printf 'full-disk-marker\\r\\n'; sleep 5".to_string(),
+        ];
+        let actor = SessionActor::spawn_managed(config, session_id, None, None, None, None)
+            .expect("spawn session actor");
+        let events = request_subscribe_events(&actor.tx, Some(0)).expect("subscribe to events");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_output = false;
+        while Instant::now() < deadline {
+            let Ok(envelope) = events.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            if let SessionEvent::Output {
+                output_seq, bytes, ..
+            } = envelope.event
+                && String::from_utf8_lossy(&bytes).contains("full-disk-marker")
+            {
+                assert!(
+                    output_seq >= 1,
+                    "the broadcast must carry the advanced sequence"
+                );
+                saw_output = true;
+                break;
+            }
+        }
+        assert!(
+            saw_output,
+            "output must be broadcast even when every log write fails"
+        );
+
+        let snapshot = actor.snapshot().expect("snapshot session actor");
+        assert!(
+            snapshot.output_seq >= 1,
+            "snapshots must keep advancing while writes fail: {snapshot:?}"
+        );
+        actor.shutdown().expect("shutdown session actor");
+    }
+
+    /// The handover handler takes the unrecovered-loss count at commit time
+    /// rather than copying it at extraction: a live mid-episode actor yields
+    /// its counted bytes exactly once, and an actor that already exited
+    /// reported at output end, leaving nothing for a second report.
+    /// Linux-only for the same /dev/full reason as the test above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn take_unrecovered_loss_consumes_the_count_once() {
+        fn take(tx: &Sender<ActorCommand>) -> u64 {
+            let (response, rx) = mpsc::channel();
+            tx.send(ActorCommand::TakeUnrecoveredLoss { response })
+                .expect("send take command");
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("take response")
+        }
+
+        // Live episode: the first take yields the counted bytes, the second
+        // finds nothing left to report.
+        let session_id = SessionId::new("session-loss-take").expect("session id");
+        let mut config = SessionConfig::new("/bin/sh", PathBuf::from("/dev/full"));
+        config.args = vec![
+            "-c".to_string(),
+            "printf 'loss-take-marker\\r\\n'; sleep 5".to_string(),
+        ];
+        let actor = SessionActor::spawn_managed(config, session_id.clone(), None, None, None, None)
+            .expect("spawn session actor");
+        let events = request_subscribe_events(&actor.tx, Some(0)).expect("subscribe to events");
+        wait_for_event(&events, "marker output", |event| {
+            matches!(
+                event,
+                SessionEvent::Output { bytes, .. }
+                    if String::from_utf8_lossy(bytes).contains("loss-take-marker")
+            )
+        });
+        let taken = take(&actor.tx);
+        assert!(
+            taken >= "loss-take-marker\r\n".len() as u64,
+            "the take must yield the unlogged bytes, got {taken}"
+        );
+        assert_eq!(take(&actor.tx), 0, "the count must be consumed by the take");
+        actor.shutdown().expect("shutdown session actor");
+
+        // Exited actor: output end already reported and consumed the count,
+        // so once the worker is gone there is nothing left to take.
+        let session_id = SessionId::new("session-loss-exited").expect("session id");
+        let mut config = SessionConfig::new("/bin/sh", PathBuf::from("/dev/full"));
+        config.args = vec![
+            "-c".to_string(),
+            "printf 'loss-exit-marker\\r\\n'".to_string(),
+        ];
+        let actor = SessionActor::spawn_managed(config, session_id.clone(), None, None, None, None)
+            .expect("spawn session actor");
+        let events = request_subscribe_events(&actor.tx, Some(0)).expect("subscribe to events");
+        wait_for_exit_event(&events, &session_id);
+        // The exit event is broadcast only after output end has reported
+        // (and thereby consumed) the count, and the worker is still serving
+        // commands on this channel, so a take now must answer zero. If the
+        // output-end report were removed, the count would still be sitting
+        // here and this would return it — that is what pins the call site,
+        // not just the helper.
+        assert_eq!(
+            take(&actor.tx),
+            0,
+            "output end must already have consumed the count"
+        );
+        actor.shutdown().expect("shutdown session actor");
+    }
+
+    /// Manager-level pin for the commit-point carriage: the handover
+    /// handler reports through `SessionManager::take_unrecovered_losses`,
+    /// so that fan-out itself is exercised here — a raw actor channel is
+    /// not enough. A degraded (`/dev/full`) and a healthy session are
+    /// registered with the manager; the take must return only the degraded
+    /// session's count, only when that session is in the transferred set,
+    /// and only once. Linux-only for the same /dev/full reason as above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn take_unrecovered_losses_reports_only_transferred_degraded_sessions() {
+        let log_dir = unique_log_dir();
+        let _ = fs::remove_dir_all(&log_dir);
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let degraded_id = SessionId::new("session-loss-manager-degraded").expect("session id");
+        let mut degraded_config = SessionConfig::new("/bin/sh", PathBuf::from("/dev/full"));
+        degraded_config.args = vec![
+            "-c".to_string(),
+            "printf 'manager-loss-marker\\r\\n'; sleep 5".to_string(),
+        ];
+        let degraded_launch = PersistedSessionLaunch::from(&degraded_config);
+        let degraded = SessionActor::spawn_managed(
+            degraded_config,
+            degraded_id.clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("spawn degraded actor");
+        let degraded_events =
+            request_subscribe_events(&degraded.tx, Some(0)).expect("subscribe to events");
+
+        let healthy_id = SessionId::new("session-loss-manager-healthy").expect("session id");
+        let mut healthy_config = SessionConfig::new("/bin/sh", log_dir.join("healthy.log"));
+        healthy_config.args = vec![
+            "-c".to_string(),
+            "printf 'manager-healthy-marker\\r\\n'; sleep 5".to_string(),
+        ];
+        let healthy_launch = PersistedSessionLaunch::from(&healthy_config);
+        let healthy =
+            SessionActor::spawn_managed(healthy_config, healthy_id.clone(), None, None, None, None)
+                .expect("spawn healthy actor");
+        let healthy_events =
+            request_subscribe_events(&healthy.tx, Some(0)).expect("subscribe to events");
+
+        {
+            let mut sessions = manager.sessions().expect("lock sessions");
+            sessions.insert(
+                degraded_id.clone(),
+                ManagedSession::Live {
+                    actor: degraded,
+                    lease: InputLeaseState::default(),
+                    launch: degraded_launch,
+                    last_known_cwd: None,
+                },
+            );
+            sessions.insert(
+                healthy_id.clone(),
+                ManagedSession::Live {
+                    actor: healthy,
+                    lease: InputLeaseState::default(),
+                    launch: healthy_launch,
+                    last_known_cwd: None,
+                },
+            );
+        }
+
+        wait_for_event(&degraded_events, "degraded marker output", |event| {
+            matches!(
+                event,
+                SessionEvent::Output { bytes, .. }
+                    if String::from_utf8_lossy(bytes).contains("manager-loss-marker")
+            )
+        });
+        wait_for_event(&healthy_events, "healthy marker output", |event| {
+            matches!(
+                event,
+                SessionEvent::Output { bytes, .. }
+                    if String::from_utf8_lossy(bytes).contains("manager-healthy-marker")
+            )
+        });
+
+        // A take restricted to the healthy session returns nothing and must
+        // not consume the degraded session's count: sessions outside the
+        // transferred set keep their count for their own backstop.
+        assert!(
+            manager
+                .take_unrecovered_losses(std::slice::from_ref(&healthy_id))
+                .is_empty(),
+            "a healthy transferred session contributes no loss"
+        );
+
+        let both_ids = [degraded_id.clone(), healthy_id.clone()];
+        let losses = manager.take_unrecovered_losses(&both_ids);
+        assert_eq!(losses.len(), 1, "exactly the degraded session is reported");
+        assert_eq!(losses[0].0, degraded_id);
+        assert!(
+            losses[0].1 >= "manager-loss-marker\r\n".len() as u64,
+            "the take must yield the unlogged bytes, got {}",
+            losses[0].1
+        );
+
+        // The count is consumed: a second take finds nothing left.
+        assert!(
+            manager.take_unrecovered_losses(&both_ids).is_empty(),
+            "the count must be consumed by the first take"
+        );
+
+        let mut sessions = manager.sessions().expect("lock sessions");
+        for id in [&degraded_id, &healthy_id] {
+            if let Some(ManagedSession::Live { actor, .. }) = sessions.remove(id) {
+                actor.shutdown().expect("shutdown session actor");
+            }
+        }
+        drop(sessions);
+        let _ = fs::remove_dir_all(&log_dir);
     }
 
     /// The log path is data from the manifest or a handover payload, so a
@@ -12997,6 +14581,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Arms the injected log-metadata failure for this thread until dropped.
+    struct FailLogMetadataGuard;
+
+    impl FailLogMetadataGuard {
+        fn arm() -> Self {
+            FAIL_LOG_METADATA.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for FailLogMetadataGuard {
+        fn drop(&mut self) {
+            FAIL_LOG_METADATA.with(|flag| flag.set(false));
+        }
+    }
+
     fn test_output_state(log_path: &PathBuf, size: SessionSize) -> OutputState {
         test_output_state_with_writer(log_path, size, Box::new(std::io::sink()))
     }
@@ -13027,6 +14627,13 @@ mod tests {
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
+            logged_output_seq: 0,
+            log_write_failing: false,
+            logged_tail_bytes: 0,
+            stat_error_reported: false,
+            cache_reseed_pending: false,
+            cache_reseed_attempts: 0,
+            unlogged_bytes: 0,
             log_cache: Some(Vec::new()),
             pending_carriage_return: false,
             pending_escape_buffer: Vec::new(),
@@ -13256,12 +14863,14 @@ mod tests {
                         log_path: probe,
                         output_seq: 7,
                         bytes_logged: 11,
+                        logged_output_seq: 7,
+                        logged_tail_bytes: 11,
                     }));
                 })
             })
             .collect();
 
-        let (state, fds) = manager
+        let SerializedHandover { state, fds } = manager
             .serialize_active_sessions()
             .expect("serialization survives a parked session");
         for responder in responders {
@@ -14148,6 +15757,8 @@ mod tests {
                         log_path: log_path.clone(),
                         output_seq: 0,
                         bytes_logged: 0,
+                        logged_output_seq: None,
+                        logged_tail_bytes: None,
                         pid: 1,
                         process_identity: None,
                         last_activity_ms: 0,
@@ -14172,7 +15783,10 @@ mod tests {
         assert!(!policy.effective);
 
         let handover = manager.begin_handover().expect("begin handover");
-        let (state, transfer_fds) = manager.serialize_active_sessions().expect("serialize");
+        let SerializedHandover {
+            state,
+            fds: transfer_fds,
+        } = manager.serialize_active_sessions().expect("serialize");
         assert_eq!(state.sessions[0].judge_override, Some(false));
         for fd in transfer_fds {
             unsafe { libc::close(fd) };
@@ -14209,7 +15823,10 @@ mod tests {
         assert_eq!(history1.len(), 2);
 
         let handover = manager1.begin_handover().expect("begin handover");
-        let (state, transfer_fds) = manager1.serialize_active_sessions().expect("serialize");
+        let SerializedHandover {
+            state,
+            fds: transfer_fds,
+        } = manager1.serialize_active_sessions().expect("serialize");
         assert_eq!(state.judge_history.len(), 2);
         for fd in transfer_fds {
             unsafe { libc::close(fd) };
@@ -14443,7 +16060,7 @@ mod tests {
             .set_session_custom_label(s1, Some("Custom X".to_string()))
             .expect("set label");
 
-        let (state, fds) = manager1
+        let SerializedHandover { state, fds } = manager1
             .serialize_active_sessions()
             .expect("extract handover state");
         assert_eq!(state.pins.group_keys, group_keys);

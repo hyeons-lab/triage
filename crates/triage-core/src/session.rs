@@ -104,6 +104,14 @@ impl SessionSize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    /// Sequence this snapshot's state covers. On history-bearing snapshots
+    /// (those carrying [`Self::raw_output`]) it is the sequence of the last
+    /// chunk fully persisted in the log — the tail's coverage claim — and
+    /// can lag the live sequence while log writes are failing; chunks past
+    /// it may exist live but are not in the tail. Once writes recover the
+    /// claim again covers the tail's end; a chunk dropped mid-episode stays
+    /// absent from the middle of the tail, which re-emulation tolerates
+    /// like a truncation.
     pub output_seq: u64,
     pub bytes_logged: u64,
     pub size: SessionSize,
@@ -116,13 +124,18 @@ pub struct SessionSnapshot {
     pub bracketed_paste_enabled: bool,
     pub exited: bool,
     /// Raw (untranslated) PTY output tail for client-side re-emulation (the
-    /// single source of truth for history, byte-identical to the live Output
-    /// stream). Empty when history is not carried (e.g. resize broadcasts) or
-    /// from old hosts.
+    /// single source of truth for history). Identical to the live Output
+    /// stream while log writes are healthy; after a write-failure episode it
+    /// permanently lacks the failed bytes, and [`Self::output_seq`] then
+    /// claims coverage only through the last fully persisted chunk. Empty
+    /// when history is not carried (e.g. resize broadcasts) or from old hosts.
     #[serde(default, with = "compressed_bytes")]
     pub raw_output: Vec<u8>,
     /// Byte offset of the first byte of [`Self::raw_output`] within the
-    /// session's full output log (`bytes_logged` is the end offset).
+    /// session's full output log. `raw_output` ends at the last fully
+    /// persisted chunk (the [`Self::output_seq`] claim); [`Self::bytes_logged`]
+    /// remains the full log length, including any partially persisted prefix
+    /// past that end.
     #[serde(default)]
     pub raw_output_start: u64,
     /// Local-LLM one-line description of what the session is doing, if one has

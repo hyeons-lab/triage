@@ -22,6 +22,15 @@ pub struct HandoverSession {
     pub log_path: PathBuf,
     pub output_seq: u64,
     pub bytes_logged: u64,
+    /// Sequence of the outgoing daemon's last fully persisted output chunk,
+    /// and the on-disk byte offset that chunk ends at. `None` in state
+    /// written before these fields existed; the accessors below then fall
+    /// back to the live counters (claiming full persistence, the only
+    /// assumption an old blob supports).
+    #[serde(default)]
+    pub logged_output_seq: Option<u64>,
+    #[serde(default)]
+    pub logged_tail_bytes: Option<u64>,
     pub pid: u32,
     /// Process birth identity used to reject PID reuse during delayed recovery.
     #[serde(default)]
@@ -41,6 +50,20 @@ pub struct HandoverSession {
     pub last_input_ms: u64,
     #[serde(default)]
     pub judge_override: Option<bool>,
+}
+
+impl HandoverSession {
+    /// Last fully persisted chunk sequence to seed adoption with; falls back
+    /// to the live sequence for pre-field state blobs.
+    pub fn logged_output_seq(&self) -> u64 {
+        self.logged_output_seq.unwrap_or(self.output_seq)
+    }
+
+    /// On-disk byte offset the last fully persisted chunk ends at; falls
+    /// back to the live byte counter for pre-field state blobs.
+    pub fn logged_tail_bytes(&self) -> u64 {
+        self.logged_tail_bytes.unwrap_or(self.bytes_logged)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

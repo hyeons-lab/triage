@@ -96,7 +96,13 @@ pub fn list_session_segments(session_dir: &Path) -> Result<Vec<SegmentFileInfo>>
         let file_name_str = file_name.to_string_lossy();
         if let Some((index, is_compressed)) = parse_segment_index(&file_name_str) {
             let path = entry.path();
-            let file_size = match entry.metadata() {
+            // Stat the file path directly rather than `entry.metadata()`: on
+            // Windows NTFS, `DirEntry::metadata()` returns the parent
+            // directory entry's cached size from `FindFirstFileW`, which stays
+            // at the last handle-close size while the active segment's writer
+            // handle is open. `fs::metadata(&path)` queries the file control
+            // block and observes live appends.
+            let file_size = match fs::metadata(&path) {
                 Ok(m) => m.len(),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -363,60 +369,89 @@ pub fn read_multi_segment_tail(
         return Ok((0, Vec::new()));
     }
 
+    // One segment walk serves both readers: the tail is the range ending at
+    // the chain's logical end. A listing or segment-read failure propagates
+    // rather than folding into the empty tail a session with no segments
+    // returns, so intact on-disk history is never rendered as empty
+    // scrollback by a transient I/O error.
     let start_offset = total_uncompressed_bytes.saturating_sub(cap);
-    let needed_bytes = (total_uncompressed_bytes - start_offset) as usize;
+    read_multi_segment_range(session_dir, start_offset, total_uncompressed_bytes)
+}
 
-    // A listing failure is reported, never folded into the empty tail that a
-    // session with no segments returns. The two are indistinguishable to a
-    // caller, so swallowing the error renders intact on-disk history as empty
-    // scrollback; and because the condition is usually transient (`EMFILE`
-    // against the daemon's descriptor ceiling), it looks like data loss rather
-    // than the retryable I/O error it is.
-    let segments = list_session_segments(session_dir)?;
+/// Clamps `[from, to)` to `buffer`'s length and copies that slice out.
+fn clamped_slice(buffer: &[u8], from: u64, to: u64) -> Vec<u8> {
+    let from = (from as usize).min(buffer.len());
+    let to = (to as usize).min(buffer.len());
+    buffer[from..to].to_vec()
+}
 
-    if segments.is_empty() {
-        return Ok((0, Vec::new()));
+/// Reads the bytes in `[from, to)` of one segment's uncompressed stream.
+pub(crate) fn read_segment_range(info: &SegmentFileInfo, from: u64, to: u64) -> Result<Vec<u8>> {
+    if to <= from {
+        return Ok(Vec::new());
     }
+    if info.is_compressed {
+        let buffer = read_segment_uncompressed(info)?;
+        return Ok(clamped_slice(&buffer, from, to));
+    }
+    let mut file = match File::open(&info.path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The compression worker may have replaced this raw segment
+            // after it was listed. Mirror the sibling readers: fall back to
+            // the compressed twin rather than failing the whole range.
+            let buffer = read_segment_uncompressed(info)?;
+            return Ok(clamped_slice(&buffer, from, to));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening segment file {}", info.path.display()));
+        }
+    };
+    file.seek(SeekFrom::Start(from))?;
+    let mut buffer = vec![0u8; (to - from) as usize];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
 
-    // Read all segments in reverse order until we have accumulated at least `needed_bytes`
-    let mut collected_chunks: Vec<Vec<u8>> = Vec::new();
-    let mut accumulated_len = 0;
-
-    for segment in segments.iter().rev() {
-        if accumulated_len >= needed_bytes {
+/// Reads the stream bytes in `[start, end)` across the segment chain, where
+/// offsets are cumulative uncompressed positions. Unlike
+/// [`read_multi_segment_tail`], `end` need not be the chain's physical end:
+/// bytes past `end` in the active segment (a partially persisted chunk's
+/// prefix) are left unserved, so the returned range always ends exactly at
+/// `end` when the chain covers it. Returns the offset of the first returned
+/// byte alongside the bytes; when the chain no longer covers `start`, that
+/// offset is the chain's actual total rather than the caller's `start`.
+pub(crate) fn read_multi_segment_range(
+    session_dir: &Path,
+    start: u64,
+    end: u64,
+) -> Result<(u64, Vec<u8>)> {
+    if end <= start {
+        return Ok((start, Vec::new()));
+    }
+    let segments = list_session_segments(session_dir)?;
+    let mut out = Vec::with_capacity((end - start) as usize);
+    let mut offset = 0u64;
+    let mut actual_start = None;
+    for segment in &segments {
+        if offset >= end {
             break;
         }
-
-        let remaining_needed = needed_bytes - accumulated_len;
-        // Skipping a failed segment is not a safe degradation: `start_offset` is
-        // derived below from the *length* of what was collected, so dropping a
-        // segment from the middle of the chain silently relabels the surviving
-        // bytes with offsets that belong to the missing ones. Clients index live
-        // writes against those offsets, so the result is misaligned scrollback
-        // rather than a short read. Fail instead, and let the caller retry.
-        let bytes = read_segment_tail(segment, remaining_needed)
-            .with_context(|| format!("reading segment tail {}", segment.path.display()))?;
-        accumulated_len += bytes.len();
-        collected_chunks.push(bytes);
-    }
-
-    // Reconstruct chunks in chronological order
-    collected_chunks.reverse();
-    if accumulated_len > needed_bytes && !collected_chunks.is_empty() {
-        let excess = accumulated_len - needed_bytes;
-        if excess < collected_chunks[0].len() {
-            collected_chunks[0].drain(..excess);
-        } else {
-            collected_chunks[0].clear();
+        let size = get_segment_uncompressed_size(segment)?;
+        let segment_end = offset + size;
+        if segment_end > start {
+            let from = start.saturating_sub(offset);
+            let to = end.min(segment_end) - offset;
+            let bytes = read_segment_range(segment, from, to)?;
+            if !bytes.is_empty() && actual_start.is_none() {
+                actual_start = Some(offset + from);
+            }
+            out.extend_from_slice(&bytes);
         }
+        offset = segment_end;
     }
-    let mut combined: Vec<u8> = Vec::with_capacity(needed_bytes);
-    for chunk in collected_chunks {
-        combined.extend_from_slice(&chunk);
-    }
-
-    let start_offset = total_uncompressed_bytes.saturating_sub(combined.len() as u64);
-    Ok((start_offset, combined))
+    Ok((actual_start.unwrap_or_else(|| end.min(offset)), out))
 }
 
 /// Reads the trailing `cap` bytes of a session directory for terminal replay during restore or resize.

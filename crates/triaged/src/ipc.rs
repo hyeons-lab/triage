@@ -30,6 +30,8 @@ use triage_core::session::{
     SubscribeSessionEventsRequest, WriteInputRequest,
 };
 
+#[cfg(unix)]
+use crate::session::SerializedHandover;
 use crate::session::SessionManager;
 
 const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -1614,9 +1616,23 @@ fn handle_handover_server(
     // never reach production through a handover.
     crate::handover::raise_fd_limit();
 
-    let (mut state, pty_fds) = manager
+    let SerializedHandover {
+        mut state,
+        fds: pty_fds,
+    } = manager
         .serialize_active_sessions()
         .context("serializing active sessions for handover")?;
+
+    // The sessions actually being transferred, captured before `state`
+    // moves into the wire response: after the commit, the loss take may
+    // only report on these. A session skipped at extraction keeps its
+    // unlogged count for its own backstop report instead of being reported
+    // here as handed over.
+    let transferred_session_ids: Vec<SessionId> = state
+        .sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect();
 
     // Tell the successor this daemon sends the 0x03 commit byte before detaching,
     // so it can read a pre-commit EOF as "aborted, sessions kept" and refuse
@@ -1710,6 +1726,20 @@ fn handle_handover_server(
         bail!(
             "failed to send teardown-commit byte (0x03); keeping sessions rather than \
              detaching, since the successor refuses to adopt without it: {error}"
+        );
+    }
+
+    // The commit byte landed, so the transfer will complete: report any
+    // sessions whose history is degraded by failed log writes now, while
+    // this process is guaranteed alive to emit it. Take the counts at this
+    // point — not copied at extraction — so the actor-side exit report
+    // stays a backstop and the same episode is never reported twice;
+    // equally, an aborted handover takes (and reports) nothing.
+    for (session_id, unlogged_bytes) in manager.take_unrecovered_losses(&transferred_session_ids) {
+        tracing::warn!(
+            session_id = %session_id,
+            unlogged_bytes,
+            "session handed over before log writes recovered; the counted bytes were never persisted"
         );
     }
 

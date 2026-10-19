@@ -1,6 +1,6 @@
 #[cfg(all(unix, test))]
 mod tests {
-    use crate::session::{SessionManager, SessionManagerConfig};
+    use crate::session::{SerializedHandover, SessionManager, SessionManagerConfig};
     use std::path::PathBuf;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use triage_core::session::{SessionApi, SessionId, SessionSize, StartSessionRequest};
@@ -123,6 +123,8 @@ mod tests {
             log_path: temp_dir.path.join("missing").join("session-1.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
@@ -160,6 +162,8 @@ mod tests {
                 log_path: temp_dir.path.join(format!("session-{}.log", index + 1)),
                 output_seq: 0,
                 bytes_logged: 0,
+                logged_output_seq: None,
+                logged_tail_bytes: None,
                 pid: 10_000 + index as u32,
                 process_identity: None,
                 last_activity_ms: 0,
@@ -235,6 +239,8 @@ mod tests {
             log_path: temp_dir.path.join("session-fallback.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 20_001,
             process_identity: None,
             last_activity_ms: 0,
@@ -320,6 +326,8 @@ mod tests {
                 log_path: temp_dir.path.join("session-1.log"),
                 output_seq: 0,
                 bytes_logged: 0,
+                logged_output_seq: None,
+                logged_tail_bytes: None,
                 pid: 10_000,
                 process_identity: None,
                 last_activity_ms: 0,
@@ -404,7 +412,7 @@ mod tests {
         crate::handover::set_active_tcp_listener_fd(listener.as_raw_fd());
 
         // 3. Serialize live sessions
-        let (mut state, fds) = manager.serialize_active_sessions()?;
+        let SerializedHandover { mut state, fds } = manager.serialize_active_sessions()?;
 
         // Assertions on the serialized state
         assert_eq!(state.sessions.len(), 1);
@@ -690,6 +698,8 @@ mod tests {
             log_path: temp_dir.path.clone(),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 1,
             process_identity: None,
             last_activity_ms: 0,
@@ -745,7 +755,10 @@ mod tests {
         let handover = manager
             .begin_handover()
             .expect("retained sessions should be transferable to another daemon");
-        let (transfer, transfer_fds) = manager.serialize_active_sessions()?;
+        let SerializedHandover {
+            state: transfer,
+            fds: transfer_fds,
+        } = manager.serialize_active_sessions()?;
         assert_eq!(transfer.sessions.len(), 2);
         assert_eq!(transfer_fds.len(), 2);
         for fd in transfer_fds {
@@ -779,6 +792,8 @@ mod tests {
                 log_path: temp_dir.path.join(format!("{id}-{pid}.log")),
                 output_seq: 0,
                 bytes_logged: 0,
+                logged_output_seq: None,
+                logged_tail_bytes: None,
                 pid,
                 process_identity: Some(crate::handover::HandoverProcessIdentity {
                     pid,
@@ -911,6 +926,8 @@ mod tests {
             log_path: temp_dir.path.join("session-1.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
@@ -966,6 +983,8 @@ mod tests {
             log_path: temp_dir.path.join("session-1.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
@@ -1027,6 +1046,8 @@ mod tests {
             log_path: temp_dir.path.join("session-1.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
@@ -1097,6 +1118,8 @@ mod tests {
             log_path: temp_dir.path.join("session-1.log"),
             output_seq: 0,
             bytes_logged: 0,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
             pid: 42,
             process_identity: None,
             last_activity_ms: 0,
@@ -1578,6 +1601,37 @@ mod tests {
         crate::handover::complete_handover_adoption(&alive_socket_path, true)?;
         handle.join().unwrap();
         responder.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_handover_watermarks_fall_back_to_live_counters() -> anyhow::Result<()> {
+        // A pre-field blob (watermark fields absent) beside a live session:
+        // adoption must claim the live counters as fully logged, not zero.
+        let mut session = crate::handover::HandoverSession {
+            id: SessionId::new("session-legacy")?,
+            command: "/bin/sh".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: PathBuf::from("session-legacy.log"),
+            output_seq: 42,
+            bytes_logged: 16,
+            logged_output_seq: None,
+            logged_tail_bytes: None,
+            pid: 42,
+            process_identity: None,
+            last_activity_ms: 0,
+            last_input_ms: 0,
+            judge_override: None,
+        };
+        assert_eq!(session.logged_output_seq(), 42);
+        assert_eq!(session.logged_tail_bytes(), 16);
+
+        session.logged_output_seq = Some(40);
+        session.logged_tail_bytes = Some(8);
+        assert_eq!(session.logged_output_seq(), 40);
+        assert_eq!(session.logged_tail_bytes(), 8);
         Ok(())
     }
 }
