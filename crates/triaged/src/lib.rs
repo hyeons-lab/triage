@@ -5,6 +5,7 @@ pub mod http;
 #[cfg(any(unix, windows))]
 pub mod ipc;
 pub mod judge;
+pub mod scrollback;
 pub mod service;
 pub mod session;
 #[cfg(unix)]
