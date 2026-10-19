@@ -1187,7 +1187,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // course of a session, so a connect-time reading alone goes stale.
   Timer? _daemonStatsTimer;
   Timer? _railReconcileTimer;
-  bool _railReconcileInFlight = false;
+  int? _railReconcileInFlightGeneration;
   static const Duration _railReconcileInterval = Duration(seconds: 60);
   // Liveness probe for the socket; a failed beat tears the connection down
   // through the close path so a half-dead socket cannot hold a green
@@ -2466,7 +2466,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _railReconcileTimer?.cancel();
     _railReconcileTimer = Timer.periodic(_railReconcileInterval, (_) async {
       if (_disposed ||
-          _railReconcileInFlight ||
+          _railReconcileInFlightGeneration != null ||
+          _needsPairing ||
           generation != _connectGeneration ||
           serverId != _activeServerId ||
           serverId != _sessionsServerId ||
@@ -2481,14 +2482,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   void _stopRailReconcile() {
     _railReconcileTimer?.cancel();
     _railReconcileTimer = null;
-    _railReconcileInFlight = false;
+    _railReconcileInFlightGeneration = null;
   }
 
   Future<void> _reconcileRail(int generation, String serverId) async {
-    if (_railReconcileInFlight) return;
-    _railReconcileInFlight = true;
+    if (_railReconcileInFlightGeneration != null) return;
+    _railReconcileInFlightGeneration = generation;
     bool stale() =>
         _disposed ||
+        _needsPairing ||
         generation != _connectGeneration ||
         serverId != _activeServerId ||
         serverId != _sessionsServerId ||
@@ -2530,11 +2532,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }, sid);
         }
       }
-      // Labels: once connected (after `_loadDaemonSessions` has seeded any
-      // initial local-only labels to an empty daemon), a non-null
-      // `getRailLayout` response is authoritative for both label updates and
-      // label clears. A null return means the RPC failed or the daemon predates
-      // layouts, so skip label changes on that tick.
+      // Labels: once connected (after `_loadDaemonSessions` or
+      // `_restoreCustomLabels` has seeded any initial local-only labels to an
+      // empty daemon), a non-null `getRailLayout` response is authoritative for
+      // both label updates and label clears. A null return means the RPC failed
+      // or the daemon predates layouts, so skip label changes on that tick.
       final RailLayoutRecord? layout;
       try {
         layout = await _client.getRailLayout();
@@ -2557,7 +2559,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       }
     } finally {
-      _railReconcileInFlight = false;
+      if (_railReconcileInFlightGeneration == generation) {
+        _railReconcileInFlightGeneration = null;
+      }
     }
   }
 
@@ -2756,8 +2760,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       await _loadDaemonSessions();
       if (_disposed ||
+          _needsPairing ||
           generation != _connectGeneration ||
-          serverId != _activeServerId) {
+          serverId != _activeServerId ||
+          !_client.isConnected) {
         return;
       }
       _startRailReconcile(generation, serverId);
@@ -3080,21 +3086,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           _customLabels = Map.of(layout.customLabels);
           unawaited(_persistCustomLabels());
         } else if (_customLabels.isNotEmpty) {
-          for (final entry in _customLabels.entries) {
-            var rawId = entry.key;
-            if (rawId.startsWith('triage / ')) {
-              rawId = rawId.substring('triage / '.length);
-            }
-            if (rawId.trim().isEmpty) continue;
-            unawaited(
-              _client
-                  .setSessionCustomLabel(
-                    sessionId: rawId,
-                    customLabel: entry.value,
-                  )
-                  .catchError((_) {}),
-            );
-          }
+          _seedCustomLabelsToDaemon(_customLabels);
         }
       }
 
@@ -3530,6 +3522,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   String? _lookupCustomLabel(String id) =>
       _customLabels[id] ?? _customLabels['triage / $id'];
 
+  void _seedCustomLabelsToDaemon(Map<String, String> labels) {
+    for (final entry in labels.entries) {
+      var rawId = entry.key;
+      if (rawId.startsWith('triage / ')) {
+        rawId = rawId.substring('triage / '.length);
+      }
+      if (rawId.trim().isEmpty) continue;
+      unawaited(
+        _client
+            .setSessionCustomLabel(sessionId: rawId, customLabel: entry.value)
+            .catchError((_) {}),
+      );
+    }
+  }
+
   /// Restores this server's custom session labels in the background and applies
   /// them to any matching sessions currently loaded.
   Future<void> _restoreCustomLabels() async {
@@ -3559,6 +3566,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         for (final session in _sessions) {
           final key = _keyForSession(session);
           session.customLabel = _lookupCustomLabel(key);
+        }
+        if (labels.isNotEmpty &&
+            _sessionsServerId == serverId &&
+            _clientInitialized &&
+            _client.isConnected &&
+            !_needsPairing) {
+          _seedCustomLabelsToDaemon(labels);
         }
         if (mounted) setState(() {});
       }

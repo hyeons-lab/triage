@@ -59,7 +59,8 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
 ## Commits
 
 - 634d824: feat(rail): reconcile rows and labels; forget labels on shutdown
-- HEAD: fix(rail): harden label manifest cleanup and rail anti-entropy reconcile
+- bc813bc: fix(rail): harden label manifest cleanup and rail anti-entropy reconcile
+- HEAD: fix(rail): guard shutdown label removal and reconcile generation lifecycle
 
 ## Progress
 
@@ -79,6 +80,13 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
   atomic manifest write excluding retiring `custom_labels`, `ServerMessage::kind`
   serde tag pin test, and `_reconcileRail` context enrichment, label deletion,
   in-flight guard, and `syncToDaemon` gating).
+- 2026-10-18T17:01-0700: addressed Round 2 review findings (remove custom label
+  before releasing `sessions` mutex in `shutdown_session` so concurrent
+  `persist_manifest` calls cannot resurrect it, unlink temporary manifest file
+  on `replace_manifest` error, recheck connection/pairing before starting
+  `_railReconcileTimer` after `_loadDaemonSessions`, scope in-flight reconcile
+  tracking by `_sessionLoadGeneration`, and seed restored local custom labels to
+  the daemon when `_restoreCustomLabels` resolves after `_loadDaemonSessions`).
 
 ## Research & Discoveries
 
@@ -95,4 +103,4 @@ leaves the custom label behind (session-294's `cera-gaps` survived alongside
 
 ## Next Steps
 
-- Complete Round 2 review on `feat/session-lifecycle-push`.
+- Complete Round 3 review on `feat/session-lifecycle-push`.

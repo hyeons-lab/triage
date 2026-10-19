@@ -4057,10 +4057,14 @@ impl SessionApi for SessionManager {
                     let completed = session.completed_session();
                     let log_path = session.persisted.log_path.clone();
                     let temp_path = self.prepare_shutdown_manifest(&sessions, &session_id)?;
-                    replace_manifest(&temp_path, &self.config.manifest_path())?;
+                    if let Err(error) = replace_manifest(&temp_path, &self.config.manifest_path()) {
+                        let _ = fs::remove_file(&temp_path);
+                        return Err(error);
+                    }
                     let Some(_removed) = sessions.remove(&session_id) else {
                         bail!("historical session {session_id} disappeared during shutdown");
                     };
+                    self.forget_custom_label(&session_id);
                     ShutdownTarget::Historical {
                         completed,
                         log_path,
@@ -4111,6 +4115,9 @@ impl SessionApi for SessionManager {
                         .and_then(|temp_path| {
                             replace_manifest(&temp_path, &self.config.manifest_path())
                         });
+                    if rewrite_result.is_err() {
+                        let _ = fs::remove_file(&prepared_manifest);
+                    }
                     let removed = sessions.remove(&session_id).with_context(|| {
                         format!("session {session_id} disappeared during shutdown")
                     })?;
@@ -4140,6 +4147,8 @@ impl SessionApi for SessionManager {
                             error = ?error,
                             "session stopped, but committing its manifest removal failed"
                         );
+                    } else {
+                        self.forget_custom_label(&session_id);
                     }
                     (actor, rewrite_result)
                 };
