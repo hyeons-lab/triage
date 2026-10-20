@@ -381,7 +381,7 @@ metadata and restores shell/workspace layout structures on restart.
 ## Agent Tracking & Conversation Restore
 
 Each session actor watches its PTY's foreground process for a known AI coding
-agent (Claude Code, Codex, Antigravity's `agy`, Muse). When one holds the
+agent (Claude Code, Codex, Antigravity's `agy`, Muse, Grok). When one holds the
 foreground, the daemon records an attachment (agent kind, conversation id,
 transcript path, and binary path) against the session and persists it in the
 session manifest. Restoring such a session (after a reboot, a daemon kill, or

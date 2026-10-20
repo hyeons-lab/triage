@@ -119,7 +119,7 @@ table SessionSnapshot {
     agent: AgentAttachment;
 }
 
-enum AgentKind : byte { Claude = 0, Codex = 1, Antigravity = 2, Muse = 3 }
+enum AgentKind : byte { Claude = 0, Codex = 1, Antigravity = 2, Muse = 3, Grok = 4 }
 
 table AgentAttachment {
     kind: AgentKind;
