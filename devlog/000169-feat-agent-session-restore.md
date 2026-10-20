@@ -62,6 +62,10 @@ status; exited sessions carry no agent state.
   `agent_observed` in `crates/triaged/src/session.rs` with `#[cfg(unix)]` so Windows test
   compilation does not reference Unix-only handover APIs (`SerializedHandover`,
   `serialize_active_sessions`).
+- **2026-10-20T15:24-0700** Dropped the `sessions` mutex guard in the
+  `ManagedSession::Historical` arm of `SessionManager::attach_session` before calling
+  `self.overlay_manager_fields`, preventing a same-thread mutex self-deadlock on
+  `self.sessions` inside `overlay_agent`.
 
 ## Decisions
 
@@ -123,7 +127,8 @@ status; exited sessions carry no agent state.
 - bb58a32: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
 - c0136e3: feat(session): add Grok agent tracking and conversation restore
 - 72cd45a: test(triaged): update Linux /dev/full tests for agent tracking fields
-- HEAD: test(triaged): gate handover agent serialization test to Unix
+- f5402cc: test(triaged): gate handover agent serialization test to Unix
+- HEAD: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
 
 ## Progress
 
