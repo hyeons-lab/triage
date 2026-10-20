@@ -54,6 +54,10 @@ status; exited sessions carry no agent state.
   FlatBuffers schema + Dart bindings, `triaged/src/agent_detect.rs` (argv classification,
   `--resume <id>` / `--continue` resume builder, `~/.grok/sessions/<encoded-cwd>/<id>/summary.json`
   correlation with `active_sessions.json` PID disambiguation), and unit tests.
+- **2026-10-20T14:43-0700** Updated Linux-only `#[cfg(target_os = "linux")]` `/dev/full`
+  test calls in `crates/triaged/src/session.rs` (`SessionActor::spawn_managed` and
+  `ManagedSession::Live` struct initializers) to include the `agent_tx` parameter and
+  `agent` / `agent_tracking` / `agent_observed` fields.
 
 ## Decisions
 
@@ -113,7 +117,8 @@ status; exited sessions carry no agent state.
 - ae90479: fix(session): retry stub-agent observation for exec race
 - e8f2c6b: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
 - bb58a32: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
-- HEAD: feat(session): add Grok agent tracking and conversation restore
+- c0136e3: feat(session): add Grok agent tracking and conversation restore
+- HEAD: test(triaged): update Linux /dev/full tests for agent tracking fields
 
 ## Progress
 
