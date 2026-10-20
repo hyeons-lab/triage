@@ -4,9 +4,11 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:fake_async/fake_async.dart';
+import 'package:flat_buffers/flat_buffers.dart' as fb;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/generated/triage_triage.generated_generated.dart'
     as fbs;
+import 'package:triage_client/services/flatbuffers_js_compat.dart' as fbjs;
 import 'package:triage_client/services/triage_websocket_client.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -87,6 +89,51 @@ class ThrowingWebSocketSink extends RecordingWebSocketSink {
   @override
   void add(Object? event) {
     throw StateError('sink closed');
+  }
+}
+
+/// An agent attachment whose wire kind (99) no checked-in enum knows,
+/// exercising the unknown-kind degrade path through a full decode. The
+/// generated object builder cannot express an unknown enum, so this
+/// mirrors its `finish` with the kind byte pinned past the table.
+class _UnknownKindAgentBuilder extends fbs.AgentAttachmentObjectBuilder {
+  _UnknownKindAgentBuilder({
+    String? conversationId,
+    String? transcriptPath,
+    String? exePath,
+    int? lastSeenMs,
+  }) : _conversationId = conversationId,
+       _transcriptPath = transcriptPath,
+       _exePath = exePath,
+       _lastSeenMs = lastSeenMs,
+       super(kind: null);
+
+  final String? _conversationId;
+  final String? _transcriptPath;
+  final String? _exePath;
+  final int? _lastSeenMs;
+
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final conversationId = _conversationId;
+    final transcriptPath = _transcriptPath;
+    final exePath = _exePath;
+    final int? conversationIdOffset = conversationId == null
+        ? null
+        : fbBuilder.writeString(conversationId);
+    final int? transcriptPathOffset = transcriptPath == null
+        ? null
+        : fbBuilder.writeString(transcriptPath);
+    final int? exePathOffset = exePath == null
+        ? null
+        : fbBuilder.writeString(exePath);
+    fbBuilder.startTable(5);
+    fbBuilder.addInt8(0, 99);
+    fbBuilder.addOffset(1, conversationIdOffset);
+    fbBuilder.addOffset(2, transcriptPathOffset);
+    fbBuilder.addOffset(3, exePathOffset);
+    fbjs.addUint64(fbBuilder, 4, _lastSeenMs);
+    return fbBuilder.endTable();
   }
 }
 
@@ -651,6 +698,13 @@ void main() {
                 styledRows: [],
                 bracketedPasteEnabled: false,
                 exited: false,
+                agent: fbs.AgentAttachmentObjectBuilder(
+                  kind: fbs.AgentKind.Muse,
+                  conversationId: 'abc',
+                  transcriptPath: '/tmp/t.jsonl',
+                  exePath: '/bin/muse',
+                  lastSeenMs: 42,
+                ),
               ),
               lease: fbs.InputLeaseStateObjectBuilder(generation: 1),
             ),
@@ -663,7 +717,204 @@ void main() {
       final result = await future;
       expect(result['result'], equals('attach_session'));
       expect(result['response']['snapshot']['visible_rows'], equals(['ready']));
+      // Parsed agent keys match the JSON transport's serde `snake_case`.
+      expect(
+        result['response']['snapshot']['agent'],
+        equals({
+          'kind': 'muse',
+          'conversation_id': 'abc',
+          'transcript_path': '/tmp/t.jsonl',
+          'exe_path': '/bin/muse',
+          'last_seen_ms': 42,
+        }),
+      );
     });
+
+    test('attachSession decodes an absent agent as null', () async {
+      final channel = FakeWebSocketChannel(
+        sink: sink,
+        protocol: 'triage-flatbuffers',
+      );
+      client = TriageWebSocketClient(
+        Uri.parse('ws://localhost/ws'),
+        channelFactory: (_) => channel,
+      );
+      await client.connect();
+
+      final future = client.attachSession(
+        sessionId: 'session-789',
+        clientId: 'client-abc',
+      );
+
+      final response = fbs.ServerMessageObjectBuilder(
+        payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+        payload: fbs.ResponsePayloadObjectBuilder(
+          id: 'req-0',
+          resultType: fbs.ServerResultPayloadTypeId.AttachSessionResult,
+          result: fbs.AttachSessionResultObjectBuilder(
+            response: fbs.AttachSessionResponseObjectBuilder(
+              snapshot: fbs.SessionSnapshotObjectBuilder(
+                outputSeq: 1,
+                bytesLogged: 2,
+                size: fbs.SessionSizeObjectBuilder(
+                  rows: 24,
+                  cols: 80,
+                  pixelWidth: 800,
+                  pixelHeight: 480,
+                  dpi: 96,
+                ),
+                visibleRows: ['ready'],
+                styledRowsStart: 0,
+                styledRows: [],
+                bracketedPasteEnabled: false,
+                exited: false,
+              ),
+              lease: fbs.InputLeaseStateObjectBuilder(generation: 1),
+            ),
+          ),
+        ),
+      ).toBytes();
+
+      channel.addIncoming(response);
+
+      final result = await future;
+      expect(result['response']['snapshot']['agent'], isNull);
+    });
+
+    test('attachSession decodes every agent kind from binary', () async {
+      const kinds = {
+        fbs.AgentKind.Claude: 'claude',
+        fbs.AgentKind.Codex: 'codex',
+        fbs.AgentKind.Antigravity: 'antigravity',
+        fbs.AgentKind.Muse: 'muse',
+      };
+      for (final entry in kinds.entries) {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final future = client.attachSession(
+          sessionId: 'session-789',
+          clientId: 'client-abc',
+        );
+
+        final response = fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.AttachSessionResult,
+            result: fbs.AttachSessionResultObjectBuilder(
+              response: fbs.AttachSessionResponseObjectBuilder(
+                snapshot: fbs.SessionSnapshotObjectBuilder(
+                  outputSeq: 1,
+                  bytesLogged: 2,
+                  size: fbs.SessionSizeObjectBuilder(
+                    rows: 24,
+                    cols: 80,
+                    pixelWidth: 800,
+                    pixelHeight: 480,
+                    dpi: 96,
+                  ),
+                  visibleRows: ['ready'],
+                  styledRowsStart: 0,
+                  styledRows: [],
+                  bracketedPasteEnabled: false,
+                  exited: false,
+                  agent: fbs.AgentAttachmentObjectBuilder(kind: entry.key),
+                ),
+                lease: fbs.InputLeaseStateObjectBuilder(generation: 1),
+              ),
+            ),
+          ),
+        ).toBytes();
+
+        channel.addIncoming(response);
+
+        final result = await future;
+        expect(
+          result['response']['snapshot']['agent']['kind'],
+          equals(entry.value),
+          reason: 'kind ${entry.key} must decode to ${entry.value}',
+        );
+      }
+    });
+
+    test(
+      'attachSession degrades an unknown agent kind, not the attachment',
+      () async {
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final future = client.attachSession(
+          sessionId: 'session-789',
+          clientId: 'client-abc',
+        );
+
+        final response = fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.AttachSessionResult,
+            result: fbs.AttachSessionResultObjectBuilder(
+              response: fbs.AttachSessionResponseObjectBuilder(
+                snapshot: fbs.SessionSnapshotObjectBuilder(
+                  outputSeq: 1,
+                  bytesLogged: 2,
+                  size: fbs.SessionSizeObjectBuilder(
+                    rows: 24,
+                    cols: 80,
+                    pixelWidth: 800,
+                    pixelHeight: 480,
+                    dpi: 96,
+                  ),
+                  visibleRows: ['ready'],
+                  styledRowsStart: 0,
+                  styledRows: [],
+                  bracketedPasteEnabled: false,
+                  exited: false,
+                  agent: _UnknownKindAgentBuilder(
+                    conversationId: 'abc',
+                    transcriptPath: '/tmp/t.jsonl',
+                    exePath: '/bin/future',
+                    lastSeenMs: 42,
+                  ),
+                ),
+                lease: fbs.InputLeaseStateObjectBuilder(generation: 1),
+              ),
+            ),
+          ),
+        ).toBytes();
+
+        channel.addIncoming(response);
+
+        final result = await future;
+        // The kind degrades to null (the badge shows 'agent'); every other
+        // field survives, so a future agent never renders as a plain shell.
+        expect(
+          result['response']['snapshot']['agent'],
+          equals({
+            'kind': null,
+            'conversation_id': 'abc',
+            'transcript_path': '/tmp/t.jsonl',
+            'exe_path': '/bin/future',
+            'last_seen_ms': 42,
+          }),
+        );
+      },
+    );
 
     test(
       'listSessionContexts completes from binary FlatBuffers response',

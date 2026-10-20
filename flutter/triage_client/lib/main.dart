@@ -5001,12 +5001,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // "use held" and "use platform budgets"), so the tri-state rides a
     // bool.
     bool unwindowed = false,
+    // True only for manager-served snapshots (attach/resume responses),
+    // whose agent field carries the live attachment or its absence.
+    // Actor-built snapshots (resync) always carry null here, which must
+    // preserve the last known agent rather than clear it.
+    bool agentAuthoritative = false,
   }) async {
     // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
     // _loadDaemonSessions) while the refresh was in flight — applying to a
     // disposed store is a use-after-dispose, and the live same-id object is
     // refreshed by its own load path.
     if (_disposed || !_sessions.contains(session)) return;
+    final snapshotAgent = snapshot['agent'] as Map<String, dynamic>?;
+    if (agentAuthoritative || snapshotAgent != null) {
+      session.agent = snapshotAgent;
+    }
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     // Kept separate from the rendering fallbacks below: the FlatBuffers decoder
     // turns an absent size into an empty map rather than null, so the container
@@ -5875,6 +5884,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               includeHistory ||
               (!session.loaded && snapshot['exited'] == true) ||
               revivedNeedsReplay,
+          // finalSnapshot comes from attach/resume responses, whose agent
+          // field is manager-overlaid and authoritative.
+          agentAuthoritative: true,
         );
       }
     } on TriageAuthException {
@@ -10464,12 +10476,17 @@ class _CustomLabelDialogState extends State<_CustomLabelDialog> {
 String _agentBadgeText(Map<String, dynamic> agent) {
   // Display names match the TUI badge (`primary_binary` style), not the
   // raw serde kind strings, so both clients render one identity. Unknown
-  // kinds render raw so a future agent stays recognizable.
+  // kinds render raw on the JSON path, and degrade to a null kind (shown
+  // here as 'agent') on the FlatBuffers path, so a future agent stays
+  // recognizable on both transports.
   final rawKind = agent['kind'] as String? ?? 'agent';
   final kind = rawKind == 'antigravity' ? 'agy' : rawKind;
   final id = agent['conversation_id'] as String?;
   if (id == null || id.isEmpty) return '$kind (recent)';
-  return '$kind ${id.length <= 8 ? id : id.substring(0, 8)}';
+  // Rune-based truncation matches the TUI badge's 8 chars exactly, even
+  // for non-ASCII ids (substring would count UTF-16 code units).
+  final short = String.fromCharCodes(id.runes.take(8));
+  return '$kind $short';
 }
 
 class SessionListTile extends StatefulWidget {
@@ -11001,7 +11018,7 @@ class _SessionGlanceCard extends StatelessWidget {
             if (hasTranscript)
               _GlanceRow(
                 icon: Icons.description_outlined,
-                label: transcriptPath!,
+                label: transcriptPath,
                 wrap: true,
               ),
             if (hasDetails)

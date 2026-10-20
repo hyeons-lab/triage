@@ -7,7 +7,7 @@
 //! fresh shell. Attachments are live-state only: exiting the agent clears
 //! them, and exited sessions never carry one.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +84,9 @@ pub struct AgentAttachment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe_path: Option<PathBuf>,
     /// Wall-clock attach time, milliseconds since the Unix epoch.
+    /// Defaults to 0 (unknown) so an attachment written without a
+    /// timestamp does not fail the whole manifest decode.
+    #[serde(default)]
     pub last_seen_ms: u64,
 }
 
@@ -95,10 +98,30 @@ impl AgentAttachment {
     /// the manifest instead of pinning a dead path that later vetoes
     /// resume; paths are stable per process, so this cannot flap.
     pub fn same_observation(&self, other: &AgentAttachment) -> bool {
-        self.kind == other.kind
-            && self.conversation_id == other.conversation_id
-            && self.transcript_path == other.transcript_path
-            && self.exe_path == other.exe_path
+        self.matches_observation(
+            other.kind,
+            other.conversation_id.as_deref(),
+            other.transcript_path.as_deref(),
+            other.exe_path.as_deref(),
+        )
+    }
+
+    /// Identity comparison over borrowed fields, so the daemon tracker's
+    /// steady-state check (which holds an observed agent, not an
+    /// attachment) compares through this instead of mirroring the
+    /// predicate inline. The compared set lives here alone and cannot
+    /// diverge when a field is added.
+    pub fn matches_observation(
+        &self,
+        kind: AgentKind,
+        conversation_id: Option<&str>,
+        transcript_path: Option<&Path>,
+        exe_path: Option<&Path>,
+    ) -> bool {
+        self.kind == kind
+            && self.conversation_id.as_deref() == conversation_id
+            && self.transcript_path.as_deref() == transcript_path
+            && self.exe_path.as_deref() == exe_path
     }
 }
 
@@ -136,10 +159,35 @@ mod tests {
             ..left.clone()
         };
         assert!(left.same_observation(&right));
-        let changed = AgentAttachment {
-            conversation_id: Some("abd".to_string()),
-            ..left.clone()
-        };
-        assert!(!left.same_observation(&changed));
+        for changed in [
+            AgentAttachment {
+                kind: AgentKind::Codex,
+                ..left.clone()
+            },
+            AgentAttachment {
+                conversation_id: Some("abd".to_string()),
+                ..left.clone()
+            },
+            AgentAttachment {
+                transcript_path: Some(std::path::PathBuf::from("/tmp/other.jsonl")),
+                ..left.clone()
+            },
+            AgentAttachment {
+                exe_path: Some(std::path::PathBuf::from("/bin/other")),
+                ..left.clone()
+            },
+        ] {
+            assert!(
+                !left.same_observation(&changed),
+                "same_observation must compare kind, conversation, transcript, and binary: {changed:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_timestamp_deserializes_as_unknown() {
+        let attachment: AgentAttachment =
+            serde_json::from_str(r#"{"kind":"muse"}"#).expect("decode");
+        assert_eq!(attachment.last_seen_ms, 0);
     }
 }

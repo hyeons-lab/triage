@@ -45,39 +45,94 @@ pub fn classify_argv(kind: AgentKind, argv: &[String]) -> Option<AgentArgv> {
     }
 }
 
-/// Positional tokens that are not flag values: a non-flag token immediately
-/// following a flag token is treated as that flag's value and skipped. This
-/// misreads a subcommand after a boolean flag as a value, which degrades to
-/// "bare interactive run" rather than a wrong classification.
-fn positional_tokens<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut prev_was_flag = false;
-    for arg in args {
-        if arg.starts_with('-') {
-            prev_was_flag = true;
-            continue;
-        }
-        if prev_was_flag {
-            prev_was_flag = false;
-            continue;
-        }
-        out.push(*arg);
-    }
-    out
+/// Positional tokens that are not flag values: only the values of known
+/// value-taking flags are skipped, and `--flag=value` never skips (its
+/// value rides along). Unknown flags are assumed boolean: skipping after
+/// every flag hid real subcommands behind boolean flags, losing resume
+/// ids and mistaking one-shot `exec` runs for interactive sessions. A
+/// flag-like token is never skipped as a value: the flag was bare
+/// (optional-value options) or the invocation is malformed, and either
+/// way the token keeps its own meaning.
+fn positional_tokens<'a>(args: &[&'a str], value_flags: &[&str]) -> Vec<&'a str> {
+    positional_tokens_split(args, value_flags).0
 }
 
-/// Value of `--flag value` or `--flag=value` for a long flag.
-fn long_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
+/// As [`positional_tokens`], plus the count of positionals from before a
+/// bare `--`. Tokens after `--` are positional (never flags) but, for
+/// the clap-style CLIs, never subcommands; subcommand scans use
+/// `[..boundary]` while resume-id lookup uses the full vec.
+fn positional_tokens_split<'a>(args: &[&'a str], value_flags: &[&str]) -> (Vec<&'a str>, usize) {
+    let mut out: Vec<&'a str> = Vec::new();
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
-        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
-            return Some(value);
+        if *arg == "--" {
+            let boundary = out.len();
+            for rest in iter {
+                out.push(*rest);
+            }
+            return (out, boundary);
         }
-        if *arg == flag {
-            return iter.next().copied();
+        if !arg.starts_with('-') {
+            out.push(*arg);
+            continue;
+        }
+        let name = arg.split('=').next().unwrap_or(*arg);
+        let takes_value = !arg.contains('=') && value_flags.contains(&name);
+        if takes_value && iter.peek().is_some_and(|next| !next.starts_with('-')) {
+            iter.next();
         }
     }
-    None
+    let boundary = out.len();
+    (out, boundary)
+}
+
+/// Index of the first positional naming a known subcommand, if any.
+/// Unknown flags may precede the subcommand, and an unknown flag's value
+/// is indistinguishable from prompt text, so the scan tolerates leading
+/// tokens rather than trusting the first positional alone. Residual: a
+/// prompt word (or unknown flag value) that spells a subcommand
+/// misclassifies; that needs a standalone subcommand word among
+/// unquoted prompt tokens.
+fn find_subcommand(positionals: &[&str], known: &[&str]) -> Option<usize> {
+    positionals.iter().position(|token| known.contains(token))
+}
+
+/// Value of `--flag value` or `--flag=value` for a long flag: the last
+/// value wins (commander-style), and a bare or empty occurrence keeps
+/// scanning rather than blinding later ones. `None` when the flag is
+/// absent or never carries a usable value.
+fn long_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
+    flag_value(args, flag, true)
+}
+
+/// Shared `--flag value` scanner behind [`long_flag_value`] (which also
+/// accepts `--flag=value`) and [`short_flag_value`]: one peek-before-
+/// consume loop, so arity fixes cannot land on one and miss the other.
+/// An empty next token is never a usable value for either spelling.
+fn flag_value<'a>(args: &[&'a str], flag: &str, equals_form: bool) -> Option<&'a str> {
+    let prefix = format!("{flag}=");
+    let mut seen = None;
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if equals_form && let Some(value) = arg.strip_prefix(&prefix) {
+            if !value.is_empty() {
+                seen = Some(value);
+            }
+            continue;
+        }
+        // Peek before consuming: a flag-like next token may itself be
+        // another occurrence, which must stay in the stream.
+        if *arg == flag {
+            match iter.peek() {
+                Some(next) if !next.starts_with('-') && !next.is_empty() => {
+                    seen = Some(**next);
+                    iter.next();
+                }
+                _ => {}
+            }
+        }
+    }
+    seen
 }
 
 /// True when any arg is one of the given flags.
@@ -85,98 +140,304 @@ fn has_any(args: &[&str], flags: &[&str]) -> bool {
     args.iter().any(|a| flags.contains(a))
 }
 
-/// Value of the short flag's next token (`-r <id>`), or `None` when the
-/// flag is absent or its value looks like another flag.
-fn short_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if *arg == flag {
-            let value = iter.next().copied()?;
-            return (!value.starts_with('-')).then_some(value);
-        }
-    }
-    None
+/// True for `--help`/`--version` style invocations, which are never
+/// trackable agent runs. (Antigravity differs and keeps its own guard;
+/// Claude's extra `-v` is checked at its own call site.)
+fn requests_help_or_version(args: &[&str]) -> bool {
+    has_any(args, &["--help", "-h"]) || has_any(args, &["--version", "-V"])
 }
+
+/// Value of the short flag's next token (`-r <id>`): the last value
+/// wins, and a bare or empty occurrence keeps scanning rather than
+/// blinding later ones. `None` when the flag is absent or never carries
+/// a usable value.
+fn short_flag_value<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
+    flag_value(args, flag, false)
+}
+
+/// Subcommands Claude treats as something other than the interactive
+/// session. Unlike codex/muse, Claude follows commander grammar: only
+/// the FIRST positional can be a subcommand, so the classifier decides
+/// from it alone rather than scanning.
+const CLAUDE_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "attach",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "import",
+    "install",
+    "logs",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "respawn",
+    "rm",
+    "setup-token",
+    "stop",
+    "kill",
+    "ultrareview",
+    "update",
+    "upgrade",
+];
+
+/// Claude options that consume the following token as their value.
+/// Commander consumes even for `[optional]` options (`-r`/`--resume`,
+/// `--from-pr`, `--cloud`), so they are listed; a flag-like next token
+/// still keeps its own meaning (see `positional_tokens`).
+const CLAUDE_VALUE_FLAGS: &[&str] = &[
+    "--add-dir",
+    "--agent",
+    "--agents",
+    "--allowedTools",
+    "--allowed-tools",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--autocompact",
+    "--betas",
+    "--cloud",
+    "-d",
+    "--debug",
+    "--debug-file",
+    "--disallowed-tools",
+    "--disallowedTools",
+    "--effort",
+    "--environment",
+    "--fallback-model",
+    "--file",
+    "--from-pr",
+    "--input-format",
+    "--json-schema",
+    "--max-budget-usd",
+    "--mcp-config",
+    "--model",
+    "-n",
+    "--name",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--permission-prompts",
+    "--plugin-dir",
+    "--plugin-url",
+    "--prompt-suggestions",
+    "--remote-control",
+    "--remote-control-session-name-prefix",
+    "--resume",
+    "-r",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--system-prompt",
+    "--system-prompt-file",
+    "--system-prompt-snapshot",
+    "--teleport",
+    "--tools",
+    "-w",
+    "--worktree",
+];
 
 fn classify_claude(args: &[&str]) -> Option<AgentArgv> {
-    if has_any(args, &["--help", "-h"]) {
+    // `-v` is Claude's version short flag alongside `-V`.
+    if requests_help_or_version(args) || has_any(args, &["-v"]) {
         return None;
     }
-    if has_any(args, &["--version", "-V"]) {
-        return None;
+    let positionals = positional_tokens(args, CLAUDE_VALUE_FLAGS);
+    match positionals.first().copied() {
+        // `claude attach <id>` opens a background session: interactive,
+        // with the id when given.
+        Some("attach") => Some(AgentArgv {
+            mode: AgentRunMode::Interactive,
+            conversation_id: positionals.get(1).map(ToString::to_string),
+        }),
+        // `claude ultrareview` runs a cloud review one-shot.
+        Some("ultrareview") => Some(AgentArgv {
+            mode: AgentRunMode::Headless,
+            conversation_id: None,
+        }),
+        // Bookkeeping subcommands (servers, installers, session
+        // management) are not agent runs.
+        Some(sub) if CLAUDE_SUBCOMMANDS.contains(&sub) => None,
+        // Bare `claude`, `claude "prompt"`, or an unknown token: the
+        // interactive session, with the id when flag-carried.
+        _ => {
+            let mode = if has_any(args, &["--print", "-p"]) {
+                AgentRunMode::Headless
+            } else {
+                AgentRunMode::Interactive
+            };
+            Some(AgentArgv {
+                mode,
+                conversation_id: long_flag_value(args, "--resume")
+                    .or_else(|| short_flag_value(args, "-r"))
+                    .map(str::to_string),
+            })
+        }
     }
-    if positional_tokens(args).first() == Some(&"mcp") {
-        return None;
-    }
-    let mode = if has_any(args, &["--print", "-p"]) {
-        AgentRunMode::Headless
-    } else {
-        AgentRunMode::Interactive
-    };
-    Some(AgentArgv {
-        mode,
-        conversation_id: long_flag_value(args, "--resume")
-            .or_else(|| short_flag_value(args, "-r"))
-            .map(str::to_string),
-    })
 }
 
+/// Subcommands codex treats as something other than the interactive
+/// TUI. The classifier locates the first positional naming one of these
+/// (see [`find_subcommand`]).
+const CODEX_SUBCOMMANDS: &[&str] = &[
+    "exec",
+    "e",
+    "review",
+    "resume",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "app-server",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "fork",
+    "cloud",
+    "exec-server",
+    "features",
+    "agents",
+    "remote-control",
+    "help",
+];
+
+/// Codex options that consume the following token as their value.
+/// (`--worktree` is boolean here, not the optional-value muse flag.)
+const CODEX_VALUE_FLAGS: &[&str] = &[
+    "-c",
+    "--config",
+    "-p",
+    "--profile",
+    "-m",
+    "--model",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-i",
+    "--image",
+    "-a",
+    "--ask-for-approval",
+    "-s",
+    "--sandbox",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+    "--local-provider",
+];
+
 fn classify_codex(args: &[&str]) -> Option<AgentArgv> {
-    if has_any(args, &["--help", "-h"]) {
+    // clap ends flag parsing at `--` (verified: `codex -- --help`
+    // launches instead of printing help), so help and subcommand scans
+    // cover only the tokens before it.
+    let dash = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    if requests_help_or_version(&args[..dash]) {
         return None;
     }
-    if has_any(args, &["--version", "-V"]) {
-        return None;
-    }
-    let positionals = positional_tokens(args);
-    match positionals.first().copied() {
+    let (positionals, boundary) = positional_tokens_split(args, CODEX_VALUE_FLAGS);
+    let Some(at) = find_subcommand(&positionals[..boundary], CODEX_SUBCOMMANDS) else {
+        // Bare `codex` or prompt text: no known subcommand anywhere.
+        return Some(AgentArgv {
+            mode: AgentRunMode::Interactive,
+            conversation_id: None,
+        });
+    };
+    match positionals[at] {
         // `codex exec|review` (and short alias `e`) run headless one-shots.
-        Some("exec" | "e" | "review") => Some(AgentArgv {
+        "exec" | "e" | "review" => Some(AgentArgv {
             mode: AgentRunMode::Headless,
             conversation_id: None,
         }),
         // `codex resume [SESSION_ID] [PROMPT]`: the id is the next positional.
-        Some("resume") => Some(AgentArgv {
+        "resume" => Some(AgentArgv {
             mode: AgentRunMode::Interactive,
-            conversation_id: positionals.get(1).map(ToString::to_string),
+            conversation_id: positionals.get(at + 1).map(ToString::to_string),
         }),
         // Bookkeeping subcommands are not agent runs.
-        Some(
-            "login" | "logout" | "mcp" | "plugin" | "app-server" | "app" | "completion" | "update"
-            | "doctor" | "sandbox" | "debug" | "apply" | "a" | "queue" | "archive" | "delete"
-            | "migrate-rollouts" | "unarchive" | "fork" | "cloud" | "exec-server" | "features"
-            | "agents" | "help",
-        ) => None,
-        // Anything else (including bare `codex` and `codex "prompt"`) is the
-        // interactive TUI: an unknown token is prompt text, not a subcommand.
-        _ => Some(AgentArgv {
-            mode: AgentRunMode::Interactive,
-            conversation_id: None,
-        }),
+        _ => None,
     }
 }
 
+/// Agy options that consume the following token as their value (Go
+/// flags: a value-taking flag always consumes the next token).
+const AGY_VALUE_FLAGS: &[&str] = &[
+    "--conversation",
+    "--project",
+    "--model",
+    "--agent",
+    "--mode",
+    "--effort",
+    "--add-dir",
+    "--log-file",
+    "--input-format",
+    "--output-format",
+    "--json-schema",
+    "--print-timeout",
+];
+
+/// Subcommands agy treats as something other than the interactive
+/// session. Go dispatches only `Args()[0]`, so the classifier decides
+/// from the first positional alone rather than scanning.
+const AGY_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "agents",
+    "changelog",
+    "install",
+    "mcp",
+    "mic-serve",
+    "models",
+    "plugin",
+    "plugins",
+    "remote-control",
+    "update",
+    "help",
+];
+
+/// Rewrite Go single-dash long flags (`-model`, `-print`, `-help`,
+/// including `-flag=value`) to double-dash. Go accepts both spellings
+/// (verified: `-help` prints usage, `-conversation` without a value
+/// errors `flag needs an argument`); without this the tables below miss
+/// every single-dash use. Single-letter flags (`-p`, `-h`) and bare `-`
+/// pass through untouched.
+fn normalize_agy_args(args: &[&str]) -> Vec<String> {
+    args.iter()
+        .map(|arg| {
+            if let Some(rest) = arg.strip_prefix('-')
+                && !rest.starts_with('-')
+                && rest.split('=').next().is_some_and(|name| name.len() > 1)
+            {
+                return format!("--{rest}");
+            }
+            (*arg).to_string()
+        })
+        .collect()
+}
+
 fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
-    if has_any(args, &["--help", "-h", "help"]) {
+    let normalized = normalize_agy_args(args);
+    let loaned: Vec<&str> = normalized.iter().map(String::as_str).collect();
+    let args = loaned.as_slice();
+    // Bare `help` is NOT matched anywhere: Go reads only Args()[0], so a
+    // later `help` is prompt text (the first-positional `help` below
+    // still covers the real help subcommand).
+    if has_any(args, &["--help", "-h"]) {
         return None;
     }
-    if positional_tokens(args).first().is_some_and(|sub| {
-        matches!(
-            *sub,
-            "agent"
-                | "agents"
-                | "changelog"
-                | "install"
-                | "mcp"
-                | "mic-serve"
-                | "models"
-                | "plugin"
-                | "plugins"
-                | "remote-control"
-                | "update"
-                | "help"
-        )
-    }) {
+    if positional_tokens(args, AGY_VALUE_FLAGS)
+        .first()
+        .is_some_and(|sub| AGY_SUBCOMMANDS.contains(sub))
+    {
         return None;
     }
     let mode = if has_any(args, &["--print", "-p", "--prompt"]) {
@@ -190,39 +451,93 @@ fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
     })
 }
 
+/// Subcommands muse treats as something other than the interactive
+/// TUI. The classifier locates the first positional naming one of these
+/// (see [`find_subcommand`]).
+const MUSE_SUBCOMMANDS: &[&str] = &[
+    "exec",
+    "resume",
+    "config",
+    "export",
+    "trace",
+    "skills",
+    "plugins",
+    "sandbox",
+    "schema",
+    "serve",
+    "session-message",
+    "mcp",
+    "auth",
+    "login",
+    "logout",
+    "init",
+    "help",
+];
+
+/// Muse options that consume the following token as their value.
+/// `-w`/`--worktree` is deliberately excluded: its value is optional,
+/// so after a bare `-w` the next token is the subcommand, not a value.
+/// Leaving it unlisted keeps both readings working through the
+/// subcommand scan; listing it would eat the subcommand itself.
+const MUSE_VALUE_FLAGS: &[&str] = &[
+    "--workspace",
+    "--model",
+    "--provider",
+    "--preset",
+    "--agents",
+    "--reasoning-effort",
+    "--base-url",
+    "--image",
+    "--worktree-base",
+    "--worktree-existing",
+    "--approval-mode",
+    "--permission-profile",
+    "--approval-judge",
+    "--echo-delay-ms",
+    "--sandbox-network",
+];
+
 fn classify_muse(args: &[&str]) -> Option<AgentArgv> {
-    if has_any(args, &["--help", "-h"]) {
+    // muse pre-scans `--help`/`--version` anywhere (verified: `muse --
+    // --help`, `muse -- --version`, and `muse foo --help` all answer),
+    // so the help scan stays global; only subcommand dispatch stops at
+    // `--` (verified: `muse -- exec` errors as an unknown argument
+    // instead of dispatching).
+    if requests_help_or_version(args) {
         return None;
     }
-    if has_any(args, &["--version", "-V"]) {
-        return None;
-    }
-    let positionals = positional_tokens(args);
-    match positionals.first().copied() {
-        Some("exec") => Some(AgentArgv {
+    let (positionals, boundary) = positional_tokens_split(args, MUSE_VALUE_FLAGS);
+    let Some(at) = find_subcommand(&positionals[..boundary], MUSE_SUBCOMMANDS) else {
+        // Bare `muse`, `muse "prompt"`, or an unknown token (prompt text).
+        return Some(AgentArgv {
+            mode: AgentRunMode::Interactive,
+            conversation_id: None,
+        });
+    };
+    match positionals[at] {
+        "exec" => Some(AgentArgv {
             mode: AgentRunMode::Headless,
             conversation_id: None,
         }),
         // `muse resume [--last|<session-ref>]`.
-        Some("resume") => Some(AgentArgv {
+        "resume" => Some(AgentArgv {
             mode: AgentRunMode::Interactive,
-            conversation_id: positionals.get(1).map(ToString::to_string),
+            conversation_id: positionals.get(at + 1).map(ToString::to_string),
         }),
-        Some(
-            "config" | "export" | "trace" | "skills" | "plugins" | "sandbox" | "schema" | "serve"
-            | "session-message" | "mcp" | "auth" | "login" | "logout" | "init" | "help",
-        ) => None,
-        // Bare `muse`, `muse "prompt"`, or an unknown token (prompt text).
-        _ => Some(AgentArgv {
-            mode: AgentRunMode::Interactive,
-            conversation_id: None,
-        }),
+        // Bookkeeping subcommands are not agent runs.
+        _ => None,
     }
 }
 
 /// Build the command restoring an agent conversation: resume the given id,
-/// or the agent's most-recent conversation when no id is known.
-pub fn resume_command(kind: AgentKind, conversation_id: Option<&str>) -> (String, Vec<String>) {
+/// or the agent's most-recent conversation when no id is known. The
+/// binary is the recorded path when it still exists, else the primary
+/// binary name for a `PATH` lookup.
+pub fn resume_command(
+    kind: AgentKind,
+    conversation_id: Option<&str>,
+    exe_path: Option<&Path>,
+) -> (String, Vec<String>) {
     let args: Vec<String> = match (kind, conversation_id) {
         (AgentKind::Claude, Some(id)) => vec!["--resume".into(), id.into()],
         (AgentKind::Claude, None) => vec!["--continue".into()],
@@ -233,7 +548,11 @@ pub fn resume_command(kind: AgentKind, conversation_id: Option<&str>) -> (String
         (AgentKind::Muse, Some(id)) => vec!["resume".into(), id.into()],
         (AgentKind::Muse, None) => vec!["resume".into(), "--last".into()],
     };
-    (kind.primary_binary().to_string(), args)
+    let binary = exe_path
+        .filter(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| kind.primary_binary().to_string());
+    (binary, args)
 }
 
 /// Home directory following the repo convention (`HOME`, else `USERPROFILE`).
@@ -266,6 +585,8 @@ pub fn transcript_store_root(kind: AgentKind) -> Option<PathBuf> {
 
 /// Claude's project directory for a cwd: the absolute path with every `/`
 /// replaced by `-` (e.g. `/Users/me/repo` becomes `-Users-me-repo`).
+/// `\` and `:` are replaced too, so a Windows path can never make the
+/// slug absolute and discard the store root at `join` time.
 /// Returns `None` for relative cwds, which have no stable mapping.
 pub fn claude_project_dir(projects_root: &Path, cwd: &Path) -> Option<PathBuf> {
     if !cwd.is_absolute() {
@@ -274,18 +595,23 @@ pub fn claude_project_dir(projects_root: &Path, cwd: &Path) -> Option<PathBuf> {
     let slug: String = cwd
         .to_string_lossy()
         .chars()
-        .map(|c| if c == '/' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     Some(projects_root.join(slug))
 }
 
-/// A transcript file plausibly belonging to a live agent: conversation id,
-/// transcript path, and the working directory the transcript records.
+/// A transcript file plausibly belonging to a live agent: conversation id
+/// plus transcript path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptHit {
     pub conversation_id: String,
     pub path: PathBuf,
-    pub cwd: PathBuf,
 }
 
 /// Outcome of transcript correlation for one agent process.
@@ -407,10 +733,15 @@ fn claude_candidates(
             if path.extension().is_some_and(|ext| ext == "jsonl")
                 && is_fresh_file(&path, now, max_age)
             {
+                let id = path.file_stem()?.to_string_lossy().into_owned();
+                // A stray stemless or dirty stem would attach an unusable
+                // id; skip it rather than building bad resume argv.
+                if !is_clean_id(&id) {
+                    return None;
+                }
                 Some(TranscriptHit {
-                    conversation_id: path.file_stem()?.to_string_lossy().into_owned(),
+                    conversation_id: id,
                     path,
-                    cwd: cwd.to_path_buf(),
                 })
             } else {
                 None
@@ -420,10 +751,12 @@ fn claude_candidates(
 }
 
 /// First JSON object of a `.jsonl` file, or `None` when unreadable.
+/// The stream is capped: a corrupt transcript with one huge line must not
+/// OOM the actor thread on a metadata probe.
 fn read_first_json_line(path: &Path) -> Option<serde_json::Value> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
     let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader = std::io::BufReader::new(file.take(64 * 1024));
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     serde_json::from_str(&line).ok()
@@ -472,10 +805,15 @@ fn codex_hit(path: &Path, want_cwd: &Path) -> Option<TranscriptHit> {
     }
     // Root threads use one id for thread and session (verified on disk).
     let id = meta.get("id")?.as_str()?;
+    // A corrupt rollout can name an empty or dirty id; attaching it
+    // would make resume argv the CLI rejects, or smuggle control
+    // characters into badges and logs.
+    if !is_clean_id(id) {
+        return None;
+    }
     Some(TranscriptHit {
         conversation_id: id.to_string(),
         path: path.to_path_buf(),
-        cwd: PathBuf::from(recorded_cwd),
     })
 }
 
@@ -503,12 +841,13 @@ fn muse_candidates(
 
 /// Parse a muse `session.jsonl` header into a hit: top-level sessions only
 /// (no `parent_task_id`), at the target cwd, preferring the agent pid when
-/// the sampler knows it. Reads at most the first 200 lines; both records
-/// appear before then.
+/// the sampler knows it. Reads at most the first 200 lines within the
+/// first megabyte; both records appear before then, and the cap keeps a
+/// corrupt transcript from OOMing the actor thread on a metadata probe.
 fn muse_hit(path: &Path, want_cwd: &Path, pid: Option<u32>) -> Option<TranscriptHit> {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
     let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
+    let reader = std::io::BufReader::new(file.take(1024 * 1024));
     let mut cwd: Option<PathBuf> = None;
     let mut recorded_pid: Option<u32> = None;
     let mut top_level: Option<bool> = None;
@@ -555,10 +894,14 @@ fn muse_hit(path: &Path, want_cwd: &Path, pid: Option<u32>) -> Option<Transcript
         return None;
     }
     let id = path.parent()?.file_name()?.to_string_lossy().into_owned();
+    // Directory names can hold anything on Unix; a dirty one would
+    // smuggle control characters into badges, logs, and resume argv.
+    if !is_clean_id(&id) {
+        return None;
+    }
     Some(TranscriptHit {
         conversation_id: id,
         path: path.to_path_buf(),
-        cwd: recorded_cwd,
     })
 }
 
@@ -619,6 +962,48 @@ pub fn observe_pid(
     observe_process(&process, cwd.as_deref(), now, max_transcript_age)
 }
 
+/// True when a conversation id is safe to keep: non-empty with no
+/// control characters, so ids from argv, transcripts, or filenames can
+/// never smuggle terminal escapes into badges, logs, or resume argv.
+fn is_clean_id(id: &str) -> bool {
+    !id.is_empty() && !id.chars().any(|c| c.is_control())
+}
+
+/// True when an argv-supplied conversation id is safe to join into a
+/// transcript path: a single file stem with no separators, so a hostile
+/// or display-name id can never escape the project directory.
+fn is_path_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Transcript path derived from an argv-carried conversation id. Only
+/// Claude's store is deterministic from the id (so argv observations
+/// still get a staleness-checkable path), and only path-safe ids derive
+/// one: the id comes straight from argv, so a hostile or display-name id
+/// must never escape the project directory. The id itself is still kept
+/// for resume argv.
+fn argv_transcript_path(
+    kind: AgentKind,
+    id: &str,
+    cwd: Option<&Path>,
+    store_root: Option<&Path>,
+) -> Option<PathBuf> {
+    match kind {
+        AgentKind::Claude if is_path_safe_id(id) => {
+            let cwd = cwd?;
+            let store_root = store_root?;
+            let path = claude_project_dir(store_root, cwd)?.join(format!("{id}.jsonl"));
+            path.is_file().then_some(path)
+        }
+        _ => None,
+    }
+}
+
 /// Classify an already-read process, correlating a bare run to its
 /// transcript when the cwd is known. Split from [`observe_pid`] so the
 /// unresolvable-cwd path gets unit coverage without a live pid: it
@@ -634,17 +1019,22 @@ fn observe_process(
     if classified.mode != AgentRunMode::Interactive {
         return None;
     }
-    if let Some(id) = classified.conversation_id {
-        // Claude's transcript path is deterministic from the id, so argv
-        // observations still get a staleness-checkable path.
-        let transcript_path = match kind {
-            AgentKind::Claude => cwd.and_then(|cwd| {
-                let path = claude_project_dir(&transcript_store_root(kind)?, cwd)?
-                    .join(format!("{id}.jsonl"));
-                path.is_file().then_some(path)
-            }),
-            _ => None,
-        };
+    // A dirty argv id falls through to correlation (usually kind-only):
+    // control characters must never reach badges, logs, or resume argv.
+    if classified
+        .conversation_id
+        .as_ref()
+        .is_some_and(|id| !is_clean_id(id))
+    {
+        tracing::debug!(
+            kind = ?kind,
+            pid = process.pid,
+            "dropping dirty argv conversation id; falling through to correlation"
+        );
+    }
+    if let Some(id) = classified.conversation_id.filter(|id| is_clean_id(id)) {
+        let transcript_path =
+            argv_transcript_path(kind, &id, cwd, transcript_store_root(kind).as_deref());
         return Some(ObservedAgent {
             kind,
             pid: process.pid,
@@ -670,7 +1060,15 @@ fn observe_process(
     };
     let (conversation_id, transcript_path) = match correlation {
         Correlation::Single(hit) => (Some(hit.conversation_id), Some(hit.path)),
-        Correlation::None | Correlation::Multiple => (None, None),
+        Correlation::None => (None, None),
+        Correlation::Multiple => {
+            tracing::debug!(
+                kind = ?kind,
+                pid = process.pid,
+                "transcript correlation found multiple contenders; tracking kind-only"
+            );
+            (None, None)
+        }
     };
     Some(ObservedAgent {
         kind,
@@ -858,6 +1256,17 @@ pub struct FgAgentTracker {
     /// retry: transient read misses (process mid-exec, /proc races) must
     /// neither wedge attach nor emit a spurious detach.
     pending_resolve: Option<u32>,
+    /// A seeded attachment still owes its first confirmation. The first
+    /// steady re-observation emits the seed once (the flush treats it as
+    /// compared-equal, so this costs one message and no persist); without
+    /// that signal the manager cannot tell "tracker alive and steady"
+    /// from "resume failed before any observation" at demote time.
+    seed_unconfirmed: bool,
+    /// Whether any processed poll has seen a foreground pid. A seed
+    /// detaches only on proof (a resolved non-agent pid, a foreground
+    /// that went away), never on an initial `None` reading, which on a
+    /// fresh seed means "nothing observed yet".
+    observed_fg: bool,
 }
 
 impl FgAgentTracker {
@@ -868,9 +1277,11 @@ impl FgAgentTracker {
     /// A tracker that already reports `initial`, for restores and handover
     /// adoption: seeding the live entry alone would strand the attachment,
     /// since a fresh tracker has nothing to clear it with when the
-    /// foreground turns out not to be that agent.
+    /// foreground turns out not to be that agent. A seed also owes one
+    /// confirmation, emitted on the first steady re-observation.
     pub fn seeded(initial: Option<AgentAttachment>) -> Self {
         Self {
+            seed_unconfirmed: initial.is_some(),
             reported: initial,
             ..Self::default()
         }
@@ -895,6 +1306,9 @@ impl FgAgentTracker {
             return None;
         }
         self.last_poll = Some(now);
+        if fg_pid.is_some() {
+            self.observed_fg = true;
+        }
         if fg_pid != self.last_fg_pid {
             self.last_fg_pid = fg_pid;
             self.candidate = match fg_pid {
@@ -932,18 +1346,28 @@ impl FgAgentTracker {
         }
         match &self.candidate {
             Some((obs, first)) if now.duration_since(*first) >= AGENT_ATTACH_AFTER => {
-                // Borrowed `same_observation`: steady-state polls must not
-                // clone only to discover nothing changed. Must mirror
-                // `AgentAttachment::same_observation` exactly (kind,
-                // conversation, transcript, binary path).
+                // Borrowed identity check: steady-state polls must not
+                // clone only to discover nothing changed. The compared
+                // set lives in `matches_observation`, shared with
+                // `same_observation`, so the two cannot diverge.
                 let unchanged = self.reported.as_ref().is_some_and(|reported| {
-                    reported.kind == obs.kind
-                        && reported.conversation_id == obs.conversation_id
-                        && reported.transcript_path == obs.transcript_path
-                        && reported.exe_path.as_deref() == Some(obs.exe_path.as_path())
+                    reported.matches_observation(
+                        obs.kind,
+                        obs.conversation_id.as_deref(),
+                        obs.transcript_path.as_deref(),
+                        Some(obs.exe_path.as_path()),
+                    )
                 });
                 if unchanged {
-                    None
+                    // First steady re-observation confirms a seed; any
+                    // later one is quiet. A transition below supersedes
+                    // the seed instead, and clears the debt the same way.
+                    if self.seed_unconfirmed {
+                        self.seed_unconfirmed = false;
+                        Some(self.reported.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     let attachment = AgentAttachment {
                         kind: obs.kind,
@@ -952,14 +1376,21 @@ impl FgAgentTracker {
                         exe_path: Some(obs.exe_path.clone()),
                         last_seen_ms: now_ms,
                     };
+                    self.seed_unconfirmed = false;
                     self.reported = Some(attachment.clone());
                     Some(Some(attachment))
                 }
             }
             Some(_) => None,
             // No detach while a retry is owed: the None may be a
-            // transient read miss, not a real foreground change.
-            None if self.reported.is_some() && self.pending_resolve.is_none() => {
+            // transient read miss, not a real foreground change. And no
+            // detach before any foreground was ever observed: on a fresh
+            // seed that None means "nothing seen yet", not disproof.
+            None if self.reported.is_some()
+                && self.pending_resolve.is_none()
+                && self.observed_fg =>
+            {
+                self.seed_unconfirmed = false;
                 self.reported = None;
                 Some(None)
             }
@@ -975,6 +1406,16 @@ impl FgAgentTracker {
                 .last_correlate
                 .is_some_and(|at| now.duration_since(at) >= AGENT_RECORRELATE_AFTER)
     }
+}
+
+/// Path to the stub-agent helper binary the build script compiles into
+/// OUT_DIR. It ignores argv and blocks quietly until killed. Shared by
+/// this module's observation tests and `session.rs`' restore tests, so
+/// the `EXE_SUFFIX` handling cannot drift between the two suites.
+#[cfg(all(test, unix))]
+pub(crate) fn stub_agent_bin() -> PathBuf {
+    PathBuf::from(env!("OUT_DIR"))
+        .join(format!("triage-stub-agent{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[cfg(test)]
@@ -1033,14 +1474,127 @@ mod tests {
             classify_argv(AgentKind::Claude, &argv(&["claude", "--print", "hi"])),
             headless()
         );
+        // A flag after `--resume` is not its value: bare `--resume`
+        // continues the most-recent conversation.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--resume", "--model", "sonnet"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "--resume="])),
+            interactive(None)
+        );
+        // Last value wins; a bare occurrence keeps scanning.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--resume", "aaa", "--resume", "bbb"])
+            ),
+            interactive(Some("bbb"))
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--resume", "--resume", "bbb"])
+            ),
+            interactive(Some("bbb"))
+        );
         assert_eq!(
             classify_argv(AgentKind::Claude, &argv(&["claude", "--help"])),
             None
+        );
+        // Subcommands: bookkeeping is untracked, attach carries its id,
+        // ultrareview runs headless. Only the first positional decides.
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "doctor"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "gateway"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--model", "sonnet", "mcp", "list"])
+            ),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "attach", "sess-9"])),
+            interactive(Some("sess-9"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "ultrareview"])),
+            headless()
+        );
+        // Commander consumes the token after `--resume` as its id, even
+        // when it spells a subcommand.
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "--resume", "mcp"])),
+            interactive(Some("mcp"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "-v"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "-V"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "-r", "abc"])),
+            interactive(Some("abc"))
         );
         assert_eq!(
             classify_argv(AgentKind::Claude, &argv(&["claude", "mcp", "list"])),
             None
         );
+        // An empty short-flag value is unusable like its long sibling,
+        // never an id.
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "-r", ""])),
+            interactive(None)
+        );
+    }
+
+    #[test]
+    fn classify_claude_value_flag_table() {
+        // Each spelling below was verified value-taking against the
+        // installed binary (`--help` arity or live acceptance). Both
+        // directions matter: the consumed token must not surface as a
+        // subcommand, and a real subcommand after the value must still
+        // dispatch.
+        for flag in [
+            "--append-system-prompt-file",
+            "-d",
+            "--debug",
+            "--disallowed-tools",
+            "--disallowedTools",
+            "-n",
+            "--name",
+            "--permission-prompt-tool",
+            "--prompt-suggestions",
+            "--remote-control",
+            "--system-prompt-file",
+            "--teleport",
+            "-w",
+            "--worktree",
+        ] {
+            assert_eq!(
+                classify_argv(AgentKind::Claude, &argv(&["claude", flag, "mcp"])),
+                interactive(None),
+                "{flag} must consume the following token",
+            );
+            assert_eq!(
+                classify_argv(AgentKind::Claude, &argv(&["claude", flag, "foo", "mcp"])),
+                None,
+                "{flag} must leave the subcommand after its value visible",
+            );
+        }
     }
 
     #[test]
@@ -1068,13 +1622,70 @@ mod tests {
             classify_argv(AgentKind::Codex, &argv(&["codex", "exec", "ls"])),
             headless()
         );
+        // Unknown flags ahead of the subcommand hide neither the
+        // subcommand nor its id.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Codex,
+                &argv(&["codex", "--verbose", "resume", "abc"])
+            ),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Codex,
+                &argv(&["codex", "--verbose", "exec", "ls"])
+            ),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Codex,
+                &argv(&["codex", "--profile", "foo", "resume", "abc"])
+            ),
+            interactive(Some("abc"))
+        );
+        // Known value flags skip their values even when they spell a
+        // subcommand or precede one.
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "--cd", "app"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "-p", "resume", "foo"])),
+            interactive(None)
+        );
         assert_eq!(
             classify_argv(AgentKind::Codex, &argv(&["codex", "login"])),
             None
         );
         assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "remote-control"])),
+            None
+        );
+        assert_eq!(
             classify_argv(AgentKind::Codex, &argv(&["codex", "--version"])),
             None
+        );
+        // clap ends flag parsing at `--`: nothing after it is a flag or
+        // a subcommand (verified: `codex -- --help` launches instead of
+        // printing help).
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "--", "exec"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "--", "resume", "abc"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "--", "--help"])),
+            interactive(None)
+        );
+        // ...but a subcommand before `--` still takes its id after it.
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "resume", "--", "abc"])),
+            interactive(Some("abc"))
         );
     }
 
@@ -1103,6 +1714,54 @@ mod tests {
             classify_argv(AgentKind::Antigravity, &argv(&["agy", "mcp", "list"])),
             None
         );
+        // Value flags skip ahead of the subcommand; a non-first `help`
+        // is prompt text under Go flag grammar.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Antigravity,
+                &argv(&["agy", "--project", "myproj", "mcp", "list"])
+            ),
+            None
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Antigravity,
+                &argv(&["agy", "please", "help", "me"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "--help"])),
+            None
+        );
+        // Go accepts single-dash long flags (verified: `-help` prints
+        // usage), so each spelling below behaves as its double-dash twin.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Antigravity,
+                &argv(&["agy", "-conversation", "abc"])
+            ),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "-conversation=abc"])),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "-print", "hi"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Antigravity,
+                &argv(&["agy", "-model", "foo", "mcp", "list"])
+            ),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "-help"])),
+            None
+        );
     }
 
     #[test]
@@ -1122,6 +1781,41 @@ mod tests {
             classify_argv(AgentKind::Muse, &argv(&["muse", "resume", "--last"])),
             interactive(None)
         );
+        // `--flag=value` never swallows the following subcommand.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Muse,
+                &argv(&["muse", "--workspace=/tmp/x", "resume", "abc"])
+            ),
+            interactive(Some("abc"))
+        );
+        // Known value flags skip their values even when they spell a
+        // subcommand.
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "--image", "config"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Muse,
+                &argv(&["muse", "--approval-judge", "off", "resume", "abc"])
+            ),
+            interactive(Some("abc"))
+        );
+        // `-w` takes an optional value, so a bare `-w` leaves the
+        // subcommand in place rather than eating it.
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "-w", "resume", "abc"])),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "--help"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "--version"])),
+            None
+        );
         assert_eq!(
             classify_argv(AgentKind::Muse, &argv(&["muse", "exec", "hi"])),
             headless()
@@ -1130,60 +1824,97 @@ mod tests {
             classify_argv(AgentKind::Muse, &argv(&["muse", "trace", "inspect"])),
             None
         );
+        // Subcommand dispatch stops at `--` (verified: `muse -- exec`
+        // errors as an unknown argument instead of dispatching), while
+        // `--help`/`--version` answer from anywhere (verified: `muse --
+        // --help`, `muse -- --version`, and `muse foo --help`).
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "--", "exec"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "--", "--help"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "--", "--version"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "resume", "--", "abc"])),
+            interactive(Some("abc"))
+        );
     }
 
     #[test]
     fn resume_commands_cover_id_and_fallback() {
         assert_eq!(
-            resume_command(AgentKind::Claude, Some("abc")),
+            resume_command(AgentKind::Claude, Some("abc"), None),
             (
                 "claude".to_string(),
                 vec!["--resume".to_string(), "abc".to_string()]
             )
         );
         assert_eq!(
-            resume_command(AgentKind::Claude, None),
+            resume_command(AgentKind::Claude, None, None),
             ("claude".to_string(), vec!["--continue".to_string()])
         );
         assert_eq!(
-            resume_command(AgentKind::Codex, Some("abc")),
+            resume_command(AgentKind::Codex, Some("abc"), None),
             (
                 "codex".to_string(),
                 vec!["resume".to_string(), "abc".to_string()]
             )
         );
         assert_eq!(
-            resume_command(AgentKind::Codex, None),
+            resume_command(AgentKind::Codex, None, None),
             (
                 "codex".to_string(),
                 vec!["resume".to_string(), "--last".to_string()]
             )
         );
         assert_eq!(
-            resume_command(AgentKind::Antigravity, Some("abc")),
+            resume_command(AgentKind::Antigravity, Some("abc"), None),
             (
                 "agy".to_string(),
                 vec!["--conversation".to_string(), "abc".to_string()]
             )
         );
         assert_eq!(
-            resume_command(AgentKind::Antigravity, None),
+            resume_command(AgentKind::Antigravity, None, None),
             ("agy".to_string(), vec!["--continue".to_string()])
         );
         assert_eq!(
-            resume_command(AgentKind::Muse, Some("abc")),
+            resume_command(AgentKind::Muse, Some("abc"), None),
             (
                 "muse".to_string(),
                 vec!["resume".to_string(), "abc".to_string()]
             )
         );
         assert_eq!(
-            resume_command(AgentKind::Muse, None),
+            resume_command(AgentKind::Muse, None, None),
             (
                 "muse".to_string(),
                 vec!["resume".to_string(), "--last".to_string()]
             )
         );
+        // A recorded binary that still exists is used verbatim; a moved
+        // one degrades to a `PATH` lookup.
+        let dir = unique_dir("exebin");
+        let exe = dir.join("codex");
+        write(&exe, "x");
+        assert_eq!(
+            resume_command(AgentKind::Codex, Some("abc"), Some(&exe)),
+            (
+                exe.to_string_lossy().into_owned(),
+                vec!["resume".to_string(), "abc".to_string()]
+            )
+        );
+        assert_eq!(
+            resume_command(AgentKind::Codex, Some("abc"), Some(&dir.join("gone"))).0,
+            "codex".to_string(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Unix path contract (`/Users/...` is not absolute on Windows); the
@@ -1197,6 +1928,121 @@ mod tests {
             Some(root.join("-Users-me-repo"))
         );
         assert_eq!(claude_project_dir(root, Path::new("repo")), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn claude_project_slug_replaces_windows_separators() {
+        let root = Path::new(r"C:\Users\me\.claude\projects");
+        // `\` and `:` map to `-` so the slug stays relative and `join`
+        // cannot discard the store root.
+        assert_eq!(
+            claude_project_dir(root, Path::new(r"C:\repo")),
+            Some(root.join("C--repo"))
+        );
+        assert_eq!(claude_project_dir(root, Path::new("repo")), None);
+    }
+
+    #[test]
+    fn path_safe_ids_reject_separators_and_dot_segments() {
+        assert!(is_path_safe_id("abc123"));
+        assert!(is_path_safe_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!is_path_safe_id(""));
+        assert!(!is_path_safe_id("."));
+        assert!(!is_path_safe_id(".."));
+        assert!(!is_path_safe_id("../planted"));
+        assert!(!is_path_safe_id("a/b"));
+        assert!(!is_path_safe_id("a\\b"));
+        assert!(!is_path_safe_id("display name"));
+    }
+
+    #[test]
+    fn argv_transcript_path_gates_on_kind_safety_and_existence() {
+        let root = unique_dir("projects");
+        let cwd = root.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projects = root.join("projects");
+        let dir = claude_project_dir(&projects, &cwd).unwrap();
+        // Safe id with an existing transcript resolves.
+        write(&dir.join("abc.jsonl"), "{}\n");
+        assert_eq!(
+            argv_transcript_path(AgentKind::Claude, "abc", Some(&cwd), Some(&projects)),
+            Some(dir.join("abc.jsonl"))
+        );
+        // Safe id with no transcript resolves to nothing.
+        assert_eq!(
+            argv_transcript_path(AgentKind::Claude, "missing", Some(&cwd), Some(&projects)),
+            None
+        );
+        // A traversal id resolves to nothing even with its escape
+        // target planted: the guard runs before the existence check.
+        write(&projects.join("planted.jsonl"), "{}\n");
+        assert_eq!(
+            argv_transcript_path(AgentKind::Claude, "../planted", Some(&cwd), Some(&projects)),
+            None
+        );
+        // Non-Claude stores are never deterministic from the id.
+        assert_eq!(
+            argv_transcript_path(AgentKind::Codex, "abc", Some(&cwd), Some(&projects)),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn observe_process_treats_dirty_argv_id_as_bare() {
+        let process = PidProcess {
+            pid: 4242,
+            exe_path: PathBuf::from("/bin/codex"),
+            argv: argv(&["codex", "resume", "a\nb"]),
+        };
+        let observed = observe_process(
+            &process,
+            None,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_secs(900),
+        )
+        .expect("dirty argv id still observes kind-only");
+        assert_eq!(observed.kind, AgentKind::Codex);
+        assert_eq!(observed.conversation_id, None);
+        assert_eq!(observed.transcript_path, None);
+    }
+
+    #[test]
+    fn correlate_codex_skips_empty_and_dirty_ids() {
+        let root = unique_dir("codex-ids");
+        let day = root.join("2026").join("09").join("20");
+        let cwd = root.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let meta = |id: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"session_id\":\"{id}\",\
+                 \"parent_thread_id\":null,\"originator\":\"codex-tui\",\"cwd\":\"{}\"}}}}\n",
+                cwd.to_string_lossy().replace('\\', "\\\\"),
+            )
+        };
+        // Empty and control-character ids are corrupt; neither attaches
+        // (both present would otherwise read as Multiple).
+        write(&day.join("rollout-empty.jsonl"), &meta(""));
+        write(&day.join("rollout-dirty.jsonl"), &meta("a\\nb"));
+        let now = std::time::SystemTime::now();
+        let max_age = std::time::Duration::from_secs(900);
+        assert_eq!(
+            correlate(AgentKind::Codex, Some(&root), &cwd, None, now, max_age),
+            Correlation::None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_first_json_line_caps_huge_lines() {
+        let dir = unique_dir("huge-line");
+        let path = dir.join("rollout-huge.jsonl");
+        // Valid JSON past the 64 KiB cap truncates and fails to parse
+        // instead of allocating unboundedly.
+        write(&path, &format!("{{\"a\":\"{}\"}}\n", "x".repeat(200_000)));
+        assert_eq!(read_first_json_line(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn write(path: &Path, content: &str) {
@@ -1252,6 +2098,7 @@ mod tests {
             ),
             Correlation::None
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1301,6 +2148,7 @@ mod tests {
             correlate(AgentKind::Codex, Some(&root), &cwd, None, now, max_age),
             Correlation::Multiple
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1356,6 +2204,7 @@ mod tests {
             Correlation::Single(hit) => assert_eq!(hit.conversation_id, "bbb"),
             other => panic!("expected pid-disambiguated hit, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1371,14 +2220,6 @@ mod tests {
     #[cfg(unix)]
     fn read_process_dead_pid() {
         assert_eq!(read_process(u32::MAX), None);
-    }
-
-    /// Path to the stub-agent helper binary the build script compiles into
-    /// OUT_DIR. It ignores argv and blocks quietly until killed.
-    #[cfg(unix)]
-    fn stub_agent_bin() -> PathBuf {
-        PathBuf::from(env!("OUT_DIR"))
-            .join(format!("triage-stub-agent{}", std::env::consts::EXE_SUFFIX))
     }
 
     /// Copy the stub agent to a temp agent binary name and spawn it, so
@@ -1401,9 +2242,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn observe_pid_stub_agent_with_argv_id() {
-        let (mut child, _dir) = spawn_stub_agent("claude", &["--resume", "abc123"]);
-        // The child may not have exec'd when the parent first reads /proc —
-        // a loaded runner schedules it late — and the pre-exec image
+        let (mut child, dir) = spawn_stub_agent("claude", &["--resume", "abc123"]);
+        // The child may not have exec'd when the parent first reads /proc
+        // (a loaded runner schedules it late), and the pre-exec image
         // observes as nothing. Retry briefly rather than flaking.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let observed = loop {
@@ -1422,12 +2263,26 @@ mod tests {
         assert_eq!(observed.conversation_id.as_deref(), Some("abc123"));
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     #[cfg(unix)]
     fn observe_pid_headless_stub_is_ignored() {
-        let (mut child, _dir) = spawn_stub_agent("codex", &["exec"]);
+        let (mut child, dir) = spawn_stub_agent("codex", &["exec"]);
+        // Wait for exec first: the pre-exec image also observes as None,
+        // which would pass without touching the headless path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if read_process(child.id()).is_some_and(|p| p.exe_name() == "codex") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stub agent never exec'd"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(
             observe_pid(
                 child.id(),
@@ -1439,6 +2294,15 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn read_process_without_reader_degrades_to_nothing() {
+        // No process reader on this platform yet: detection stays off
+        // rather than guessing.
+        assert_eq!(read_process(std::process::id()), None);
     }
 
     fn observed(kind: AgentKind, pid: u32, id: Option<&str>) -> ObservedAgent {
@@ -1716,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_tracker_stays_quiet_when_seed_matches_foreground() {
+    fn seeded_tracker_confirms_once_then_stays_quiet() {
         let seed = seed_attachment();
         let mut tracker = FgAgentTracker::seeded(Some(seed.clone()));
         let resolve = |pid: u32| -> Option<ObservedAgent> {
@@ -1734,8 +2598,11 @@ mod tests {
             tracker.poll(Some(42), &resolve, start + AGENT_POLL_INTERVAL, 3),
             None
         );
-        // Past the attach debounce the observation matches the seed exactly,
-        // so the seeded report stands and nothing is emitted.
+        // Past the attach debounce the observation matches the seed exactly:
+        // the first steady match confirms the seed once (the flush treats
+        // it as compared-equal), and only then does the tracker go quiet.
+        // Without the confirmation the manager cannot tell a healthy
+        // steady seed from a resume that failed before any observation.
         assert_eq!(
             tracker.poll(
                 Some(42),
@@ -1743,7 +2610,99 @@ mod tests {
                 start + AGENT_ATTACH_AFTER + AGENT_POLL_INTERVAL,
                 4
             ),
+            Some(Some(seed.clone()))
+        );
+        assert_eq!(
+            tracker.poll(
+                Some(42),
+                &resolve,
+                start + AGENT_ATTACH_AFTER + 2 * AGENT_POLL_INTERVAL,
+                5
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn seeded_tracker_stays_quiet_until_a_foreground_is_observed() {
+        let mut tracker = FgAgentTracker::seeded(Some(seed_attachment()));
+        let resolve = |_pid: u32| -> Option<ObservedAgent> { None };
+        let start = std::time::Instant::now();
+        // A fresh seed has observed nothing: repeated `None` polls (the
+        // pre-foreground state, and every poll on non-unix) must not
+        // detach the seed they never disproved.
+        assert_eq!(tracker.poll(None, &resolve, start, 2), None);
+        assert_eq!(
+            tracker.poll(None, &resolve, start + AGENT_POLL_INTERVAL, 3),
+            None
+        );
+        assert_eq!(
+            tracker.poll(None, &resolve, start + 2 * AGENT_POLL_INTERVAL, 4),
+            None
+        );
+        // ...but a resolved non-agent pid still detaches once observed:
+        // the first poll owes the retry, the second detaches.
+        assert_eq!(
+            tracker.poll(Some(999), &resolve, start + 3 * AGENT_POLL_INTERVAL, 5),
+            None
+        );
+        assert_eq!(
+            tracker.poll(Some(999), &resolve, start + 4 * AGENT_POLL_INTERVAL, 6),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn tracker_detaches_when_the_foreground_goes_away() {
+        let mut tracker = FgAgentTracker::new();
+        let resolve = |pid: u32| Some(observed(AgentKind::Claude, pid, Some("abc")));
+        let start = std::time::Instant::now();
+        assert_eq!(tracker.poll(Some(42), &resolve, start, 1), None);
+        let report = tracker.poll(Some(42), &resolve, start + AGENT_ATTACH_AFTER, 2);
+        assert!(attached(&report).is_some());
+        // The foreground going away after an observation is proof of
+        // change, so this `None` detaches.
+        assert_eq!(
+            tracker.poll(
+                None,
+                &resolve,
+                start + AGENT_ATTACH_AFTER + AGENT_POLL_INTERVAL,
+                3
+            ),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn tracker_recovers_when_retry_resolves_after_transient_miss() {
+        use std::cell::Cell;
+        let missed = Cell::new(false);
+        let mut tracker = FgAgentTracker::new();
+        let start = std::time::Instant::now();
+        let resolve = |pid: u32| {
+            if missed.get() {
+                Some(observed(AgentKind::Claude, pid, Some("abc")))
+            } else {
+                missed.set(true);
+                None
+            }
+        };
+        // First read misses; the retry owed to this pid recovers.
+        assert_eq!(tracker.poll(Some(111), &resolve, start, 1), None);
+        assert_eq!(
+            tracker.poll(Some(111), &resolve, start + AGENT_POLL_INTERVAL, 2),
+            None
+        );
+        // The recovered candidate still serves the full attach hold.
+        let report = tracker.poll(
+            Some(111),
+            &resolve,
+            start + AGENT_POLL_INTERVAL + AGENT_ATTACH_AFTER,
+            3,
+        );
+        assert_eq!(
+            attached(&report).unwrap().conversation_id.as_deref(),
+            Some("abc")
         );
     }
 }

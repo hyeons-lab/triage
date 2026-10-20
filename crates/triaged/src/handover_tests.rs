@@ -467,6 +467,20 @@ mod tests {
         let mut fds_to_adopt = vec![dup_tcp];
         fds_to_adopt.extend(fds);
         state.has_tcp_listener = true;
+        // The live attachment rides the handover state: set one, then run
+        // the real JSON round-trip (as the socket transfer would) so both
+        // the encoding and the adoption seeding below are pinned.
+        let attachment = triage_core::agent::AgentAttachment {
+            kind: triage_core::agent::AgentKind::Claude,
+            conversation_id: Some("handover-conv".to_string()),
+            transcript_path: None,
+            exe_path: None,
+            last_seen_ms: 7,
+        };
+        state.sessions[0].agent = Some(attachment.clone());
+        let state: crate::handover::HandoverState =
+            serde_json::from_str(&serde_json::to_string(&state)?)?;
+        assert_eq!(state.sessions[0].agent.as_ref(), Some(&attachment));
 
         // 5. Adopt sessions in a brand new manager
         let new_config = SessionManagerConfig::new(log_dir.clone());
@@ -494,6 +508,13 @@ mod tests {
         let snap = new_manager.snapshot_session(session_id.clone())?;
         assert!(!snap.exited);
         assert_eq!(snap.size, SessionSize::default());
+        // Adoption seeds the live entry from the carried attachment.
+        assert_eq!(
+            snap.agent
+                .as_ref()
+                .and_then(|a| a.conversation_id.as_deref()),
+            Some("handover-conv")
+        );
 
         // Recency carried across the swap rather than being re-stamped.
         let adopted_activity = new_manager

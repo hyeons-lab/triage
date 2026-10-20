@@ -28,7 +28,7 @@ use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::{
     Intensity, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize, Underline,
 };
-use triage_core::agent::AgentAttachment;
+use triage_core::agent::{AgentAttachment, AgentKind};
 use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputControllerKind,
@@ -577,6 +577,17 @@ enum ManagedSession {
         /// carry one. Persisted so a daemon kill restores the session by
         /// resuming the same conversation.
         agent: Option<AgentAttachment>,
+        /// Whether the actor holds an agent-update sender, so tracker
+        /// reports can reach the manager. False when agent tracking is
+        /// off or for test actors without a channel.
+        agent_tracking: bool,
+        /// Whether the manager received at least one agent update for
+        /// this live generation (applied or compared-equal). Together
+        /// with `agent_tracking`, this tells demotion a seeded
+        /// attachment the actor never confirmed: a resume that failed
+        /// before any observation, which must fall back to the launch
+        /// baseline instead of retrying the identical resume forever.
+        agent_observed: bool,
     },
     Historical {
         session: Box<HistoricalSession>,
@@ -1081,21 +1092,37 @@ impl SessionManager {
             return;
         }
         let Ok(mut sessions) = self.sessions() else {
+            // A poisoned lock means an earlier holder panicked mid-mutation;
+            // the updates are genuinely lost, so say so loudly.
+            tracing::warn!(
+                dropped = updates.len(),
+                "agent updates dropped: session map lock poisoned",
+            );
             return;
         };
         let mut changed = false;
-        let mut previous = HashMap::new();
         for (session_id, agent) in updates {
-            if let Some(ManagedSession::Live { agent: current, .. }) = sessions.get_mut(&session_id)
+            if let Some(ManagedSession::Live {
+                agent: current,
+                agent_observed: observed,
+                ..
+            }) = sessions.get_mut(&session_id)
             {
+                // Any received update confirms this generation, even a
+                // compared-equal one: the tracker is alive and reporting.
+                *observed = true;
                 let same = match (&current, &agent) {
                     (Some(a), Some(b)) => a.same_observation(b),
                     (None, None) => true,
                     _ => false,
                 };
                 if !same {
-                    previous.insert(session_id.clone(), current.clone());
                     *current = agent;
+                    tracing::debug!(
+                        session_id = %session_id,
+                        agent = ?current,
+                        "foreground agent attachment changed",
+                    );
                     changed = true;
                 }
             }
@@ -1104,20 +1131,15 @@ impl SessionManager {
             return;
         }
         if let Err(error) = self.persist_manifest(&sessions) {
-            // Revert so the next identical report retries instead of
-            // no-op-ing against already-mutated memory and leaving the
-            // manifest stale.
-            for (session_id, old) in previous {
-                if let Some(ManagedSession::Live { agent: current, .. }) =
-                    sessions.get_mut(&session_id)
-                {
-                    *current = old;
-                }
-            }
+            // Memory keeps the latest observation: the tracker never
+            // resends an identical report, so a revert could not enable
+            // a retry and would only make live reads stale. The manifest
+            // is rewritten in full on every persist, so the next
+            // successful persist heals durability.
             tracing::warn!(
                 manifest = %self.config.manifest_path().display(),
                 error = ?error,
-                "failed to persist agent updates; in-memory state reverted so the next report retries",
+                "failed to persist agent updates; live state kept, manifest heals on the next successful persist",
             );
         }
     }
@@ -2359,11 +2381,10 @@ impl SessionManager {
     /// — notably one adopted across a handover — can never be re-spawned.
     ///
     /// Returns `Ok(())` when the session is left unchanged (still running, not
-    /// `Live`, or neither a restorable shell nor agent-carrying) or
-    /// successfully demoted; returns `Err` only when the session is a
-    /// confirmed-exited restorable `Live` whose log could not be rebuilt, so
-    /// the caller can report the real cause instead of a misleading
-    /// "already live".
+    /// `Live`, or not restorable) or successfully demoted; returns `Err`
+    /// only when the session is a confirmed-exited restorable `Live` whose
+    /// log could not be rebuilt, so the caller can report the real cause
+    /// instead of a misleading "already live".
     fn demote_dead_live_session(&self, session_id: &SessionId) -> Result<()> {
         // Phase 1 (brief lock): grab the actor command channel + launch of a
         // `Live` session, without doing the actor round-trip under the lock.
@@ -2385,6 +2406,11 @@ impl SessionManager {
                 last_known_cwd.clone(),
                 actor.last_activity_ms(),
                 actor.last_input_ms(),
+                // Gate on the carried attachment: the phase-3 swap below
+                // reapplies the unconfirmed-seed drop to refreshed values,
+                // so dropping here would only blind the gate and strand
+                // wrapper-launched agent sessions as dead-Live with an
+                // "already live" error.
                 agent.clone(),
             )
         };
@@ -2412,15 +2438,15 @@ impl SessionManager {
         persisted.last_activity_ms = last_activity_ms;
         persisted.last_input_ms = last_input_ms;
         // Carry the live attachment like the cwd above: without this an
-        // exit-then-restore would forget the agent the session was running,
-        // and agent-launched sessions could never demote at all. The
-        // phase-1 capture only feeds the gate below; phase 3 refreshes the
-        // record from the swap, since a report can land during the replay.
-        // (A still-unflushed attach at gate time conservatively skips the
-        // demote; the restore then reports "already live" once and succeeds
-        // on retry after the report lands.)
+        // exit-then-restore would forget the agent the session was running.
+        // (An unconfirmed seed is dropped at the phase-3 swap instead, so a
+        // resume that failed before any observation still demotes to its
+        // launch baseline rather than retrying the identical resume
+        // forever.) The phase-1 capture only feeds the gate below; phase 3
+        // refreshes the record from the swap, since a report can land
+        // during the replay.
         persisted.agent = live_agent;
-        if !is_restorable_shell_launch(&persisted) && persisted.agent.is_none() {
+        if !is_restorable_launch(&persisted) {
             return Ok(());
         }
 
@@ -2441,12 +2467,17 @@ impl SessionManager {
                 actor,
                 lease,
                 agent,
+                agent_tracking,
+                agent_observed,
                 ..
             }) = sessions.remove(session_id)
             {
                 // Refresh the attachment from the swap: the phase-1 capture
-                // went stale if a report landed during the log replay.
-                historical.persisted.agent = agent;
+                // went stale if a report landed during the log replay. A
+                // report also confirms the seed, so the drop is reapplied
+                // to the refreshed values rather than reused from phase 1.
+                historical.persisted.agent =
+                    drop_unconfirmed_seed(session_id, agent, agent_tracking, agent_observed);
                 // The `Live` -> `Historical` transition is otherwise invisible: it
                 // happens lazily on a restore request, so without this the map can
                 // change shape with nothing in the log to explain it.
@@ -2668,8 +2699,11 @@ impl SessionManager {
                     last_known_cwd: _,
                     // Unlike the cwd, the agent cannot be re-derived without
                     // a transcript scan, so carry the last-known attachment
-                    // and seed adoption with it.
+                    // and seed adoption with it. Observation flags stay
+                    // behind: adoption starts a fresh live generation.
                     agent,
+                    agent_tracking: _,
+                    agent_observed: _,
                 } => Some((
                     id.clone(),
                     actor.tx.clone(),
@@ -3315,6 +3349,7 @@ impl SessionManager {
         let dirty_tx = self.dirty_tx();
         let cwd_update_tx = self.cwd_update_tx();
         let agent_update_tx = self.agent_update_tx();
+        let agent_tracking = agent_update_tx.is_some();
         let global_senders = Some(self.global_senders());
 
         let PtyRuntime {
@@ -3428,6 +3463,8 @@ impl SessionManager {
                 // match): re-observation confirms without churn, and a
                 // crash before then keeps the conversation.
                 agent: h_sess.agent.clone(),
+                agent_tracking,
+                agent_observed: false,
             },
         );
 
@@ -3911,12 +3948,14 @@ impl SessionApi for SessionManager {
         };
         let launch = PersistedSessionLaunch::from(&config);
         let last_known_cwd = launch.cwd.clone().or_else(|| std::env::current_dir().ok());
+        let agent_update_tx = self.agent_update_tx();
+        let agent_tracking = agent_update_tx.is_some();
         let actor = SessionActor::spawn_managed(
             config,
             session_id.clone(),
             self.dirty_tx(),
             self.cwd_update_tx(),
-            self.agent_update_tx(),
+            agent_update_tx,
             Some(self.global_senders()),
             self.compression_tx(),
         )?;
@@ -3954,6 +3993,8 @@ impl SessionApi for SessionManager {
                 launch,
                 last_known_cwd,
                 agent: None,
+                agent_tracking,
+                agent_observed: false,
             },
         );
         if let Err(error) = self.persist_manifest(&sessions) {
@@ -4257,11 +4298,10 @@ impl SessionApi for SessionManager {
                 }
                 // A stale attachment still restores: the baseline below is
                 // the original launch command, a fresh agent for
-                // agent-launched sessions. Only sessions with neither a
-                // shell launch nor any agent history stay unrestorable.
-                if !is_restorable_shell_launch(&session.persisted)
-                    && session.persisted.agent.is_none()
-                {
+                // agent-launched sessions. Only sessions that are
+                // neither a shell launch, nor agent-carrying, nor
+                // agent-launched stay unrestorable.
+                if !is_restorable_launch(&session.persisted) {
                     sessions.insert(
                         request.session_id.clone(),
                         ManagedSession::Historical { session, lease },
@@ -4310,10 +4350,12 @@ impl SessionApi for SessionManager {
             (persisted.last_activity_ms != 0).then_some(persisted.last_activity_ms);
         let restored_input_ms = (persisted.last_input_ms != 0).then_some(persisted.last_input_ms);
         // Spawn attempts in order: the agent resume first when attached,
-        // then the launch baseline once — the shell for shell launches,
+        // then the launch baseline once (the shell for shell launches,
         // the original agent command (a fresh agent) for agent-launched
-        // sessions. Every session reaching here has one of the two, so a
-        // failed resume degrades instead of stranding the session.
+        // sessions). Every session reaching here has one of the two, so a
+        // resume that fails to spawn degrades instead of stranding the
+        // session; a resume that spawns but fails at runtime degrades on
+        // the next restore, when demotion drops its unconfirmed seed.
         let mut spawn_configs = Vec::with_capacity(2);
         // Whether the resume config below was enqueued (index 0 when
         // present): the winning attempt seeds the live attachment and the
@@ -4337,6 +4379,8 @@ impl SessionApi for SessionManager {
         let mut used_resume = false;
         let mut spawn_error = None;
         let attempts = spawn_configs.len();
+        let agent_update_tx = self.agent_update_tx();
+        let agent_tracking = agent_update_tx.is_some();
         for (index, config) in spawn_configs.into_iter().enumerate() {
             let attempt_command = config.command.clone();
             match SessionActor::spawn_restored(
@@ -4351,7 +4395,7 @@ impl SessionApi for SessionManager {
                 },
                 self.dirty_tx(),
                 self.cwd_update_tx(),
-                self.agent_update_tx(),
+                agent_update_tx.clone(),
                 Some(self.global_senders()),
                 self.compression_tx(),
             ) {
@@ -4386,13 +4430,9 @@ impl SessionApi for SessionManager {
                         "failed to roll back restoring session after spawn failure",
                     );
                 }
-                let Some(error) = spawn_error else {
-                    tracing::error!(
-                        session_id = %request.session_id,
-                        "restore spawn loop ran zero attempts",
-                    );
-                    bail!("session {} could not be restored", request.session_id);
-                };
+                // Unreachable: the launch baseline is always enqueued, so an
+                // all-failed loop always leaves a spawn error behind.
+                let error = spawn_error.expect("spawn_configs always holds the launch baseline");
                 return Err(error.context(format!("restoring session {}", request.session_id)));
             }
         };
@@ -4408,7 +4448,15 @@ impl SessionApi for SessionManager {
                         "failed to roll back restoring session after snapshot failure",
                     );
                 }
-                actor.shutdown()?;
+                // Best-effort cleanup like the rollback above: a shutdown
+                // failure must not mask the snapshot error being returned.
+                if let Err(shutdown_error) = actor.shutdown() {
+                    tracing::warn!(
+                        session_id = %request.session_id,
+                        error = ?shutdown_error,
+                        "failed to shut down restored session after snapshot failure",
+                    );
+                }
                 return Err(error);
             }
         };
@@ -4438,7 +4486,15 @@ impl SessionApi for SessionManager {
                     "failed to roll back restoring session during handover",
                 );
             }
-            actor.shutdown()?;
+            // Best-effort cleanup like the rollback above: a shutdown
+            // failure must not mask the retryable handover message below.
+            if let Err(shutdown_error) = actor.shutdown() {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    error = ?shutdown_error,
+                    "failed to shut down restored session during handover",
+                );
+            }
             bail!("a handover is in progress; try again once the daemon swap completes");
         }
 
@@ -4448,7 +4504,15 @@ impl SessionApi for SessionManager {
         let ManagedSession::Restoring { session, lease } = existing else {
             sessions.insert(request.session_id.clone(), existing);
             drop(sessions);
-            actor.shutdown()?;
+            // Best-effort cleanup like the arms above: a shutdown
+            // failure must not mask the message below.
+            if let Err(shutdown_error) = actor.shutdown() {
+                tracing::warn!(
+                    session_id = %request.session_id,
+                    error = ?shutdown_error,
+                    "failed to shut down restored session that is no longer being restored",
+                );
+            }
             bail!("session {} is no longer being restored", request.session_id);
         };
         sessions.insert(
@@ -4467,6 +4531,8 @@ impl SessionApi for SessionManager {
                 } else {
                     None
                 },
+                agent_tracking,
+                agent_observed: false,
             },
         );
         if let Err(error) = self.persist_manifest(&sessions) {
@@ -6027,6 +6093,48 @@ fn is_triage_default_shell_wrapper(args: &[String]) -> bool {
             && script.contains("exec \"${SHELL:-/bin/sh}\""))
 }
 
+/// Sessions that can come back: restorable shells, sessions carrying an
+/// agent attachment (which resume, or fall back to their launch command
+/// when the attachment is stale), and sessions launched directly into an
+/// agent binary (which restore through the original launch even with no
+/// attachment, e.g. after an unconfirmed seed was dropped).
+fn is_restorable_launch(persisted: &PersistedSession) -> bool {
+    if is_restorable_shell_launch(persisted) {
+        return true;
+    }
+    if persisted.agent.is_some() {
+        return true;
+    }
+    Path::new(&persisted.command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(AgentKind::detect)
+        .is_some()
+}
+
+/// Drop a live attachment the actor never confirmed: with tracking on,
+/// the tracker reports within seconds of a restore or adoption, so an
+/// unconfirmed attachment at demote time is a resume that failed before
+/// any observation, and keeping it would retry the identical resume on
+/// every restore. Confirmed attachments, and seeds under disabled
+/// tracking (which can never confirm), pass through untouched.
+fn drop_unconfirmed_seed(
+    session_id: &SessionId,
+    agent: Option<AgentAttachment>,
+    tracking: bool,
+    observed: bool,
+) -> Option<AgentAttachment> {
+    if agent.is_some() && tracking && !observed {
+        tracing::debug!(
+            session_id = %session_id,
+            "dropping unconfirmed agent seed; restore falls back to the launch baseline",
+        );
+        None
+    } else {
+        agent
+    }
+}
+
 /// Resume command (binary plus args) for a persisted agent attachment, or
 /// `None` when the attachment is provably stale: a recorded transcript
 /// file that is gone. A recorded binary that no longer exists degrades to
@@ -6034,23 +6142,20 @@ fn is_triage_default_shell_wrapper(args: &[String]) -> bool {
 /// binaries); the spawn chain falls back to the launch baseline when
 /// `PATH` misses too. Unverifiable attachments (no paths: argv ids,
 /// kind-only, Antigravity) always attempt; the agent CLI reports a bad id
-/// visibly in the PTY, and the next restore then falls back to the
-/// original launch command through demotion.
+/// visibly in the PTY, and a resume that fails before any observation is
+/// dropped at demote time, so the next restore takes the launch baseline
+/// instead of retrying the identical resume.
 fn agent_resume_command(agent: &AgentAttachment) -> Option<(String, Vec<String>)> {
     if let Some(transcript) = &agent.transcript_path
         && !transcript.is_file()
     {
         return None;
     }
-    let (_, args) =
-        crate::agent_detect::resume_command(agent.kind, agent.conversation_id.as_deref());
-    let command = agent
-        .exe_path
-        .as_ref()
-        .filter(|exe| exe.is_file())
-        .map(|exe| exe.to_string_lossy().into_owned())
-        .unwrap_or_else(|| agent.kind.primary_binary().to_string());
-    Some((command, args))
+    Some(crate::agent_detect::resume_command(
+        agent.kind,
+        agent.conversation_id.as_deref(),
+        agent.exe_path.as_deref(),
+    ))
 }
 
 fn restorable_cwd(
@@ -13792,6 +13897,9 @@ mod tests {
                             log_path: log_dir.join(format!("{wedged_id}.log")),
                         },
                         last_known_cwd: None,
+                        agent: None,
+                        agent_tracking: false,
+                        agent_observed: false,
                     },
                 );
             }
@@ -17845,6 +17953,19 @@ mod tests {
         std::env::temp_dir().join(unique)
     }
 
+    /// Bin dir holding the stub agent copied under `name`: the stub
+    /// answers argv probes by sleeping, so it stands in for any agent
+    /// binary. Returns the dir (for cleanup) and the binary path.
+    #[cfg(unix)]
+    fn stub_agent_bin_dir(name: &str) -> (PathBuf, PathBuf) {
+        let bin_dir = unique_log_dir().join("stubbin");
+        std::fs::create_dir_all(&bin_dir).expect("stub bin dir");
+        let stub_src = crate::agent_detect::stub_agent_bin();
+        let agent_bin = bin_dir.join(name);
+        std::fs::copy(&stub_src, &agent_bin).expect("copy stub agent");
+        (bin_dir, agent_bin)
+    }
+
     /// A session whose actor never answers must not freeze every other session.
     ///
     /// This is the regression for the wedge of 2026-08-13: `write_input` held the
@@ -17899,6 +18020,8 @@ mod tests {
                 },
                 last_known_cwd: None,
                 agent: None,
+                agent_tracking: false,
+                agent_observed: false,
             },
         );
 
@@ -18022,6 +18145,8 @@ mod tests {
                     },
                     last_known_cwd: None,
                     agent: None,
+                    agent_tracking: false,
+                    agent_observed: false,
                 },
             );
             rx
@@ -18131,6 +18256,8 @@ mod tests {
                 },
                 last_known_cwd: None,
                 agent: None,
+                agent_tracking: false,
+                agent_observed: false,
             },
         );
         assert_eq!(manager.try_live_session_count(), Some(1));
@@ -19564,6 +19691,18 @@ mod tests {
         }
     }
 
+    /// Whether the manager has received any agent update for this live
+    /// generation. Starts false at restore and flips on the first tracker
+    /// report, so unlike the seeded attachment itself it is a genuine
+    /// confirmation signal a test can poll without seed-defeating.
+    fn agent_observed(manager: &SessionManager, session_id: &SessionId) -> bool {
+        let sessions = manager.sessions().expect("sessions lock");
+        match sessions.get(session_id).expect("session") {
+            ManagedSession::Live { agent_observed, .. } => *agent_observed,
+            _ => panic!("expected a live session"),
+        }
+    }
+
     fn manifest_agent(log_dir: &Path, session_id: &SessionId) -> Option<AgentAttachment> {
         let manifest_path = SessionManagerConfig::new(log_dir).manifest_path();
         let manifest: SessionManifest =
@@ -19621,18 +19760,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn flush_agent_updates_keeps_latest_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+
+        // A failed persist keeps the latest observation live: the
+        // tracker never resends an identical report, so a revert could
+        // not enable a retry and would only strand stale reads.
+        let mut perms = std::fs::metadata(&log_dir).expect("stat").permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&log_dir, perms).expect("read-only dir");
+        manager.flush_agent_updates(HashMap::from([(
+            session_id.clone(),
+            Some(test_attachment()),
+        )]));
+        assert_eq!(
+            live_agent(&manager, &session_id).as_ref(),
+            Some(&test_attachment())
+        );
+        assert_eq!(manifest_agent(&log_dir, &session_id), None);
+
+        // The manifest heals on the next successful persist.
+        let mut perms = std::fs::metadata(&log_dir).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&log_dir, perms).expect("writable dir");
+        let mut refined = test_attachment();
+        refined.conversation_id = Some("def".to_string());
+        manager.flush_agent_updates(HashMap::from([(session_id.clone(), Some(refined))]));
+        assert_eq!(
+            manifest_agent(&log_dir, &session_id)
+                .as_ref()
+                .and_then(|a| a.conversation_id.as_deref()),
+            Some("def")
+        );
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn serialize_active_sessions_carries_live_agent() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        manager.flush_agent_updates(HashMap::from([(
+            session_id.clone(),
+            Some(test_attachment()),
+        )]));
+
+        let SerializedHandover { state, .. } = manager
+            .serialize_active_sessions()
+            .expect("serialize sessions");
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].agent.as_ref(), Some(&test_attachment()));
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
     /// Full agent lifecycle against a stub agent binary: observe and attach
     /// while live, survive a simulated daemon death through the manifest,
-    /// and restore by respawning the resume command (proved by the id
-    /// round-tripping through the respawned process's argv).
+    /// and restore with the same conversation reseeded from the manifest
+    /// (the winning resume attempt seeds the live attachment, which the
+    /// immediate assertion confirms; the baseline path would leave it
+    /// empty).
     #[test]
     #[cfg(unix)]
     fn restore_resumes_observed_agent_conversation() {
-        let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
-        let bin_dir = unique_log_dir().join("stubbin");
-        std::fs::create_dir_all(&bin_dir).expect("stub bin dir");
-        let agent_bin = bin_dir.join("claude");
-        std::fs::copy(&stub_src, &agent_bin).expect("copy stub agent");
+        let (bin_dir, agent_bin) = stub_agent_bin_dir("claude");
         let conversation = format!(
             "e2e-{}-{:?}",
             std::process::id(),
@@ -19698,24 +19906,16 @@ mod tests {
             })
             .expect("restore session");
         assert!(!snapshot.exited);
-        // The respawned stub carries the resume argv, so the actor
-        // re-observes the same conversation id: the id round-trips through
-        // the respawn.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        loop {
-            if let Some(agent) = live_agent(&manager, &session_id) {
-                assert_eq!(
-                    agent.conversation_id.as_deref(),
-                    Some(conversation.as_str())
-                );
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "resumed agent never re-attached"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
+        // The winning resume attempt seeds the live attachment at restore
+        // time; the baseline path would leave it empty, so this pins the
+        // mechanism with no poll loop (a loop would break on the seed at
+        // once and prove nothing more).
+        assert_eq!(
+            live_agent(&manager, &session_id)
+                .as_ref()
+                .and_then(|a| a.conversation_id.as_deref()),
+            Some(conversation.as_str())
+        );
 
         manager
             .shutdown_session(session_id)
@@ -19724,20 +19924,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bin_dir);
     }
 
+    #[test]
+    fn agent_resume_command_degrades_moved_binary_to_path_lookup() {
+        // A recorded binary that moved degrades to a `PATH` lookup
+        // rather than vetoing the resume; only a gone recorded
+        // transcript vetoes it.
+        let moved = AgentAttachment {
+            kind: triage_core::agent::AgentKind::Codex,
+            conversation_id: Some("abc".to_string()),
+            transcript_path: None,
+            exe_path: Some(PathBuf::from("/definitely/not/here/codex")),
+            last_seen_ms: 1,
+        };
+        assert_eq!(
+            agent_resume_command(&moved),
+            Some((
+                "codex".to_string(),
+                vec!["resume".to_string(), "abc".to_string()]
+            ))
+        );
+        // A recorded binary that still exists is used verbatim.
+        let dir = unique_log_dir();
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let exe = dir.join("codex");
+        std::fs::write(&exe, b"x").expect("write exe");
+        let verbatim = AgentAttachment {
+            exe_path: Some(exe.clone()),
+            ..moved.clone()
+        };
+        assert_eq!(
+            agent_resume_command(&verbatim),
+            Some((
+                exe.to_string_lossy().into_owned(),
+                vec!["resume".to_string(), "abc".to_string()]
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let stale = AgentAttachment {
+            transcript_path: Some(PathBuf::from("/definitely/not/here/r.jsonl")),
+            ..moved
+        };
+        assert_eq!(agent_resume_command(&stale), None);
+    }
+
+    #[test]
+    fn restorable_launch_covers_shells_attachments_and_agent_commands() {
+        let persisted = |command: &str, agent: bool| PersistedSession {
+            id: SessionId::new("session-x").expect("session id"),
+            command: command.to_string(),
+            args: Vec::new(),
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: PathBuf::from("x.log"),
+            exited: false,
+            last_known_cwd: None,
+            last_activity_ms: 0,
+            last_input_ms: 0,
+            agent: agent.then(test_attachment),
+        };
+        assert!(is_restorable_launch(&persisted("/bin/sh", false)));
+        assert!(is_restorable_launch(&persisted("/bin/sh", true)));
+        assert!(is_restorable_launch(&persisted(
+            "/usr/local/bin/codex",
+            true
+        )));
+        // Agent-launched sessions stay restorable with no attachment, so
+        // a dropped unconfirmed seed restores through the baseline.
+        assert!(is_restorable_launch(&persisted(
+            "/usr/local/bin/codex",
+            false
+        )));
+        assert!(!is_restorable_launch(&persisted("/usr/bin/top", false)));
+        // An attachment still carries a session the command gates miss.
+        assert!(is_restorable_launch(&persisted("/usr/bin/top", true)));
+    }
+
+    #[test]
+    fn unconfirmed_seed_drop_needs_tracking_without_observation() {
+        let id = SessionId::new("session-x").expect("session id");
+        assert_eq!(
+            drop_unconfirmed_seed(&id, Some(test_attachment()), true, false),
+            None
+        );
+        assert_eq!(
+            drop_unconfirmed_seed(&id, Some(test_attachment()), true, true).as_ref(),
+            Some(&test_attachment())
+        );
+        // Seeds under disabled tracking can never confirm, so they stay.
+        assert_eq!(
+            drop_unconfirmed_seed(&id, Some(test_attachment()), false, false).as_ref(),
+            Some(&test_attachment())
+        );
+        assert_eq!(drop_unconfirmed_seed(&id, None, true, false), None);
+    }
+
     /// A session launched directly into an agent restores through its
     /// original launch command when the attachment is stale (recorded
-    /// binary gone): restore degrades to a fresh agent instead of failing
-    /// as a non-shell launch.
+    /// transcript gone, so no resume is built): restore reruns the
+    /// original launch argv instead of failing as a non-shell launch.
     // Unix-only: Windows has no process observation, so the respawned
     // agent never re-attaches there.
     #[test]
     #[cfg(unix)]
     fn restore_falls_back_to_original_launch_when_attachment_stale() {
-        let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
-        let bin_dir = unique_log_dir().join("stubbin");
-        std::fs::create_dir_all(&bin_dir).expect("stub bin dir");
-        let agent_bin = bin_dir.join("codex");
-        std::fs::copy(&stub_src, &agent_bin).expect("copy stub agent");
+        let (bin_dir, agent_bin) = stub_agent_bin_dir("codex");
         let conversation = format!(
             "stale-{}-{:?}",
             std::process::id(),
@@ -19761,13 +20051,15 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
                 agent: Some(AgentAttachment {
                     kind: triage_core::agent::AgentKind::Codex,
                     conversation_id: Some(conversation.clone()),
-                    transcript_path: None,
-                    // Stale: the recorded binary no longer exists, so no
-                    // resume command is built.
-                    exe_path: Some(bin_dir.join("codex-gone")),
+                    // Provably stale: the recorded transcript is gone, so
+                    // `agent_resume_command` builds no resume and restore
+                    // must take the original launch on every machine.
+                    transcript_path: Some(bin_dir.join("rollout-gone.jsonl")),
+                    exe_path: None,
                     last_seen_ms: 1,
                 }),
             },
@@ -19784,6 +20076,9 @@ mod tests {
             })
             .expect("stale attachment restores through the original launch");
         assert!(!snapshot.exited);
+        // No resume was enqueued, so the live entry starts empty; the
+        // fallback respawn re-attaches below. (A resume would seed this.)
+        assert_eq!(live_agent(&manager, &session_id), None);
         // The fallback respawns the original launch argv, so the actor
         // re-observes the same conversation id.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -19818,11 +20113,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn restore_falls_back_to_original_launch_when_resume_spawn_fails() {
-        let stub_src = PathBuf::from(env!("OUT_DIR")).join("triage-stub-agent");
-        let bin_dir = unique_log_dir().join("stubbin");
-        std::fs::create_dir_all(&bin_dir).expect("stub bin dir");
-        let agent_bin = bin_dir.join("claude");
-        std::fs::copy(&stub_src, &agent_bin).expect("copy stub agent");
+        let (bin_dir, agent_bin) = stub_agent_bin_dir("claude");
         // Exists on disk (so a resume command is built) but is not
         // executable (so spawning it fails).
         let broken_exe = bin_dir.join("claude-broken");
@@ -19850,6 +20141,7 @@ mod tests {
                 exited: false,
                 last_known_cwd: None,
                 last_activity_ms: 0,
+                last_input_ms: 0,
                 agent: Some(AgentAttachment {
                     kind: triage_core::agent::AgentKind::Claude,
                     conversation_id: Some(conversation),
@@ -19886,6 +20178,328 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// A resume that spawns but fails at runtime (a bad conversation id)
+    /// must not retry forever: demotion drops its unconfirmed seed, so the
+    /// next restore takes the launch baseline. The failing resume is a
+    /// script that exits 1 at once; the exit poll below proves restore#1
+    /// ran it (the baseline stub would run forever), and the empty live
+    /// entry after restore#2 proves the baseline ran there.
+    // Unix-only: the failing resume is a shell script.
+    #[test]
+    #[cfg(unix)]
+    fn restore_falls_back_to_baseline_when_resume_fails_at_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (bin_dir, agent_bin) = stub_agent_bin_dir("codex");
+        // Spawns fine but fails at once, like an agent CLI rejecting a
+        // bad conversation id.
+        let fail_exe = bin_dir.join("codex-fail");
+        std::fs::write(&fail_exe, b"#!/bin/sh\nexit 1\n").expect("write fail script");
+        std::fs::set_permissions(&fail_exe, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fail script");
+        let conversation = format!(
+            "runfail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-resume-run-fail").expect("session id");
+        let log_path = log_dir.join("session-resume-run-fail.log");
+        std::fs::write(&log_path, b"run fail\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: agent_bin.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+                agent: Some(AgentAttachment {
+                    kind: triage_core::agent::AgentKind::Codex,
+                    conversation_id: Some(conversation),
+                    transcript_path: None,
+                    exe_path: Some(fail_exe),
+                    last_seen_ms: 1,
+                }),
+            },
+        );
+
+        let manager = std::sync::Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_agent_persistence();
+        manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore session");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed agent never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // restore#2 demotes (dropping the unconfirmed seed) and takes the
+        // launch baseline: no resume means no seed.
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("failed resume restores through the original launch");
+        assert!(!snapshot.exited);
+        assert_eq!(live_agent(&manager, &session_id), None);
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// A wrapper-launched agent session (command basename neither a shell
+    /// nor an agent binary) whose resume fails before any observation must
+    /// demote to `Historical` and report the real cause: the gate sees the
+    /// carried attachment, and only the phase-3 swap drops the unconfirmed
+    /// seed. Before the gate fix this stranded the session as dead-`Live`
+    /// with "already live or restoring" on every retry.
+    // Unix-only: the failing resume is a shell script.
+    #[test]
+    #[cfg(unix)]
+    fn restore_reports_real_cause_for_wrapper_launched_failed_resume() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (bin_dir, _agent_bin) = stub_agent_bin_dir("codex");
+        let fail_exe = bin_dir.join("codex-fail");
+        std::fs::write(&fail_exe, b"#!/bin/sh\nexit 1\n").expect("write fail script");
+        std::fs::set_permissions(&fail_exe, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fail script");
+        // Basename neither a shell nor an agent: without the carried
+        // attachment this launch is unrestorable.
+        let wrapper = bin_dir.join("wrapper");
+        let conversation = format!(
+            "wrapperfail-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-wrapper-run-fail").expect("session id");
+        let log_path = log_dir.join("session-wrapper-run-fail.log");
+        std::fs::write(&log_path, b"wrapper fail\r\n").expect("write session log");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: wrapper.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+                agent: Some(AgentAttachment {
+                    kind: triage_core::agent::AgentKind::Codex,
+                    conversation_id: Some(conversation),
+                    transcript_path: None,
+                    exe_path: Some(fail_exe),
+                    last_seen_ms: 1,
+                }),
+            },
+        );
+
+        let manager = std::sync::Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_agent_persistence();
+        manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore session");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed agent never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // restore#2 demotes (the gate sees the carried attachment) and
+        // drops the unconfirmed seed at the swap, so the restore reports
+        // the unrestorable launch instead of "already live or restoring".
+        let error = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect_err("wrapper baseline is unrestorable");
+        assert!(
+            error
+                .to_string()
+                .contains("was not launched as a restorable shell"),
+            "unexpected restore error: {error:?}"
+        );
+        let sessions = manager.sessions().expect("sessions lock");
+        assert!(
+            matches!(
+                sessions.get(&session_id),
+                Some(ManagedSession::Historical { .. })
+            ),
+            "failed wrapper resume must demote out of Live"
+        );
+        drop(sessions);
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// A healthy resumed agent confirms its seed through re-observation,
+    /// so demotion keeps (not drops) the attachment and the next restore
+    /// resumes again. restore#1 runs the stub resume; after the tracker
+    /// confirms (3s hold plus poll and flush settle), the child is killed
+    /// and restore#2 must reseed the same conversation, not the baseline.
+    // Unix-only: needs process observation plus `pkill` to end the child.
+    #[test]
+    #[cfg(unix)]
+    fn restore_keeps_confirmed_seed_across_demotions() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let (bin_dir, agent_bin) = stub_agent_bin_dir("codex");
+        // Regex-safe (no `ThreadId(..)` parens): `pkill -f` matches ERE.
+        let conversation = format!(
+            "steady-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let session_id = SessionId::new("session-steady-seed").expect("session id");
+        let log_path = log_dir.join("session-steady-seed.log");
+        std::fs::write(&log_path, b"steady seed\r\n").expect("write session log");
+        // Canonical exe plus a unique cwd: re-observation must match the
+        // seed EXACTLY (no exe-symlink mismatch attach, no real
+        // transcript refining it), so only the tracker's steady
+        // confirmation can keep the seed across the demotion.
+        let agent_exe = agent_bin.canonicalize().expect("canonicalize stub");
+        write_manifest(
+            &log_dir,
+            PersistedSession {
+                id: session_id.clone(),
+                command: agent_bin.to_string_lossy().into_owned(),
+                args: vec!["resume".to_string(), conversation.clone()],
+                cwd: Some(log_dir.clone()),
+                size: SessionSize::default(),
+                log_path,
+                exited: false,
+                last_known_cwd: None,
+                last_activity_ms: 0,
+                last_input_ms: 0,
+                agent: Some(AgentAttachment {
+                    kind: triage_core::agent::AgentKind::Codex,
+                    conversation_id: Some(conversation.clone()),
+                    transcript_path: None,
+                    exe_path: Some(agent_exe),
+                    last_seen_ms: 1,
+                }),
+            },
+        );
+
+        let manager = std::sync::Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_agent_persistence();
+        manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore session");
+        // Poll the confirmation signal, not the seeded attachment (which
+        // is present from restore): the tracker's first steady
+        // re-observation flips `agent_observed`, whenever load lets it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if agent_observed(&manager, &session_id) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "seed never confirmed");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let kill = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg(&conversation)
+            .status()
+            .expect("run pkill");
+        assert!(kill.success(), "pkill must end the resumed stub");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = manager
+                .snapshot_session(session_id.clone())
+                .expect("snapshot session");
+            if snapshot.exited {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed agent never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // restore#2 demotes with the seed confirmed, so it resumes the
+        // same conversation again: the live entry is seeded at once.
+        // (Without the confirmation the seed would drop and this would
+        // read None from the baseline path.)
+        let snapshot = manager
+            .restore_session(RestoreSessionRequest {
+                session_id: session_id.clone(),
+                size: SessionSize::default(),
+            })
+            .expect("restore session");
+        assert!(!snapshot.exited);
+        assert_eq!(
+            live_agent(&manager, &session_id)
+                .as_ref()
+                .and_then(|a| a.conversation_id.as_deref()),
+            Some(conversation.as_str())
+        );
 
         manager
             .shutdown_session(session_id)

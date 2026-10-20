@@ -405,7 +405,7 @@ mod tests {
             kind: crate::agent::AgentKind::Muse,
             conversation_id: Some("abc".to_string()),
             transcript_path: Some(std::path::PathBuf::from("/tmp/t.jsonl")),
-            exe_path: None,
+            exe_path: Some(std::path::PathBuf::from("/bin/muse")),
             last_seen_ms: 42,
         });
         let mut builder = FlatBufferBuilder::new();
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(agent.kind(), fb::AgentKind::Muse);
         assert_eq!(agent.conversation_id(), Some("abc"));
         assert_eq!(agent.transcript_path(), Some("/tmp/t.jsonl"));
-        assert_eq!(agent.exe_path(), None);
+        assert_eq!(agent.exe_path(), Some("/bin/muse"));
         assert_eq!(agent.last_seen_ms(), 42);
     }
 

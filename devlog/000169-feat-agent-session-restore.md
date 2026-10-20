@@ -1,4 +1,4 @@
-# 000153: Track foreground AI agents and resume conversations on restore
+# 000169: Track foreground AI agents and resume conversations on restore
 
 ## Agent
 
@@ -41,6 +41,14 @@ status; exited sessions carry no agent state.
   and PR #176). Resolved conflict in `flutter/triage_client/lib/main.dart`
   (_SessionGlanceCard popover composition). Renumbered devlog and plan from
   000152 to 000153 to resolve sequence collision with merged PR #176.
+- **2026-09-25T17:47-0700** Rebased onto `origin/main` (incorporating PR #178
+  and PR #179). No conflicts. Renumbered devlog and plan from 000153 to
+  000154 to resolve sequence collision with merged PR #178.
+- **2026-10-20T12:46-0700** Committed R2-R5 review-loop hardening (`agent_detect.rs`,
+  `session.rs`, `agent.rs`, `triage.fbs`, `main.dart`, `triage_websocket_client.dart`,
+  and tests), rebased onto `origin/main` (`879b8a3`, incorporating PRs #180-#197),
+  regenerated FlatBuffers bindings (`VT_AGENT = 36` after `VT_RAW_OUTPUT_PREFIX = 34`),
+  and renumbered devlog and plan to `000169`.
 
 ## Decisions
 
@@ -67,7 +75,7 @@ status; exited sessions carry no agent state.
   badges are present everywhere; Flutter remote shows badges after
   attach. A `list_session_agents` call (mirroring snippets) is the
   follow-up if attach-first proves insufficient there.
-- See `devlog/plans/000153-01-agent-session-restore.md` for the full plan
+- See `devlog/plans/000169-01-agent-session-restore.md` for the full plan
   and spike findings.
 
 ## Issues
@@ -92,13 +100,14 @@ status; exited sessions carry no agent state.
 
 ## Commits
 
-- ea1361e: feat(session): track foreground AI agents and resume conversations on restore
-- 3670726: fix(session): harden agent restore fallback and macOS argv parsing
-- c930466: fix(session): gate Windows-observation tests and escape fixture paths
-- 35892d8: fix(session): address Antigravity review findings
-- 04ef184: fix(session): address R1 agent-review-loop findings
-- 366f33b: fix(session): retry stub-agent observation for exec race
-- HEAD: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
+- d44666c: feat(session): track foreground AI agents and resume conversations on restore
+- 1fd7199: fix(session): harden agent restore fallback and macOS argv parsing
+- 017e529: fix(session): gate Windows-observation tests and escape fixture paths
+- 289fb00: fix(session): address Antigravity review findings
+- d2dd3f3: fix(session): address R1 agent-review-loop findings
+- ae90479: fix(session): retry stub-agent observation for exec race
+- e8f2c6b: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
+- HEAD: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
 
 ## Progress
 
@@ -118,6 +127,8 @@ status; exited sessions carry no agent state.
   hardening, TUI/Flutter badge parity; repaired non-compiling synthesis
   (missing HandoverSession initializers, seeded-adoption borrow error,
   clippy type_complexity), added seeded-tracker regression tests
+- [x] 2026-10-20T12:46-0700 R2-R5 review-loop hardening committed and rebased
+  onto `origin/main` (`879b8a3`), devlog and plan renumbered to `000169`
 
 ## Research & Discoveries
 
