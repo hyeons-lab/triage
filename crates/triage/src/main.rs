@@ -1480,7 +1480,12 @@ fn selected_row_to_line(
 }
 
 fn selected_row_text(row: &str, row_index: usize, selection: VisibleSelection) -> Option<String> {
-    let (start, end) = selected_row_bounds(row, row_index, selection)?;
+    if row_index < selection.start.row || row_index > selection.end.row {
+        return None;
+    }
+    let Some((start, end)) = selected_row_bounds(row, row_index, selection) else {
+        return (selection.start.row != selection.end.row).then(String::new);
+    };
     Some(slice_chars(row, start, end.min(row.chars().count())))
 }
 
@@ -2531,6 +2536,50 @@ mod tests {
         };
 
         assert_eq!(selected_text(&view, area, selection), "cmd   \nne");
+    }
+
+    #[test]
+    fn terminal_selection_preserves_empty_middle_lines() {
+        let view = SessionView {
+            session_id: triage_core::session::SessionId::new("session-1").expect("session id"),
+            snapshot: triage_core::session::SessionSnapshot {
+                output_seq: 0,
+                bytes_logged: 0,
+                size: SessionSize::default(),
+                visible_rows: vec!["first".to_string(), String::new(), "third".to_string()],
+                styled_rows_start: 0,
+                styled_rows: Vec::new(),
+                cursor: triage_core::session::TerminalCursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                },
+                current_working_directory: None,
+                context: None,
+                bracketed_paste_enabled: false,
+                exited: false,
+                raw_output: Vec::new(),
+                raw_output_start: 0,
+                raw_output_prefix: Vec::new(),
+                snippet: None,
+                snippet_detail: None,
+            },
+            lease: triage_core::session::InputLeaseState::default(),
+            last_completed: None,
+            scroll_offset: 0,
+        };
+        let area = Rect {
+            x: SIDEBAR_COLS,
+            y: 0,
+            width: 20,
+            height: 3,
+        };
+        let selection = TerminalSelection {
+            start: TerminalPoint { col: 0, row: 0 },
+            end: TerminalPoint { col: 4, row: 2 },
+        };
+
+        assert_eq!(selected_text(&view, area, selection), "first\n\nthird");
     }
 
     #[test]

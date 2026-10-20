@@ -18,6 +18,60 @@ bool terminalSelectionIsLive(xt.Buffer buffer, xt.BufferRange range) {
   return normalized.begin.y >= 0 && normalized.end.y < buffer.lines.length;
 }
 
+/// Computes the `(base, extent)` cell offsets to pass to
+/// `TerminalController.setSelection` for a selection anchored at [anchorCell]
+/// and extended to [targetCell].
+///
+/// `BufferRangeLine` treats its normalized `[begin, end)` range as half-open on
+/// the end column. When [targetCell] is at or after [anchorCell] in `(row, col)`
+/// order, `extent.x` is incremented by 1 so [targetCell] is included. When
+/// [targetCell] is before [anchorCell] (a backward drag or Shift-click),
+/// `BufferRangeLine.normalized` swaps `base` and `extent`, making `base` the
+/// exclusive upper bound; `base.x` is therefore incremented by 1 so
+/// [anchorCell] itself stays included.
+(xt.CellOffset base, xt.CellOffset extent)? resolveSelectionEndpoints({
+  required xt.CellOffset anchorCell,
+  required xt.CellOffset targetCell,
+  required int viewWidth,
+  required int lineCount,
+}) {
+  final lastRow = lineCount - 1;
+  if (lastRow < 0 || viewWidth <= 0) return null;
+  final maxCol = viewWidth - 1;
+  final safeAnchor = xt.CellOffset(
+    anchorCell.x.clamp(0, maxCol),
+    anchorCell.y.clamp(0, lastRow),
+  );
+  final safeTarget = xt.CellOffset(
+    targetCell.x.clamp(0, maxCol),
+    targetCell.y.clamp(0, lastRow),
+  );
+  final forward =
+      safeTarget.y > safeAnchor.y ||
+      (safeTarget.y == safeAnchor.y && safeTarget.x >= safeAnchor.x);
+  final base = xt.CellOffset(
+    forward ? safeAnchor.x : safeAnchor.x + 1,
+    safeAnchor.y,
+  );
+  final extent = xt.CellOffset(
+    forward ? safeTarget.x + 1 : safeTarget.x,
+    safeTarget.y,
+  );
+  return (base, extent);
+}
+
+/// Shifts [offset] down by [addedLines] after a scrollback page prepends older
+/// rows at the top of the buffer, clamping into `[0, lineCount - 1]`.
+xt.CellOffset? shiftCellOffsetForHistoryPage({
+  required xt.CellOffset offset,
+  required int addedLines,
+  required int lineCount,
+}) {
+  final lastRow = lineCount - 1;
+  if (lastRow < 0) return null;
+  return xt.CellOffset(offset.x, (offset.y + addedLines).clamp(0, lastRow));
+}
+
 /// Rebuilds the plain text for a terminal selection [range], preserving the
 /// spaces that xterm.dart's own `Buffer.getText` drops.
 ///

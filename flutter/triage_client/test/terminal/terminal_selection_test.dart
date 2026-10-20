@@ -93,4 +93,81 @@ void main() {
       expect(terminalSelectionText(terminal.buffer, range), 'A  B\nC  D');
     });
   });
+
+  group('resolveSelectionEndpoints', () {
+    test(
+      'forward and backward selections over the same cells produce identical text',
+      () {
+        final terminal = xt.Terminal(maxLines: 100);
+        terminal.resize(20, 5);
+        terminal.write('hello world\r\nsecond line');
+        final top = terminal.buffer.height - terminal.viewHeight;
+
+        final forward = resolveSelectionEndpoints(
+          anchorCell: xt.CellOffset(2, top),
+          targetCell: xt.CellOffset(8, top + 1),
+          viewWidth: terminal.viewWidth,
+          lineCount: terminal.buffer.lines.length,
+        )!;
+        final backward = resolveSelectionEndpoints(
+          anchorCell: xt.CellOffset(8, top + 1),
+          targetCell: xt.CellOffset(2, top),
+          viewWidth: terminal.viewWidth,
+          lineCount: terminal.buffer.lines.length,
+        )!;
+
+        final forwardText = terminalSelectionText(
+          terminal.buffer,
+          xt.BufferRangeLine(forward.$1, forward.$2),
+        );
+        final backwardText = terminalSelectionText(
+          terminal.buffer,
+          xt.BufferRangeLine(backward.$1, backward.$2),
+        );
+
+        expect(forwardText, 'llo world\nsecond li');
+        expect(backwardText, forwardText);
+      },
+    );
+
+    test('backward single-line selection includes the anchor cell', () {
+      final terminal = xt.Terminal(maxLines: 100);
+      terminal.resize(20, 5);
+      terminal.write('abcdef');
+      final top = terminal.buffer.height - terminal.viewHeight;
+
+      final backward = resolveSelectionEndpoints(
+        anchorCell: xt.CellOffset(4, top),
+        targetCell: xt.CellOffset(1, top),
+        viewWidth: terminal.viewWidth,
+        lineCount: terminal.buffer.lines.length,
+      )!;
+      final text = terminalSelectionText(
+        terminal.buffer,
+        xt.BufferRangeLine(backward.$1, backward.$2),
+      );
+      expect(text, 'bcde');
+    });
+  });
+
+  group('shiftCellOffsetForHistoryPage', () {
+    test('shifts row by addedLines and clamps to lineCount - 1', () {
+      expect(
+        shiftCellOffsetForHistoryPage(
+          offset: const xt.CellOffset(5, 10),
+          addedLines: 25,
+          lineCount: 101,
+        ),
+        const xt.CellOffset(5, 35),
+      );
+      expect(
+        shiftCellOffsetForHistoryPage(
+          offset: const xt.CellOffset(5, 90),
+          addedLines: 25,
+          lineCount: 101,
+        ),
+        const xt.CellOffset(5, 100),
+      );
+    });
+  });
 }

@@ -220,9 +220,10 @@ const MAX_PENDING_PAIRING_CHALLENGES: usize = 64;
 /// a client that went away.
 const PARKED_INPUT_TTL: Duration = Duration::from_secs(10);
 /// Cap per (session, client) so a client typing into a denied lease for
-/// minutes cannot grow the parked map without bound. Bytes past the cap are
-/// dropped, and the client is already re-acquiring on the first denial.
-const PARKED_INPUT_CAP_BYTES: usize = 4096;
+/// minutes cannot grow the parked map without bound. Sized to 1 MiB so large
+/// clipboard pastes sent while acquiring the interactive lease are not
+/// truncated mid-passage.
+const PARKED_INPUT_CAP_BYTES: usize = 1024 * 1024;
 /// Maximum number of distinct clients that can concurrently park denied input per session.
 const MAX_PARKED_CLIENTS_PER_SESSION: usize = 8;
 const MAX_PAIRING_CLIENT_ID_LENGTH: usize = 128;
@@ -1323,15 +1324,15 @@ impl SessionManager {
             return;
         }
         let room = PARKED_INPUT_CAP_BYTES.saturating_sub(buffered);
-        if bytes.len() > room {
+        let kept = truncate_parked_input_bytes(&bytes, room);
+        if kept.len() < bytes.len() {
             tracing::warn!(
                 session_id = %session_id,
                 client_id = %client_id,
-                dropped_bytes = bytes.len() - room,
+                dropped_bytes = bytes.len() - kept.len(),
                 "parked input buffer cap reached; dropping excess denied input"
             );
         }
-        let kept: Vec<u8> = bytes.into_iter().take(room).collect();
         match entries.iter_mut().find(|entry| entry.client == *client_id) {
             Some(existing) => existing.bytes.extend(kept),
             None => entries.push(ParkedInput {
@@ -1370,13 +1371,9 @@ impl SessionManager {
                 // are older and belong at the front; any cap overflow drops
                 // from the newer tail.
                 existing.parked_at = existing.parked_at.min(entry.parked_at);
-                let mut merged: Vec<u8> = entry
-                    .bytes
-                    .into_iter()
-                    .take(PARKED_INPUT_CAP_BYTES)
-                    .collect();
+                let mut merged = truncate_parked_input_bytes(&entry.bytes, PARKED_INPUT_CAP_BYTES);
                 let room = PARKED_INPUT_CAP_BYTES.saturating_sub(merged.len());
-                merged.extend(existing.bytes.drain(..).take(room));
+                merged.extend(truncate_parked_input_bytes(&existing.bytes, room));
                 existing.bytes = merged;
             }
             None => entries.push(entry),
@@ -8570,6 +8567,54 @@ fn read_pty_output(mut reader: Box<dyn Read + Send>, tx: SyncSender<ActorMessage
 }
 
 const PTY_INPUT_CHANNEL_CAPACITY: usize = 128;
+const PTY_WRITE_CHUNK_BYTES: usize = 4096;
+const PTY_WOULDBLOCK_RETRY_BUDGET: Duration = Duration::from_secs(5);
+
+fn truncate_parked_input_bytes(bytes: &[u8], room: usize) -> Vec<u8> {
+    const BRACKETED_START: &[u8] = b"\x1b[200~";
+    const BRACKETED_END: &[u8] = b"\x1b[201~";
+
+    if room == 0 {
+        return Vec::new();
+    }
+    if bytes.len() <= room {
+        return bytes.to_vec();
+    }
+    if bytes.starts_with(BRACKETED_START)
+        && bytes.ends_with(BRACKETED_END)
+        && room >= BRACKETED_START.len() + BRACKETED_END.len()
+    {
+        let body_end = utf8_safe_prefix_len(
+            &bytes[..bytes.len() - BRACKETED_END.len()],
+            room - BRACKETED_END.len(),
+        );
+        let mut out = Vec::with_capacity(body_end + BRACKETED_END.len());
+        out.extend_from_slice(&bytes[..body_end]);
+        out.extend_from_slice(BRACKETED_END);
+        return out;
+    }
+    let end = utf8_safe_prefix_len(bytes, room);
+    bytes[..end].to_vec()
+}
+
+fn utf8_safe_prefix_len(bytes: &[u8], max_len: usize) -> usize {
+    let limit = max_len.min(bytes.len());
+    if limit == 0 || limit >= bytes.len() {
+        return limit;
+    }
+    if (bytes[limit] & 0b1100_0000) != 0b1000_0000 {
+        return limit;
+    }
+    let mut start = limit - 1;
+    while start > 0 && limit - start <= 3 && (bytes[start] & 0b1100_0000) == 0b1000_0000 {
+        start -= 1;
+    }
+    if (bytes[start] & 0b1100_0000) == 0b1100_0000 {
+        start
+    } else {
+        limit
+    }
+}
 
 fn spawn_pty_writer(writer: SharedPtyWriter) -> Result<(SyncSender<Vec<u8>>, JoinHandle<()>)> {
     let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_CHANNEL_CAPACITY);
@@ -8581,29 +8626,68 @@ fn spawn_pty_writer(writer: SharedPtyWriter) -> Result<(SyncSender<Vec<u8>>, Joi
     Ok((writer_tx, writer_handle))
 }
 
+fn write_pty_chunk(writer: &SharedPtyWriter, bytes: &[u8]) -> std::io::Result<()> {
+    let mut offset = 0;
+    let mut would_block_since: Option<Instant> = None;
+    while offset < bytes.len() {
+        let end = (offset + PTY_WRITE_CHUNK_BYTES).min(bytes.len());
+        let write_result = {
+            let mut guard = writer
+                .lock()
+                .map_err(|_| std::io::Error::other("PTY writer mutex poisoned"))?;
+            guard.write(&bytes[offset..end])
+        };
+        match write_result {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write whole buffer to PTY",
+                ));
+            }
+            Ok(written) => {
+                offset += written;
+                would_block_since = None;
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                let start = *would_block_since.get_or_insert_with(Instant::now);
+                if start.elapsed() >= PTY_WOULDBLOCK_RETRY_BUDGET {
+                    return Err(err);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
     while let Ok(bytes) = rx.recv() {
-        let mut guard = match writer.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::warn!("PTY writer mutex poisoned; stopping writer thread");
-                break;
-            }
-        };
         let mut write_err = false;
-        if let Err(err) = guard.write_all(&bytes) {
+        if let Err(err) = write_pty_chunk(&writer, &bytes) {
             tracing::debug!(error = %err, "PTY write error; terminating writer thread");
             write_err = true;
         } else {
             while let Ok(next) = rx.try_recv() {
-                if let Err(err) = guard.write_all(&next) {
+                if let Err(err) = write_pty_chunk(&writer, &next) {
                     tracing::debug!(error = %err, "PTY write error; terminating writer thread");
                     write_err = true;
                     break;
                 }
             }
         }
-        if write_err || guard.flush().is_err() {
+        if write_err {
+            break;
+        }
+        let flush_ok = match writer.lock() {
+            Ok(mut guard) => guard.flush().is_ok(),
+            Err(_) => {
+                tracing::warn!("PTY writer mutex poisoned; stopping writer thread");
+                false
+            }
+        };
+        if !flush_ok {
             break;
         }
     }
@@ -12958,6 +13042,48 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn truncate_parked_input_preserves_utf8_and_bracketed_paste_terminator() {
+        let payload = b"\x1b[200~\xe4\xb8\x96\xe7\x95\x8c\x1b[201~";
+        // Room for prefix (6) + one 3-byte char (3) + 1 byte of the second char + suffix (6) = 16.
+        // Must back up to the UTF-8 boundary and keep the closing \x1b[201~ (total 15 bytes).
+        let truncated = truncate_parked_input_bytes(payload, 16);
+        assert_eq!(truncated, b"\x1b[200~\xe4\xb8\x96\x1b[201~");
+        assert!(std::str::from_utf8(&truncated).is_ok());
+    }
+
+    #[test]
+    fn write_pty_chunk_retries_would_block_and_writes_all_bytes() {
+        struct FlakyWriter {
+            buf: Vec<u8>,
+            calls: usize,
+        }
+        impl Write for FlakyWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls % 2 == 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "pty buffer full",
+                    ));
+                }
+                let take = data.len().min(1024);
+                self.buf.extend_from_slice(&data[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let writer: SharedPtyWriter = Arc::new(Mutex::new(Box::new(FlakyWriter {
+            buf: Vec::new(),
+            calls: 0,
+        })));
+        let input: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+        write_pty_chunk(&writer, &input).expect("chunked pty write should succeed");
     }
 
     /// Expired entries are swept on touch, so clients that went away leave
