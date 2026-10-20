@@ -1582,16 +1582,26 @@ class TriageWebSocketClient {
 
   Map<String, dynamic>? _parseAgentAttachment(fbs.AgentAttachment? agent) {
     if (agent == null) return null;
-    return {
+    // An unknown enum value throws inside the generated getter; degrade
+    // the kind, never the whole attachment (a throw here would drop the
+    // snapshot and strand the request's completer). The badge falls back
+    // to 'agent' on a null kind, so a future agent stays recognizable.
+    String? kindName;
+    try {
       // Explicit strings, not `kind.name.toLowerCase()`: the first
       // multi-word kind would otherwise report a different string than
       // the JSON transport's serde `snake_case`.
-      'kind': switch (agent.kind) {
+      kindName = switch (agent.kind) {
         fbs.AgentKind.Claude => 'claude',
         fbs.AgentKind.Codex => 'codex',
         fbs.AgentKind.Antigravity => 'antigravity',
         fbs.AgentKind.Muse => 'muse',
-      },
+      };
+    } on StateError {
+      kindName = null;
+    }
+    return {
+      'kind': kindName,
       'conversation_id': agent.conversationId,
       'transcript_path': agent.transcriptPath,
       'exe_path': agent.exePath,

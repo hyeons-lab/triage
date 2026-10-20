@@ -979,8 +979,10 @@ fn session_sidebar_rows(
 fn agent_badge_text(agent: &triage_core::agent::AgentAttachment) -> String {
     let kind = agent.kind.primary_binary();
     match agent.conversation_id.as_deref() {
-        Some(id) => format!("{kind} {}", id.chars().take(8).collect::<String>()),
-        None => format!("{kind} (recent)"),
+        Some(id) if !id.is_empty() => {
+            format!("{kind} {}", id.chars().take(8).collect::<String>())
+        }
+        _ => format!("{kind} (recent)"),
     }
 }
 
@@ -2349,6 +2351,7 @@ mod tests {
                 exited: false,
                 raw_output: Vec::new(),
                 raw_output_start: 0,
+                raw_output_prefix: Vec::new(),
                 snippet: None,
                 snippet_detail: None,
                 agent: Some(triage_core::agent::AgentAttachment {
@@ -2381,6 +2384,33 @@ mod tests {
             }),
             "muse (recent)"
         );
+    }
+
+    #[test]
+    fn agent_badge_text_covers_every_kind_with_id_recent_and_empty_legs() {
+        for kind in triage_core::agent::AgentKind::all() {
+            let name = kind.primary_binary();
+            let with_id = triage_core::agent::AgentAttachment {
+                kind,
+                conversation_id: Some("abc12345ef".to_string()),
+                transcript_path: None,
+                exe_path: None,
+                last_seen_ms: 1,
+            };
+            assert_eq!(agent_badge_text(&with_id), format!("{name} abc12345"));
+            let kind_only = triage_core::agent::AgentAttachment {
+                conversation_id: None,
+                ..with_id.clone()
+            };
+            assert_eq!(agent_badge_text(&kind_only), format!("{name} (recent)"));
+            // An empty id degrades to the most-recent fallback like the
+            // Flutter badge, never a trailing space.
+            let empty_id = triage_core::agent::AgentAttachment {
+                conversation_id: Some(String::new()),
+                ..with_id.clone()
+            };
+            assert_eq!(agent_badge_text(&empty_id), format!("{name} (recent)"));
+        }
     }
 
     #[test]

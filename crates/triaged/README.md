@@ -382,8 +382,8 @@ metadata and restores shell/workspace layout structures on restart.
 
 Each session actor watches its PTY's foreground process for a known AI coding
 agent (Claude Code, Codex, Antigravity's `agy`, Muse). When one holds the
-foreground, the daemon records an attachment — agent kind, conversation id,
-transcript path, and binary path — against the session and persists it in the
+foreground, the daemon records an attachment (agent kind, conversation id,
+transcript path, and binary path) against the session and persists it in the
 session manifest. Restoring such a session (after a reboot, a daemon kill, or
 from history) relaunches the agent resumed into the same conversation instead
 of a fresh shell.
@@ -396,7 +396,7 @@ original launch command: the shell for shell sessions, a fresh agent for
 sessions started directly in an agent. A recorded binary that moved degrades
 to a `PATH` lookup rather than failing outright. Conversation ids come from
 argv when the agent was started with a resume flag, else from transcript
-correlation — and only on a single unambiguous candidate, so a wrong guess
+correlation, and only on a single unambiguous candidate, so a wrong guess
 never resumes the wrong conversation.
 
 Detection is read-only observation (process names, argv, transcript metadata);
