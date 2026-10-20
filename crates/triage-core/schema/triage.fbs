@@ -113,10 +113,13 @@ table SessionSnapshot {
     raw_output_prefix: [ubyte];
     // The AI coding agent in the session's foreground, if the daemon
     // observed one. Absent for plain shells, exited agents, and old hosts.
+    // Push and resync snapshots are actor-built and never overlaid, so a
+    // null here is "unknown", not "absent": clients must preserve their
+    // last known attachment rather than clear it.
     agent: AgentAttachment;
 }
 
-enum AgentKind : byte { Claude, Codex, Antigravity, Muse }
+enum AgentKind : byte { Claude = 0, Codex = 1, Antigravity = 2, Muse = 3 }
 
 table AgentAttachment {
     kind: AgentKind;
