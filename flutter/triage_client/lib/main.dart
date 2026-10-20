@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:math';
+
 import 'package:flutter/foundation.dart'
     show
         TargetPlatform,
@@ -1013,7 +1014,23 @@ class TriageHome extends StatefulWidget {
 /// [confirmSent] removes bytes, so a failed write loses nothing and bytes
 /// typed during the send stay queued behind the ones in flight.
 class PendingInputBuffer {
-  static const int capacity = 4096;
+  static const int capacity = 1024 * 1024;
+  static const List<int> _bracketedPasteStart = <int>[
+    0x1b,
+    0x5b,
+    0x32,
+    0x30,
+    0x30,
+    0x7e,
+  ];
+  static const List<int> _bracketedPasteEnd = <int>[
+    0x1b,
+    0x5b,
+    0x32,
+    0x30,
+    0x31,
+    0x7e,
+  ];
 
   final Map<String, List<int>> _buffered = {};
 
@@ -1022,9 +1039,54 @@ class PendingInputBuffer {
   int add(String sessionId, List<int> bytes) {
     final buffer = _buffered.putIfAbsent(sessionId, () => <int>[]);
     final room = capacity - buffer.length;
-    final kept = bytes.length <= room ? bytes : bytes.sublist(0, room);
+    final kept = _truncateToRoom(bytes, room);
     buffer.addAll(kept);
     return bytes.length - kept.length;
+  }
+
+  static List<int> _truncateToRoom(List<int> bytes, int room) {
+    if (room <= 0) return const <int>[];
+    if (bytes.length <= room) return bytes;
+    if (_isBracketedPaste(bytes) && room >= 12) {
+      final bodyEnd = _utf8SafePrefixLength(
+        bytes,
+        room - _bracketedPasteEnd.length,
+      );
+      return <int>[...bytes.sublist(0, bodyEnd), ..._bracketedPasteEnd];
+    }
+    final end = _utf8SafePrefixLength(bytes, room);
+    return bytes.sublist(0, end);
+  }
+
+  static bool _isBracketedPaste(List<int> bytes) {
+    if (bytes.length <
+        _bracketedPasteStart.length + _bracketedPasteEnd.length) {
+      return false;
+    }
+    for (var i = 0; i < _bracketedPasteStart.length; i++) {
+      if (bytes[i] != _bracketedPasteStart[i]) return false;
+    }
+    final suffixOffset = bytes.length - _bracketedPasteEnd.length;
+    for (var i = 0; i < _bracketedPasteEnd.length; i++) {
+      if (bytes[suffixOffset + i] != _bracketedPasteEnd[i]) return false;
+    }
+    return true;
+  }
+
+  static int _utf8SafePrefixLength(List<int> bytes, int maxLen) {
+    final limit = maxLen.clamp(0, bytes.length);
+    if (limit == 0 || limit >= bytes.length) return limit;
+    // If the first dropped byte is not a UTF-8 continuation byte (10xxxxxx),
+    // the cut does not split a multi-byte sequence.
+    if ((bytes[limit] & 0xC0) != 0x80) return limit;
+    var start = limit - 1;
+    while (start >= 0 && limit - start <= 3 && (bytes[start] & 0xC0) == 0x80) {
+      start--;
+    }
+    if (start >= 0 && (bytes[start] & 0xC0) == 0xC0) {
+      return start;
+    }
+    return limit;
   }
 
   bool hasPending(String sessionId) =>
