@@ -58,6 +58,10 @@ status; exited sessions carry no agent state.
   test calls in `crates/triaged/src/session.rs` (`SessionActor::spawn_managed` and
   `ManagedSession::Live` struct initializers) to include the `agent_tx` parameter and
   `agent` / `agent_tracking` / `agent_observed` fields.
+- **2026-10-20T14:53-0700** Gated `serialize_active_sessions_carries_live_agent` and
+  `agent_observed` in `crates/triaged/src/session.rs` with `#[cfg(unix)]` so Windows test
+  compilation does not reference Unix-only handover APIs (`SerializedHandover`,
+  `serialize_active_sessions`).
 
 ## Decisions
 
@@ -118,7 +122,8 @@ status; exited sessions carry no agent state.
 - e8f2c6b: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
 - bb58a32: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
 - c0136e3: feat(session): add Grok agent tracking and conversation restore
-- HEAD: test(triaged): update Linux /dev/full tests for agent tracking fields
+- 72cd45a: test(triaged): update Linux /dev/full tests for agent tracking fields
+- HEAD: test(triaged): gate handover agent serialization test to Unix
 
 ## Progress
 
