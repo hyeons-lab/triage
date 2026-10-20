@@ -19082,6 +19082,7 @@ mod tests {
     /// generation. Starts false at restore and flips on the first tracker
     /// report, so unlike the seeded attachment itself it is a genuine
     /// confirmation signal a test can poll without seed-defeating.
+    #[cfg(unix)]
     fn agent_observed(manager: &SessionManager, session_id: &SessionId) -> bool {
         let sessions = manager.sessions().expect("sessions lock");
         match sessions.get(session_id).expect("session") {
@@ -19195,6 +19196,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn serialize_active_sessions_carries_live_agent() {
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
