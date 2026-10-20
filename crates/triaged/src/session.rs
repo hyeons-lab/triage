@@ -3829,6 +3829,7 @@ impl SessionApi for SessionManager {
             ManagedSession::Historical { session, lease } => {
                 let snapshot = session.snapshot_with_history(history_cap);
                 let lease = lease.clone();
+                drop(sessions);
                 let snapshot = self.overlay_manager_fields(snapshot, &request.session_id);
                 Ok(AttachSessionResponse { snapshot, lease })
             }
