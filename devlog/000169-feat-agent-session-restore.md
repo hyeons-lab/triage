@@ -49,6 +49,11 @@ status; exited sessions carry no agent state.
   and tests), rebased onto `origin/main` (`879b8a3`, incorporating PRs #180-#197),
   regenerated FlatBuffers bindings (`VT_AGENT = 36` after `VT_RAW_OUTPUT_PREFIX = 34`),
   and renumbered devlog and plan to `000169`.
+- **2026-10-20T14:01-0700** Added `AgentKind::Grok` support across `triage-core`
+  (including platform-suffixed `~/.grok/downloads/grok-<os>-<arch>` binary stems),
+  FlatBuffers schema + Dart bindings, `triaged/src/agent_detect.rs` (argv classification,
+  `--resume <id>` / `--continue` resume builder, `~/.grok/sessions/<encoded-cwd>/<id>/summary.json`
+  correlation with `active_sessions.json` PID disambiguation), and unit tests.
 
 ## Decisions
 
@@ -107,7 +112,8 @@ status; exited sessions carry no agent state.
 - d2dd3f3: fix(session): address R1 agent-review-loop findings
 - ae90479: fix(session): retry stub-agent observation for exec race
 - e8f2c6b: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
-- HEAD: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
+- bb58a32: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
+- HEAD: feat(session): add Grok agent tracking and conversation restore
 
 ## Progress
 
@@ -129,6 +135,7 @@ status; exited sessions carry no agent state.
   clippy type_complexity), added seeded-tracker regression tests
 - [x] 2026-10-20T12:46-0700 R2-R5 review-loop hardening committed and rebased
   onto `origin/main` (`879b8a3`), devlog and plan renumbered to `000169`
+- [x] 2026-10-20T14:01-0700 Added `AgentKind::Grok` support and tests
 
 ## Research & Discoveries
 

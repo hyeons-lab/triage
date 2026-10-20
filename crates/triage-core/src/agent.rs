@@ -19,26 +19,40 @@ pub enum AgentKind {
     Codex,
     Antigravity,
     Muse,
+    Grok,
 }
 
 impl AgentKind {
     /// All supported agents, for exhaustive matching.
-    pub fn all() -> [AgentKind; 4] {
+    pub fn all() -> [AgentKind; 5] {
         [
             AgentKind::Claude,
             AgentKind::Codex,
             AgentKind::Antigravity,
             AgentKind::Muse,
+            AgentKind::Grok,
         ]
     }
 
     /// Executable file stems (lowercase, no extension) identifying this agent.
+    /// Grok's installer symlinks `grok` to `~/.grok/downloads/grok-<os>-<arch>`,
+    /// and kernel process-path queries resolve symlinks, so the platform
+    /// binary stems are listed alongside `grok`.
     pub fn binary_names(&self) -> &'static [&'static str] {
         match self {
             AgentKind::Claude => &["claude"],
             AgentKind::Codex => &["codex"],
             AgentKind::Antigravity => &["agy", "antigravity"],
             AgentKind::Muse => &["muse"],
+            AgentKind::Grok => &[
+                "grok",
+                "grok-macos-aarch64",
+                "grok-macos-x86_64",
+                "grok-linux-aarch64",
+                "grok-linux-x86_64",
+                "grok-windows-aarch64",
+                "grok-windows-x86_64",
+            ],
         }
     }
 
@@ -49,6 +63,7 @@ impl AgentKind {
             AgentKind::Codex => "codex",
             AgentKind::Antigravity => "agy",
             AgentKind::Muse => "muse",
+            AgentKind::Grok => "grok",
         }
     }
 
@@ -140,6 +155,15 @@ mod tests {
         );
         assert_eq!(AgentKind::detect("muse"), Some(AgentKind::Muse));
         assert_eq!(AgentKind::detect("Muse"), Some(AgentKind::Muse));
+        assert_eq!(AgentKind::detect("grok"), Some(AgentKind::Grok));
+        assert_eq!(
+            AgentKind::detect("grok-macos-aarch64"),
+            Some(AgentKind::Grok)
+        );
+        assert_eq!(
+            AgentKind::detect("grok-windows-x86_64.exe"),
+            Some(AgentKind::Grok)
+        );
         assert_eq!(AgentKind::detect("codex.exe"), Some(AgentKind::Codex));
         assert_eq!(AgentKind::detect("bash"), None);
         assert_eq!(AgentKind::detect("claude-code"), None);
