@@ -17552,7 +17552,7 @@ mod tests {
             "-c".to_string(),
             "printf 'full-disk-marker\\r\\n'; sleep 5".to_string(),
         ];
-        let actor = SessionActor::spawn_managed(config, session_id, None, None, None, None)
+        let actor = SessionActor::spawn_managed(config, session_id, None, None, None, None, None)
             .expect("spawn session actor");
         let events = request_subscribe_events(&actor.tx, Some(0)).expect("subscribe to events");
 
@@ -17612,8 +17612,9 @@ mod tests {
             "-c".to_string(),
             "printf 'loss-take-marker\\r\\n'; sleep 5".to_string(),
         ];
-        let actor = SessionActor::spawn_managed(config, session_id.clone(), None, None, None, None)
-            .expect("spawn session actor");
+        let actor =
+            SessionActor::spawn_managed(config, session_id.clone(), None, None, None, None, None)
+                .expect("spawn session actor");
         let events = request_subscribe_events(&actor.tx, Some(0)).expect("subscribe to events");
         wait_for_event(&events, "marker output", |event| {
             matches!(
@@ -17638,8 +17639,9 @@ mod tests {
             "-c".to_string(),
             "printf 'loss-exit-marker\\r\\n'".to_string(),
         ];
-        let actor = SessionActor::spawn_managed(config, session_id.clone(), None, None, None, None)
-            .expect("spawn session actor");
+        let actor =
+            SessionActor::spawn_managed(config, session_id.clone(), None, None, None, None, None)
+                .expect("spawn session actor");
         let events = request_subscribe_events(&actor.tx, Some(0)).expect("subscribe to events");
         wait_for_exit_event(&events, &session_id);
         // The exit event is broadcast only after output end has reported
@@ -17685,6 +17687,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("spawn degraded actor");
         let degraded_events =
@@ -17697,9 +17700,16 @@ mod tests {
             "printf 'manager-healthy-marker\\r\\n'; sleep 5".to_string(),
         ];
         let healthy_launch = PersistedSessionLaunch::from(&healthy_config);
-        let healthy =
-            SessionActor::spawn_managed(healthy_config, healthy_id.clone(), None, None, None, None)
-                .expect("spawn healthy actor");
+        let healthy = SessionActor::spawn_managed(
+            healthy_config,
+            healthy_id.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("spawn healthy actor");
         let healthy_events =
             request_subscribe_events(&healthy.tx, Some(0)).expect("subscribe to events");
 
@@ -17712,6 +17722,9 @@ mod tests {
                     lease: InputLeaseState::default(),
                     launch: degraded_launch,
                     last_known_cwd: None,
+                    agent: None,
+                    agent_tracking: false,
+                    agent_observed: false,
                 },
             );
             sessions.insert(
@@ -17721,6 +17734,9 @@ mod tests {
                     lease: InputLeaseState::default(),
                     launch: healthy_launch,
                     last_known_cwd: None,
+                    agent: None,
+                    agent_tracking: false,
+                    agent_observed: false,
                 },
             );
         }
