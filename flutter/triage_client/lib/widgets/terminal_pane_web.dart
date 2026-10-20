@@ -309,6 +309,7 @@ class _TerminalPaneState extends State<TerminalPane>
   late Object _inputRouteToken;
   late final FocusNode _focusNode;
   late final void Function(html.Event) _windowKeyDownListener;
+  late final void Function(html.Event) _windowPasteListener;
   // Bound together by [_bindContainerEvents] and taken off together by
   // [_unbindContainerEvents]. Nullable rather than `late final` because they are
   // not always held: a pane whose container has been taken over by its
@@ -459,6 +460,7 @@ class _TerminalPaneState extends State<TerminalPane>
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
+  (int, int, int, int)? _pageSelection;
   void _clearPageAnchor({bool cancelRestoreTimer = true}) {
     if (cancelRestoreTimer) {
       _scrollRestoreGeneration++;
@@ -468,6 +470,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _pageAnchorY = null;
     _pageAnchorLen = null;
     _pageAnchorAt = null;
+    _pageSelection = null;
   }
 
   Timer? _suppressScrollSaveTimer;
@@ -739,7 +742,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
         final isCurrent = _isRouteCurrentAndUnobscured;
-        if (!widget.isExited && isCurrent && _eventTargetsTerminal(event)) {
+        if (isCurrent && _eventTargetsTerminal(event, allowExited: true)) {
           // Allow IME composition to proceed natively.
           if (event.isComposing == true || event.key == 'Process') {
             return;
@@ -782,9 +785,33 @@ class _TerminalPaneState extends State<TerminalPane>
             if (event.metaKey && !event.ctrlKey) {
               return;
             }
-          } else if ((event.ctrlKey || event.metaKey) &&
+          } else if (((event.metaKey &&
+                      !event.ctrlKey &&
+                      !event.altKey &&
+                      !event.shiftKey) ||
+                  (event.ctrlKey &&
+                      event.shiftKey &&
+                      !event.metaKey &&
+                      !event.altKey)) &&
+              (event.key == 'a' || event.key == 'A')) {
+            event.preventDefault();
+            event.stopPropagation();
+            try {
+              js_util.callMethod(_term, 'selectAll', []);
+            } catch (_) {}
+            return;
+          }
+
+          if (widget.isExited) {
+            return;
+          }
+
+          if ((event.ctrlKey || event.metaKey) &&
               (event.key == 'v' || event.key == 'V')) {
-            // Deliberately not handled here: paste is left to the browser.
+            // Ensure the helper textarea has DOM focus before the browser
+            // dispatches the paste event, while leaving the paste itself to the
+            // browser's ClipboardEvent pipeline.
+            _activateTerminal();
             return;
           }
 
@@ -857,6 +884,28 @@ class _TerminalPaneState extends State<TerminalPane>
       }
     };
     html.window.addEventListener('keydown', _windowKeyDownListener, true);
+    _windowPasteListener = (html.Event event) {
+      if (event is html.ClipboardEvent && !event.defaultPrevented) {
+        final target = event.target;
+        if (target is html.Node && _container.contains(target)) {
+          return;
+        }
+        final isCurrent = _currentRoute?.isCurrent ?? true;
+        if (!widget.isExited &&
+            !_isPasteDialogShowing &&
+            isCurrent &&
+            _eventTargetsTerminal(event)) {
+          event.preventDefault();
+          event.stopPropagation();
+          final clipboardData = event.clipboardData;
+          final text = clipboardData?.getData('text/plain') ?? '';
+          if (text.isNotEmpty) {
+            unawaited(_handlePaste(text));
+          }
+        }
+      }
+    };
+    html.window.addEventListener('paste', _windowPasteListener, false);
 
     if (!_registeredViewTypes.contains(_viewType)) {
       ui_web.platformViewRegistry.registerViewFactory(
@@ -1464,7 +1513,13 @@ class _TerminalPaneState extends State<TerminalPane>
           // stop), so repeat scroll events while a page is in flight are
           // cheap. Suppressed saves (programmatic restores) return above,
           // so our own scrollToLine never retriggers.
-          if (!isAtBottom && baseY > 0 && viewportY <= 5) {
+          final isMouseDragSelecting =
+              activePane._activePointerCount > 0 &&
+              activePane._activeTouchCount == 0;
+          if (!isAtBottom &&
+              baseY > 0 &&
+              viewportY <= 5 &&
+              !isMouseDragSelecting) {
             activePane.widget.onNearTop?.call();
           }
         } catch (_) {}
@@ -1567,6 +1622,42 @@ class _TerminalPaneState extends State<TerminalPane>
                 _sessionInputRouter.sendInput(sessionId, '\t');
               }
             }
+            return false;
+          }
+          final ctrlKey =
+              js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
+          final metaKey =
+              js_util.getProperty(event, 'metaKey') as bool? ?? false;
+          final shiftKey =
+              js_util.getProperty(event, 'shiftKey') as bool? ?? false;
+          final altKey = js_util.getProperty(event, 'altKey') as bool? ?? false;
+          if ((ctrlKey || metaKey) && (key == 'c' || key == 'C')) {
+            var selection = '';
+            try {
+              selection =
+                  js_util.callMethod(_term, 'getSelection', []) as String? ??
+                  '';
+            } catch (_) {}
+            if (selection.isNotEmpty) {
+              js_util.callMethod(event, 'preventDefault', []);
+              js_util.callMethod(event, 'stopPropagation', []);
+              _copyTextToClipboard(selection);
+              return false;
+            }
+            if (metaKey && !ctrlKey) {
+              return false;
+            }
+          }
+          if (ctrlKey &&
+              shiftKey &&
+              !metaKey &&
+              !altKey &&
+              (key == 'a' || key == 'A')) {
+            js_util.callMethod(event, 'preventDefault', []);
+            js_util.callMethod(event, 'stopPropagation', []);
+            try {
+              js_util.callMethod(_term, 'selectAll', []);
+            } catch (_) {}
             return false;
           }
           return true;
@@ -1883,6 +1974,20 @@ class _TerminalPaneState extends State<TerminalPane>
           ?.toInt();
       _pageAnchorLen = (js_util.getProperty(active, 'length') as num?)?.toInt();
       _pageAnchorAt = DateTime.now();
+      final pos = js_util.callMethod(_term, 'getSelectionPosition', []);
+      if (pos != null) {
+        final start = js_util.getProperty(pos, 'start');
+        final end = js_util.getProperty(pos, 'end');
+        if (start != null && end != null) {
+          final sx = (js_util.getProperty(start, 'x') as num?)?.toInt();
+          final sy = (js_util.getProperty(start, 'y') as num?)?.toInt();
+          final ex = (js_util.getProperty(end, 'x') as num?)?.toInt();
+          final ey = (js_util.getProperty(end, 'y') as num?)?.toInt();
+          if (sx != null && sy != null && ex != null && ey != null) {
+            _pageSelection = (sx, sy, ex, ey);
+          }
+        }
+      }
     } catch (_) {
       _clearPageAnchor(cancelRestoreTimer: false);
     }
@@ -1896,6 +2001,7 @@ class _TerminalPaneState extends State<TerminalPane>
   void _restorePagedScrollPosition() {
     final anchorY = _pageAnchorY;
     final anchorLen = _pageAnchorLen;
+    final pageSelection = _pageSelection;
     _clearPageAnchor();
     final restoreGen = ++_scrollRestoreGeneration;
     _pendingScrollToBottomOnRelease = false;
@@ -1949,6 +2055,27 @@ class _TerminalPaneState extends State<TerminalPane>
         js_util.callMethod(_term, 'scrollToLine', [clamped]);
         _syncTermViewportDomScroll();
       } catch (_) {}
+      if (pageSelection != null && len > 0) {
+        try {
+          final cols =
+              (js_util.getProperty(_term, 'cols') as num?)?.toInt() ?? 0;
+          if (cols > 0) {
+            final shift = math.max(addedLines, 0);
+            final newStartY = (pageSelection.$2 + shift)
+                .clamp(0, len - 1)
+                .toInt();
+            final newEndY = (pageSelection.$4 + shift)
+                .clamp(0, len - 1)
+                .toInt();
+            final startX = pageSelection.$1.clamp(0, cols).toInt();
+            final endX = pageSelection.$3.clamp(0, cols).toInt();
+            final length = (newEndY - newStartY) * cols - startX + endX;
+            if (length > 0) {
+              js_util.callMethod(_term, 'select', [startX, newStartY, length]);
+            }
+          }
+        } catch (_) {}
+      }
       _unmaskTerminalAfterReplay();
       if (clamped >= baseY) {
         _sessionSavedViewportY.remove(_sanitizedId);
@@ -3003,8 +3130,10 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
-  bool _eventTargetsTerminal(html.Event event) {
-    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
+  bool _eventTargetsTerminal(html.Event event, {bool allowExited = false}) {
+    if (!mounted ||
+        (!allowExited && widget.isExited) ||
+        !_isRouteCurrentAndUnobscured) {
       return false;
     }
 
@@ -3012,12 +3141,7 @@ class _TerminalPaneState extends State<TerminalPane>
       return false;
     }
 
-    // If this pane's FocusNode has Flutter focus, it owns the input.
-    if (_focusNode.hasFocus) {
-      return true;
-    }
-
-    // Otherwise, check if the event target or composed path originates from this container.
+    // Check if the event target or composed path originates from this container.
     try {
       final path = js_util.callMethod(event, 'composedPath', []) as List?;
       if (path != null && path.contains(_container)) {
@@ -3055,6 +3179,11 @@ class _TerminalPaneState extends State<TerminalPane>
     final active = _deepActiveElement();
     if (_isExternalInput(active)) {
       return false;
+    }
+
+    // If this pane's FocusNode has Flutter focus, it owns the input.
+    if (_focusNode.hasFocus) {
+      return true;
     }
 
     // Do not intercept Tab navigation or Escape from outside the terminal.
@@ -3508,6 +3637,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
     html.window.removeEventListener('keydown', _windowKeyDownListener, true);
+    html.window.removeEventListener('paste', _windowPasteListener, false);
     _unbindContainerEvents();
     _clearRefitRetryTimers();
     // Oldest-first: a live debounce is strictly newer than any pending
