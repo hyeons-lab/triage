@@ -1,7 +1,7 @@
 //! Detect AI coding agents running inside session PTYs.
 //!
 //! Each triage session is a shell, but the interesting occupant is usually an
-//! agent TUI (Claude Code, Codex, Antigravity, Muse) running inside it. This
+//! agent TUI (Claude Code, Codex, Antigravity, Muse, Grok) running inside it. This
 //! module identifies those agents from process names and argv, resolves their
 //! conversation ids, and builds resume commands, so a session restored after
 //! a reboot can re-enter the same conversation instead of a fresh shell.
@@ -42,6 +42,7 @@ pub fn classify_argv(kind: AgentKind, argv: &[String]) -> Option<AgentArgv> {
         AgentKind::Codex => classify_codex(&args),
         AgentKind::Antigravity => classify_agy(&args),
         AgentKind::Muse => classify_muse(&args),
+        AgentKind::Grok => classify_grok(&args),
     }
 }
 
@@ -529,6 +530,127 @@ fn classify_muse(args: &[&str]) -> Option<AgentArgv> {
     }
 }
 
+/// Subcommands grok treats as something other than an interactive
+/// conversation session (bookkeeping, daemons, SSH/clipboard wrappers,
+/// and the multi-session dashboard).
+const GROK_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "inspect",
+    "doctor",
+    "leader",
+    "logout",
+    "login",
+    "mcp",
+    "plugin",
+    "memory",
+    "models",
+    "sessions",
+    "usage",
+    "setup",
+    "wrap",
+    "ssh",
+    "export",
+    "trace",
+    "update",
+    "version",
+    "v",
+    "completions",
+    "worktree",
+    "clone",
+    "du",
+    "disk-usage",
+    "workspace",
+    "cursor-worker",
+    "dashboard",
+    "help",
+];
+
+/// Grok options that consume the following token as their value.
+/// `-w`/`--worktree` is deliberately excluded because its value is
+/// optional; `-r`/`--resume` is included so a session title or id
+/// that spells a subcommand is consumed as the resume target rather
+/// than mistaken for a bookkeeping subcommand.
+const GROK_VALUE_FLAGS: &[&str] = &[
+    "--cwd",
+    "--leader-socket",
+    "--debug-file",
+    "--allow",
+    "--allowedTools",
+    "--allowed-tools",
+    "--deny",
+    "--disallowedTools",
+    "-p",
+    "--single",
+    "--prompt-json",
+    "--prompt-file",
+    "--output-format",
+    "--json-schema",
+    "-m",
+    "--model",
+    "--reasoning-effort",
+    "--effort",
+    "--rules",
+    "--compaction-mode",
+    "--compaction-detail",
+    "--system-prompt-override",
+    "--system-prompt",
+    "-r",
+    "--resume",
+    "--load",
+    "-s",
+    "--session-id",
+    "--worktree-ref",
+    "--ref",
+    "--agent",
+    "--agents",
+    "--tools",
+    "--disallowed-tools",
+    "--max-turns",
+    "--permission-mode",
+    "--background-wait-timeout",
+    "--sandbox",
+    "--storage-mode",
+    "--client-identifier",
+    "--hunk-tracker-mode",
+    "--installer",
+];
+
+fn classify_grok(args: &[&str]) -> Option<AgentArgv> {
+    let dash = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let before_dash = &args[..dash];
+    if requests_help_or_version(before_dash) || has_any(before_dash, &["-v"]) {
+        return None;
+    }
+    let (positionals, boundary) = positional_tokens_split(args, GROK_VALUE_FLAGS);
+    if find_subcommand(&positionals[..boundary], GROK_SUBCOMMANDS).is_some() {
+        return None;
+    }
+    let mode = if has_any(
+        before_dash,
+        &[
+            "-p",
+            "--single",
+            "--prompt-json",
+            "--prompt-file",
+            "--memory-flush",
+        ],
+    ) {
+        AgentRunMode::Headless
+    } else {
+        AgentRunMode::Interactive
+    };
+    let conversation_id = long_flag_value(before_dash, "--session-id")
+        .or_else(|| short_flag_value(before_dash, "-s"))
+        .or_else(|| long_flag_value(before_dash, "--resume"))
+        .or_else(|| short_flag_value(before_dash, "-r"))
+        .or_else(|| long_flag_value(before_dash, "--load"))
+        .map(str::to_string);
+    Some(AgentArgv {
+        mode,
+        conversation_id,
+    })
+}
+
 /// Build the command restoring an agent conversation: resume the given id,
 /// or the agent's most-recent conversation when no id is known. The
 /// binary is the recorded path when it still exists, else the primary
@@ -547,6 +669,8 @@ pub fn resume_command(
         (AgentKind::Antigravity, None) => vec!["--continue".into()],
         (AgentKind::Muse, Some(id)) => vec!["resume".into(), id.into()],
         (AgentKind::Muse, None) => vec!["resume".into(), "--last".into()],
+        (AgentKind::Grok, Some(id)) => vec!["--resume".into(), id.into()],
+        (AgentKind::Grok, None) => vec!["--continue".into()],
     };
     let binary = exe_path
         .filter(|path| path.is_file())
@@ -577,6 +701,12 @@ pub fn transcript_store_root(kind: AgentKind) -> Option<PathBuf> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".local").join("share"))
                 .join("muse")
+                .join("sessions"),
+        ),
+        AgentKind::Grok => Some(
+            std::env::var_os("GROK_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".grok"))
                 .join("sessions"),
         ),
         AgentKind::Antigravity => None,
@@ -654,6 +784,7 @@ pub fn correlate(
         AgentKind::Codex => codex_candidates(root, cwd, now, max_age),
         AgentKind::Antigravity => return Correlation::None,
         AgentKind::Muse => muse_candidates(root, cwd, pid, now, max_age),
+        AgentKind::Grok => grok_candidates(root, cwd, pid, now, max_age),
     };
     let mut hits = candidates.into_iter();
     match (hits.next(), hits.next()) {
@@ -903,6 +1034,102 @@ fn muse_hit(path: &Path, want_cwd: &Path, pid: Option<u32>) -> Option<Transcript
         conversation_id: id,
         path: path.to_path_buf(),
     })
+}
+
+fn grok_candidates(
+    sessions_root: &Path,
+    cwd: &Path,
+    pid: Option<u32>,
+    now: std::time::SystemTime,
+    max_age: std::time::Duration,
+) -> Vec<TranscriptHit> {
+    // Top-level sessions sit at `<sessions_root>/<encoded-cwd>/<session-id>/summary.json`
+    // (subagent sessions nest deeper under `<session-id>/subagents/`).
+    let mut hits = Vec::new();
+    let want = canonical_or_raw(cwd);
+    let Ok(buckets) = std::fs::read_dir(sessions_root) else {
+        return hits;
+    };
+    for bucket in buckets.flatten() {
+        let Ok(sessions) = std::fs::read_dir(bucket.path()) else {
+            continue;
+        };
+        for session_dir in sessions.flatten() {
+            let summary_path = session_dir.path().join("summary.json");
+            if !is_fresh_file(&summary_path, now, max_age) {
+                continue;
+            }
+            if let Some(hit) = grok_hit(&summary_path, &want) {
+                hits.push(hit);
+            }
+        }
+    }
+    // When multiple fresh sessions share `cwd`, disambiguate via
+    // `~/.grok/active_sessions.json` if it maps `pid` to one of the hits.
+    if hits.len() > 1
+        && let Some(want_pid) = pid
+        && let Some(active_id) = grok_active_session_for_pid(sessions_root, &want, want_pid)
+        && hits.iter().any(|hit| hit.conversation_id == active_id)
+    {
+        hits.retain(|hit| hit.conversation_id == active_id);
+    }
+    hits
+}
+
+/// Parse a grok `summary.json` index file into a hit at the target cwd.
+/// Reads are capped at 64 KiB so a corrupt file cannot OOM the actor
+/// thread on a metadata probe.
+fn grok_hit(path: &Path, want_cwd: &Path) -> Option<TranscriptHit> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let value: serde_json::Value = serde_json::from_reader(file.take(64 * 1024)).ok()?;
+    if value.get("hidden").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let info = value.get("info")?;
+    let recorded_cwd = info.get("cwd")?.as_str()?;
+    if canonical_or_raw(Path::new(recorded_cwd)) != *want_cwd {
+        return None;
+    }
+    let id = info.get("id")?.as_str()?;
+    if !is_clean_id(id) {
+        return None;
+    }
+    Some(TranscriptHit {
+        conversation_id: id.to_string(),
+        path: path.to_path_buf(),
+    })
+}
+
+/// Look up `want_pid` in `<grok_home>/active_sessions.json` (the sibling
+/// of `sessions/`), returning its `session_id` when a single active entry
+/// matches both `want_pid` and `want_cwd`.
+fn grok_active_session_for_pid(
+    sessions_root: &Path,
+    want_cwd: &Path,
+    want_pid: u32,
+) -> Option<String> {
+    use std::io::Read;
+    let active_path = sessions_root.parent()?.join("active_sessions.json");
+    let file = std::fs::File::open(active_path).ok()?;
+    let entries: serde_json::Value = serde_json::from_reader(file.take(64 * 1024)).ok()?;
+    let mut matched = entries.as_array()?.iter().filter_map(|entry| {
+        let pid = entry
+            .get("pid")
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u32::try_from(p).ok())?;
+        if pid != want_pid {
+            return None;
+        }
+        let cwd = entry.get("cwd")?.as_str()?;
+        if canonical_or_raw(Path::new(cwd)) != *want_cwd {
+            return None;
+        }
+        let id = entry.get("session_id")?.as_str()?;
+        is_clean_id(id).then(|| id.to_string())
+    });
+    let first = matched.next()?;
+    matched.next().is_none().then_some(first)
 }
 
 /// A process observed by pid: executable path plus full argv.
@@ -1847,6 +2074,117 @@ mod tests {
     }
 
     #[test]
+    fn classify_grok_modes_ids_and_subcommands() {
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--resume", "abc"])),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "-r", "abc"])),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--load", "abc"])),
+            interactive(Some("abc"))
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--session-id", "abc"])),
+            interactive(Some("abc"))
+        );
+        // `--session-id` names the forked session when combined with `--resume`.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Grok,
+                &argv(&["grok", "--resume", "old", "--fork-session", "-s", "new-id"])
+            ),
+            interactive(Some("new-id"))
+        );
+        // Bare `-r`/`--resume` and `-c`/`--continue` resume the most recent.
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "-r"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--continue"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "-c"])),
+            interactive(None)
+        );
+        // A session title/id after `-r` that spells a subcommand is consumed
+        // as the resume value, not treated as a bookkeeping subcommand.
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--resume", "models"])),
+            interactive(Some("models"))
+        );
+        // Headless single-turn and memory-flush invocations.
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "-p", "hi"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--single", "hi"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--prompt-file", "p.txt"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--memory-flush"])),
+            headless()
+        );
+        // Bookkeeping, daemon, wrapper, and dashboard subcommands are ignored.
+        for sub in [
+            "agent",
+            "inspect",
+            "doctor",
+            "leader",
+            "login",
+            "logout",
+            "mcp",
+            "plugin",
+            "memory",
+            "models",
+            "sessions",
+            "usage",
+            "setup",
+            "wrap",
+            "ssh",
+            "export",
+            "trace",
+            "update",
+            "version",
+            "v",
+            "completions",
+            "worktree",
+            "clone",
+            "du",
+            "disk-usage",
+            "workspace",
+            "cursor-worker",
+            "dashboard",
+            "help",
+        ] {
+            assert_eq!(
+                classify_argv(AgentKind::Grok, &argv(&["grok", sub])),
+                None,
+                "grok {sub} must not classify as an interactive session",
+            );
+        }
+        assert_eq!(classify_argv(AgentKind::Grok, &argv(&["grok", "-v"])), None);
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--help"])),
+            None
+        );
+    }
+
+    #[test]
     fn resume_commands_cover_id_and_fallback() {
         assert_eq!(
             resume_command(AgentKind::Claude, Some("abc"), None),
@@ -1897,6 +2235,17 @@ mod tests {
                 "muse".to_string(),
                 vec!["resume".to_string(), "--last".to_string()]
             )
+        );
+        assert_eq!(
+            resume_command(AgentKind::Grok, Some("abc"), None),
+            (
+                "grok".to_string(),
+                vec!["--resume".to_string(), "abc".to_string()]
+            )
+        );
+        assert_eq!(
+            resume_command(AgentKind::Grok, None, None),
+            ("grok".to_string(), vec!["--continue".to_string()])
         );
         // A recorded binary that still exists is used verbatim; a moved
         // one degrades to a `PATH` lookup.
@@ -2205,6 +2554,69 @@ mod tests {
             other => panic!("expected pid-disambiguated hit, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn correlate_grok_filters_cwd_hidden_and_disambiguates_pid() {
+        let grok_home = unique_dir("grok");
+        let root = grok_home.join("sessions");
+        let bucket = root.join("%2Fwork");
+        let cwd = grok_home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let summary = |id: &str, cwd: &str, hidden: bool| {
+            let cwd = cwd.replace('\\', "\\\\");
+            format!("{{\"info\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}},\"hidden\":{hidden}}}\n")
+        };
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        write(
+            &bucket.join("aaa").join("summary.json"),
+            &summary("aaa", &cwd_str, false),
+        );
+        // Subagents live under `<session>/subagents/<sub>/` and are never
+        // visited by the two-level top-level walk; hidden sessions and
+        // other-cwd buckets are ignored.
+        write(
+            &bucket
+                .join("aaa")
+                .join("subagents")
+                .join("sub-1")
+                .join("summary.json"),
+            &summary("sub-1", &cwd_str, false),
+        );
+        write(
+            &bucket.join("hid").join("summary.json"),
+            &summary("hid", &cwd_str, true),
+        );
+        write(
+            &root.join("%2Fother").join("els").join("summary.json"),
+            &summary("els", "/somewhere/else", false),
+        );
+        let now = std::time::SystemTime::now();
+        let max_age = std::time::Duration::from_secs(900);
+        match correlate(AgentKind::Grok, Some(&root), &cwd, None, now, max_age) {
+            Correlation::Single(hit) => assert_eq!(hit.conversation_id, "aaa"),
+            other => panic!("expected single hit, got {other:?}"),
+        }
+        // A second top-level session at the same cwd degrades to Multiple,
+        // unless `active_sessions.json` maps the foreground pid to one of them.
+        write(
+            &bucket.join("bbb").join("summary.json"),
+            &summary("bbb", &cwd_str, false),
+        );
+        assert_eq!(
+            correlate(AgentKind::Grok, Some(&root), &cwd, None, now, max_age),
+            Correlation::Multiple
+        );
+        let escaped_cwd = cwd_str.replace('\\', "\\\\");
+        write(
+            &grok_home.join("active_sessions.json"),
+            &format!("[{{\"session_id\":\"bbb\",\"pid\":444,\"cwd\":\"{escaped_cwd}\"}}]\n"),
+        );
+        match correlate(AgentKind::Grok, Some(&root), &cwd, Some(444), now, max_age) {
+            Correlation::Single(hit) => assert_eq!(hit.conversation_id, "bbb"),
+            other => panic!("expected pid-disambiguated hit, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&grok_home);
     }
 
     #[test]

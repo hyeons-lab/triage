@@ -787,6 +787,7 @@ void main() {
         fbs.AgentKind.Codex: 'codex',
         fbs.AgentKind.Antigravity: 'antigravity',
         fbs.AgentKind.Muse: 'muse',
+        fbs.AgentKind.Grok: 'grok',
       };
       for (final entry in kinds.entries) {
         final channel = FakeWebSocketChannel(

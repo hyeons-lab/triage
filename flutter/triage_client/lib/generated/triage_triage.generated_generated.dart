@@ -158,7 +158,8 @@ enum AgentKind {
   Claude(0),
   Codex(1),
   Antigravity(2),
-  Muse(3);
+  Muse(3),
+  Grok(4);
 
   final int value;
   const AgentKind(this.value);
@@ -169,6 +170,7 @@ enum AgentKind {
       case 1: return AgentKind.Codex;
       case 2: return AgentKind.Antigravity;
       case 3: return AgentKind.Muse;
+      case 4: return AgentKind.Grok;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -177,7 +179,7 @@ enum AgentKind {
       value == null ? null : AgentKind.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 3;
+  static const int maxValue = 4;
   static const fb.Reader<AgentKind> reader = _AgentKindReader();
 }
 

@@ -195,6 +195,7 @@ pub fn build_agent_attachment<'a>(
         crate::agent::AgentKind::Codex => fb::AgentKind::Codex,
         crate::agent::AgentKind::Antigravity => fb::AgentKind::Antigravity,
         crate::agent::AgentKind::Muse => fb::AgentKind::Muse,
+        crate::agent::AgentKind::Grok => fb::AgentKind::Grok,
     };
     fb::AgentAttachment::create(
         builder,
