@@ -226,6 +226,10 @@ const PARKED_INPUT_TTL: Duration = Duration::from_secs(10);
 /// clipboard pastes sent while acquiring the interactive lease are not
 /// truncated mid-passage.
 const PARKED_INPUT_CAP_BYTES: usize = 1024 * 1024;
+/// Daemon-wide cap across all parked input entries so worst-case 4x JSON
+/// array expansion in `HandoverSession::parked_input` stays well under
+/// `MAX_HANDOVER_STATE_BYTES` (16 MiB).
+const MAX_TOTAL_PARKED_INPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum number of distinct clients that can concurrently park denied input per session.
 const MAX_PARKED_CLIENTS_PER_SESSION: usize = 8;
 const MAX_PAIRING_CLIENT_ID_LENGTH: usize = 128;
@@ -1519,7 +1523,7 @@ impl SessionManager {
     }
 
     /// One cap policy for the append and new-entry arms alike: room is what
-    /// fits under the per-client cap beyond what is already parked.
+    /// fits under both the per-client cap and the daemon-wide total cap.
     fn push_parked_input(
         parked: &mut HashMap<SessionId, Vec<ParkedInput>>,
         session_id: &SessionId,
@@ -1527,6 +1531,11 @@ impl SessionManager {
         bytes: Vec<u8>,
         parked_at: Instant,
     ) {
+        let total_buffered: usize = parked
+            .values()
+            .flat_map(|entries| entries.iter())
+            .map(|entry| entry.bytes.len())
+            .sum();
         let entries = parked.entry(session_id.clone()).or_default();
         let buffered = entries
             .iter()
@@ -1539,9 +1548,14 @@ impl SessionManager {
                 dropped_bytes = bytes.len(),
                 "maximum parked clients per session reached; dropping denied input"
             );
+            if entries.is_empty() {
+                parked.remove(session_id);
+            }
             return;
         }
-        let room = PARKED_INPUT_CAP_BYTES.saturating_sub(buffered);
+        let room = PARKED_INPUT_CAP_BYTES
+            .saturating_sub(buffered)
+            .min(MAX_TOTAL_PARKED_INPUT_BYTES.saturating_sub(total_buffered));
         let kept = truncate_parked_input_bytes(&bytes, room);
         if kept.len() < bytes.len() {
             tracing::warn!(
@@ -1550,6 +1564,12 @@ impl SessionManager {
                 dropped_bytes = bytes.len() - kept.len(),
                 "parked input buffer cap reached; dropping excess denied input"
             );
+        }
+        if kept.is_empty() {
+            if entries.is_empty() {
+                parked.remove(session_id);
+            }
+            return;
         }
         match entries.iter_mut().find(|entry| entry.client == *client_id) {
             Some(existing) => existing.bytes.extend_from_slice(&kept),
@@ -1586,9 +1606,21 @@ impl SessionManager {
     /// parked in the interim. The original first-byte stamp is preserved
     /// (an older raced entry wins), so a failed flush never refreshes
     /// the TTL either.
-    fn restore_parked_entry(&self, session_id: &SessionId, entry: ParkedInput) {
+    fn restore_parked_entry(&self, session_id: &SessionId, mut entry: ParkedInput) {
         let mut parked = self.parked_input.lock().unwrap_or_else(|p| p.into_inner());
         Self::sweep_parked_input(&mut parked);
+        let entry_client = &entry.client;
+        let other_buffered: usize = parked
+            .iter()
+            .flat_map(|(sid, entries)| {
+                entries
+                    .iter()
+                    .filter(move |e| !(sid == session_id && e.client == *entry_client))
+            })
+            .map(|e| e.bytes.len())
+            .sum();
+        let entry_cap =
+            PARKED_INPUT_CAP_BYTES.min(MAX_TOTAL_PARKED_INPUT_BYTES.saturating_sub(other_buffered));
         let entries = parked.entry(session_id.clone()).or_default();
         match entries.iter_mut().find(|e| e.client == entry.client) {
             Some(existing) => {
@@ -1596,13 +1628,21 @@ impl SessionManager {
                 // are older and belong at the front; any cap overflow drops
                 // from the newer tail.
                 existing.parked_at = existing.parked_at.min(entry.parked_at);
-                let mut merged =
-                    truncate_parked_input_bytes(&entry.bytes, PARKED_INPUT_CAP_BYTES).into_owned();
-                let room = PARKED_INPUT_CAP_BYTES.saturating_sub(merged.len());
+                let mut merged = truncate_parked_input_bytes(&entry.bytes, entry_cap).into_owned();
+                let room = entry_cap.saturating_sub(merged.len());
                 merged.extend_from_slice(&truncate_parked_input_bytes(&existing.bytes, room));
                 existing.bytes = merged;
             }
-            None => entries.push(entry),
+            None => {
+                entry.bytes = truncate_parked_input_bytes(&entry.bytes, entry_cap).into_owned();
+                if !entry.bytes.is_empty() {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.retain(|e| !e.bytes.is_empty());
+        if entries.is_empty() {
+            parked.remove(session_id);
         }
     }
 
@@ -9783,22 +9823,16 @@ fn write_pty_chunk(writer: &SharedPtyWriter, bytes: &[u8]) -> std::io::Result<()
 }
 
 fn write_pty_input(writer: SharedPtyWriter, rx: Receiver<Vec<u8>>) {
-    while let Ok(bytes) = rx.recv() {
-        let mut write_err = false;
+    'recv_loop: while let Ok(bytes) = rx.recv() {
         if let Err(err) = write_pty_chunk(&writer, &bytes) {
             tracing::debug!(error = %err, "PTY write error; terminating writer thread");
-            write_err = true;
-        } else {
-            while let Ok(next) = rx.try_recv() {
-                if let Err(err) = write_pty_chunk(&writer, &next) {
-                    tracing::debug!(error = %err, "PTY write error; terminating writer thread");
-                    write_err = true;
-                    break;
-                }
-            }
-        }
-        if write_err {
             break;
+        }
+        while let Ok(next) = rx.try_recv() {
+            if let Err(err) = write_pty_chunk(&writer, &next) {
+                tracing::debug!(error = %err, "PTY write error; terminating writer thread");
+                break 'recv_loop;
+            }
         }
         let flush_ok = match writer.lock() {
             Ok(mut guard) => guard.flush().is_ok(),
@@ -14236,16 +14270,143 @@ mod tests {
             &*truncate_parked_input_bytes(emoji, 5),
             b"a\xf0\x9f\xa6\x80"
         );
+
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = SessionId::new("session-utf8-cap").expect("session id");
+        let client = ClientId::new("utf8-client").expect("client id");
+
+        // Initial-insert (`None` arm, `Cow::Owned`) over `PARKED_INPUT_CAP_BYTES`
+        // with a bracketed paste that splits a 3-byte UTF-8 codepoint at the cap.
+        let mut over_cap_paste = b"\x1b[200~a".to_vec();
+        while over_cap_paste.len() <= PARKED_INPUT_CAP_BYTES {
+            over_cap_paste.extend_from_slice("\u{4e16}".as_bytes());
+        }
+        over_cap_paste.extend_from_slice(b"\x1b[201~");
+        manager.park_denied_input(&session_id, &client, over_cap_paste);
+        let first_take = manager.take_parked_input(&session_id, &client);
+        assert!(first_take.len() <= PARKED_INPUT_CAP_BYTES);
+        assert!(first_take.ends_with(b"\x1b[201~"));
+        assert!(std::str::from_utf8(&first_take).is_ok());
+
+        // Initial-insert (`None` arm, `Cow::Borrowed` slice) over `PARKED_INPUT_CAP_BYTES`
+        // with plain multi-byte UTF-8 text.
+        let mut over_cap_plain = vec![b'a'];
+        while over_cap_plain.len() <= PARKED_INPUT_CAP_BYTES {
+            over_cap_plain.extend_from_slice("\u{4e16}".as_bytes());
+        }
+        manager.park_denied_input(&session_id, &client, over_cap_plain);
+        let plain_take = manager.take_parked_input(&session_id, &client);
+        assert!(plain_take.len() <= PARKED_INPUT_CAP_BYTES);
+        assert!(std::str::from_utf8(&plain_take).is_ok());
+
+        // Append (`Some(existing)` arm) that overflows `PARKED_INPUT_CAP_BYTES`
+        // inside a bracketed paste's second UTF-8 character.
+        manager.park_denied_input(
+            &session_id,
+            &client,
+            vec![b'x'; PARKED_INPUT_CAP_BYTES - 16],
+        );
+        manager.park_denied_input(&session_id, &client, payload.to_vec());
+        let appended_take = manager.take_parked_input(&session_id, &client);
+        assert_eq!(
+            &appended_take[PARKED_INPUT_CAP_BYTES - 16..],
+            b"\x1b[200~\xe4\xb8\x96\x1b[201~"
+        );
+        assert!(std::str::from_utf8(&appended_take).is_ok());
+
+        // `restore_parked_entry` merge overflow preserves UTF-8 and closing `\x1b[201~`.
+        manager.park_denied_input(
+            &session_id,
+            &client,
+            vec![b'y'; PARKED_INPUT_CAP_BYTES - 16],
+        );
+        let older_entry = manager
+            .take_parked_entry(&session_id, &client)
+            .expect("older entry");
+        manager.park_denied_input(&session_id, &client, payload.to_vec());
+        manager.restore_parked_entry(&session_id, older_entry);
+        let restored_take = manager.take_parked_input(&session_id, &client);
+        assert_eq!(
+            &restored_take[PARKED_INPUT_CAP_BYTES - 16..],
+            b"\x1b[200~\xe4\xb8\x96\x1b[201~"
+        );
+        assert!(std::str::from_utf8(&restored_take).is_ok());
+
+        // Daemon-wide cap (`MAX_TOTAL_PARKED_INPUT_BYTES`) bounds total parked bytes
+        // across sessions/clients so handover state stays under `MAX_HANDOVER_STATE_BYTES`.
+        let c1 = ClientId::new("total-cap-1").expect("client id");
+        let c2 = ClientId::new("total-cap-2").expect("client id");
+        let c3 = ClientId::new("total-cap-3").expect("client id");
+        manager.park_denied_input(&session_id, &c1, vec![b'1'; PARKED_INPUT_CAP_BYTES]);
+        manager.park_denied_input(&session_id, &c2, vec![b'2'; PARKED_INPUT_CAP_BYTES]);
+        manager.park_denied_input(&session_id, &c3, vec![b'3'; PARKED_INPUT_CAP_BYTES]);
+        assert_eq!(
+            manager.take_parked_input(&session_id, &c1).len()
+                + manager.take_parked_input(&session_id, &c2).len()
+                + manager.take_parked_input(&session_id, &c3).len(),
+            MAX_TOTAL_PARKED_INPUT_BYTES
+        );
+
+        // `restore_parked_entry` (`None` arm) also enforces `MAX_TOTAL_PARKED_INPUT_BYTES`
+        // when other clients fill the daemon-wide cap while `in_flight` is taken.
+        manager.park_denied_input(&session_id, &c3, payload.to_vec());
+        let in_flight = manager
+            .take_parked_entry(&session_id, &c3)
+            .expect("in-flight entry");
+        manager.park_denied_input(&session_id, &c1, vec![b'1'; PARKED_INPUT_CAP_BYTES]);
+        manager.park_denied_input(&session_id, &c2, vec![b'2'; PARKED_INPUT_CAP_BYTES - 16]);
+        manager.restore_parked_entry(&session_id, in_flight);
+        assert_eq!(
+            manager.take_parked_input(&session_id, &c3),
+            b"\x1b[200~\xe4\xb8\x96\x1b[201~"
+        );
+        // When `other_buffered` reaches `MAX_TOTAL_PARKED_INPUT_BYTES` (`entry_cap == 0`),
+        // `restore_parked_entry` drops the restored entry and cleans up an empty session key.
+        manager.park_denied_input(&session_id, &c2, vec![b'2'; 16]);
+        let other_session = SessionId::new("session-restore-zero-cap").expect("session id");
+        manager.park_denied_input(&other_session, &c3, b"hello".to_vec());
+        assert!(manager.take_parked_input(&other_session, &c3).is_empty());
+        manager.restore_parked_entry(
+            &other_session,
+            ParkedInput {
+                client: c3.clone(),
+                bytes: payload.to_vec(),
+                parked_at: Instant::now(),
+            },
+        );
+        assert!(manager.take_parked_input(&other_session, &c3).is_empty());
+        assert!(
+            !manager
+                .parked_input
+                .lock()
+                .expect("parked lock")
+                .contains_key(&other_session)
+        );
+        let _ = manager.take_parked_input(&session_id, &c1);
+        let _ = manager.take_parked_input(&session_id, &c2);
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     #[test]
     fn write_pty_chunk_retries_would_block_and_writes_all_bytes() {
         struct FlakyWriter {
             buf: Arc<Mutex<Vec<u8>>>,
+            max_chunk_seen: Arc<Mutex<usize>>,
             calls: usize,
         }
         impl Write for FlakyWriter {
             fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                assert!(
+                    data.len() <= PTY_WRITE_CHUNK_BYTES,
+                    "write_pty_chunk must cap each write call at PTY_WRITE_CHUNK_BYTES ({}), got {}",
+                    PTY_WRITE_CHUNK_BYTES,
+                    data.len()
+                );
+                let mut max_seen = self.max_chunk_seen.lock().expect("max_chunk_seen lock");
+                *max_seen = (*max_seen).max(data.len());
+                drop(max_seen);
                 self.calls += 1;
                 if self.calls % 2 == 1 {
                     return Err(std::io::Error::new(
@@ -14266,12 +14427,18 @@ mod tests {
         }
 
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let max_chunk_seen = Arc::new(Mutex::new(0usize));
         let writer: SharedPtyWriter = Arc::new(Mutex::new(Box::new(FlakyWriter {
             buf: Arc::clone(&captured),
+            max_chunk_seen: Arc::clone(&max_chunk_seen),
             calls: 0,
         })));
         let input: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
         write_pty_chunk(&writer, &input).expect("chunked pty write should succeed");
+        assert_eq!(
+            *max_chunk_seen.lock().expect("max_chunk_seen lock"),
+            PTY_WRITE_CHUNK_BYTES
+        );
         assert_eq!(
             *captured.lock().expect("captured buffer lock"),
             input,

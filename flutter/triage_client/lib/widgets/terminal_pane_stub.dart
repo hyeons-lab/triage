@@ -1854,9 +1854,10 @@ class _TerminalPaneState extends State<TerminalPane>
     );
   }
 
-  // The platform copy chord, matching terminal emulator conventions: Cmd+C on
-  // macOS/iOS, Ctrl+Shift+C elsewhere so plain Ctrl+C still reaches the program.
-  bool _isCopyChord() {
+  // Platform primary terminal shortcut modifiers: Cmd+<Key> on macOS/iOS,
+  // Ctrl+Shift+<Key> elsewhere so plain Ctrl+C (SIGINT) and Ctrl+A (0x01 /
+  // start-of-line in shells and readline) still reach the PTY.
+  bool _hasPrimaryTerminalShortcutModifiers() {
     final keys = HardwareKeyboard.instance;
     switch (defaultTargetPlatform) {
       case TargetPlatform.macOS:
@@ -1873,24 +1874,9 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
-  // Select-all chord: Cmd+A on macOS/iOS, Ctrl+Shift+A elsewhere so plain
-  // Ctrl+A (0x01 / start-of-line in shells and readline) still reaches the PTY.
-  bool _isSelectAllChord() {
-    final keys = HardwareKeyboard.instance;
-    switch (defaultTargetPlatform) {
-      case TargetPlatform.macOS:
-      case TargetPlatform.iOS:
-        return keys.isMetaPressed &&
-            !keys.isControlPressed &&
-            !keys.isAltPressed &&
-            !keys.isShiftPressed;
-      default:
-        return keys.isControlPressed &&
-            keys.isShiftPressed &&
-            !keys.isMetaPressed &&
-            !keys.isAltPressed;
-    }
-  }
+  bool _isCopyChord() => _hasPrimaryTerminalShortcutModifiers();
+
+  bool _isSelectAllChord() => _hasPrimaryTerminalShortcutModifiers();
 
   // The platform paste chord, matching terminal emulator conventions across
   // platforms: Cmd+V on macOS/iOS, Ctrl+Shift+V / Shift+Insert elsewhere so plain
