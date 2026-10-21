@@ -48,6 +48,16 @@ pending-input queue, and the daemon parked-input buffer.
   added unit tests for `resolveSelectionEndpoints`,
   `shiftCellOffsetForHistoryPage`, and `PendingInputBuffer` UTF-8 / bracketed
   paste truncation.
+- 2026-10-20T23:05-0700 `crates/triaged/src/session.rs`, `flutter/triage_client/lib/main.dart`, `flutter/triage_client/lib/widgets/terminal_pane_web.dart`, `flutter/triage_client/test/pending_input_buffer_test.dart`, `flutter/triage_client/test/terminal/terminal_selection_test.dart`:
+  dropped bracketed-paste payloads when remaining buffer room is under 12 bytes
+  so an unclosed `\x1b[200~` sequence is never emitted; returned `Cow<[u8]>`
+  from `truncate_parked_input_bytes` to avoid cloning fitting buffers; held the
+  `SharedPtyWriter` lock across immediately succeeding 4 KiB slices of a single
+  message in `write_pty_chunk` (releasing only across `WouldBlock` sleeps) so
+  `TerminalOutputSink` query responses cannot interleave mid-paste; matched
+  `Cmd+A` and `Ctrl+Shift+A` select-all chords in `attachCustomKeyEventHandler`;
+  and asserted captured `FlakyWriter` bytes and right-margin / 4-byte UTF-8
+  boundary cases in tests.
 
 ## Decisions
 
@@ -56,7 +66,8 @@ pending-input queue, and the daemon parked-input buffer.
 
 ## Commits
 
-- HEAD: fix: prevent copy and paste truncation across clients and daemon
+- 5fe90ef: fix: prevent copy and paste truncation across clients and daemon
+- HEAD: fix: address PR #198 review comments on paste truncation and PTY chunk locking
 
 ## Progress
 
