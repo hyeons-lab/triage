@@ -83,6 +83,17 @@ status; exited sessions carry no agent state.
   `_applySnapshotToSession`'s `uiChanged` gate in `main.dart`; simplified
   `mac_exe_path`; added `cargo:rerun-if-changed` for `src/stub_agent.rs` in
   `build.rs`; and added unit and widget tests.
+- **2026-10-21T09:38-0700** Addressed PR #177 review findings in
+  `crates/triaged/src/agent_detect.rs`: return `None` from `classify_argv` on
+  empty `argv` slices; restrict single-character subcommand aliases (`a`, `e`,
+  `v`) in `find_subcommand` to positional index `0` so multi-word unquoted
+  prompts (`codex fix a bug`) are not misclassified as subcommands; reject
+  leading-hyphen conversation IDs (`!id.starts_with('-')`) across
+  `is_clean_id`, `is_path_safe_id`, `resume_command`, `flag_value`,
+  `classify_codex`, and `classify_muse` to prevent CLI option injection;
+  strip Windows extended-length prefixes (`\\?\`), trim trailing separators,
+  and normalize path characters in `claude_project_dir`; and avoid aborting the
+  200-line scan in `muse_hit` when an earlier JSONL line lacks `payload.record`.
 
 ## Decisions
 
@@ -146,7 +157,8 @@ status; exited sessions carry no agent state.
 - 72cd45a: test(triaged): update Linux /dev/full tests for agent tracking fields
 - f5402cc: test(triaged): gate handover agent serialization test to Unix
 - a004a49: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
-- HEAD: fix(session): harden agent argv classification, exit detach guards, and generation checks
+- 4bcb4ae: fix(session): harden agent argv classification, exit detach guards, and generation checks
+- HEAD: fix(session): address PR #177 review findings in agent_detect
 
 ## Progress
 
