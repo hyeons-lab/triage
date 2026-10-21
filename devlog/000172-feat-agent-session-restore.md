@@ -1,4 +1,4 @@
-# 000169: Track foreground AI agents and resume conversations on restore
+# 000172: Track foreground AI agents and resume conversations on restore
 
 ## Agent
 
@@ -83,6 +83,17 @@ status; exited sessions carry no agent state.
   `_applySnapshotToSession`'s `uiChanged` gate in `main.dart`; simplified
   `mac_exe_path`; added `cargo:rerun-if-changed` for `src/stub_agent.rs` in
   `build.rs`; and added unit and widget tests.
+- **2026-10-21T09:38-0700** Addressed PR #177 review findings in
+  `crates/triaged/src/agent_detect.rs`: return `None` from `classify_argv` on
+  empty `argv` slices; restrict single-character subcommand aliases (`a`, `e`,
+  `v`) in `find_subcommand` to positional index `0` so multi-word unquoted
+  prompts (`codex fix a bug`) are not misclassified as subcommands; reject
+  leading-hyphen conversation IDs (`!id.starts_with('-')`) across
+  `is_clean_id`, `is_path_safe_id`, `resume_command`, `flag_value`,
+  `classify_codex`, and `classify_muse` to prevent CLI option injection;
+  strip Windows extended-length prefixes (`\\?\`), trim trailing separators,
+  and normalize path characters in `claude_project_dir`; and avoid aborting the
+  200-line scan in `muse_hit` when an earlier JSONL line lacks `payload.record`.
 
 ## Decisions
 
@@ -134,19 +145,20 @@ status; exited sessions carry no agent state.
 
 ## Commits
 
-- d44666c: feat(session): track foreground AI agents and resume conversations on restore
-- 1fd7199: fix(session): harden agent restore fallback and macOS argv parsing
-- 017e529: fix(session): gate Windows-observation tests and escape fixture paths
-- 289fb00: fix(session): address Antigravity review findings
-- d2dd3f3: fix(session): address R1 agent-review-loop findings
-- ae90479: fix(session): retry stub-agent observation for exec race
-- e8f2c6b: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
-- bb58a32: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
-- c0136e3: feat(session): add Grok agent tracking and conversation restore
-- 72cd45a: test(triaged): update Linux /dev/full tests for agent tracking fields
-- f5402cc: test(triaged): gate handover agent serialization test to Unix
-- a004a49: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
-- HEAD: fix(session): harden agent argv classification, exit detach guards, and generation checks
+- 32c59b1: feat(session): track foreground AI agents and resume conversations on restore
+- af4d736: fix(session): harden agent restore fallback and macOS argv parsing
+- e357130: fix(session): gate Windows-observation tests and escape fixture paths
+- bac9091: fix(session): address Antigravity review findings
+- 2987b7e: fix(session): address R1 agent-review-loop findings
+- 42a6d46: fix(session): retry stub-agent observation for exec race
+- 9bd45ed: chore(devlog): renumber devlog and plan to 000153 after rebase onto main
+- 292eeab: fix(session): address R2-R5 agent-review-loop findings and harden agent restore
+- f2810c8: feat(session): add Grok agent tracking and conversation restore
+- ce0149c: test(triaged): update Linux /dev/full tests for agent tracking fields
+- 7ea1c8b: test(triaged): gate handover agent serialization test to Unix
+- fb0cde3: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
+- bfbdde7: fix(session): harden agent argv classification, exit detach guards, and generation checks
+- HEAD: fix(session): address PR #177 review findings in agent_detect
 
 ## Progress
 
