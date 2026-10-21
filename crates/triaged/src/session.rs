@@ -2205,6 +2205,7 @@ impl SessionManager {
             raw_output_prefix: Vec::new(),
             snippet: None,
             snippet_detail: None,
+            agent: None,
         };
         let overlaid = overlay_raw_output_history(
             base,
@@ -9163,6 +9164,7 @@ fn metadata_snapshot_from_output(
         raw_output_prefix: Vec::new(),
         snippet: None,
         snippet_detail: None,
+        agent: None,
     }
 }
 

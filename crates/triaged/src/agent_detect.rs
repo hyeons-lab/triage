@@ -36,6 +36,9 @@ pub struct AgentArgv {
 /// (`--help`, `--version`, `mcp`/`login` bookkeeping subcommands, ...),
 /// so session plumbing never masquerades as an agent to resume.
 pub fn classify_argv(kind: AgentKind, argv: &[String]) -> Option<AgentArgv> {
+    if argv.is_empty() {
+        return None;
+    }
     let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
     match kind {
         AgentKind::Claude => classify_claude(&args),
@@ -95,7 +98,12 @@ fn positional_tokens_split<'a>(args: &[&'a str], value_flags: &[&str]) -> (Vec<&
 /// misclassifies; that needs a standalone subcommand word among
 /// unquoted prompt tokens.
 fn find_subcommand(positionals: &[&str], known: &[&str]) -> Option<usize> {
-    positionals.iter().position(|token| known.contains(token))
+    positionals.iter().enumerate().position(|(idx, token)| {
+        // Single-character subcommand aliases (`a`, `e`, `v`) are only
+        // valid at the head of positionals; deeper occurrences inside
+        // unquoted prompts (`codex fix a bug`) are ordinary words.
+        (token.len() > 1 || idx == 0) && known.contains(token)
+    })
 }
 
 /// Value of `--flag value` or `--flag=value` for a long flag: the last
@@ -116,7 +124,7 @@ fn flag_value<'a>(args: &[&'a str], flag: &str, equals_form: bool) -> Option<&'a
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         if equals_form && let Some(value) = arg.strip_prefix(&prefix) {
-            if !value.is_empty() {
+            if !value.is_empty() && !value.starts_with('-') {
                 seen = Some(value);
             }
             continue;
@@ -386,7 +394,12 @@ fn classify_codex(args: &[&str]) -> Option<AgentArgv> {
         "resume" => Some(AgentArgv {
             mode: AgentRunMode::Interactive,
             conversation_id: (!has_any(before_dash, &["--last"]))
-                .then(|| positionals.get(at + 1).copied())
+                .then(|| {
+                    positionals
+                        .get(at + 1)
+                        .copied()
+                        .filter(|id| !id.is_empty() && !id.starts_with('-'))
+                })
                 .flatten()
                 .map(ToString::to_string),
         }),
@@ -573,7 +586,12 @@ fn classify_muse(args: &[&str]) -> Option<AgentArgv> {
         "resume" => Some(AgentArgv {
             mode: AgentRunMode::Interactive,
             conversation_id: (!has_any(before_dash, &["--last"]))
-                .then(|| positionals.get(at + 1).copied())
+                .then(|| {
+                    positionals
+                        .get(at + 1)
+                        .copied()
+                        .filter(|id| !id.is_empty() && !id.starts_with('-'))
+                })
                 .flatten()
                 .map(ToString::to_string),
         }),
@@ -719,6 +737,7 @@ pub fn resume_command(
     conversation_id: Option<&str>,
     exe_path: Option<&Path>,
 ) -> (String, Vec<String>) {
+    let conversation_id = conversation_id.filter(|id| is_clean_id(id));
     let args: Vec<String> = match (kind, conversation_id) {
         (AgentKind::Claude, Some(id)) => vec!["--resume".into(), id.into()],
         (AgentKind::Claude, None) => vec!["--continue".into()],
@@ -774,18 +793,26 @@ pub fn transcript_store_root(kind: AgentKind) -> Option<PathBuf> {
 
 /// Claude's project directory for a cwd: the absolute path with every `/`
 /// replaced by `-` (e.g. `/Users/me/repo` becomes `-Users-me-repo`).
-/// `\` and `:` are replaced too, so a Windows path can never make the
-/// slug absolute and discard the store root at `join` time.
+/// `\` and `:` (plus Windows verbatim `\\?\` prefixes and reserved
+/// filename characters) are normalized too, so a Windows path can never
+/// make the slug absolute or produce an invalid directory name.
 /// Returns `None` for relative cwds, which have no stable mapping.
 pub fn claude_project_dir(projects_root: &Path, cwd: &Path) -> Option<PathBuf> {
     if !cwd.is_absolute() {
         return None;
     }
-    let slug: String = cwd
-        .to_string_lossy()
+    let cwd_str = cwd.to_string_lossy();
+    let stripped = cwd_str.strip_prefix(r"\\?\").unwrap_or(&cwd_str);
+    let trimmed = stripped.trim_end_matches(['/', '\\']);
+    let source = if trimmed.is_empty() {
+        stripped
+    } else {
+        trimmed
+    };
+    let slug: String = source
         .chars()
         .map(|c| {
-            if c == '/' || c == '\\' || c == ':' {
+            if matches!(c, '/' | '\\' | ':' | '?' | '*' | '<' | '>' | '|' | '"') {
                 '-'
             } else {
                 c
@@ -1047,21 +1074,23 @@ fn muse_hit(path: &Path, want_cwd: &Path, pid: Option<u32>) -> Option<Transcript
         };
         match value.get("payload_type").and_then(|t| t.as_str()) {
             Some("runtime.session.route_facts") => {
-                let record = value.get("payload")?.get("record")?;
-                cwd = record
-                    .get("cwd")
-                    .and_then(|c| c.as_str())
-                    .map(PathBuf::from);
-                // `try_from` (not `as`): a huge pid must degrade to a
-                // cwd-only candidate, never wrap into a false pid match.
-                recorded_pid = record
-                    .get("pid")
-                    .and_then(|p| p.as_u64())
-                    .and_then(|p| u32::try_from(p).ok());
+                if let Some(record) = value.get("payload").and_then(|p| p.get("record")) {
+                    cwd = record
+                        .get("cwd")
+                        .and_then(|c| c.as_str())
+                        .map(PathBuf::from);
+                    // `try_from` (not `as`): a huge pid must degrade to a
+                    // cwd-only candidate, never wrap into a false pid match.
+                    recorded_pid = record
+                        .get("pid")
+                        .and_then(|p| p.as_u64())
+                        .and_then(|p| u32::try_from(p).ok());
+                }
             }
             Some("runtime.session") => {
-                let record = value.get("payload")?.get("record")?;
-                top_level = Some(record.get("parent_task_id").is_none_or(|v| v.is_null()));
+                if let Some(record) = value.get("payload").and_then(|p| p.get("record")) {
+                    top_level = Some(record.get("parent_task_id").is_none_or(|v| v.is_null()));
+                }
             }
             _ => {}
         }
@@ -1248,18 +1277,21 @@ pub fn observe_pid(
     observe_process(&process, cwd.as_deref(), now, max_transcript_age)
 }
 
-/// True when a conversation id is safe to keep: non-empty with no
-/// control characters, so ids from argv, transcripts, or filenames can
-/// never smuggle terminal escapes into badges, logs, or resume argv.
+/// True when a conversation id is safe to keep: non-empty, not flag-like
+/// (never starts with `-`), and free of control characters, so ids from
+/// argv, transcripts, or filenames can never inject CLI options or smuggle
+/// terminal escapes into badges, logs, or resume argv.
 fn is_clean_id(id: &str) -> bool {
-    !id.is_empty() && !id.chars().any(|c| c.is_control())
+    !id.is_empty() && !id.starts_with('-') && !id.chars().any(|c| c.is_control())
 }
 
 /// True when an argv-supplied conversation id is safe to join into a
-/// transcript path: a single file stem with no separators, so a hostile
-/// or display-name id can never escape the project directory.
+/// transcript path: a single non-flag file stem with no separators, so a
+/// hostile or display-name id can never escape the project directory or
+/// inject CLI flags.
 fn is_path_safe_id(id: &str) -> bool {
     !id.is_empty()
+        && !id.starts_with('-')
         && id != "."
         && id != ".."
         && id
@@ -2060,6 +2092,37 @@ mod tests {
             classify_argv(AgentKind::Codex, &argv(&["codex", "resume", "--", "abc"])),
             interactive(Some("abc"))
         );
+        // Single-character subcommand aliases (`a` for `apply`, `e` for
+        // `exec`) only match at the first positional; deeper occurrences
+        // in unquoted prompts are ordinary English words.
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "fix", "a", "bug"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Codex,
+                &argv(&["codex", "explain", "e", "to", "me"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "e", "ls"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "a"])),
+            None
+        );
+        // Flag-like tokens after `resume --` are rejected rather than
+        // captured as conversation ids.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Codex,
+                &argv(&["codex", "resume", "--", "--dangerously-skip-permissions"])
+            ),
+            interactive(None)
+        );
     }
 
     #[test]
@@ -2423,6 +2486,25 @@ mod tests {
             classify_argv(AgentKind::Grok, &argv(&["grok", "--help"])),
             None
         );
+        // Single-character alias `v` (`version`) at a non-initial positional
+        // inside an unquoted prompt stays interactive.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Grok,
+                &argv(&["grok", "compare", "v", "and", "w"])
+            ),
+            interactive(None)
+        );
+        // Empty argv slices never classify as interactive agent runs.
+        for kind in [
+            AgentKind::Claude,
+            AgentKind::Codex,
+            AgentKind::Antigravity,
+            AgentKind::Muse,
+            AgentKind::Grok,
+        ] {
+            assert_eq!(classify_argv(kind, &[]), None);
+        }
     }
 
     #[test]
@@ -2517,6 +2599,18 @@ mod tests {
             claude_project_dir(root, Path::new("/Users/me/repo")),
             Some(root.join("-Users-me-repo"))
         );
+        assert_eq!(
+            claude_project_dir(root, Path::new("/Users/me/repo/")),
+            Some(root.join("-Users-me-repo"))
+        );
+        assert_eq!(
+            claude_project_dir(root, Path::new("/")),
+            Some(root.join("-"))
+        );
+        assert_eq!(
+            claude_project_dir(root, Path::new(r"/Users/me/\\?\C:\repo/")),
+            Some(root.join("-Users-me-----C--repo"))
+        );
         assert_eq!(claude_project_dir(root, Path::new("repo")), None);
     }
 
@@ -2528,6 +2622,10 @@ mod tests {
         // cannot discard the store root.
         assert_eq!(
             claude_project_dir(root, Path::new(r"C:\repo")),
+            Some(root.join("C--repo"))
+        );
+        assert_eq!(
+            claude_project_dir(root, Path::new(r"\\?\C:\repo\")),
             Some(root.join("C--repo"))
         );
         assert_eq!(claude_project_dir(root, Path::new("repo")), None);
@@ -2544,6 +2642,25 @@ mod tests {
         assert!(!is_path_safe_id("a/b"));
         assert!(!is_path_safe_id("a\\b"));
         assert!(!is_path_safe_id("display name"));
+        assert!(!is_path_safe_id("-flag"));
+        assert!(!is_path_safe_id("--dangerously-skip-permissions"));
+        assert!(!is_clean_id("-flag"));
+        assert!(!is_clean_id("--dangerously-skip-permissions"));
+        assert_eq!(
+            resume_command(
+                AgentKind::Claude,
+                Some("--dangerously-skip-permissions"),
+                None,
+            ),
+            ("claude".to_string(), vec!["--continue".to_string()])
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--resume=--dangerously-skip-permissions"]),
+            ),
+            interactive(None)
+        );
     }
 
     #[test]
@@ -2793,6 +2910,23 @@ mod tests {
         match correlate(AgentKind::Muse, Some(&root), &cwd, Some(333), now, max_age) {
             Correlation::Single(hit) => assert_eq!(hit.conversation_id, "bbb"),
             other => panic!("expected pid-disambiguated hit, got {other:?}"),
+        }
+        // An earlier envelope line missing `payload` or `record` must be
+        // skipped rather than aborting the scan before valid lines.
+        let malformed_then_valid = format!(
+            "{{\"payload_type\":\"runtime.session.route_facts\",\"payload\":null}}\n\
+             {{\"payload_type\":\"runtime.session\",\"payload\":{{}}}}\n\
+             {}\n{}\n",
+            facts(&cwd.to_string_lossy(), 555),
+            top,
+        );
+        write(
+            &day.join("ccc").join("session.jsonl"),
+            &malformed_then_valid,
+        );
+        match correlate(AgentKind::Muse, Some(&root), &cwd, Some(555), now, max_age) {
+            Correlation::Single(hit) => assert_eq!(hit.conversation_id, "ccc"),
+            other => panic!("expected hit after malformed envelope line, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
     }
