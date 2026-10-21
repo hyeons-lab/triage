@@ -136,9 +136,13 @@ fn flag_value<'a>(args: &[&'a str], flag: &str, equals_form: bool) -> Option<&'a
     seen
 }
 
-/// True when any arg is one of the given flags.
+/// True when any arg is one of the given flags (including `--flag=value`
+/// spellings).
 fn has_any(args: &[&str], flags: &[&str]) -> bool {
-    args.iter().any(|a| flags.contains(a))
+    args.iter().any(|a| {
+        let name = a.split('=').next().unwrap_or(*a);
+        flags.contains(&name)
+    })
 }
 
 /// True for `--help`/`--version` style invocations, which are never
@@ -174,6 +178,7 @@ const CLAUDE_SUBCOMMANDS: &[&str] = &[
     "plugin",
     "plugins",
     "project",
+    "purge",
     "respawn",
     "rm",
     "setup-token",
@@ -240,12 +245,14 @@ const CLAUDE_VALUE_FLAGS: &[&str] = &[
 ];
 
 fn classify_claude(args: &[&str]) -> Option<AgentArgv> {
+    let dash = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let before_dash = &args[..dash];
     // `-v` is Claude's version short flag alongside `-V`.
-    if requests_help_or_version(args) || has_any(args, &["-v"]) {
+    if requests_help_or_version(before_dash) || has_any(before_dash, &["-v"]) {
         return None;
     }
-    let positionals = positional_tokens(args, CLAUDE_VALUE_FLAGS);
-    match positionals.first().copied() {
+    let (positionals, boundary) = positional_tokens_split(args, CLAUDE_VALUE_FLAGS);
+    match positionals[..boundary].first().copied() {
         // `claude attach <id>` opens a background session: interactive,
         // with the id when given.
         Some("attach") => Some(AgentArgv {
@@ -263,16 +270,28 @@ fn classify_claude(args: &[&str]) -> Option<AgentArgv> {
         // Bare `claude`, `claude "prompt"`, or an unknown token: the
         // interactive session, with the id when flag-carried.
         _ => {
-            let mode = if has_any(args, &["--print", "-p"]) {
+            let mode = if has_any(
+                before_dash,
+                &["--print", "-p", "--bg", "--background", "--desktop"],
+            ) {
                 AgentRunMode::Headless
             } else {
                 AgentRunMode::Interactive
             };
+            let fork = has_any(before_dash, &["--fork-session"]);
+            let conversation_id = long_flag_value(before_dash, "--session-id")
+                .or_else(|| {
+                    (!fork)
+                        .then(|| {
+                            long_flag_value(before_dash, "--resume")
+                                .or_else(|| short_flag_value(before_dash, "-r"))
+                        })
+                        .flatten()
+                })
+                .map(str::to_string);
             Some(AgentArgv {
                 mode,
-                conversation_id: long_flag_value(args, "--resume")
-                    .or_else(|| short_flag_value(args, "-r"))
-                    .map(str::to_string),
+                conversation_id,
             })
         }
     }
@@ -343,7 +362,8 @@ fn classify_codex(args: &[&str]) -> Option<AgentArgv> {
     // launches instead of printing help), so help and subcommand scans
     // cover only the tokens before it.
     let dash = args.iter().position(|a| *a == "--").unwrap_or(args.len());
-    if requests_help_or_version(&args[..dash]) {
+    let before_dash = &args[..dash];
+    if requests_help_or_version(before_dash) {
         return None;
     }
     let (positionals, boundary) = positional_tokens_split(args, CODEX_VALUE_FLAGS);
@@ -360,10 +380,22 @@ fn classify_codex(args: &[&str]) -> Option<AgentArgv> {
             mode: AgentRunMode::Headless,
             conversation_id: None,
         }),
-        // `codex resume [SESSION_ID] [PROMPT]`: the id is the next positional.
+        // `codex resume [SESSION_ID] [PROMPT]`: the id is the next
+        // positional unless `--last` is passed (where the positional is
+        // the prompt).
         "resume" => Some(AgentArgv {
             mode: AgentRunMode::Interactive,
-            conversation_id: positionals.get(at + 1).map(ToString::to_string),
+            conversation_id: (!has_any(before_dash, &["--last"]))
+                .then(|| positionals.get(at + 1).copied())
+                .flatten()
+                .map(ToString::to_string),
+        }),
+        // `codex fork` opens a new interactive session forked from a prior
+        // one; its positional is the source session, so transcript
+        // correlation supplies the new id.
+        "fork" => Some(AgentArgv {
+            mode: AgentRunMode::Interactive,
+            conversation_id: None,
         }),
         // Bookkeeping subcommands are not agent runs.
         _ => None,
@@ -385,6 +417,12 @@ const AGY_VALUE_FLAGS: &[&str] = &[
     "--output-format",
     "--json-schema",
     "--print-timeout",
+    "-i",
+    "--prompt-interactive",
+    "-p",
+    "--print",
+    "--prompt",
+    "-v",
 ];
 
 /// Subcommands agy treats as something other than the interactive
@@ -429,10 +467,13 @@ fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
     let normalized = normalize_agy_args(args);
     let loaned: Vec<&str> = normalized.iter().map(String::as_str).collect();
     let args = loaned.as_slice();
+    let dash = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let before_dash = &args[..dash];
     // Bare `help` is NOT matched anywhere: Go reads only Args()[0], so a
     // later `help` is prompt text (the first-positional `help` below
-    // still covers the real help subcommand).
-    if has_any(args, &["--help", "-h"]) {
+    // still covers the real help subcommand). `-version` is rewritten to
+    // `--version` above; `-v` is the verbose log level flag, not version.
+    if has_any(before_dash, &["--help", "-h", "--version"]) {
         return None;
     }
     if positional_tokens(args, AGY_VALUE_FLAGS)
@@ -441,14 +482,14 @@ fn classify_agy(args: &[&str]) -> Option<AgentArgv> {
     {
         return None;
     }
-    let mode = if has_any(args, &["--print", "-p", "--prompt"]) {
+    let mode = if has_any(before_dash, &["--print", "-p", "--prompt"]) {
         AgentRunMode::Headless
     } else {
         AgentRunMode::Interactive
     };
     Some(AgentArgv {
         mode,
-        conversation_id: long_flag_value(args, "--conversation").map(str::to_string),
+        conversation_id: long_flag_value(before_dash, "--conversation").map(str::to_string),
     })
 }
 
@@ -468,6 +509,8 @@ const MUSE_SUBCOMMANDS: &[&str] = &[
     "serve",
     "session-message",
     "mcp",
+    "model-profile",
+    "voice",
     "auth",
     "login",
     "logout",
@@ -481,6 +524,10 @@ const MUSE_SUBCOMMANDS: &[&str] = &[
 /// Leaving it unlisted keeps both readings working through the
 /// subcommand scan; listing it would eat the subcommand itself.
 const MUSE_VALUE_FLAGS: &[&str] = &[
+    "-c",
+    "--config",
+    "--contributor-mode",
+    "--effort",
     "--workspace",
     "--model",
     "--provider",
@@ -507,6 +554,8 @@ fn classify_muse(args: &[&str]) -> Option<AgentArgv> {
     if requests_help_or_version(args) {
         return None;
     }
+    let dash = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let before_dash = &args[..dash];
     let (positionals, boundary) = positional_tokens_split(args, MUSE_VALUE_FLAGS);
     let Some(at) = find_subcommand(&positionals[..boundary], MUSE_SUBCOMMANDS) else {
         // Bare `muse`, `muse "prompt"`, or an unknown token (prompt text).
@@ -523,7 +572,10 @@ fn classify_muse(args: &[&str]) -> Option<AgentArgv> {
         // `muse resume [--last|<session-ref>]`.
         "resume" => Some(AgentArgv {
             mode: AgentRunMode::Interactive,
-            conversation_id: positionals.get(at + 1).map(ToString::to_string),
+            conversation_id: (!has_any(before_dash, &["--last"]))
+                .then(|| positionals.get(at + 1).copied())
+                .flatten()
+                .map(ToString::to_string),
         }),
         // Bookkeeping subcommands are not agent runs.
         _ => None,
@@ -639,11 +691,18 @@ fn classify_grok(args: &[&str]) -> Option<AgentArgv> {
     } else {
         AgentRunMode::Interactive
     };
+    let fork = has_any(before_dash, &["--fork-session"]);
     let conversation_id = long_flag_value(before_dash, "--session-id")
         .or_else(|| short_flag_value(before_dash, "-s"))
-        .or_else(|| long_flag_value(before_dash, "--resume"))
-        .or_else(|| short_flag_value(before_dash, "-r"))
-        .or_else(|| long_flag_value(before_dash, "--load"))
+        .or_else(|| {
+            (!fork)
+                .then(|| {
+                    long_flag_value(before_dash, "--resume")
+                        .or_else(|| short_flag_value(before_dash, "-r"))
+                        .or_else(|| long_flag_value(before_dash, "--load"))
+                })
+                .flatten()
+        })
         .map(str::to_string);
     Some(AgentArgv {
         mode,
@@ -1336,18 +1395,17 @@ fn mac_exe_path(pid: u32) -> Option<PathBuf> {
     // Kernel pids fit `c_int`; refuse to wrap instead of querying the
     // wrong process at the FFI boundary.
     let pid = libc::c_int::try_from(pid).ok()?;
-    let mut buf = vec![0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: `buf` is a writable `PROC_PIDPATHINFO_MAXSIZE` buffer, the
     // documented size for `proc_pidpath`.
     let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if len <= 0 {
         return None;
     }
-    let path =
-        std::ffi::CStr::from_bytes_until_nul(&buf.iter().map(|c| *c as u8).collect::<Vec<_>>())
-            .ok()?
-            .to_string_lossy()
-            .into_owned();
+    let path = std::ffi::CStr::from_bytes_until_nul(&buf)
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
     Some(PathBuf::from(path))
 }
 
@@ -1786,6 +1844,76 @@ mod tests {
             classify_argv(AgentKind::Claude, &argv(&["claude", "-r", ""])),
             interactive(None)
         );
+        // `--session-id` carries an explicit session UUID; `--fork-session`
+        // mints a new session from `--resume`, so `--resume`'s source id
+        // must not be recorded as the new conversation's id.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--session-id", "sid-1"])
+            ),
+            interactive(Some("sid-1"))
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--resume", "old", "--fork-session"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&[
+                    "claude",
+                    "--resume",
+                    "old",
+                    "--fork-session",
+                    "--session-id",
+                    "new-id"
+                ])
+            ),
+            interactive(Some("new-id"))
+        );
+        // Detached background and desktop handoff flags are non-TUI runs.
+        for flag in ["--bg", "--background", "--desktop"] {
+            assert_eq!(
+                classify_argv(AgentKind::Claude, &argv(&["claude", flag])),
+                headless(),
+                "claude {flag} must classify as headless",
+            );
+        }
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "purge"])),
+            None
+        );
+        // Commander ends option and subcommand parsing at `--`.
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "--", "--help"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "--", "--print"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Claude, &argv(&["claude", "--", "mcp"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "--", "--resume", "abc"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Claude,
+                &argv(&["claude", "attach", "--", "sess-9"])
+            ),
+            interactive(Some("sess-9"))
+        );
     }
 
     #[test]
@@ -1843,6 +1971,24 @@ mod tests {
         );
         assert_eq!(
             classify_argv(AgentKind::Codex, &argv(&["codex", "resume", "--last"])),
+            interactive(None)
+        );
+        // Positional after `resume --last` is the prompt, not a session id.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Codex,
+                &argv(&["codex", "resume", "--last", "fix the bug"])
+            ),
+            interactive(None)
+        );
+        // `codex fork` opens a new interactive session whose positional
+        // names the source session, not the new session id.
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "fork"])),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Codex, &argv(&["codex", "fork", "old-id"])),
             interactive(None)
         );
         assert_eq!(
@@ -1989,6 +2135,54 @@ mod tests {
             classify_argv(AgentKind::Antigravity, &argv(&["agy", "-help"])),
             None
         );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "--version"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "-version"])),
+            None
+        );
+        // `--flag=value` and `-flag=value` spellings on headless flags.
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "--print=hi"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "-print=hi"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Antigravity, &argv(&["agy", "--prompt=hi"])),
+            headless()
+        );
+        // `-i`/`--prompt-interactive` and `-v` consume their argument, so a
+        // prompt or log level that spells a subcommand is not misread, and
+        // a real subcommand after the value still dispatches.
+        for flag in ["-i", "--prompt-interactive", "-v"] {
+            assert_eq!(
+                classify_argv(AgentKind::Antigravity, &argv(&["agy", flag, "mcp"])),
+                interactive(None),
+                "{flag} must consume the following token",
+            );
+            assert_eq!(
+                classify_argv(
+                    AgentKind::Antigravity,
+                    &argv(&["agy", flag, "info", "mcp", "list"])
+                ),
+                None,
+                "{flag} must leave the subcommand after its value visible",
+            );
+        }
+        // Go's `flag` package stops parsing flags at `--`, so flag-like
+        // prompt tokens after `--` are ignored by flag checks.
+        assert_eq!(
+            classify_argv(
+                AgentKind::Antigravity,
+                &argv(&["agy", "--", "-p", "--help", "--conversation", "fake"])
+            ),
+            interactive(None)
+        );
     }
 
     #[test]
@@ -2008,6 +2202,36 @@ mod tests {
             classify_argv(AgentKind::Muse, &argv(&["muse", "resume", "--last"])),
             interactive(None)
         );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Muse,
+                &argv(&["muse", "resume", "--last", "fix the bug"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "model-profile"])),
+            None
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Muse, &argv(&["muse", "voice"])),
+            None
+        );
+        for flag in ["-c", "--config", "--contributor-mode", "--effort"] {
+            assert_eq!(
+                classify_argv(AgentKind::Muse, &argv(&["muse", flag, "exec"])),
+                interactive(None),
+                "{flag} must consume the following token",
+            );
+            assert_eq!(
+                classify_argv(
+                    AgentKind::Muse,
+                    &argv(&["muse", flag, "val", "resume", "abc"])
+                ),
+                interactive(Some("abc")),
+                "{flag} must leave the subcommand after its value visible",
+            );
+        }
         // `--flag=value` never swallows the following subcommand.
         assert_eq!(
             classify_argv(
@@ -2095,13 +2319,30 @@ mod tests {
             classify_argv(AgentKind::Grok, &argv(&["grok", "--session-id", "abc"])),
             interactive(Some("abc"))
         );
-        // `--session-id` names the forked session when combined with `--resume`.
+        // `--session-id` names the forked session when combined with `--resume`;
+        // without `--session-id`, `--fork-session` mints a fresh id, so the
+        // source `--resume` id is not reused.
         assert_eq!(
             classify_argv(
                 AgentKind::Grok,
                 &argv(&["grok", "--resume", "old", "--fork-session", "-s", "new-id"])
             ),
             interactive(Some("new-id"))
+        );
+        assert_eq!(
+            classify_argv(
+                AgentKind::Grok,
+                &argv(&["grok", "--resume", "old", "--fork-session"])
+            ),
+            interactive(None)
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--single=hi"])),
+            headless()
+        );
+        assert_eq!(
+            classify_argv(AgentKind::Grok, &argv(&["grok", "--prompt-file=p.txt"])),
+            headless()
         );
         // Bare `-r`/`--resume` and `-c`/`--continue` resume the most recent.
         assert_eq!(
