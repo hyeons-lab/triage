@@ -163,6 +163,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   /// an outright throw, like [emptyIdStartSessionCommands].
   final Set<String> emptyIdSubscribeSessions = {};
   final Map<String, List<String>> snapshotVisibleRows = {};
+  final Map<String, Map<String, dynamic>?> snapshotAgents = {};
   final Map<String, List<String>> resizedVisibleRows = {};
   final Map<String, Completer<Map<String, dynamic>>> snapshotCompleters = {};
   final Map<String, Completer<Map<String, dynamic>>> attachCompleters = {};
@@ -330,6 +331,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           'snapshot': {
             'size': _snapshotSize,
             'exited': exitedSessionIds.contains(sessionId),
+            'agent': snapshotAgents[sessionId],
             ..._historyKeysFor(sessionId, historyBytes),
             'visible_rows': visibleRows,
             'styled_rows': visibleRows
@@ -373,6 +375,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
           },
           'size': _snapshotSize,
           'exited': exitedSessionIds.contains(sessionId),
+          'agent': snapshotAgents[sessionId],
           'styled_rows': [
             {
               'spans': [
@@ -440,6 +443,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       'snapshot': {
         'size': _snapshotSize,
         'exited': exitedSessionIds.contains(sessionId),
+        'agent': snapshotAgents[sessionId],
         if (visibleRows != null) ...{
           'visible_rows': visibleRows,
           'styled_rows': visibleRows
@@ -1835,6 +1839,65 @@ void main() {
     expect(find.text('fresh after switch back'), findsOneWidget);
     expect(find.text('line 1 from flutter-spike'), findsNothing);
   });
+
+  testWidgets(
+    'refreshes rail agent badge on re-select even when terminal rows are static',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient();
+      client.snapshotVisibleRows['flutter-spike'] = ['static row'];
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
+      expect(find.text('claude abc12345'), findsNothing);
+
+      await tester.tap(find.text('triage / main'));
+      await tester.pumpAndSettle();
+
+      // Park the re-select attach until after `_selectSession`'s own
+      // `setState` and `_activityResortTimer` have settled, so only
+      // `_applySnapshotToSession` can trigger the rebuild that paints the
+      // updated agent badge.
+      final attachRefresh = Completer<Map<String, dynamic>>();
+      client.snapshotCompleters['flutter-spike'] = attachRefresh;
+      await tester.tap(find.text('triage / flutter-spike').first);
+      await tester.pumpAndSettle();
+      expect(find.text('claude abc12345'), findsNothing);
+
+      attachRefresh.complete({
+        'snapshot': {
+          'size': {'rows': 24, 'cols': 80},
+          'exited': false,
+          'visible_rows': ['static row'],
+          'agent': const {'kind': 'claude', 'conversation_id': 'abc12345ef'},
+        },
+      });
+      client.snapshotCompleters.remove('flutter-spike');
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('claude abc12345'), findsOneWidget);
+
+      await tester.tap(find.text('main').first);
+      await tester.pumpAndSettle();
+
+      final detachRefresh = Completer<Map<String, dynamic>>();
+      client.snapshotCompleters['flutter-spike'] = detachRefresh;
+      await tester.tap(find.text('triage / flutter-spike').first);
+      await tester.pumpAndSettle();
+      expect(find.text('claude abc12345'), findsOneWidget);
+
+      detachRefresh.complete({
+        'snapshot': {
+          'size': {'rows': 24, 'cols': 80},
+          'exited': false,
+          'visible_rows': ['static row'],
+          'agent': null,
+        },
+      });
+      client.snapshotCompleters.remove('flutter-spike');
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('claude abc12345'), findsNothing);
+    },
+  );
 
   testWidgets('redraws the active session when resuming after occlusion', (
     WidgetTester tester,

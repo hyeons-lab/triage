@@ -1574,6 +1574,39 @@ class TriageWebSocketClient {
       'snippet': snap.snippet,
       // Local-LLM longer-form summary for the hover popover / search.
       'snippet_detail': snap.snippetDetail,
+      // Foreground AI coding agent observed by the daemon, if any. Shape
+      // matches the JSON protocol's serde keys.
+      'agent': _parseAgentAttachment(snap.agent),
+    };
+  }
+
+  Map<String, dynamic>? _parseAgentAttachment(fbs.AgentAttachment? agent) {
+    if (agent == null) return null;
+    // An unknown enum value throws inside the generated getter; degrade
+    // the kind, never the whole attachment (a throw here would drop the
+    // snapshot and strand the request's completer). The badge falls back
+    // to 'agent' on a null kind, so a future agent stays recognizable.
+    String? kindName;
+    try {
+      // Explicit strings, not `kind.name.toLowerCase()`: the first
+      // multi-word kind would otherwise report a different string than
+      // the JSON transport's serde `snake_case`.
+      kindName = switch (agent.kind) {
+        fbs.AgentKind.Claude => 'claude',
+        fbs.AgentKind.Codex => 'codex',
+        fbs.AgentKind.Antigravity => 'antigravity',
+        fbs.AgentKind.Muse => 'muse',
+        fbs.AgentKind.Grok => 'grok',
+      };
+    } on StateError {
+      kindName = null;
+    }
+    return {
+      'kind': kindName,
+      'conversation_id': agent.conversationId,
+      'transcript_path': agent.transcriptPath,
+      'exe_path': agent.exePath,
+      'last_seen_ms': agent.lastSeenMs,
     };
   }
 
