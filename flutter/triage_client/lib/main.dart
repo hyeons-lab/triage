@@ -1047,7 +1047,10 @@ class PendingInputBuffer {
   static List<int> _truncateToRoom(List<int> bytes, int room) {
     if (room <= 0) return const <int>[];
     if (bytes.length <= room) return bytes;
-    if (_isBracketedPaste(bytes) && room >= 12) {
+    if (_isBracketedPaste(bytes)) {
+      if (room < _bracketedPasteStart.length + _bracketedPasteEnd.length) {
+        return const <int>[];
+      }
       final bodyEnd = _utf8SafePrefixLength(
         bytes,
         room - _bracketedPasteEnd.length,

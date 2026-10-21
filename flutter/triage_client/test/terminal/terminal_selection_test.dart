@@ -148,6 +148,35 @@ void main() {
       );
       expect(text, 'bcde');
     });
+
+    test(
+      'backward multi-line selection at right margin creates valid buffer anchors and includes rightmost cell',
+      () {
+        final terminal = xt.Terminal(maxLines: 100);
+        terminal.resize(10, 5);
+        terminal.write('0123456789\r\nabcdefghij');
+        final top = terminal.buffer.height - terminal.viewHeight;
+
+        final backward = resolveSelectionEndpoints(
+          anchorCell: xt.CellOffset(terminal.viewWidth - 1, top + 1),
+          targetCell: xt.CellOffset(terminal.viewWidth - 1, top),
+          viewWidth: terminal.viewWidth,
+          lineCount: terminal.buffer.lines.length,
+        )!;
+        final baseAnchor = terminal.buffer.createAnchorFromOffset(backward.$1);
+        final extentAnchor = terminal.buffer.createAnchorFromOffset(
+          backward.$2,
+        );
+        expect(baseAnchor.x, terminal.viewWidth);
+        expect(extentAnchor.x, terminal.viewWidth - 1);
+
+        final text = terminalSelectionText(
+          terminal.buffer,
+          xt.BufferRangeLine(backward.$1, backward.$2),
+        );
+        expect(text, '9\nabcdefghij');
+      },
+    );
   });
 
   group('shiftCellOffsetForHistoryPage', () {
@@ -167,6 +196,17 @@ void main() {
           lineCount: 101,
         ),
         const xt.CellOffset(5, 100),
+      );
+    });
+
+    test('preserves cell offset unchanged when addedLines is 0', () {
+      expect(
+        shiftCellOffsetForHistoryPage(
+          offset: const xt.CellOffset(7, 42),
+          addedLines: 0,
+          lineCount: 100,
+        ),
+        const xt.CellOffset(7, 42),
       );
     });
   });

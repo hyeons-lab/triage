@@ -1648,11 +1648,10 @@ class _TerminalPaneState extends State<TerminalPane>
               return false;
             }
           }
-          if (ctrlKey &&
-              shiftKey &&
-              !metaKey &&
-              !altKey &&
-              (key == 'a' || key == 'A')) {
+          final isSelectAll =
+              (metaKey && !ctrlKey && !altKey && !shiftKey) ||
+              (ctrlKey && shiftKey && !metaKey && !altKey);
+          if (isSelectAll && (key == 'a' || key == 'A')) {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
             try {
