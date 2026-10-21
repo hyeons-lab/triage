@@ -2671,6 +2671,7 @@ mod tests {
                 raw_output_prefix: Vec::new(),
                 snippet: None,
                 snippet_detail: None,
+                agent: None,
             },
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
