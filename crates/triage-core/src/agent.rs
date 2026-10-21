@@ -4,8 +4,9 @@
 //! agent TUI running inside it. The daemon observes which agent (if any) is
 //! in each session's foreground and records an [`AgentAttachment`]; after a
 //! reboot, restoring the session resumes that conversation instead of a
-//! fresh shell. Attachments are live-state only: exiting the agent clears
-//! them, and exited sessions never carry one.
+//! fresh shell. Exiting the agent back to the shell clears the attachment,
+//! while a session that exits with a confirmed foreground agent keeps its
+//! attachment across demotion so `restore_session` can resume it.
 
 use std::path::{Path, PathBuf};
 

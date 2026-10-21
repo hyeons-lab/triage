@@ -388,9 +388,11 @@ session manifest. Restoring such a session (after a reboot, a daemon kill, or
 from history) relaunches the agent resumed into the same conversation instead
 of a fresh shell.
 
-Attachments are live-state only. Exiting the agent clears the attachment, so
-going back to the shell and rebooting restores a shell; exited sessions never
-carry one. When the attachment is provably stale (recorded transcript gone),
+Exiting the agent back to the shell clears the attachment, so going back to
+the shell and rebooting restores a shell; a session that exits while a
+confirmed agent still holds the foreground keeps its attachment across
+demotion so restoring it from history resumes the conversation. When the
+attachment is provably stale (recorded transcript gone),
 or the agent binary fails to spawn, restore falls back to the session's
 original launch command: the shell for shell sessions, a fresh agent for
 sessions started directly in an agent. A recorded binary that moved degrades

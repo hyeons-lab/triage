@@ -423,6 +423,7 @@ fn is_executable(path: &Path) -> bool {
 /// never references it.
 fn build_stub_agent() {
     let src = Path::new("src/stub_agent.rs");
+    println!("cargo:rerun-if-changed={}", src.display());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is set"));
     let exe_suffix = std::env::var("CARGO_CFG_TARGET_EXE_SUFFIX").unwrap_or_default();
     let out = out_dir.join(format!("triage-stub-agent{exe_suffix}"));
