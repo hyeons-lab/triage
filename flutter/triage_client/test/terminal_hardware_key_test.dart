@@ -268,9 +268,7 @@ void main() {
       expect(inputs, ['\n']);
     });
 
-    testWidgets('plain Enter is left to the emulator default', (
-      tester,
-    ) async {
+    testWidgets('plain Enter is left to the emulator default', (tester) async {
       final inputs = await pumpPane(tester);
 
       // Our layer sends nothing: xterm's own handler owns plain Enter (CR)
@@ -303,5 +301,174 @@ void main() {
       });
     }
   });
-}
 
+  group('TerminalPane select-all and history-page selection preservation', () {
+    String? copiedText;
+
+    setUp(() {
+      copiedText = null;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.setData') {
+              final args = call.arguments as Map<dynamic, dynamic>;
+              copiedText = args['text'] as String?;
+            }
+            return null;
+          });
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null);
+    });
+
+    testWidgets(
+      'Cmd+A selects all buffer lines on macOS and Cmd+C copies them',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        try {
+          final terminal = Terminal(maxLines: 100);
+          terminal.resize(20, 2);
+          terminal.write('first line\r\nsecond line');
+          final controller = TerminalController();
+          final inputs = <String>[];
+          controller.addInputListener(inputs.add);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: 'test-select-all-macos',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+          await tester.pump();
+
+          expect(inputs, isEmpty);
+          expect(copiedText, 'first line\nsecond line');
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'Ctrl+Shift+A selects all buffer lines on Linux while plain Ctrl+A does not select',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+        try {
+          final terminal = Terminal(maxLines: 100);
+          terminal.resize(20, 2);
+          terminal.write('alpha\r\nbeta');
+          final controller = TerminalController();
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: 'test-select-all-linux',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          // Plain Ctrl+A must not trigger select-all, so a subsequent
+          // Ctrl+Shift+C has nothing to copy.
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await tester.pump();
+          expect(copiedText, isNull);
+
+          // Ctrl+Shift+A selects all and Ctrl+Shift+C copies it.
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await tester.pump();
+          expect(copiedText, 'alpha\nbeta');
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'prepending a scrollback history page shifts the active selection down by addedLines',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        try {
+          final terminal = Terminal(maxLines: 100);
+          terminal.resize(20, 2);
+          terminal.write('target 1\r\ntarget 2');
+          final controller = TerminalController();
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: 'test-history-page-selection',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          // Select the current 2-line buffer ('target 1\ntarget 2').
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+          await tester.pump();
+
+          // Simulate a scrollback page prepending 2 older lines ahead of the
+          // originally selected lines.
+          controller.notifyHistoryPageStarted();
+          terminal.buffer.clear();
+          terminal.buffer.setCursor(0, 0);
+          terminal.write('older 1\r\nolder 2\r\ntarget 1\r\ntarget 2');
+          controller.notifyHistoryReplayed();
+          await tester.pump();
+
+          // Copying the selection after replay must copy the shifted original
+          // lines ('target 1\ntarget 2'), not the newly prepended top lines.
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+          await tester.pump();
+
+          expect(copiedText, 'target 1\ntarget 2');
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+  });
+}

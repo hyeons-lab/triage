@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/gestures.dart' show kPrimaryButton;
@@ -27,6 +28,7 @@ import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
 import 'package:triage_client/widgets/terminal_scrollbar.dart';
+
 import 'terminal_pane.dart';
 
 /// Native terminal view. A thin presentation layer over the persistent
@@ -144,12 +146,16 @@ class _TerminalPaneState extends State<TerminalPane>
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
   DateTime? _pageAnchorAt;
+  xt.CellOffset? _pageSelectionBase;
+  xt.CellOffset? _pageSelectionExtent;
   int _pageJumpGeneration = 0;
 
   void _clearPageAnchor() {
     _pageAnchorPixels = null;
     _pageAnchorLines = null;
     _pageAnchorAt = null;
+    _pageSelectionBase = null;
+    _pageSelectionExtent = null;
   }
 
   // Keeps the viewport pinned to a scrollback line while the user is scrolled
@@ -557,10 +563,53 @@ class _TerminalPaneState extends State<TerminalPane>
         _scrollController.hasClients) {
       final anchorPixels = _pageAnchorPixels!;
       final anchorLines = _pageAnchorLines!;
+      final savedSelectionBase = _pageSelectionBase;
+      final savedSelectionExtent = _pageSelectionExtent;
       _clearPageAnchor();
       _pendingBottomSnapOnPointerUp = false;
       _lastScrollPixels = null;
-      final addedLines = _terminal.buffer.lines.length - anchorLines;
+      final lineCount = _terminal.buffer.lines.length;
+      final addedLines = lineCount - anchorLines;
+      if (addedLines >= 0 && lineCount > 0) {
+        if (_selectionAnchor != null &&
+            identical(_selectionAnchorBuffer, _terminal.buffer)) {
+          _selectionAnchor = shiftCellOffsetForHistoryPage(
+            offset: _selectionAnchor!,
+            addedLines: addedLines,
+            lineCount: lineCount,
+          );
+        }
+        if (_dragAnchorCell != null) {
+          _dragAnchorCell = shiftCellOffsetForHistoryPage(
+            offset: _dragAnchorCell!,
+            addedLines: addedLines,
+            lineCount: lineCount,
+          );
+        }
+        if (savedSelectionBase != null && savedSelectionExtent != null) {
+          final shiftedBase = shiftCellOffsetForHistoryPage(
+            offset: savedSelectionBase,
+            addedLines: addedLines,
+            lineCount: lineCount,
+          );
+          final shiftedExtent = shiftCellOffsetForHistoryPage(
+            offset: savedSelectionExtent,
+            addedLines: addedLines,
+            lineCount: lineCount,
+          );
+          if (shiftedBase != null && shiftedExtent != null) {
+            _extendingSelection = true;
+            try {
+              _xtermController.setSelection(
+                _terminal.buffer.createAnchorFromOffset(shiftedBase),
+                _terminal.buffer.createAnchorFromOffset(shiftedExtent),
+              );
+            } finally {
+              _extendingSelection = false;
+            }
+          }
+        }
+      }
       final initialLh = _lineHeight() ?? 2.0;
       // Read before the re-seat jump below: a fruitful page moves the
       // viewport, and the barren check cares where the user was when the
@@ -596,6 +645,9 @@ class _TerminalPaneState extends State<TerminalPane>
           lineHeight: lh,
         );
         _saveScrollOffset(widget.terminalId, lh);
+        if (_dragSelecting) {
+          _scheduleDragExtend();
+        }
       }
 
       applyPagedJump();
@@ -633,6 +685,15 @@ class _TerminalPaneState extends State<TerminalPane>
     _pageAnchorPixels = _scrollController.position.pixels;
     _pageAnchorLines = _terminal.buffer.lines.length;
     _pageAnchorAt = DateTime.now();
+    final selection = _xtermController.selection;
+    if (selection != null &&
+        terminalSelectionIsLive(_terminal.buffer, selection)) {
+      _pageSelectionBase = selection.begin;
+      _pageSelectionExtent = selection.end;
+    } else {
+      _pageSelectionBase = null;
+      _pageSelectionExtent = null;
+    }
   }
 
   /// A page landed with no new buffer lines while the user is still near
@@ -664,10 +725,11 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   // Remember where the current selection is anchored so a shift-click can extend
-  // from it. Skipped while we are doing the extending ourselves so the anchor
-  // stays pinned to the original start across repeated shift-clicks.
+  // from it. Skipped while we are doing the extending or drag-selecting ourselves
+  // so the anchor stays pinned to the original start cell instead of drifting with
+  // xterm's viewport-relative drag updates.
   void _recordSelectionAnchor() {
-    if (_extendingSelection) return;
+    if (_extendingSelection || _dragSelecting) return;
     final selection = _xtermController.selection;
     if (selection != null) {
       _selectionAnchor = selection.begin;
@@ -691,31 +753,22 @@ class _TerminalPaneState extends State<TerminalPane>
 
   // Set the live selection from [anchorCell] to [targetCell] (both absolute
   // buffer cells). Clamps a possibly-stale anchor into the current grid and adds
-  // the +1 trailing column on forward selections, matching xterm's own
-  // selectCharacters so the clicked/dragged cell is included.
+  // the +1 trailing column on the exclusive end of the half-open range so both
+  // forward and backward selections include both endpoint cells.
   void _applySelection(xt.CellOffset anchorCell, xt.CellOffset targetCell) {
     final buffer = _terminal.buffer;
-    final lastRow = buffer.lines.length - 1;
-    if (lastRow < 0) return;
-    final maxCol = _terminal.viewWidth - 1;
-    final safeAnchor = xt.CellOffset(
-      anchorCell.x.clamp(0, maxCol),
-      anchorCell.y.clamp(0, lastRow),
+    final endpoints = resolveSelectionEndpoints(
+      anchorCell: anchorCell,
+      targetCell: targetCell,
+      viewWidth: _terminal.viewWidth,
+      lineCount: buffer.lines.length,
     );
-    // Forward/backward follows the full (row, col) order, not the column alone:
-    // a target on a later row is forward even when its column is smaller. xterm's
-    // selectCharacters adds 1 to the trailing column so the pointed cell is
-    // included; deciding that on column alone drops the last character of a
-    // diagonal forward (multi-row) selection.
-    final forward =
-        targetCell.y > safeAnchor.y ||
-        (targetCell.y == safeAnchor.y && targetCell.x >= safeAnchor.x);
-    final extentX = forward ? targetCell.x + 1 : targetCell.x;
-    final extent = xt.CellOffset(extentX, targetCell.y.clamp(0, lastRow));
+    if (endpoints == null) return;
+    final (base, extent) = endpoints;
     _extendingSelection = true;
     try {
       _xtermController.setSelection(
-        buffer.createAnchorFromOffset(safeAnchor),
+        buffer.createAnchorFromOffset(base),
         buffer.createAnchorFromOffset(extent),
       );
     } finally {
@@ -824,7 +877,21 @@ class _TerminalPaneState extends State<TerminalPane>
   void _handlePointerUp(PointerUpEvent event) {
     _activePointers.remove(event.pointer);
     if (event.pointer == _dragPointer) {
+      final wasDragSelecting = _dragSelecting;
+      final anchor = _dragAnchorCell;
+      final endPosition = event.position;
+      final buffer = _terminal.buffer;
       _endDrag();
+      if (wasDragSelecting && anchor != null) {
+        _applyDragSelectionAt(anchor, endPosition);
+        // Also re-apply in a microtask so any gesture-arena callbacks fired by
+        // xterm's PanGestureRecognizer during pointer-up cannot overwrite the
+        // pinned selection with a viewport-relative range.
+        scheduleMicrotask(() {
+          if (!mounted || !identical(_terminal.buffer, buffer)) return;
+          _applyDragSelectionAt(anchor, endPosition);
+        });
+      }
     }
     _checkDeferredBottomSnapOnPointerRelease();
     if (_activePointers.isEmpty && _scrollAnchor.hasAnchor) {
@@ -890,7 +957,11 @@ class _TerminalPaneState extends State<TerminalPane>
     final anchor = _dragAnchorCell;
     final position = _dragLastPosition;
     if (anchor == null || position == null) return;
-    final target = _cellAtGlobal(position);
+    _applyDragSelectionAt(anchor, position);
+  }
+
+  void _applyDragSelectionAt(xt.CellOffset anchor, Offset globalPosition) {
+    final target = _cellAtGlobal(globalPosition);
     if (target == null) return;
     _applySelection(anchor, target);
     // Keep the shift-click anchor in sync so a later shift-click extends from the
@@ -1572,6 +1643,18 @@ class _TerminalPaneState extends State<TerminalPane>
       // Nothing selected (or nothing in it) leaves xterm's own handling in place.
       if (_copySelectionToClipboard()) return KeyEventResult.handled;
     }
+    if (event.logicalKey == LogicalKeyboardKey.keyA && _isSelectAllChord()) {
+      final lastRow = _terminal.buffer.lines.length - 1;
+      if (lastRow >= 0 && _terminal.viewWidth > 0) {
+        _applySelection(
+          const xt.CellOffset(0, 0),
+          xt.CellOffset(_terminal.viewWidth - 1, lastRow),
+        );
+        _selectionAnchor = const xt.CellOffset(0, 0);
+        _selectionAnchorBuffer = _terminal.buffer;
+      }
+      return KeyEventResult.handled;
+    }
     if (_isPasteChord(event)) {
       unawaited(_pasteFromClipboard());
       return KeyEventResult.handled;
@@ -1736,9 +1819,10 @@ class _TerminalPaneState extends State<TerminalPane>
     );
   }
 
-  // The platform copy chord, matching terminal emulator conventions: Cmd+C on
-  // macOS/iOS, Ctrl+Shift+C elsewhere so plain Ctrl+C still reaches the program.
-  bool _isCopyChord() {
+  // Platform primary terminal shortcut modifiers: Cmd+<Key> on macOS/iOS,
+  // Ctrl+Shift+<Key> elsewhere so plain Ctrl+C (SIGINT) and Ctrl+A (0x01 /
+  // start-of-line in shells and readline) still reach the PTY.
+  bool _hasPrimaryTerminalShortcutModifiers() {
     final keys = HardwareKeyboard.instance;
     switch (defaultTargetPlatform) {
       case TargetPlatform.macOS:
@@ -1754,6 +1838,10 @@ class _TerminalPaneState extends State<TerminalPane>
             !keys.isAltPressed;
     }
   }
+
+  bool _isCopyChord() => _hasPrimaryTerminalShortcutModifiers();
+
+  bool _isSelectAllChord() => _hasPrimaryTerminalShortcutModifiers();
 
   // The platform paste chord, matching terminal emulator conventions across
   // platforms: Cmd+V on macOS/iOS, Ctrl+Shift+V / Shift+Insert elsewhere so plain
