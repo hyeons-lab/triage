@@ -461,9 +461,12 @@ pub struct SessionManager {
 /// Channel an actor uses to report a working-directory change to the manager's
 /// cwd-persistence thread: `(session_id, new_cwd)`.
 type CwdUpdateSender = std::sync::mpsc::Sender<(SessionId, PathBuf)>;
-/// Actor-reported foreground agent: `Some` attaches (or refines), `None`
-/// detaches when the agent leaves the foreground.
-type AgentUpdateSender = std::sync::mpsc::Sender<(SessionId, Option<AgentAttachment>)>;
+/// Actor-reported foreground agent tagged with the reporting actor's
+/// per-generation identity token (`last_activity_ms` `Arc`), so a report
+/// queued by a previous actor generation before `restore_session` cannot
+/// flush onto the newly restored `Live` session.
+type AgentUpdatePayload = (Arc<AtomicU64>, Option<AgentAttachment>);
+type AgentUpdateSender = std::sync::mpsc::Sender<(SessionId, AgentUpdatePayload)>;
 
 /// Shared list of per-connection global push channels. Cloned (cheaply, by
 /// `Arc`) into managed session actors so they can broadcast context updates as a
@@ -570,10 +573,10 @@ enum ManagedSession {
         /// Seeded from the launch/restored cwd; `None` until first known.
         last_known_cwd: Option<PathBuf>,
         /// The AI coding agent currently in this session's foreground, if the
-        /// actor observed one (via the agent-update channel). Live-state
-        /// only: exiting the agent clears it, and exited sessions never
-        /// carry one. Persisted so a daemon kill restores the session by
-        /// resuming the same conversation.
+        /// actor observed one (via the agent-update channel). Exiting the
+        /// agent back to the shell clears it, while a session that exits with
+        /// a confirmed foreground agent keeps it across demotion so
+        /// `restore_session` can resume the same conversation.
         agent: Option<AgentAttachment>,
         /// Whether the actor holds an agent-update sender, so tracker
         /// reports can reach the manager. False when agent tracking is
@@ -692,9 +695,10 @@ struct PersistedSession {
     #[serde(default)]
     last_input_ms: u64,
     /// The agent in the session's foreground when the manifest was written,
-    /// if any. Live-state only: actors clear it on agent exit, and sessions
-    /// that exited carry none. Defaults to `None` for manifests written
-    /// before this field existed.
+    /// if any. Actors clear it when the agent exits back to the shell; a
+    /// session demoted while a confirmed agent held the foreground keeps it
+    /// so `restore_session` can resume the conversation. Defaults to `None`
+    /// for manifests written before this field existed.
     #[serde(default)]
     agent: Option<AgentAttachment>,
 }
@@ -735,8 +739,8 @@ impl PersistedSessionLaunch {
             // is the only caller with access to the actor's stamps.
             last_activity_ms: 0,
             last_input_ms: 0,
-            // Fresh launches and demotions (exited sessions) never carry an
-            // agent; live sessions fill this in `persisted` below.
+            // Baseline carries no agent; callers (`ManagedSession::persisted`
+            // and `demote_exited_session`) populate it when applicable.
             agent: None,
         }
     }
@@ -1030,7 +1034,7 @@ impl SessionManager {
             if guard.is_some() {
                 return; // already started
             }
-            let (tx, rx) = mpsc::channel::<(SessionId, Option<AgentAttachment>)>();
+            let (tx, rx) = mpsc::channel::<(SessionId, AgentUpdatePayload)>();
             *guard = Some(tx);
             rx
         };
@@ -1071,12 +1075,11 @@ impl SessionManager {
         }
     }
 
-    /// Applies a coalesced batch of working-directory updates and persists the
-    /// manifest at most once. No-op unless at least one live session's cwd
-    /// actually changed. Holds the global `sessions` lock across the manifest
-    /// write (like the lifecycle persisters); the debounce keeps this to roughly
-    /// one write per [`CWD_PERSIST_SETTLE`] even under a `cd` storm.
-    fn flush_agent_updates(&self, updates: HashMap<SessionId, Option<AgentAttachment>>) {
+    /// Applies a coalesced batch of foreground-agent updates and persists the
+    /// manifest at most once. Updates whose actor generation token does not
+    /// match the current live actor are ignored so a report queued before
+    /// `restore_session` cannot clobber or confirm the newly restored session.
+    fn flush_actor_agent_updates(&self, updates: HashMap<SessionId, AgentUpdatePayload>) {
         if updates.is_empty() {
             return;
         }
@@ -1090,15 +1093,19 @@ impl SessionManager {
             return;
         };
         let mut changed = false;
-        for (session_id, agent) in updates {
+        for (session_id, (actor_token, agent)) in updates {
             if let Some(ManagedSession::Live {
+                actor,
                 agent: current,
                 agent_observed: observed,
                 ..
             }) = sessions.get_mut(&session_id)
             {
-                // Any received update confirms this generation, even a
-                // compared-equal one: the tracker is alive and reporting.
+                if !Arc::ptr_eq(&actor.last_activity_ms, &actor_token) {
+                    continue;
+                }
+                // Any received update from the current generation confirms it,
+                // even a compared-equal one: the tracker is alive and reporting.
                 *observed = true;
                 let same = match (&current, &agent) {
                     (Some(a), Some(b)) => a.same_observation(b),
@@ -1133,6 +1140,31 @@ impl SessionManager {
         }
     }
 
+    #[cfg(test)]
+    fn flush_agent_updates(&self, updates: HashMap<SessionId, Option<AgentAttachment>>) {
+        let tagged = {
+            let Ok(sessions) = self.sessions() else {
+                return;
+            };
+            updates
+                .into_iter()
+                .filter_map(|(session_id, agent)| {
+                    let token = match sessions.get(&session_id)? {
+                        ManagedSession::Live { actor, .. } => Arc::clone(&actor.last_activity_ms),
+                        _ => return None,
+                    };
+                    Some((session_id, (token, agent)))
+                })
+                .collect()
+        };
+        self.flush_actor_agent_updates(tagged);
+    }
+
+    /// Applies a coalesced batch of working-directory updates and persists the
+    /// manifest at most once. No-op unless at least one live session's cwd
+    /// actually changed. Holds the global `sessions` lock across the manifest
+    /// write (like the lifecycle persisters); the debounce keeps this to roughly
+    /// one write per [`CWD_PERSIST_SETTLE`] even under a `cd` storm.
     fn flush_cwd_updates(&self, updates: HashMap<SessionId, PathBuf>) {
         if updates.is_empty() {
             return;
@@ -5181,14 +5213,14 @@ fn run_cwd_persistence_loop(
 
 /// Drains the agent-update channel, coalescing a burst of attach/detach
 /// reports within one [`CWD_PERSIST_SETTLE`] window into a single
-/// [`SessionManager::flush_agent_updates`] call. Same shape as
+/// [`SessionManager::flush_actor_agent_updates`] call. Same shape as
 /// [`run_cwd_persistence_loop`]; exits when the manager is dropped or every
 /// sender (the manager's plus all live actors' clones) has been dropped.
 fn run_agent_persistence_loop(
     manager: std::sync::Weak<SessionManager>,
-    rx: Receiver<(SessionId, Option<AgentAttachment>)>,
+    rx: Receiver<(SessionId, AgentUpdatePayload)>,
 ) {
-    run_coalescing_persistence_loop(manager, rx, SessionManager::flush_agent_updates);
+    run_coalescing_persistence_loop(manager, rx, SessionManager::flush_actor_agent_updates);
 }
 
 /// Shared batching shape behind the cwd and agent persistence loops:
@@ -6863,29 +6895,37 @@ impl ActorState {
     /// so the steady-state cost is one `tcgetpgrp` per poll interval.
     /// Skipped after the child has exited, and without a sender.
     fn poll_foreground_agent(&mut self) {
-        // The session id is cloned only when a report actually sends.
-        // (Resolution itself allocates, but the tracker runs it only on
-        // foreground changes, not on every tick.)
-        let (Some(session_id), Some(tx)) = (
-            self.event_session_id.as_ref(),
-            self.agent_update_tx.as_ref(),
-        ) else {
+        if self.exited || self.output_closed {
             return;
-        };
-        if self.exited {
+        }
+        if self.event_session_id.is_none() || self.agent_update_tx.is_none() {
             return;
         }
         let now = std::time::Instant::now();
         if !self.agent_tracker.poll_due(now) {
             return;
         }
+        // Reap before and around the foreground check so a session child
+        // that just exited is not mistaken for an agent returning to the
+        // shell.
+        self.mark_exited();
+        if self.exited {
+            return;
+        }
         let fg = self.foreground_pgid();
+        if fg.is_none() {
+            self.mark_exited();
+            if self.exited {
+                return;
+            }
+        }
+        let cwd = self.current_working_directory.as_deref();
         let report = self.agent_tracker.poll(
             fg,
             &|pid| {
                 crate::agent_detect::observe_pid(
                     pid,
-                    self.current_working_directory.as_deref(),
+                    cwd,
                     std::time::SystemTime::now(),
                     crate::agent_detect::TRANSCRIPT_MAX_AGE,
                 )
@@ -6894,7 +6934,21 @@ impl ActorState {
             now_unix_millis(),
         );
         if let Some(update) = report {
-            let _ = tx.send((session_id.clone(), update));
+            if update.is_none() {
+                self.mark_exited();
+                if self.exited {
+                    return;
+                }
+            }
+            if let (Some(session_id), Some(tx)) = (
+                self.event_session_id.as_ref(),
+                self.agent_update_tx.as_ref(),
+            ) {
+                let _ = tx.send((
+                    session_id.clone(),
+                    (Arc::clone(&self.last_activity_ms), update),
+                ));
+            }
         }
     }
 
@@ -6903,7 +6957,7 @@ impl ActorState {
     /// shell or agent even when the session is quiet. Throttled by
     /// [`Self::poll_child_cwd`]; skipped after the child has exited.
     fn refresh_idle_cwd(&mut self) {
-        if self.exited {
+        if self.exited || self.output_closed {
             return;
         }
         if let Some(cwd) = self.poll_child_cwd() {
@@ -19083,7 +19137,6 @@ mod tests {
     /// generation. Starts false at restore and flips on the first tracker
     /// report, so unlike the seeded attachment itself it is a genuine
     /// confirmation signal a test can poll without seed-defeating.
-    #[cfg(unix)]
     fn agent_observed(manager: &SessionManager, session_id: &SessionId) -> bool {
         let sessions = manager.sessions().expect("sessions lock");
         match sessions.get(session_id).expect("session") {
@@ -19103,6 +19156,156 @@ mod tests {
             .find(|s| &s.id == session_id)
             .expect("session in manifest")
             .agent
+    }
+
+    #[test]
+    fn flush_actor_agent_updates_ignores_stale_generation_token() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let session_id = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start session");
+        assert_eq!(live_agent(&manager, &session_id), None);
+        assert!(!agent_observed(&manager, &session_id));
+
+        // A report carrying a prior actor generation's token must neither
+        // attach nor confirm the current generation.
+        let stale_token = Arc::new(AtomicU64::new(0));
+        manager.flush_actor_agent_updates(HashMap::from([(
+            session_id.clone(),
+            (Arc::clone(&stale_token), Some(test_attachment())),
+        )]));
+        assert_eq!(live_agent(&manager, &session_id), None);
+        assert!(!agent_observed(&manager, &session_id));
+
+        // Current-generation report attaches and confirms.
+        manager.flush_agent_updates(HashMap::from([(
+            session_id.clone(),
+            Some(test_attachment()),
+        )]));
+        assert_eq!(
+            live_agent(&manager, &session_id).as_ref(),
+            Some(&test_attachment())
+        );
+        assert!(agent_observed(&manager, &session_id));
+
+        // A stale detach from a prior generation must not clear the live
+        // attachment either.
+        manager
+            .flush_actor_agent_updates(HashMap::from([(session_id.clone(), (stale_token, None))]));
+        assert_eq!(
+            live_agent(&manager, &session_id).as_ref(),
+            Some(&test_attachment())
+        );
+
+        manager
+            .shutdown_session(session_id)
+            .expect("shutdown session");
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn poll_foreground_agent_skips_detach_on_exiting_or_closed_session() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("exit-race.log");
+        let runtime = spawn_pty_runtime(
+            SessionConfig {
+                command: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 60".to_string()],
+                cwd: None,
+                size: SessionSize::default(),
+                log_path,
+                session_id: None,
+            },
+            LogInitialization::Truncate,
+        )
+        .expect("spawn pty runtime");
+        let PtyRuntime {
+            master,
+            child,
+            process_identity,
+            reader: _reader,
+            writer,
+            output,
+            size,
+            current_working_directory,
+        } = runtime;
+
+        let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let mut state = ActorState {
+            master,
+            child,
+            process_identity,
+            writer,
+            writer_tx,
+            output,
+            size,
+            exited: false,
+            output_closed: false,
+            exit_broadcasted: false,
+            current_working_directory,
+            context: None,
+            event_session_id: Some(SessionId::new("session-exit-race").expect("session id")),
+            dirty_tx: None,
+            last_activity_ms: Arc::new(AtomicU64::new(1)),
+            last_input_ms: Arc::new(AtomicU64::new(0)),
+            cwd_update_tx: None,
+            agent_update_tx: Some(agent_tx),
+            agent_tracker: crate::agent_detect::FgAgentTracker::seeded(Some(test_attachment())),
+            global_senders: None,
+            context_resend_pending: false,
+            last_cwd_poll: None,
+            subscribers: Vec::new(),
+            event_log: VecDeque::new(),
+            next_event_seq: 1,
+        };
+
+        // Prime the tracker so a subsequent unguarded poll detaches immediately:
+        // feed the current foreground pid once in the past so `observed_fg` is
+        // true and the one-sample retry debt on that non-agent pid is already
+        // spent.
+        let past = Instant::now() - Duration::from_secs(10);
+        let live_fg = state.foreground_pgid().or_else(|| state.child.process_id());
+        assert!(live_fg.is_some(), "expected live PTY child pid");
+        assert_eq!(
+            state.agent_tracker.poll(live_fg, &|_| None, past, 1),
+            None,
+            "first non-agent sample only arms pending_resolve"
+        );
+
+        // 1. While the child is still alive (`try_wait` is `None`),
+        // `output_closed == true` alone must prevent `poll_foreground_agent`
+        // from polling the tracker and emitting a detach.
+        state.output_closed = true;
+        state.poll_foreground_agent();
+        assert!(!state.exited, "child is still running in step 1");
+        assert!(
+            agent_rx.try_recv().is_err(),
+            "output_closed session must not emit a detach"
+        );
+
+        // 2. When `output_closed == false` and the child has just exited
+        // (before the actor loop called `mark_exited`), `poll_foreground_agent`
+        // must reap via `mark_exited` and suppress the spurious detach.
+        state.child.kill().expect("kill child");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.child.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "killed child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        state.output_closed = false;
+        state.exited = false;
+        state.poll_foreground_agent();
+        assert!(state.exited, "poll_foreground_agent must reap exited child");
+        assert!(
+            agent_rx.try_recv().is_err(),
+            "exiting session child must not emit a spurious detach"
+        );
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 
     #[test]

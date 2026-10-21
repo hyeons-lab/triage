@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart'
         defaultTargetPlatform,
         kIsWeb,
         listEquals,
+        mapEquals,
         visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -4942,10 +4943,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // disposed store is a use-after-dispose, and the live same-id object is
     // refreshed by its own load path.
     if (_disposed || !_sessions.contains(session)) return;
+    final prevAgent = session.agent;
     final snapshotAgent = snapshot['agent'] as Map<String, dynamic>?;
     if (agentAuthoritative || snapshotAgent != null) {
       session.agent = snapshotAgent;
     }
+    final agentChanged = !mapEquals(prevAgent, session.agent);
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     // Kept separate from the rendering fallbacks below: the FlatBuffers decoder
     // turns an absent size into an empty map rather than null, so the container
@@ -5054,6 +5057,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         !wasLoaded ||
         replayHistory ||
         rowsChanged ||
+        agentChanged ||
         session.cwd != prevCwd ||
         session.bracketedPasteEnabled != prevBracketedPaste ||
         prevExited != exited ||

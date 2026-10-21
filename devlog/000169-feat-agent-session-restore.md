@@ -4,6 +4,7 @@
 
 Muse Code (muse-spark) @ triage branch feat/agent-session-restore (2026-09-20T10:26-0700)
 Antigravity (gemini-2.5-pro) @ triage branch feat/agent-session-restore (2026-09-22T17:38-0700)
+Antigravity (gemini-4-argon) @ triage branch feat/agent-session-restore (2026-10-21T08:51-0700)
 
 ## Intent
 
@@ -66,6 +67,22 @@ status; exited sessions carry no agent state.
   `ManagedSession::Historical` arm of `SessionManager::attach_session` before calling
   `self.overlay_manager_fields`, preventing a same-thread mutex self-deadlock on
   `self.sessions` inside `overlay_agent`.
+- **2026-10-21T08:51-0700** Hardened CLI argv classification across all 5
+  supported agents (`has_any` matching `--flag=value`, bounding option and
+  subcommand scans to `--`, Claude `purge`/`--bg`/`--background`/`--desktop`/
+  `--session-id`/`--fork-session`, Codex `resume --last` and `fork`, Agy
+  `-i`/`--prompt-interactive`/`-p`/`--print`/`--prompt`/`-v` and `--version`,
+  Muse `model-profile`/`voice`/`-c`/`--config`/`--contributor-mode`/`--effort`
+  and `resume --last`, and Grok `--fork-session`); guarded
+  `ActorState::poll_foreground_agent` and `refresh_idle_cwd` on
+  `self.output_closed` and reaped the child via `self.mark_exited()` before and
+  around `foreground_pgid()` and before sending a `None` detach report; tagged
+  `AgentUpdateSender` updates with the actor's per-generation
+  `Arc<AtomicU64>` token and verified `Arc::ptr_eq` in
+  `SessionManager::flush_actor_agent_updates`; included `agentChanged` in
+  `_applySnapshotToSession`'s `uiChanged` gate in `main.dart`; simplified
+  `mac_exe_path`; added `cargo:rerun-if-changed` for `src/stub_agent.rs` in
+  `build.rs`; and added unit and widget tests.
 
 ## Decisions
 
@@ -128,7 +145,8 @@ status; exited sessions carry no agent state.
 - c0136e3: feat(session): add Grok agent tracking and conversation restore
 - 72cd45a: test(triaged): update Linux /dev/full tests for agent tracking fields
 - f5402cc: test(triaged): gate handover agent serialization test to Unix
-- HEAD: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
+- a004a49: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
+- HEAD: fix(session): harden agent argv classification, exit detach guards, and generation checks
 
 ## Progress
 
