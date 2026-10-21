@@ -15,6 +15,7 @@ import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
+import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/terminal/touch_scroll_takeover.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
@@ -454,7 +455,7 @@ class _TerminalPaneState extends State<TerminalPane>
   int? _pageAnchorY;
   int? _pageAnchorLen;
   DateTime? _pageAnchorAt;
-  (int, int, int, int)? _pageSelection;
+  WebSelectionRange? _pageSelection;
   void _clearPageAnchor({bool cancelRestoreTimer = true}) {
     if (cancelRestoreTimer) {
       _scrollRestoreGeneration++;
@@ -779,20 +780,16 @@ class _TerminalPaneState extends State<TerminalPane>
             if (event.metaKey && !event.ctrlKey) {
               return;
             }
-          } else if (((event.metaKey &&
-                      !event.ctrlKey &&
-                      !event.altKey &&
-                      !event.shiftKey) ||
-                  (event.ctrlKey &&
-                      event.shiftKey &&
-                      !event.metaKey &&
-                      !event.altKey)) &&
-              (event.key == 'a' || event.key == 'A')) {
+          } else if (isWebSelectAllShortcut(
+            key: event.key,
+            ctrlKey: event.ctrlKey,
+            metaKey: event.metaKey,
+            shiftKey: event.shiftKey,
+            altKey: event.altKey,
+          )) {
             event.preventDefault();
             event.stopPropagation();
-            try {
-              js_util.callMethod(_term, 'selectAll', []);
-            } catch (_) {}
+            _selectAllInTerm();
             return;
           }
 
@@ -1608,15 +1605,16 @@ class _TerminalPaneState extends State<TerminalPane>
               return false;
             }
           }
-          final isSelectAll =
-              (metaKey && !ctrlKey && !altKey && !shiftKey) ||
-              (ctrlKey && shiftKey && !metaKey && !altKey);
-          if (isSelectAll && (key == 'a' || key == 'A')) {
+          if (isWebSelectAllShortcut(
+            key: key,
+            ctrlKey: ctrlKey,
+            metaKey: metaKey,
+            shiftKey: shiftKey,
+            altKey: altKey,
+          )) {
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
-            try {
-              js_util.callMethod(_term, 'selectAll', []);
-            } catch (_) {}
+            _selectAllInTerm();
             return false;
           }
           return true;
@@ -1625,6 +1623,12 @@ class _TerminalPaneState extends State<TerminalPane>
     } catch (_) {}
 
     _setupResizeObserver();
+  }
+
+  void _selectAllInTerm() {
+    try {
+      js_util.callMethod(_term, 'selectAll', []);
+    } catch (_) {}
   }
 
   void _setupResizeObserver() {
@@ -1943,7 +1947,12 @@ class _TerminalPaneState extends State<TerminalPane>
           final ex = (js_util.getProperty(end, 'x') as num?)?.toInt();
           final ey = (js_util.getProperty(end, 'y') as num?)?.toInt();
           if (sx != null && sy != null && ex != null && ey != null) {
-            _pageSelection = (sx, sy, ex, ey);
+            _pageSelection = WebSelectionRange(
+              startX: sx,
+              startY: sy,
+              endX: ex,
+              endY: ey,
+            );
           }
         }
       }
@@ -2018,20 +2027,18 @@ class _TerminalPaneState extends State<TerminalPane>
         try {
           final cols =
               (js_util.getProperty(_term, 'cols') as num?)?.toInt() ?? 0;
-          if (cols > 0) {
-            final shift = math.max(addedLines, 0);
-            final newStartY = (pageSelection.$2 + shift)
-                .clamp(0, len - 1)
-                .toInt();
-            final newEndY = (pageSelection.$4 + shift)
-                .clamp(0, len - 1)
-                .toInt();
-            final startX = pageSelection.$1.clamp(0, cols).toInt();
-            final endX = pageSelection.$3.clamp(0, cols).toInt();
-            final length = (newEndY - newStartY) * cols - startX + endX;
-            if (length > 0) {
-              js_util.callMethod(_term, 'select', [startX, newStartY, length]);
-            }
+          final shifted = shiftWebSelectionForHistoryPage(
+            selection: pageSelection,
+            addedLines: addedLines,
+            lineCount: len,
+            cols: cols,
+          );
+          if (shifted != null) {
+            js_util.callMethod(_term, 'select', [
+              shifted.column,
+              shifted.row,
+              shifted.length,
+            ]);
           }
         } catch (_) {}
       }

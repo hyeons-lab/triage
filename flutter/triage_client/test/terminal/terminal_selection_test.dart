@@ -210,4 +210,153 @@ void main() {
       );
     });
   });
+
+  group('isWebSelectAllShortcut', () {
+    test(
+      'matches Cmd+A without extra modifiers and Ctrl+Shift+A without Meta/Alt',
+      () {
+        expect(
+          isWebSelectAllShortcut(
+            key: 'a',
+            ctrlKey: false,
+            metaKey: true,
+            shiftKey: false,
+            altKey: false,
+          ),
+          isTrue,
+        );
+        expect(
+          isWebSelectAllShortcut(
+            key: 'A',
+            ctrlKey: true,
+            metaKey: false,
+            shiftKey: true,
+            altKey: false,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test('rejects plain Ctrl+A, extra modifiers, and non-A keys', () {
+      expect(
+        isWebSelectAllShortcut(
+          key: 'a',
+          ctrlKey: true,
+          metaKey: false,
+          shiftKey: false,
+          altKey: false,
+        ),
+        isFalse,
+      );
+      expect(
+        isWebSelectAllShortcut(
+          key: 'a',
+          ctrlKey: false,
+          metaKey: true,
+          shiftKey: true,
+          altKey: false,
+        ),
+        isFalse,
+      );
+      expect(
+        isWebSelectAllShortcut(
+          key: 'a',
+          ctrlKey: true,
+          metaKey: false,
+          shiftKey: true,
+          altKey: true,
+        ),
+        isFalse,
+      );
+      expect(
+        isWebSelectAllShortcut(
+          key: 'c',
+          ctrlKey: false,
+          metaKey: true,
+          shiftKey: false,
+          altKey: false,
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('shiftWebSelectionForHistoryPage', () {
+    test('shifts single-line and multi-line selections by addedLines', () {
+      expect(
+        shiftWebSelectionForHistoryPage(
+          selection: const WebSelectionRange(
+            startX: 3,
+            startY: 10,
+            endX: 15,
+            endY: 10,
+          ),
+          addedLines: 25,
+          lineCount: 100,
+          cols: 80,
+        ),
+        (column: 3, row: 35, length: 12),
+      );
+      expect(
+        shiftWebSelectionForHistoryPage(
+          selection: const WebSelectionRange(
+            startX: 5,
+            startY: 10,
+            endX: 12,
+            endY: 12,
+          ),
+          addedLines: 20,
+          lineCount: 100,
+          cols: 80,
+        ),
+        (column: 5, row: 30, length: 2 * 80 - 5 + 12),
+      );
+    });
+
+    test('clamps coordinates to buffer bounds and returns null when empty', () {
+      expect(
+        shiftWebSelectionForHistoryPage(
+          selection: const WebSelectionRange(
+            startX: -4,
+            startY: 90,
+            endX: 120,
+            endY: 95,
+          ),
+          addedLines: 20,
+          lineCount: 100,
+          cols: 80,
+        ),
+        (column: 0, row: 99, length: 80),
+      );
+      expect(
+        shiftWebSelectionForHistoryPage(
+          selection: const WebSelectionRange(
+            startX: 10,
+            startY: 5,
+            endX: 10,
+            endY: 5,
+          ),
+          addedLines: 10,
+          lineCount: 100,
+          cols: 80,
+        ),
+        isNull,
+      );
+      expect(
+        shiftWebSelectionForHistoryPage(
+          selection: const WebSelectionRange(
+            startX: 0,
+            startY: 0,
+            endX: 5,
+            endY: 0,
+          ),
+          addedLines: 10,
+          lineCount: 100,
+          cols: 0,
+        ),
+        isNull,
+      );
+    });
+  });
 }

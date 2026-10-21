@@ -3,6 +3,7 @@
 ## Agent
 
 Antigravity (gemini-2.5-pro) @ triage branch fix/copy-paste (2026-10-20T14:55-0700)
+Antigravity (gemini-4-argon) @ triage branch fix/copy-paste (2026-10-21T08:51-0700)
 
 ## Intent
 
@@ -58,6 +59,16 @@ pending-input queue, and the daemon parked-input buffer.
   `Cmd+A` and `Ctrl+Shift+A` select-all chords in `attachCustomKeyEventHandler`;
   and asserted captured `FlakyWriter` bytes and right-margin / 4-byte UTF-8
   boundary cases in tests.
+- 2026-10-21T08:51-0700 `crates/triaged/src/session.rs`, `flutter/triage_client/lib/terminal/terminal_selection.dart`, `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`, `flutter/triage_client/lib/widgets/terminal_pane_web.dart`, `flutter/triage_client/test/terminal/terminal_selection_test.dart`, `flutter/triage_client/test/terminal_hardware_key_test.dart`:
+  enforced a daemon-wide `MAX_TOTAL_PARKED_INPUT_BYTES` (`2 MiB`) cap across
+  `SessionManager::parked_denied_input` entries in `park_denied_input` and
+  `restore_parked_entry` so worst-case base64 handover serialization stays
+  below `MAX_HANDOVER_FRAME_BYTES` (`4 MiB`); extracted `WebSelectionRange`,
+  `shiftWebSelectionForHistoryPage`, and `isWebSelectAllShortcut` into
+  `terminal_selection.dart` with VM unit tests; unified shortcut helpers across
+  stub and web terminal panes; and added widget and call-site unit tests for
+  select-all, history-page selection shift, `FlakyWriter` chunk bounds, and
+  parked-input aggregate cap truncation.
 
 ## Decisions
 
@@ -67,7 +78,8 @@ pending-input queue, and the daemon parked-input buffer.
 ## Commits
 
 - 5fe90ef: fix: prevent copy and paste truncation across clients and daemon
-- HEAD: fix: address PR #198 review comments on paste truncation and PTY chunk locking
+- 0db6ca5: fix: address PR #198 review comments on paste truncation and PTY chunk locking
+- HEAD: fix: cap aggregate parked input and harden terminal selection tests
 
 ## Progress
 
