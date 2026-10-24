@@ -114,4 +114,39 @@ void main() {
     final tight = trimHistoryTail(input, maxLines: 1000, maxBytes: 7);
     expect(s(tight), '\x1b[0m world\n');
   });
+
+  test(
+    'in-place spinner frames with cursor-up and linefeeds do not starve earlier history lines',
+    () {
+      final historyLines = List.generate(20, (i) => 'scrollback-$i\r\n').join();
+      final spinnerFrames =
+          '\x1b[?2026h\r\x1b[3A⠹  Running command...\n\n\n\x1b[19D\x1b[?2026l' *
+          400;
+      final input = b('$historyLines$spinnerFrames');
+      final res = trimHistoryTailWithOffset(
+        input,
+        maxLines: 1000,
+        maxBytes: 65536,
+      );
+      expect(res.droppedBytes, 0);
+      expect(s(res.bytes), contains('scrollback-0\r\n'));
+    },
+  );
+
+  test(
+    'trimHistoryReplay preserves rawOutputPrefix when rawOutput alone exceeds maxBytes',
+    () {
+      final prefix = b(List.generate(50, (i) => 'prefix-$i\r\n').join());
+      final raw = b('x' * 4000);
+      final trimmed = trimHistoryReplay(
+        rawOutputPrefix: prefix,
+        rawOutput: raw,
+        maxLines: 1000,
+        maxBytes: 2000,
+      );
+      expect(trimmed.retainedPrefixBytes, greaterThan(0));
+      expect(trimmed.prefixBytes, isNotEmpty);
+      expect(s(trimmed.prefixBytes), contains('prefix-49\r\n'));
+    },
+  );
 }

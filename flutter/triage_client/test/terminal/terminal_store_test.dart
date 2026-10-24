@@ -1223,6 +1223,63 @@ void main() {
     );
   });
 
+  test(
+    'HistoryBytes and LiveBytes strip CSI 3 J so session redraws do not wipe scrollback',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 24));
+
+      store.dispatch(
+        HistoryBytes(
+          b('\x1b[2J\x1b[3J\x1b[Hscreen frame\r\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 100,
+          rawOutputPrefix: b('\x1b[0mold scrollback\r\n'),
+        ),
+      );
+      store.dispatch(
+        LiveBytes(b('\x1b[?2026h\x1b[2J\x1b[3'), outputSeq: 6),
+      );
+      store.dispatch(
+        LiveBytes(b('J\x1b[Hupdated frame\x1b[?2026l'), outputSeq: 7),
+      );
+
+      final painted = sink.written.toString();
+      expect(painted, contains('old scrollback\r\n'));
+      expect(painted, contains('updated frame'));
+      expect(painted, isNot(contains('\x1b[3J')));
+    },
+  );
+
+  test(
+    'HistoryBytes pushes prefix into scrollback and strips leading torn CSI at raw_output_start',
+    () {
+      final sink = FakeTerminalSink();
+      final store = TerminalStore(sink);
+      store.dispatch(const Resize(80, 5));
+
+      store.dispatch(
+        HistoryBytes(
+          b('0mRunning command...\r\n'),
+          cols: 80,
+          rows: 5,
+          throughOutputSeq: 10,
+          rawOutputStart: 500,
+          rawOutputPrefix: b('\x1b[0mprefix line\r\n'),
+        ),
+      );
+
+      final painted = sink.written.toString();
+      expect(painted, contains('\x1b[0mprefix line\r\n'));
+      expect(painted, contains('\r\n\r\n\r\n\r\n\x1b[H\x1b[0m'));
+      expect(painted, contains('\x1b[H\x1b[0mRunning command...\r\n'));
+      expect(painted, isNot(contains('0m0mRunning command...')));
+    },
+  );
+
   test('delta merge ignores the journaled prefix', () {
     final sink = FakeTerminalSink();
     final store = TerminalStore(sink);
