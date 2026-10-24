@@ -111,6 +111,83 @@ const int kEmulatorMaxScrollbackLines = 50000;
 /// `droppedBytes` measures the exact cut offset in the caller's input [bytes]
 /// so `rawStart + droppedBytes` is the true log offset of the oldest retained
 /// byte, while the log end offset stays `rawStart + original.length`.
+bool _isCursorPositioningNewline(List<int> bytes, int index, int end) {
+  var k = index + 1;
+  while (k < end && (bytes[k] == 0x0a || bytes[k] == 0x0d)) {
+    k++;
+  }
+  if (k + 2 >= end || bytes[k] != 0x1b || bytes[k + 1] != 0x5b) {
+    return false;
+  }
+  var p = k + 2;
+  var hasDigits = false;
+  while (p < end && bytes[p] >= 0x30 && bytes[p] <= 0x39) {
+    hasDigits = true;
+    p++;
+  }
+  if (!hasDigits || p >= end) {
+    return false;
+  }
+  final finalByte = bytes[p];
+  // Relative horizontal cursor move (`CSI Ps C` / `CSI Ps D`) immediately
+  // after linefeeds, as in `\r\x1b[3A...\n\n\n\x1b[19D` spinner frames.
+  return finalByte == 0x43 || finalByte == 0x44;
+}
+
+List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
+  final indices = <int>[];
+  var cursorUpDebt = 0;
+  for (var i = start; i < end; i++) {
+    final b = bytes[i];
+    if (b == 0x1b && i + 1 < end && bytes[i + 1] == 0x5b) {
+      var p = i + 2;
+      var privateMarker = 0;
+      if (p < end && bytes[p] >= 0x3c && bytes[p] <= 0x3f) {
+        privateMarker = bytes[p];
+        p++;
+      }
+      var firstParam = 0;
+      var hasFirstParam = false;
+      var seenSeparator = false;
+      while (p < end && bytes[p] >= 0x30 && bytes[p] <= 0x3b) {
+        final c = bytes[p];
+        if (c == 0x3a || c == 0x3b) {
+          seenSeparator = true;
+        } else if (!seenSeparator) {
+          hasFirstParam = true;
+          firstParam = firstParam * 10 + (c - 0x30);
+        }
+        p++;
+      }
+      while (p < end && bytes[p] >= 0x20 && bytes[p] <= 0x2f) {
+        p++;
+      }
+      if (p < end && bytes[p] >= 0x40 && bytes[p] <= 0x7e) {
+        final finalByte = bytes[p];
+        if (privateMarker == 0) {
+          if (finalByte == 0x41) {
+            cursorUpDebt +=
+                (!hasFirstParam || firstParam <= 0) ? 1 : firstParam;
+          } else if (finalByte == 0x48 ||
+              finalByte == 0x66 ||
+              finalByte == 0x4a) {
+            cursorUpDebt = 0;
+          }
+        }
+        i = p;
+        continue;
+      }
+    } else if (b == 0x0a) {
+      if (cursorUpDebt > 0) {
+        cursorUpDebt--;
+      } else if (!_isCursorPositioningNewline(bytes, i, end)) {
+        indices.add(i);
+      }
+    }
+  }
+  return indices;
+}
+
 ({List<int> bytes, int droppedBytes}) trimHistoryTailWithOffset(
   List<int> bytes, {
   required int maxLines,
@@ -124,17 +201,10 @@ const int kEmulatorMaxScrollbackLines = 50000;
   }
   var end = bytes.length;
   if (bytes[end - 1] == 0x0a) end--;
-  var start = 0;
-  var newlines = 0;
-  for (var i = end - 1; i >= 0; i--) {
-    if (bytes[i] == 0x0a) {
-      newlines++;
-      if (newlines >= maxLines) {
-        start = i + 1;
-        break;
-      }
-    }
-  }
+  final newlineIndices = _collectGenuineNewlineIndices(bytes, 0, end);
+  var start = newlineIndices.length >= maxLines
+      ? newlineIndices[newlineIndices.length - maxLines] + 1
+      : 0;
   final byteFloor = bytes.length - maxBytes;
   if (byteFloor > start) {
     // The byte cap binds. byteFloor > start >= 0, so byteFloor - 1 below
@@ -171,6 +241,121 @@ const int kEmulatorMaxScrollbackLines = 50000;
     bytes: [...reset, ...bytes.sublist(start)],
     droppedBytes: start,
   );
+}
+
+({
+  List<int> prefixBytes,
+  List<int> rawBytes,
+  int retainedPrefixBytes,
+  int droppedRawBytes,
+}) trimHistoryReplay({
+  required List<int> rawOutputPrefix,
+  required List<int> rawOutput,
+  required int maxLines,
+  required int maxBytes,
+}) {
+  if (rawOutputPrefix.isEmpty) {
+    final trimmed = trimHistoryTailWithOffset(
+      rawOutput,
+      maxLines: maxLines,
+      maxBytes: maxBytes,
+    );
+    return (
+      prefixBytes: const <int>[],
+      rawBytes: trimmed.bytes,
+      retainedPrefixBytes: 0,
+      droppedRawBytes: trimmed.droppedBytes,
+    );
+  }
+  if (rawOutput.isEmpty) {
+    final trimmed = trimHistoryTailWithOffset(
+      rawOutputPrefix,
+      maxLines: maxLines,
+      maxBytes: maxBytes,
+    );
+    final retained = rawOutputPrefix.length > trimmed.droppedBytes
+        ? rawOutputPrefix.length - trimmed.droppedBytes
+        : 0;
+    return (
+      prefixBytes: trimmed.bytes,
+      rawBytes: const <int>[],
+      retainedPrefixBytes: retained,
+      droppedRawBytes: 0,
+    );
+  }
+  if (maxLines <= 0 || maxBytes <= 0) {
+    return (
+      prefixBytes: const <int>[],
+      rawBytes: const <int>[],
+      retainedPrefixBytes: 0,
+      droppedRawBytes: rawOutput.length,
+    );
+  }
+
+  final prefixNewlines = _collectGenuineNewlineIndices(
+    rawOutputPrefix,
+    0,
+    rawOutputPrefix.length,
+  ).length;
+  final prefixByteReserve = min(rawOutputPrefix.length, maxBytes ~/ 2);
+  final prefixLineReserve = min(prefixNewlines, maxLines ~/ 2);
+  final rawByteBudget = max(1, maxBytes - prefixByteReserve);
+  final rawLineBudget = max(1, maxLines - prefixLineReserve);
+
+  final trimmedRaw = trimHistoryTailWithOffset(
+    rawOutput,
+    maxLines: rawLineBudget,
+    maxBytes: rawByteBudget,
+  );
+  final retainedRawBytes = rawOutput.length - trimmedRaw.droppedBytes;
+  final retainedRawNewlines = _collectGenuineNewlineIndices(
+    rawOutput,
+    trimmedRaw.droppedBytes,
+    rawOutput.length,
+  ).length;
+
+  final remainingBytes = max(0, maxBytes - retainedRawBytes);
+  final remainingLines = max(0, maxLines - retainedRawNewlines);
+  final trimmedPrefix = trimHistoryTailWithOffset(
+    rawOutputPrefix,
+    maxLines: remainingLines,
+    maxBytes: remainingBytes,
+  );
+  final retainedPrefix = rawOutputPrefix.length > trimmedPrefix.droppedBytes
+      ? rawOutputPrefix.length - trimmedPrefix.droppedBytes
+      : 0;
+
+  return (
+    prefixBytes: trimmedPrefix.bytes,
+    rawBytes: trimmedRaw.bytes,
+    retainedPrefixBytes: retainedPrefix,
+    droppedRawBytes: trimmedRaw.droppedBytes,
+  );
+}
+
+final RegExp _leadingTornCsi = RegExp(
+  r'^(?:\[[?>]?[0-9;]*[mHfABCDEFGJKhlr]|[?>][0-9;]+[hlm]|;[0-9;]*[mHfABCDEFGJKhlr]|[0-9]+;[0-9;]*[mHfABCDEFGJKhlr]|[0-9]{1,4}[mABCDEFGJKhl])',
+);
+
+List<int> _sanitizeRawTailStart(List<int> bytes) {
+  if (bytes.isEmpty) return bytes;
+  var start = 0;
+  while (start < bytes.length && (bytes[start] & 0xC0) == 0x80) {
+    start++;
+  }
+  final scanEnd = min(bytes.length, start + 32);
+  final asciiBuf = StringBuffer();
+  for (var i = start; i < scanEnd; i++) {
+    final b = bytes[i];
+    if (b < 0x20 || b > 0x7e) break;
+    asciiBuf.writeCharCode(b);
+  }
+  final match = _leadingTornCsi.firstMatch(asciiBuf.toString());
+  if (match != null) {
+    start += match.end;
+  }
+  if (start <= 0) return bytes;
+  return bytes.sublist(start);
 }
 
 List<int> trimHistoryTail(
@@ -245,7 +430,7 @@ const int _kMaxCarryEscapeLength = 32;
 // `Output`): a trailing not-yet-terminated `CSI > …` / `CSI ? 2026 …` and a complete
 // `CSI > … m` private sequence.
 final RegExp _partialEscapeSequence = RegExp(r'\x1b(?:\[(?:[>?]?[0-9;]*)?)?$');
-final RegExp _completePrivateCsi = RegExp(r'\x1b\[>[0-9;]*m');
+final RegExp _completePrivateCsi = RegExp(r'\x1b\[(?:>[0-9;]*m|3J)');
 
 /// The single reducer for the terminal pipeline.
 ///
@@ -731,33 +916,37 @@ class TerminalStore extends ChangeNotifier {
     // the combined stream keeps the newest bytes, so an over-budget
     // prefix sheds its oldest lines first; windowed replays then still
     // fit the raw tail, while unwindowed ones trim it as before.
-    final replaySource = rawOutputPrefix.isEmpty
-        ? bytes
-        : [...rawOutputPrefix, ...bytes];
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
-    final trimmed = trimHistoryTailWithOffset(
-      replaySource,
+    final trimmed = trimHistoryReplay(
+      rawOutputPrefix: rawOutputPrefix,
+      rawOutput: bytes,
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
-    final replayBytes = trimmed.bytes;
-    if (!identical(replayBytes, replaySource)) {
-      tdbg(
-        'store.history',
-        'TRIMMED replay ${replaySource.length}B -> ${replayBytes.length}B '
-            '(dropped=${trimmed.droppedBytes}B)',
-      );
+    if (trimmed.prefixBytes.isNotEmpty) {
+      _writeDecoded(trimmed.prefixBytes);
+      if (trimmed.rawBytes.isNotEmpty) {
+        final trailingNewline =
+            trimmed.prefixBytes.last == 0x0a ? '' : '\r\n';
+        final pushScrollback = rows > 1 ? '\r\n' * (rows - 1) : '';
+        _writeDecoded(
+          utf8.encode('$trailingNewline$pushScrollback\x1b[H\x1b[0m'),
+        );
+      } else if (trimmed.prefixBytes.last != 0x0a) {
+        _writeDecoded(const <int>[0x0d, 0x0a]);
+      }
     }
-    _writeDecoded(replayBytes);
+    if (trimmed.rawBytes.isNotEmpty) {
+      final rawToWrite =
+          (rawStart ?? 0) > 0 && trimmed.droppedRawBytes == 0
+              ? _sanitizeRawTailStart(trimmed.rawBytes)
+              : trimmed.rawBytes;
+      _writeDecoded(rawToWrite);
+    }
 
-    final retainedPrefixBytes = rawOutputPrefix.length > trimmed.droppedBytes
-        ? rawOutputPrefix.length - trimmed.droppedBytes
-        : 0;
-    final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
-        ? trimmed.droppedBytes - rawOutputPrefix.length
-        : 0;
-    _appliedHistoryPrefixBytes = retainedPrefixBytes;
-    _appliedHistoryStart = rawStart != null ? rawStart + rawDropped : null;
+    _appliedHistoryPrefixBytes = trimmed.retainedPrefixBytes;
+    _appliedHistoryStart =
+        rawStart != null ? rawStart + trimmed.droppedRawBytes : null;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;
     } else {

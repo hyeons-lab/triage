@@ -957,19 +957,14 @@ class _PendingHistory {
   int? get effectiveStart {
     final start = rawOutputStart;
     if (start == null) return null;
-    final replaySource = rawOutputPrefix.isEmpty
-        ? rawOutput
-        : [...rawOutputPrefix, ...rawOutput];
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
-    final trimmed = trimHistoryTailWithOffset(
-      replaySource,
+    final trimmed = trimHistoryReplay(
+      rawOutputPrefix: rawOutputPrefix,
+      rawOutput: rawOutput,
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
-    final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
-        ? trimmed.droppedBytes - rawOutputPrefix.length
-        : 0;
-    return start + rawDropped;
+    return start + trimmed.droppedRawBytes;
   }
 }
 
@@ -5496,22 +5491,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
       final rawOutputStart = snapshot['raw_output_start'] as int?;
       if (rawOutputStart == null) return;
-      final replaySource = rawOutputPrefix.isEmpty
-          ? rawOutput
-          : [...rawOutputPrefix, ...rawOutput];
       final budgets = historyTrimBudgetsForWindow(nextWindow, web: kIsWeb);
-      final trimmed = trimHistoryTailWithOffset(
-        replaySource,
+      final trimmed = trimHistoryReplay(
+        rawOutputPrefix: rawOutputPrefix,
+        rawOutput: rawOutput,
         maxLines: budgets.maxLines,
         maxBytes: budgets.maxBytes,
       );
-      final retainedPrefixBytes = rawOutputPrefix.length > trimmed.droppedBytes
-          ? rawOutputPrefix.length - trimmed.droppedBytes
-          : 0;
-      final rawDropped = trimmed.droppedBytes > rawOutputPrefix.length
-          ? trimmed.droppedBytes - rawOutputPrefix.length
-          : 0;
-      final effectiveStart = rawOutputStart + rawDropped;
+      final retainedPrefixBytes = trimmed.retainedPrefixBytes;
+      final effectiveStart = rawOutputStart + trimmed.droppedRawBytes;
       if ((rawOutput.isEmpty && rawOutputPrefix.isEmpty) ||
           (effectiveStart >= currentStart &&
               retainedPrefixBytes <= session.historyPrefixBytes)) {
