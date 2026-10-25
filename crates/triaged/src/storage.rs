@@ -919,11 +919,13 @@ pub fn migrate_legacy_session_log(
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("creating temp migration dir {}", tmp_dir.display()))?;
+    crate::session::set_private_dir_permissions(&tmp_dir);
 
     let migrate_res = (|| -> Result<()> {
         if total_len == 0 {
             let active_path = tmp_dir.join(segment_file_name(1));
             File::create(&active_path)?;
+            crate::session::set_private_file_permissions(&active_path);
             return Ok(());
         }
 
@@ -942,6 +944,7 @@ pub fn migrate_legacy_session_log(
             if is_last_segment {
                 let segment_path = tmp_dir.join(segment_file_name(segment_index));
                 let mut seg_file = File::create(&segment_path)?;
+                crate::session::set_private_file_permissions(&segment_path);
                 seg_file.write_all(chunk_slice)?;
                 seg_file.flush()?;
                 drop(seg_file);
@@ -952,6 +955,7 @@ pub fn migrate_legacy_session_log(
                 let tmp_compressed_path = tmp_dir.join(tmp_compressed_name);
 
                 let tmp_file = File::create(&tmp_compressed_path)?;
+                crate::session::set_private_file_permissions(&tmp_compressed_path);
                 let writer = BufWriter::new(tmp_file);
 
                 let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;

@@ -19,62 +19,36 @@ void main() {
   });
 
   test('keeps the last K complete lines with trailing newline', () {
-    final out = trimHistoryTail(
-      b('a\nb\nc\nd\n'),
-      maxLines: 2,
-      maxBytes: 1024,
-    );
+    final out = trimHistoryTail(b('a\nb\nc\nd\n'), maxLines: 2, maxBytes: 1024);
     expect(s(out), '\x1b[0mc\nd\n');
   });
 
   test('keeps the last K lines without trailing newline', () {
-    final out = trimHistoryTail(
-      b('a\nb\nc'),
-      maxLines: 2,
-      maxBytes: 1024,
-    );
+    final out = trimHistoryTail(b('a\nb\nc'), maxLines: 2, maxBytes: 1024);
     expect(s(out), '\x1b[0mb\nc');
   });
 
   test('trailing newline terminates instead of starting an empty line', () {
-    final out = trimHistoryTail(
-      b('a\nb\n'),
-      maxLines: 1,
-      maxBytes: 1024,
-    );
+    final out = trimHistoryTail(b('a\nb\n'), maxLines: 1, maxBytes: 1024);
     expect(s(out), '\x1b[0mb\n');
   });
 
   test('byte cap binds a single huge line', () {
     final line = 'x' * 100;
-    final out = trimHistoryTail(
-      b(line),
-      maxLines: 1000,
-      maxBytes: 10,
-    );
+    final out = trimHistoryTail(b(line), maxLines: 1000, maxBytes: 10);
     expect(s(out), '\x1b[0m${'x' * 10}');
   });
 
   test('byte cap wins when the line window is still too big', () {
     // 10 lines x 11 bytes = 110 bytes; line cap keeps all, byte cap keeps 22.
     final payload = List.generate(10, (i) => 'line$i-5678\n').join();
-    final out = trimHistoryTail(
-      b(payload),
-      maxLines: 1000,
-      maxBytes: 22,
-    );
+    final out = trimHistoryTail(b(payload), maxLines: 1000, maxBytes: 22);
     expect(s(out), '\x1b[0mline8-5678\nline9-5678\n');
   });
 
   test('non-positive budgets keep nothing', () {
-    expect(
-      trimHistoryTail(b('a\nb\n'), maxLines: 0, maxBytes: 1024),
-      isEmpty,
-    );
-    expect(
-      trimHistoryTail(b('a\nb\n'), maxLines: 10, maxBytes: 0),
-      isEmpty,
-    );
+    expect(trimHistoryTail(b('a\nb\n'), maxLines: 0, maxBytes: 1024), isEmpty);
+    expect(trimHistoryTail(b('a\nb\n'), maxLines: 10, maxBytes: 0), isEmpty);
   });
 
   test('reset prologue appears exactly when trimmed', () {
@@ -89,11 +63,7 @@ void main() {
     // 20-byte window cuts into line8; the partial row is dropped rather than
     // replayed mid-line.
     final payload = List.generate(10, (i) => 'line$i-5678\n').join();
-    final out = trimHistoryTail(
-      b(payload),
-      maxLines: 1000,
-      maxBytes: 20,
-    );
+    final out = trimHistoryTail(b(payload), maxLines: 1000, maxBytes: 20);
     expect(s(out), '\x1b[0mline9-5678\n');
   });
 

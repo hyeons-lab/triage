@@ -4,8 +4,6 @@ import 'dart:typed_data';
 
 import 'history_http.dart';
 
-const int maxHistoryResponseBytes = 16 * 1024 * 1024;
-
 final HttpClient _sharedHistoryHttpClient = HttpClient()
   ..autoUncompress = true
   ..connectionTimeout = const Duration(seconds: 10)

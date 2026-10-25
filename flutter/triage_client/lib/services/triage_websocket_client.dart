@@ -254,7 +254,7 @@ Uint8List historyBytesFromField(dynamic raw) {
   return Uint8List(0);
 }
 
-const int maxHistoryFramePayloadBytes = 16 * 1024 * 1024;
+const int maxHistoryFramePayloadBytes = maxHistoryResponseBytes;
 
 /// Decodes a `THS1` binary history frame into a snapshot-compatible map with
 /// `raw_output_prefix` and `raw_output` populated as zero-copy [Uint8List]

@@ -2372,7 +2372,7 @@ impl SessionManager {
         let mut challenges = self.pairing_challenges()?;
         prune_expired_pairing_challenges(&mut challenges, now);
 
-        let (pin_code, challenge_expires_at, challenge_expires_at_unix) = {
+        let (existing_pin, challenge_expires_at, challenge_expires_at_unix) = {
             let challenge = challenges
                 .get(&normalized)
                 .with_context(|| "invalid or expired pairing device code")?;
@@ -2381,15 +2381,20 @@ impl SessionManager {
                 bail!("pairing device code has expired");
             }
 
-            let pin_code = match &challenge.pin {
-                Some(pin) if pin.expires_at > now => Some(pin.code.clone()),
+            let existing_pin = match &challenge.pin {
+                Some(pin) if pin.expires_at > now => Some((pin.code.clone(), pin.failed_attempts)),
                 _ => None,
             };
 
-            (pin_code, challenge.expires_at, challenge.expires_at_unix)
+            (
+                existing_pin,
+                challenge.expires_at,
+                challenge.expires_at_unix,
+            )
         };
 
-        let pin_code = pin_code.unwrap_or_else(|| unique_pairing_pin(&challenges));
+        let (pin_code, failed_attempts) =
+            existing_pin.unwrap_or_else(|| (unique_pairing_pin(&challenges), 0));
         let pin_expires_at = std::cmp::min(now + PAIRING_PIN_TTL, challenge_expires_at);
         let pin_expires_at_unix = std::cmp::min(
             now_unix + PAIRING_PIN_TTL.as_secs(),
@@ -2401,7 +2406,7 @@ impl SessionManager {
         challenge.pin = Some(PendingPairingPin {
             code: pin_code.clone(),
             expires_at: pin_expires_at,
-            failed_attempts: 0,
+            failed_attempts,
         });
 
         tracing::info!(client_id = %challenge.client_id, "issued pairing PIN for device code");
@@ -3513,6 +3518,7 @@ fn spawn_adopted_pty_runtime(
 
     if let Some(parent) = target_log_path.parent() {
         let _ = fs::create_dir_all(parent);
+        set_private_dir_permissions(parent);
     }
 
     let log = OpenOptions::new()
@@ -3521,6 +3527,7 @@ fn spawn_adopted_pty_runtime(
         .append(true)
         .open(&target_log_path)
         .with_context(|| format!("opening session log {}", target_log_path.display()))?;
+    set_private_file_permissions(&target_log_path);
 
     let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
     let mut output = OutputState {
@@ -5225,6 +5232,14 @@ pub(crate) fn set_private_dir_permissions(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        if let Some(parent) = path.parent()
+            && parent.file_name().and_then(|n| n.to_str()) == Some("sessions")
+        {
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            if let Some(log_dir) = parent.parent() {
+                let _ = fs::set_permissions(log_dir, fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -7005,8 +7020,11 @@ impl ActorState {
     }
 
     /// A snapshot carrying the raw output-history tail for client-side
-    /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
-    /// the plain [`Self::snapshot`] so they never carry history.
+    /// re-emulation (attach / explicit snapshot). Resize and `ResyncRequired`
+    /// broadcasts use the plain [`Self::snapshot`] (omitting raw history so
+    /// WebSocket clients fetch the delta over HTTP while keeping rendered rows
+    /// for the local TUI), and 1 KiB lease/metadata probes use
+    /// [`Self::metadata_snapshot`].
     fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
         overlay_raw_output_history(
             self.snapshot(),
@@ -8509,8 +8527,8 @@ fn snapshot_from_output(
         bracketed_paste_enabled: output.terminal.bracketed_paste_enabled(),
         exited,
         // History (raw_output + raw_output_prefix) is attached only on the
-        // attach/resync/snapshot paths via `*_with_history`; resize
-        // broadcasts carry none.
+        // attach/snapshot paths via `*_with_history`; resize broadcasts and
+        // metadata-only `ResyncRequired` snapshots carry none.
         raw_output: Vec::new(),
         raw_output_start: 0,
         raw_output_prefix: Vec::new(),
@@ -8660,8 +8678,8 @@ const _: () = assert!(
 );
 
 /// Overlays the raw output-history tail onto a snapshot for client-side
-/// re-emulation. Used by the attach/resync/snapshot paths; the resize broadcast
-/// keeps the plain `snapshot()` so it never carries the tail.
+/// re-emulation. Used by the attach/snapshot paths; resize and resync broadcasts
+/// keep the plain `snapshot()` so they never carry the tail.
 ///
 /// When a scrollback journal is passed, journaled lines at or older than
 /// the raw window seam ride along in `raw_output_prefix`, ahead of the raw
@@ -10113,39 +10131,33 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 
             let mut matched = None;
             for (device_code, challenge) in challenges.iter() {
-                if let Some(pin) = challenge.pin.as_ref()
+                if &challenge.client_id == client_id
+                    && let Some(pin) = challenge.pin.as_ref()
                     && constant_time_eq(pin.code.as_bytes(), normalized.as_bytes())
                 {
-                    matched = Some((
-                        device_code.clone(),
-                        challenge.client_id.clone(),
-                        pin.expires_at,
-                    ));
+                    matched = Some((device_code.clone(), pin.expires_at));
                 }
             }
 
-            let Some((device_code, paired_client_id, pin_expires_at)) = matched else {
-                if let Some((_, challenge)) = challenges
+            let Some((device_code, pin_expires_at)) = matched else {
+                for (_, challenge) in challenges
                     .iter_mut()
-                    .find(|(_, challenge)| &challenge.client_id == client_id)
-                    && let Some(pin) = challenge.pin.as_mut()
+                    .filter(|(_, challenge)| &challenge.client_id == client_id)
                 {
-                    pin.failed_attempts = pin.failed_attempts.saturating_add(1);
-                    if pin.failed_attempts >= MAX_PAIRING_PIN_ATTEMPTS {
-                        tracing::warn!(
-                            client_id = %client_id,
-                            attempts = pin.failed_attempts,
-                            "invalidating pairing PIN after repeated failed attempts"
-                        );
-                        challenge.pin = None;
+                    if let Some(pin) = challenge.pin.as_mut() {
+                        pin.failed_attempts = pin.failed_attempts.saturating_add(1);
+                        if pin.failed_attempts >= MAX_PAIRING_PIN_ATTEMPTS {
+                            tracing::warn!(
+                                client_id = %client_id,
+                                attempts = pin.failed_attempts,
+                                "invalidating pairing PIN after repeated failed attempts"
+                            );
+                            challenge.pin = None;
+                        }
                     }
                 }
                 bail!("invalid pairing PIN");
             };
-
-            if &paired_client_id != client_id {
-                bail!("pairing PIN was issued for a different device");
-            }
 
             if pin_expires_at <= now {
                 if let Some(challenge) = challenges.get_mut(&device_code) {
@@ -17807,6 +17819,13 @@ mod tests {
             .approve_pairing_device_code(&challenge.device_code)
             .expect("approve challenge");
 
+        // Another client_id presenting the real PIN must neither oracle the PIN nor bypass lockout.
+        let other_client = ClientId::new("attacker-client").expect("other client id");
+        let cross_client_err =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &other_client)
+                .expect_err("PIN for different client must fail with generic error");
+        assert!(cross_client_err.to_string().contains("invalid pairing PIN"));
+
         for _ in 0..MAX_PAIRING_PIN_ATTEMPTS {
             let err =
                 triage_transport_ws::WebSocketAuthenticator::pair(&manager, "00000000", &client)
@@ -17837,6 +17856,15 @@ mod tests {
         let _token =
             triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &client).unwrap();
 
+        let session_id = manager
+            .start_session(StartSessionRequest {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "printf 'perm-test'; sleep 30".to_string()],
+                cwd: None,
+                size: SessionSize::default(),
+            })
+            .expect("start session");
+
         let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         let paired_mode = std::fs::metadata(log_dir.join("paired_devices.json"))
@@ -17845,7 +17873,34 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(paired_mode, 0o600);
+        let manifest_mode = std::fs::metadata(log_dir.join("sessions.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(manifest_mode, 0o600);
+        let sessions_root = log_dir.join("sessions");
+        let sessions_root_mode = std::fs::metadata(&sessions_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sessions_root_mode, 0o700);
+        let session_dir = sessions_root.join(session_id.as_str());
+        let session_dir_mode = std::fs::metadata(&session_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(session_dir_mode, 0o700);
+        let segment_mode = std::fs::metadata(session_dir.join("segment-000001.tlog"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(segment_mode, 0o600);
 
+        let _ = manager.shutdown_session(session_id);
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 

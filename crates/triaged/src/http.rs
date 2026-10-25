@@ -536,7 +536,12 @@ fn apply_history_cors_headers(headers: &mut header::HeaderMap) {
     );
 }
 
-fn json_error_response(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
+fn json_error_response(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    include_cors: bool,
+) -> Response<Full<Bytes>> {
     let body = serde_json::json!({
         "error": {
             "code": code,
@@ -547,7 +552,9 @@ fn json_error_response(status: StatusCode, code: &str, message: &str) -> Respons
     let mut res = Response::new(Full::new(bytes.clone()));
     *res.status_mut() = status;
     let headers = res.headers_mut();
-    apply_history_cors_headers(headers);
+    if include_cors {
+        apply_history_cors_headers(headers);
+    }
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -599,26 +606,12 @@ where
 
     let require_pairing = manager.require_pairing();
     if !require_pairing && !is_allowed_unpaired_origin(req.headers()) {
-        let body = serde_json::json!({
-            "error": {
-                "code": "forbidden_origin",
-                "message": "cross-origin access is not permitted when pairing is disabled",
-            }
-        });
-        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
-        let mut res = Response::new(Full::new(bytes.clone()));
-        *res.status_mut() = StatusCode::FORBIDDEN;
-        let headers = res.headers_mut();
-        headers.insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+        return json_error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "cross-origin access is not permitted when pairing is disabled",
+            false,
         );
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json; charset=utf-8"),
-        );
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-        return res;
     }
 
     if req.method() == hyper::Method::OPTIONS {
@@ -635,6 +628,7 @@ where
             StatusCode::METHOD_NOT_ALLOWED,
             "method_not_allowed",
             "only GET and OPTIONS are supported",
+            require_pairing,
         );
     }
 
@@ -644,6 +638,7 @@ where
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "missing or invalid Authorization bearer token",
+                require_pairing,
             );
         };
         let Some(raw_client_id) = req
@@ -657,6 +652,7 @@ where
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "missing X-Triage-Client-Id header",
+                require_pairing,
             );
         };
         let Ok(client_id) = triage_core::session::ClientId::new(raw_client_id) else {
@@ -664,6 +660,7 @@ where
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "invalid X-Triage-Client-Id header",
+                require_pairing,
             );
         };
         match manager.authenticate(&client_id, token) {
@@ -673,6 +670,7 @@ where
                     StatusCode::UNAUTHORIZED,
                     "unauthorized",
                     "invalid client credentials",
+                    require_pairing,
                 );
             }
         }
@@ -683,6 +681,7 @@ where
             StatusCode::BAD_REQUEST,
             "invalid_session_id",
             "invalid session_id",
+            require_pairing,
         );
     };
 
@@ -701,6 +700,7 @@ where
                             StatusCode::BAD_REQUEST,
                             "invalid_query",
                             "invalid window_bytes query parameter",
+                            require_pairing,
                         );
                     }
                 },
@@ -711,6 +711,7 @@ where
                             StatusCode::BAD_REQUEST,
                             "invalid_query",
                             "invalid after_byte query parameter",
+                            require_pairing,
                         );
                     }
                 },
@@ -721,6 +722,7 @@ where
                             StatusCode::BAD_REQUEST,
                             "invalid_query",
                             "invalid after_seq query parameter",
+                            require_pairing,
                         );
                     }
                 },
@@ -731,6 +733,7 @@ where
                             StatusCode::BAD_REQUEST,
                             "invalid_query",
                             "invalid before_byte query parameter",
+                            require_pairing,
                         );
                     }
                 },
@@ -803,13 +806,14 @@ where
             } else {
                 StatusCode::BAD_REQUEST
             };
-            return json_error_response(status, "history_error", &msg);
+            return json_error_response(status, "history_error", &msg, require_pairing);
         }
         Err(join_error) => {
             return json_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 &join_error.to_string(),
+                require_pairing,
             );
         }
     };
@@ -1186,6 +1190,11 @@ mod history_http_tests {
             .await
             .unwrap();
         assert_eq!(evil_history_res.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !evil_history_res
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
 
         // Cross-origin WebSocket upgrade when require_pairing=false is rejected.
         let evil_ws_req = Request::builder()

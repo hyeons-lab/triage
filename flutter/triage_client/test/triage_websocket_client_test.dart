@@ -1799,5 +1799,101 @@ void main() {
         );
       },
     );
+
+    test(
+      'fetchSessionHistory falls back to WebSocket attachSession on HTTP 404 or SPA text/html response',
+      () async {
+        var returnSpaHtml = false;
+        final sink = RecordingWebSocketSink();
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-json',
+        );
+        final client = TriageWebSocketClient(
+          Uri.parse('ws://127.0.0.1:7777/ws'),
+          channelFactory: (_) => channel,
+          httpFetcher: (uri, {required headers}) async {
+            if (returnSpaHtml) {
+              return (
+                statusCode: 200,
+                body: Uint8List.fromList(utf8.encode('<!doctype html>')),
+                contentType: 'text/html; charset=utf-8',
+              );
+            }
+            return (
+              statusCode: 404,
+              body: Uint8List(0),
+              contentType: 'text/plain',
+            );
+          },
+        );
+        await client.connect();
+
+        // 1. HTTP 404 (legacy server without /api/sessions/:id/history) falls back to attachSession.
+        final fallbackFuture1 = client.fetchSessionHistory(
+          sessionId: 'main',
+          clientId: 'client-1',
+          windowBytes: 65536,
+        );
+        await Future<void>.delayed(Duration.zero);
+        final attachReq1 =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        expect(attachReq1['type'], 'attach_session');
+        expect(attachReq1['request']['history_bytes'], 65536);
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'response',
+            'id': attachReq1['id'],
+            'result': {
+              'type': 'attach_session',
+              'response': {
+                'snapshot': {
+                  'output_seq': 7,
+                  'bytes_logged': 12,
+                  'raw_output': base64Encode(utf8.encode('ws-fallback\n')),
+                  'raw_output_start': 0,
+                  'exited': false,
+                },
+              },
+            },
+          }),
+        );
+        final snap1 = await fallbackFuture1;
+        expect(snap1['output_seq'], 7);
+
+        // 2. SPA text/html fallback response also falls back to attachSession.
+        returnSpaHtml = true;
+        final fallbackFuture2 = client.fetchSessionHistory(
+          sessionId: 'main',
+          clientId: 'client-1',
+          windowBytes: 32768,
+        );
+        await Future<void>.delayed(Duration.zero);
+        final attachReq2 =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        expect(attachReq2['type'], 'attach_session');
+        expect(attachReq2['request']['history_bytes'], 32768);
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'response',
+            'id': attachReq2['id'],
+            'result': {
+              'type': 'attach_session',
+              'response': {
+                'snapshot': {
+                  'output_seq': 8,
+                  'bytes_logged': 15,
+                  'raw_output': base64Encode(utf8.encode('ws-fallback-2\n')),
+                  'raw_output_start': 0,
+                  'exited': false,
+                },
+              },
+            },
+          }),
+        );
+        final snap2 = await fallbackFuture2;
+        expect(snap2['output_seq'], 8);
+      },
+    );
   });
 }

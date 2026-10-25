@@ -268,9 +268,7 @@ void main() {
       expect(inputs, ['\n']);
     });
 
-    testWidgets('plain Enter is left to the emulator default', (
-      tester,
-    ) async {
+    testWidgets('plain Enter is left to the emulator default', (tester) async {
       final inputs = await pumpPane(tester);
 
       // Our layer sends nothing: xterm's own handler owns plain Enter (CR)
@@ -303,5 +301,66 @@ void main() {
       });
     }
   });
-}
 
+  group('TerminalPane exited, obscured, and modal-route input guards', () {
+    testWidgets(
+      'ignores user terminal output and key events when isExited or isObscured while passing emulator query responses',
+      (tester) async {
+        final terminal = Terminal();
+        final controller = TerminalController();
+        final inputs = <String>[];
+        controller.addInputListener(inputs.add);
+
+        Widget buildHost({required bool isExited, required bool isObscured}) {
+          return MaterialApp(
+            home: Scaffold(
+              body: TerminalPane(
+                terminalId: 'guard-session',
+                terminal: terminal,
+                controller: controller,
+                fallbackRows: const [],
+                onTerminalResizeBind: (_) {},
+                focusCursorRevision: 0,
+                bracketedPasteEnabled: false,
+                isExited: isExited,
+                isObscured: isObscured,
+              ),
+            ),
+          );
+        }
+
+        // 1. Exited session drops user typing and Shift+Enter/Tab, but allows emulator query responses.
+        await tester.pumpWidget(buildHost(isExited: true, isObscured: false));
+        await tester.pumpAndSettle();
+
+        terminal.onOutput?.call('ls\n');
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.pump();
+        expect(inputs, isEmpty);
+
+        terminal.onOutput?.call('\x1b[1;1R');
+        expect(inputs, ['\x1b[1;1R']);
+        inputs.clear();
+
+        // 2. Obscured session drops user typing and hardware keys.
+        await tester.pumpWidget(buildHost(isExited: false, isObscured: true));
+        await tester.pumpAndSettle();
+
+        terminal.onOutput?.call('pwd\n');
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+        expect(inputs, isEmpty);
+
+        // 3. Unobscured live session accepts input again.
+        await tester.pumpWidget(buildHost(isExited: false, isObscured: false));
+        await tester.pumpAndSettle();
+
+        terminal.onOutput?.call('ok');
+        expect(inputs, ['ok']);
+      },
+    );
+  });
+}

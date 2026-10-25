@@ -251,7 +251,8 @@ pub struct JournalRecord {
     /// Absolute `bytes_logged` end offset of the chunk that scrolled this
     /// line. Monotonic within a file; used for the serve-time seam.
     pub log_offset: u64,
-    /// Exact bytes to serve (reset-prefixed SGR text + CRLF).
+    /// Exact bytes to serve (reset-prefixed SGR text, terminated by CRLF
+    /// on hard line breaks and without CRLF on soft-wrapped lines).
     pub bytes: Vec<u8>,
 }
 
@@ -1184,6 +1185,7 @@ impl ScrollbackJournal {
                 .write(true)
                 .truncate(true)
                 .open(&staging)?;
+            crate::session::set_private_file_permissions(&staging);
             let mut staged = BufWriter::new(file);
             staged.write_all(&journal_header())?;
             for record in &survivors {
