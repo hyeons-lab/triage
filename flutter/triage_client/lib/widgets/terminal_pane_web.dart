@@ -35,6 +35,7 @@ class TerminalPane extends StatefulWidget {
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
+    this.isObscured = false,
     this.softKeyboardEnabled = true,
   });
 
@@ -61,6 +62,11 @@ class TerminalPane extends StatefulWidget {
   final int focusCursorRevision;
   final bool isExited;
   final bool isLoading;
+
+  /// True when an in-route overlay (such as the mobile session rail) covers
+  /// the workspace, so pointer/touch gestures on the overlay cannot leak into
+  /// or scroll the xterm.js DOM element underneath.
+  final bool isObscured;
 
   /// Mobile soft-keyboard kill switch. While false the pane never focuses
   /// xterm's hidden textarea, so the keyboard stays down and its insets stop
@@ -732,7 +738,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
-        final isCurrent = _currentRoute?.isCurrent ?? true;
+        final isCurrent = _isRouteCurrentAndUnobscured;
         if (!widget.isExited && isCurrent && _eventTargetsTerminal(event)) {
           // Allow IME composition to proceed natively.
           if (event.isComposing == true || event.key == 'Process') {
@@ -868,9 +874,11 @@ class _TerminalPaneState extends State<TerminalPane>
     _syncPointerEvents();
   }
 
+  bool get _isRouteCurrentAndUnobscured =>
+      (_currentRoute?.isCurrent ?? true) && !widget.isObscured;
+
   void _syncPointerEvents() {
-    final isCurrent = _currentRoute?.isCurrent ?? true;
-    final isInteractive = isCurrent && !widget.isLoading;
+    final isInteractive = _isRouteCurrentAndUnobscured && !widget.isLoading;
     final target = isInteractive ? 'auto' : 'none';
     if (_initialized || _sessionContainers.containsKey(_sanitizedId)) {
       if (_container.style.pointerEvents != target) {
@@ -899,7 +907,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // handler.
   void _sendMobileInput(String text) {
     if (!mounted || widget.isExited || text.isEmpty) return;
-    if (_currentRoute?.isCurrent == false) return;
+    if (!_isRouteCurrentAndUnobscured) return;
 
     if (_ctrlArmed) {
       _setCtrlArmed(false);
@@ -1100,7 +1108,7 @@ class _TerminalPaneState extends State<TerminalPane>
       late final Timer timer;
       timer = Timer(Duration(milliseconds: delayMs), () {
         _focusRetryTimers.remove(timer);
-        if (!mounted || !_initialized || !(_currentRoute?.isCurrent ?? true)) {
+        if (!mounted || !_initialized || !_isRouteCurrentAndUnobscured) {
           return;
         }
         if (_isActiveElementInTerminal()) {
@@ -1115,8 +1123,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
   void _activateTerminal({bool force = false}) {
     if (!mounted || !_initialized || widget.isExited) return;
-    final isCurrent = _currentRoute?.isCurrent ?? true;
-    if (!isCurrent) return;
+    if (!_isRouteCurrentAndUnobscured) return;
 
     if (!force) {
       final active = _deepActiveElement();
@@ -1367,7 +1374,7 @@ class _TerminalPaneState extends State<TerminalPane>
         }
         if (data.length > 1 && isMultiLine(data) && data != '\r\n') {
           _sessionAutoSpace[sessionId]?.reset();
-          if (_currentRoute?.isCurrent == false) return;
+          if (!activePane._isRouteCurrentAndUnobscured) return;
           unawaited(activePane._handlePaste(data));
           return;
         }
@@ -2175,6 +2182,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
+      if (widget.isObscured) return;
       _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
       if (event.touches != null && event.touches!.isNotEmpty) {
@@ -2183,6 +2191,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerTouchMoveSubscription = _container.onTouchMove.listen((event) {
+      if (widget.isObscured) return;
       _touchScrollTakeover.onTouchMove(DateTime.now().millisecondsSinceEpoch);
       if (_touchStartY != null &&
           event.touches != null &&
@@ -2245,6 +2254,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerPointerDownSubscription = _container.on['pointerdown'].listen((
       event,
     ) {
+      if (widget.isObscured) return;
       _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activePointerCount++;
     });
@@ -2283,7 +2293,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerPointerMoveSubscription = _container.on['pointermove'].listen((
       event,
     ) {
-      if (!_initialized) return;
+      if (!_initialized || widget.isObscured) return;
       final term = _sessionTerms[_sanitizedId];
       if (term == null) return;
       final int buttons;
@@ -2353,7 +2363,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerWheelSubscription = _container.onWheel.listen((event) {
-      if (_currentRoute?.isCurrent == false) {
+      if (!_isRouteCurrentAndUnobscured) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -2363,7 +2373,7 @@ class _TerminalPaneState extends State<TerminalPane>
       if (event is html.ClipboardEvent) {
         event.preventDefault();
         event.stopPropagation();
-        if (_currentRoute?.isCurrent == false ||
+        if (!_isRouteCurrentAndUnobscured ||
             _isPasteDialogShowing ||
             widget.isExited) {
           return;
@@ -2432,7 +2442,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _unbindTextareaEvents();
 
     void beforeInputListener(html.Event event) {
-      if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
+      if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
         return;
       }
       final inputType = js_util.getProperty(event, 'inputType') as String?;
@@ -2504,7 +2514,7 @@ class _TerminalPaneState extends State<TerminalPane>
     }
 
     void inputListener(html.Event event) {
-      if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
+      if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
         return;
       }
       final inputType = js_util.getProperty(event, 'inputType') as String?;
@@ -2536,7 +2546,7 @@ class _TerminalPaneState extends State<TerminalPane>
     }
 
     void compositionEndListener(html.Event event) {
-      if (!mounted || widget.isExited || _currentRoute?.isCurrent == false) {
+      if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
         return;
       }
       final data = js_util.getProperty(event, 'data') as String?;
@@ -2977,8 +2987,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   bool _eventTargetsTerminal(html.Event event) {
-    final isCurrent = _currentRoute?.isCurrent ?? true;
-    if (!mounted || widget.isExited || !isCurrent) {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
       return false;
     }
 
@@ -3406,6 +3415,15 @@ class _TerminalPaneState extends State<TerminalPane>
         _restoreScrollPosition(requestFocus: false);
       }
     }
+    if (oldWidget.isObscured != widget.isObscured) {
+      _syncPointerEvents();
+      if (widget.isObscured) {
+        _touchStartY = null;
+        _activeTouchCount = 0;
+        _activePointerCount = 0;
+        _clearFocusRetryTimers();
+      }
+    }
     if (oldWidget.controller != widget.controller ||
         oldWidget.terminalId != widget.terminalId) {
       final alreadyRebound =
@@ -3555,7 +3573,7 @@ class _TerminalPaneState extends State<TerminalPane>
             child: Stack(
               children: [
                 IgnorePointer(
-                  ignoring: widget.isLoading,
+                  ignoring: widget.isLoading || widget.isObscured,
                   child: AnimatedOpacity(
                     opacity: widget.isLoading ? 0.7 : 1.0,
                     duration: const Duration(milliseconds: 150),
