@@ -681,6 +681,7 @@ impl ScrollbackJournal {
                 .create(true)
                 .append(true)
                 .open(&path)?;
+            crate::session::set_private_file_permissions(&path);
             let mut writer = BufWriter::new(file);
             if fresh {
                 writer.write_all(&journal_header())?;

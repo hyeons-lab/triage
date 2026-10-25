@@ -4,6 +4,8 @@ import 'dart:typed_data';
 
 import 'history_http.dart';
 
+const int maxHistoryResponseBytes = 16 * 1024 * 1024;
+
 final HttpClient _sharedHistoryHttpClient = HttpClient()
   ..autoUncompress = true
   ..connectionTimeout = const Duration(seconds: 10)
@@ -22,6 +24,11 @@ Future<HistoryHttpResponse> performHistoryHttpGet(
   final response = await request.close().timeout(const Duration(seconds: 10));
   final builder = BytesBuilder(copy: false);
   await for (final chunk in response.timeout(const Duration(seconds: 10))) {
+    if (builder.length + chunk.length > maxHistoryResponseBytes) {
+      throw const FormatException(
+        'HTTP history response exceeds 16 MiB size limit',
+      );
+    }
     builder.add(chunk);
   }
   final contentType =

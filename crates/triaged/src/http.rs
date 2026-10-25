@@ -73,20 +73,16 @@ impl WebAssetCache {
     }
 
     fn load_override_file(&self, path: &str) -> Option<CachedFile> {
-        if let Some(ref dir) = self.override_dir {
-            let safe_path = path.replace("..", "");
-            let full_path = dir.join(&safe_path);
-            let content_opt = if full_path.is_file() {
-                std::fs::read(&full_path).ok()
-            } else {
-                None
-            };
-            if let Some(content) = content_opt {
-                return Some(cached_file_from_bytes(path, Bytes::from(content)));
-            }
+        let dir = self.override_dir.as_ref()?;
+        let rel_path = sanitize_override_relative_path(path)?;
+        let canonical_dir = std::fs::canonicalize(dir).ok()?;
+        let candidate = canonical_dir.join(&rel_path);
+        let canonical_file = std::fs::canonicalize(&candidate).ok()?;
+        if !canonical_file.starts_with(&canonical_dir) || !canonical_file.is_file() {
+            return None;
         }
-
-        None
+        let content = std::fs::read(&canonical_file).ok()?;
+        Some(cached_file_from_bytes(path, Bytes::from(content)))
     }
 
     fn load_embedded_file(&self, path: &str) -> Option<CachedFile> {
@@ -220,7 +216,8 @@ where
         && req
             .headers()
             .get(header::UPGRADE)
-            .is_some_and(|val| val == "websocket")
+            .and_then(|val| val.to_str().ok())
+            .is_some_and(|val| val.eq_ignore_ascii_case("websocket"))
     {
         return Ok(handle_ws_upgrade(req, manager));
     }
@@ -299,6 +296,14 @@ fn handle_ws_upgrade<B>(
 where
     B: hyper::body::Body + Send + 'static,
 {
+    use triage_transport_ws::WebSocketAuthenticator;
+
+    if !manager.require_pairing() && !is_allowed_unpaired_origin(req.headers()) {
+        let mut res = Response::new(Full::new(Bytes::from("Forbidden")));
+        *res.status_mut() = StatusCode::FORBIDDEN;
+        return res;
+    }
+
     let key = match req.headers().get("sec-websocket-key") {
         Some(val) => val,
         None => {
@@ -365,10 +370,15 @@ where
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let io = hyper_util::rt::TokioIo::new(upgraded);
+                let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                    max_message_size: Some(4 * 1024 * 1024),
+                    max_frame_size: Some(1024 * 1024),
+                    ..Default::default()
+                };
                 let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
                     io,
                     tokio_tungstenite::tungstenite::protocol::Role::Server,
-                    None,
+                    Some(ws_config),
                 )
                 .await;
                 if let Err(error) =
@@ -389,6 +399,86 @@ where
 
 pub const HISTORY_FRAME_MAGIC: &[u8; 4] = b"THS1";
 pub const HISTORY_CONTENT_TYPE: &str = "application/x-triage-history";
+
+fn sanitize_override_relative_path(path: &str) -> Option<PathBuf> {
+    let decoded = percent_decode(path);
+    let trimmed = decoded.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.contains('\\') {
+        return None;
+    }
+    let mut clean = PathBuf::new();
+    for component in std::path::Path::new(trimmed).components() {
+        match component {
+            std::path::Component::Normal(segment) => {
+                let seg_str = segment.to_str()?;
+                if seg_str.is_empty() || seg_str == "." || seg_str == ".." || seg_str.contains("..")
+                {
+                    return None;
+                }
+                clean.push(seg_str);
+            }
+            _ => return None,
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn extract_origin_host(origin: &str) -> Option<&str> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    let authority = rest.split('/').next()?;
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let host_end = bracketed.find(']')?;
+        return Some(&authority[..=host_end + 1]);
+    }
+    Some(authority.split(':').next().unwrap_or(authority))
+}
+
+fn extract_host_header_hostname(host_header: &str) -> &str {
+    let trimmed = host_header.trim();
+    if let Some(bracketed) = trimmed.strip_prefix('[')
+        && let Some(host_end) = bracketed.find(']')
+    {
+        return &trimmed[..=host_end + 1];
+    }
+    trimmed.split(':').next().unwrap_or(trimmed)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "[::1]"
+        || host == "::1"
+}
+
+fn is_allowed_unpaired_origin(headers: &header::HeaderMap) -> bool {
+    let Some(origin_val) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin_str) = origin_val.to_str() else {
+        return false;
+    };
+    let Some(origin_host) = extract_origin_host(origin_str.trim()) else {
+        return false;
+    };
+    if is_loopback_host(origin_host) {
+        return true;
+    }
+    if let Some(host_val) = headers.get(header::HOST)
+        && let Ok(host_str) = host_val.to_str()
+    {
+        let req_host = extract_host_header_hostname(host_str);
+        if origin_host.eq_ignore_ascii_case(req_host) {
+            return true;
+        }
+    }
+    false
+}
 
 fn parse_history_session_id(path: &str) -> Option<String> {
     let rest = path.strip_prefix("/api/sessions/")?;
@@ -507,10 +597,36 @@ where
 {
     use triage_transport_ws::WebSocketAuthenticator;
 
+    let require_pairing = manager.require_pairing();
+    if !require_pairing && !is_allowed_unpaired_origin(req.headers()) {
+        let body = serde_json::json!({
+            "error": {
+                "code": "forbidden_origin",
+                "message": "cross-origin access is not permitted when pairing is disabled",
+            }
+        });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap_or_default());
+        let mut res = Response::new(Full::new(bytes.clone()));
+        *res.status_mut() = StatusCode::FORBIDDEN;
+        let headers = res.headers_mut();
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+        return res;
+    }
+
     if req.method() == hyper::Method::OPTIONS {
         let mut res = Response::new(Full::new(Bytes::new()));
         *res.status_mut() = StatusCode::NO_CONTENT;
-        apply_history_cors_headers(res.headers_mut());
+        if require_pairing {
+            apply_history_cors_headers(res.headers_mut());
+        }
         return res;
     }
 
@@ -522,7 +638,7 @@ where
         );
     }
 
-    if manager.require_pairing() {
+    if require_pairing {
         let Some(token) = extract_bearer_token(req.headers()) else {
             return json_error_response(
                 StatusCode::UNAUTHORIZED,
@@ -701,7 +817,9 @@ where
     let mut res = Response::new(Full::new(body.clone()));
     *res.status_mut() = StatusCode::OK;
     let headers = res.headers_mut();
-    apply_history_cors_headers(headers);
+    if require_pairing {
+        apply_history_cors_headers(headers);
+    }
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
@@ -969,6 +1087,139 @@ mod history_http_tests {
         );
         assert_eq!(back_meta["raw_output_end"].as_u64(), Some(total_bytes - 6));
         assert_eq!(back_meta["raw_output_truncated"].as_bool(), Some(true));
+
+        let _ = manager.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[tokio::test]
+    async fn web_asset_cache_rejects_override_dir_path_traversal() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "triage-web-override-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let override_dir = base_dir.join("web");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(base_dir.join("secret.txt"), b"TOP_SECRET").unwrap();
+        std::fs::write(override_dir.join("custom.txt"), b"PUBLIC_ASSET").unwrap();
+
+        let log_dir = base_dir.join("logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(log_dir)));
+        let cache = Arc::new(WebAssetCache::new(Some(override_dir)));
+
+        for traversal_uri in [
+            "/....//secret.txt",
+            "/%2e%2e/secret.txt",
+            "/..%2fsecret.txt",
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(traversal_uri)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let res = serve_http(req, cache.clone(), manager.clone())
+                .await
+                .unwrap();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            assert_ne!(
+                &body[..],
+                b"TOP_SECRET",
+                "traversal URI {traversal_uri} leaked file outside override_dir"
+            );
+        }
+
+        let valid_req = Request::builder()
+            .method("GET")
+            .uri("/custom.txt")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let valid_res = serve_http(valid_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(valid_res.status(), StatusCode::OK);
+        let valid_body = valid_res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&valid_body[..], b"PUBLIC_ASSET");
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn unpaired_mode_rejects_cross_origin_requests() {
+        let log_dir = std::env::temp_dir().join(format!(
+            "triage-cswsh-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manager = Arc::new(
+            SessionManager::new(SessionManagerConfig::new(log_dir.clone()))
+                .with_require_pairing(false),
+        );
+        let cache = Arc::new(WebAssetCache::new(None));
+
+        let session_id = manager
+            .start_session(StartSessionRequest {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "printf 'hi'; sleep 30".to_string()],
+                cwd: None,
+                size: SessionSize::default(),
+            })
+            .expect("start session");
+
+        // Cross-origin request to /api/sessions/{id}/history when require_pairing=false is rejected.
+        let evil_history_req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/sessions/{session_id}/history?window_bytes=64"
+            ))
+            .header(header::HOST, "localhost:8742")
+            .header(header::ORIGIN, "https://evil.example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let evil_history_res = serve_http(evil_history_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(evil_history_res.status(), StatusCode::FORBIDDEN);
+
+        // Cross-origin WebSocket upgrade when require_pairing=false is rejected.
+        let evil_ws_req = Request::builder()
+            .method("GET")
+            .uri("/ws")
+            .header(header::HOST, "localhost:8742")
+            .header(header::UPGRADE, "websocket")
+            .header(header::ORIGIN, "https://evil.example.com")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let evil_ws_res = serve_http(evil_ws_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(evil_ws_res.status(), StatusCode::FORBIDDEN);
+
+        // Loopback origin is allowed.
+        let loopback_history_req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/sessions/{session_id}/history?window_bytes=64"
+            ))
+            .header(header::HOST, "localhost:8742")
+            .header(header::ORIGIN, "http://localhost:8742")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let loopback_history_res = serve_http(loopback_history_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(loopback_history_res.status(), StatusCode::OK);
+        assert!(
+            !loopback_history_res
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
 
         let _ = manager.shutdown_session(session_id);
         let _ = std::fs::remove_dir_all(&log_dir);

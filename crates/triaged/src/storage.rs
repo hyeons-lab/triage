@@ -212,6 +212,7 @@ pub(crate) fn encode_phase(raw_path: &Path, tmp_path: &Path) -> Result<()> {
         .truncate(true)
         .open(tmp_path)
         .with_context(|| format!("creating temp compressed segment {}", tmp_path.display()))?;
+    crate::session::set_private_file_permissions(tmp_path);
     let writer = BufWriter::new(tmp_file);
 
     let mut encoder = zstd::stream::Encoder::new(writer, ZSTD_COMPRESSION_LEVEL)?;

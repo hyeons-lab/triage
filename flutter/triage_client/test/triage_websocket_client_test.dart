@@ -1712,6 +1712,17 @@ void main() {
         utf8.decode(decoded['raw_output_prefix'] as Uint8List),
         'older prefix\n',
       );
+
+      final oversizedHeader = Uint8List(16);
+      oversizedHeader.setRange(0, 4, [0x54, 0x48, 0x53, 0x31]);
+      final bd = ByteData.sublistView(oversizedHeader);
+      bd.setUint32(4, 32, Endian.little);
+      bd.setUint32(8, 0, Endian.little);
+      bd.setUint32(12, maxHistoryFramePayloadBytes + 1, Endian.little);
+      expect(
+        () => decodeHistoryFrame(oversizedHeader),
+        throwsA(isA<FormatException>()),
+      );
     });
 
     test(

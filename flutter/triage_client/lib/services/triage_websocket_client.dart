@@ -254,6 +254,8 @@ Uint8List historyBytesFromField(dynamic raw) {
   return Uint8List(0);
 }
 
+const int maxHistoryFramePayloadBytes = 16 * 1024 * 1024;
+
 /// Decodes a `THS1` binary history frame into a snapshot-compatible map with
 /// `raw_output_prefix` and `raw_output` populated as zero-copy [Uint8List]
 /// subviews.
@@ -269,7 +271,13 @@ Map<String, dynamic> decodeHistoryFrame(Uint8List bytes) {
   final metaLen = header.getUint32(4, Endian.little);
   final prefixLen = header.getUint32(8, Endian.little);
   final rawLen = header.getUint32(12, Endian.little);
-  final expectedTotal = 16 + metaLen + prefixLen + rawLen;
+  final payloadBytes = metaLen + prefixLen + rawLen;
+  if (payloadBytes > maxHistoryFramePayloadBytes) {
+    throw FormatException(
+      'THS1 history frame payload ($payloadBytes bytes) exceeds 16 MiB limit',
+    );
+  }
+  final expectedTotal = 16 + payloadBytes;
   if (bytes.length < expectedTotal) {
     throw FormatException(
       'Truncated THS1 history frame (${bytes.length} < $expectedTotal)',
