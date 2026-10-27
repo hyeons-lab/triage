@@ -339,6 +339,36 @@ void main() {
         ),
       );
     });
+
+    test(
+      'hasLineShifted is false until top trim changes anchored line index',
+      () {
+        final terminal = _fullTerminal(maxLines: 30);
+        final anchor = TerminalScrollAnchor();
+        final maxExtent = _maxExtent(terminal, lineHeight);
+
+        anchor.capture(
+          buffer: terminal.buffer,
+          pixels: 10 * lineHeight,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        );
+        expect(anchor.hasAnchor, isTrue);
+        expect(anchor.hasLineShifted, isFalse);
+
+        // In-place cursor-addressed write does not trim or shift buffer lines.
+        terminal.write('\x1b[1;1Hspinner');
+        expect(anchor.hasLineShifted, isFalse);
+
+        // Appending a new line at full capacity trims 1 line off the top,
+        // shifting the anchored line's index from 10 to 9.
+        terminal.write('\x1b[${terminal.viewHeight};1H\r\nnext line');
+        expect(anchor.hasLineShifted, isTrue);
+
+        anchor.markPinned();
+        expect(anchor.hasLineShifted, isFalse);
+      },
+    );
   });
 
   group('shouldReleaseScrollPin', () {

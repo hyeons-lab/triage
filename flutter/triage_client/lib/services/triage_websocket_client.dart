@@ -196,6 +196,129 @@ Uint8List rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) {
   return historyBytesFromField(snapshot['raw_output_prefix']);
 }
 
+bool _isDefaultBlankSpanStyle(dynamic style) {
+  if (style is! Map) return true;
+  return style['background'] == null &&
+      style['underline'] != true &&
+      style['reverse'] != true;
+}
+
+/// Encodes the snapshot's visible `styled_rows` and `cursor` into an ANSI
+/// byte stream that paints the authoritative visible viewport after
+/// `raw_output_prefix` when a snapshot splits history across
+/// `raw_output_prefix` and `raw_output`.
+///
+/// `raw_output_prefix` holds all scrolled lines up to row 0 of the visible
+/// screen, ending with `\r\n` so the last `rows - 1` lines of the prefix are
+/// still sitting on visible rows `0 .. rows - 2` of the client emulator.
+/// Replaying a cursor-addressed `raw_output` tail (which begins mid-session
+/// at `seam > 0` and uses relative/absolute cursor positioning without
+/// scrolling `rows - 1` times) would overwrite those prefix lines in place.
+/// Writing `styled_rows` separated by `\r\n` with autowrap disabled (`DECAWM`
+/// `\x1b[?7l`) advances the emulator by `rows - 1` lines (pushing 100% of
+/// `raw_output_prefix` into scrollback above visible row 0) and paints the
+/// exact visible screen and cursor position.
+Uint8List rawOutputViewportFromSnapshot(Map<String, dynamic> snapshot) {
+  final prefix = rawOutputPrefixFromSnapshot(snapshot);
+  if (prefix.isEmpty || rawOutputFromSnapshot(snapshot).isEmpty) {
+    return Uint8List(0);
+  }
+  final styledRows = snapshot['styled_rows'];
+  if (styledRows is! List || styledRows.isEmpty) {
+    return Uint8List(0);
+  }
+  final buf = StringBuffer('\x1b[?7l');
+  if (!prefix.contains(0x0a)) {
+    buf.write('\x1b[H');
+  }
+  for (var i = 0; i < styledRows.length; i++) {
+    if (i > 0) {
+      buf.write('\r\n');
+    }
+    buf.write('\x1b[0m');
+    final row = styledRows[i];
+    if (row is Map) {
+      final rawSpans = row['spans'];
+      if (rawSpans is List && rawSpans.isNotEmpty) {
+        var endSpan = rawSpans.length;
+        while (endSpan > 0) {
+          final last = rawSpans[endSpan - 1];
+          if (last is! Map) {
+            endSpan--;
+            continue;
+          }
+          final text = last['text']?.toString() ?? '';
+          if (text.trim().isEmpty && _isDefaultBlankSpanStyle(last['style'])) {
+            endSpan--;
+          } else {
+            break;
+          }
+        }
+        for (var s = 0; s < endSpan; s++) {
+          final span = rawSpans[s];
+          if (span is! Map) continue;
+          var text = span['text']?.toString() ?? '';
+          if (s == endSpan - 1 && _isDefaultBlankSpanStyle(span['style'])) {
+            text = text.trimRight();
+          }
+          if (text.isEmpty) continue;
+          final style = span['style'];
+          buf.write('\x1b[0');
+          if (style is Map) {
+            if (style['bold'] == true) buf.write(';1');
+            if (style['dim'] == true) buf.write(';2');
+            if (style['italic'] == true) buf.write(';3');
+            if (style['underline'] == true) buf.write(';4');
+            if (style['reverse'] == true) buf.write(';7');
+            final fg = style['foreground'];
+            if (fg is Map) {
+              final r = fg['red'] as int? ?? 0;
+              final g = fg['green'] as int? ?? 0;
+              final b = fg['blue'] as int? ?? 0;
+              buf.write(';38;2;$r;$g;$b');
+            }
+            final bg = style['background'];
+            if (bg is Map) {
+              final r = bg['red'] as int? ?? 0;
+              final g = bg['green'] as int? ?? 0;
+              final b = bg['blue'] as int? ?? 0;
+              buf.write(';48;2;$r;$g;$b');
+            }
+          }
+          buf.write('m');
+          buf.write(text);
+        }
+      }
+    }
+    buf.write('\x1b[0m');
+  }
+  buf.write('\x1b[?7h');
+  final styledRowsStart = snapshot['styled_rows_start'] as int? ?? 0;
+  final cursor = snapshot['cursor'];
+  if (cursor is Map) {
+    final rawRow = cursor['row'] as int? ?? styledRowsStart;
+    final col = (cursor['col'] as int? ?? 0).clamp(0, 10000);
+    final visible = cursor['visible'] as bool? ?? true;
+    final viewportRow = (rawRow - styledRowsStart).clamp(
+      0,
+      styledRows.length - 1,
+    );
+    final rowsUp = (styledRows.length - 1) - viewportRow;
+    buf.write('\r');
+    if (rowsUp > 0) {
+      buf.write('\x1b[${rowsUp}A');
+    }
+    if (col > 0) {
+      buf.write('\x1b[${col}C');
+    }
+    buf.write(visible ? '\x1b[?25h' : '\x1b[?25l');
+  }
+  if (snapshot['bracketed_paste_enabled'] == true) {
+    buf.write('\x1b[?2004h');
+  }
+  return Uint8List.fromList(utf8.encode(buf.toString()));
+}
+
 /// Whether a parsed snapshot carries replayable history: either the raw
 /// tail or the journaled prefix counts. A prefix-only snapshot is
 /// reachable when the raw tail is empty but offset-0 journal survivors

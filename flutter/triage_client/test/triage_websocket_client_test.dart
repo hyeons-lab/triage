@@ -1641,6 +1641,41 @@ void main() {
       },
     );
 
+    test(
+      'rawOutputViewportFromSnapshot encodes styled_rows and cursor when split history is present',
+      () {
+        final raw = Uint8List.fromList(utf8.encode('raw-tail'));
+        final prefix = Uint8List.fromList(utf8.encode('\x1b[0mprefix\r\n'));
+        final snapshot = <String, dynamic>{
+          'raw_output': raw,
+          'raw_output_prefix': prefix,
+          'styled_rows_start': 10,
+          'styled_rows': [
+            {
+              'spans': [
+                {
+                  'text': 'Row 0   ',
+                  'style': {'bold': true},
+                },
+              ],
+            },
+            {
+              'spans': [
+                {'text': 'Row 1', 'style': <String, dynamic>{}},
+              ],
+            },
+          ],
+          'cursor': {'row': 11, 'col': 5, 'visible': true},
+        };
+        final viewport = utf8.decode(rawOutputViewportFromSnapshot(snapshot));
+        expect(viewport, contains('Row 0'));
+        expect(viewport, isNot(contains('Row 0   ')));
+        expect(viewport, contains('\r\n'));
+        expect(viewport, contains('\r\x1b[5C\x1b[?25h'));
+        expect(rawOutputViewportFromSnapshot({'raw_output': raw}), isEmpty);
+      },
+    );
+
     test('rejects corrupted gzip stream and returns empty Uint8List', () {
       final corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
       final encoded = base64Encode(corrupt);
@@ -2184,5 +2219,55 @@ void main() {
         expect(snap3['output_seq'], 9);
       },
     );
+  });
+
+  group('rawOutputViewportFromSnapshot mode-only prefix', () {
+    test('homes cursor with ESC[H when prefix has no newlines', () {
+      final modePrefix = utf8.encode(
+        '\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h',
+      );
+      final snapshot = <String, dynamic>{
+        'raw_output_prefix': modePrefix,
+        'raw_output': utf8.encode('frame'),
+        'styled_rows': [
+          {
+            'spans': [
+              {
+                'text': 'row0',
+                'fg': {'type': 'default'},
+                'bg': {'type': 'default'},
+                'bold': false,
+                'dim': false,
+                'italic': false,
+                'underline': false,
+                'inverse': false,
+              },
+            ],
+          },
+          {
+            'spans': [
+              {
+                'text': 'row1',
+                'fg': {'type': 'default'},
+                'bg': {'type': 'default'},
+                'bold': false,
+                'dim': false,
+                'italic': false,
+                'underline': false,
+                'inverse': false,
+              },
+            ],
+          },
+        ],
+        'cursor': {'row': 1, 'col': 4, 'visible': true},
+      };
+      final viewport = utf8.decode(rawOutputViewportFromSnapshot(snapshot));
+      expect(
+        viewport,
+        startsWith(
+          '\x1b[?7l\x1b[H\x1b[0m\x1b[0mrow0\x1b[0m\r\n\x1b[0m\x1b[0mrow1',
+        ),
+      );
+    });
   });
 }

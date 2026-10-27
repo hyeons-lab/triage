@@ -2,7 +2,15 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
-import 'package:flutter/gestures.dart' show kPrimaryButton;
+import 'package:flutter/gestures.dart'
+    show
+        GestureBinding,
+        PointerPanZoomEndEvent,
+        PointerPanZoomStartEvent,
+        PointerPanZoomUpdateEvent,
+        PointerScrollEvent,
+        PointerSignalEvent,
+        kPrimaryButton;
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
 import 'package:flutter/services.dart'
@@ -50,6 +58,7 @@ class TerminalPane extends StatefulWidget {
     this.isExited = false,
     this.isLoading = false,
     this.isObscured = false,
+    this.interactionEnabled = true,
     this.softKeyboardEnabled = true,
   });
 
@@ -81,6 +90,10 @@ class TerminalPane extends StatefulWidget {
   /// or scroll the terminal underneath.
   final bool isObscured;
 
+  /// False while the session rail overlay covers the workspace or a rail drag
+  /// is in flight, so gestures on the rail never scroll or focus the terminal.
+  final bool interactionEnabled;
+
   /// Mobile soft-keyboard kill switch. While false the pane neither takes
   /// focus nor opens the IME path, so the keyboard stays down and its
   /// viewport insets stop churning the terminal layout. Desktop ignores it.
@@ -88,6 +101,7 @@ class TerminalPane extends StatefulWidget {
 
   static void destroySession(String terminalId) {
     final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _TerminalPaneState._mountedPanes.remove(terminalId);
     _TerminalPaneState._clearSavedSessionScroll(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
     _TerminalPaneState._sessionLastResizeOutCols.remove(terminalId);
@@ -100,13 +114,18 @@ class TerminalPane extends StatefulWidget {
     _TerminalPaneState._sessionBracketedPasteModes[terminalId] = enabled;
   }
 
-  /// No-op on non-web: the native pane binds its `Terminal` through the widget
-  /// tree, so a controller swap arrives with the rebuild. Declared so callers
-  /// do not have to branch on platform.
+  /// Rebinds the mounted pane for [terminalId] to [controller] immediately so
+  /// history-replay notifications emitted before the next widget rebuild are
+  /// not lost on the outgoing placeholder controller.
   static void rebindSessionController(
     String terminalId,
     TerminalController controller,
-  ) {}
+  ) {
+    final pane = _TerminalPaneState._mountedPanes[terminalId];
+    if (pane != null && pane.mounted) {
+      pane._bindController(controller);
+    }
+  }
 
   /// Live grid size as (rows, cols); null when unknown.
   /// Rows-first: destructure rows as $1, cols as $2.
@@ -116,8 +135,9 @@ class TerminalPane extends StatefulWidget {
         _TerminalPaneState._sessionLastGridSize[terminalId];
   }
 
-  /// Last fitted workspace grid size as (rows, cols) on web; null on native.
-  static (int, int)? getLastFittedWorkspaceSize() => null;
+  /// Last fitted workspace grid size as (rows, cols).
+  static (int, int)? getLastFittedWorkspaceSize() =>
+      _TerminalPaneState._lastWorkspaceFittedSize;
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -125,6 +145,7 @@ class TerminalPane extends StatefulWidget {
 
 class _TerminalPaneState extends State<TerminalPane>
     with NoOlderScrollbackLatch {
+  static final Map<String, _TerminalPaneState> _mountedPanes = {};
   static final Map<String, double> _sessionSavedScrollOffsets = {};
   static final Map<String, TerminalScrollAnchor> _sessionSavedScrollAnchors =
       {};
@@ -133,6 +154,7 @@ class _TerminalPaneState extends State<TerminalPane>
   static final Map<String, int> _sessionLastResizeOutCols = {};
   static final Map<String, int> _sessionLastResizeOutRows = {};
   static final Map<String, (int, int)> _sessionLastGridSize = {};
+  static (int, int)? _lastWorkspaceFittedSize;
 
   static void _clearSavedSessionScroll(String id) {
     _sessionSavedScrollOffsets.remove(id);
@@ -149,12 +171,14 @@ class _TerminalPaneState extends State<TerminalPane>
   xt.Terminal get _terminal => widget.terminal;
   final FocusNode _focusNode = FocusNode();
   late final ScrollController _scrollController;
+  TerminalController? _boundController;
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
   DateTime? _pageAnchorAt;
   xt.CellOffset? _pageSelectionBase;
   xt.CellOffset? _pageSelectionExtent;
   int _pageJumpGeneration = 0;
+  int _scrollToCursorGeneration = 0;
 
   void _clearPageAnchor() {
     _pageAnchorPixels = null;
@@ -170,18 +194,6 @@ class _TerminalPaneState extends State<TerminalPane>
   // True while we drive `_scrollController` ourselves, so the resulting scroll
   // notification doesn't re-capture the anchor from our own correction.
   bool _suppressAnchorCapture = false;
-  bool _suppressScrollSave = false;
-  Timer? _suppressScrollSaveTimer;
-
-  void _suppressScrollSaveFor(Duration duration) {
-    _suppressScrollSave = true;
-    _suppressScrollSaveTimer?.cancel();
-    _suppressScrollSaveTimer = Timer(duration, () {
-      if (mounted) {
-        _suppressScrollSave = false;
-      }
-    });
-  }
 
   bool _repinScheduled = false;
   // Viewport pixels at the previous scroll event, to tell a downward chase
@@ -199,6 +211,9 @@ class _TerminalPaneState extends State<TerminalPane>
   // scrolling, so the scroll state alone would treat a finger resting on a
   // stopped fling as settled.
   final Set<int> _activePointers = <int>{};
+  bool _panZoomActive = false;
+  bool get _hasActivePointerOrPanZoom =>
+      _activePointers.isNotEmpty || _panZoomActive;
   bool _pendingBottomSnapOnPointerUp = false;
 
   Timer? _resizeOutDebounceTimer;
@@ -210,7 +225,9 @@ class _TerminalPaneState extends State<TerminalPane>
   // observe it to keep the live anchor (the cell a selection started from) so a
   // later shift-click can extend the range to a new cell — even after scrolling,
   // since anchors track buffer lines, not viewport rows.
-  final xt.TerminalController _xtermController = xt.TerminalController();
+  final xt.TerminalController _xtermController = xt.TerminalController(
+    pointerInputs: const xt.PointerInputs.none(),
+  );
   // Lets us hit-test a pointer position to a buffer cell (getCellOffset) for
   // shift-click extension. xterm 4.0.0's TerminalView.onTapUp never fires (the
   // TapGestureRecognizer only routes to the unforwarded onSingleTapUp), so we
@@ -351,11 +368,8 @@ class _TerminalPaneState extends State<TerminalPane>
     widget.onTerminalResizeBind?.call(_onTerminalResize);
     _scrollController.addListener(_onScrollChanged);
     _bindTerminal(_terminal);
-    widget.controller.addFitListener(_onFit);
-    widget.controller.addRefitListener(_onRefit);
-    widget.controller.addClearListener(_onClear);
-    widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
-    widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+    _mountedPanes[widget.terminalId] = this;
+    _bindController(widget.controller);
     _xtermController.addListener(_recordSelectionAnchor);
     _xtermController.addListener(_syncCopyTarget);
     if (widget.focusCursorRevision > 0) {
@@ -363,11 +377,35 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  void _bindController(TerminalController controller) {
+    if (identical(_boundController, controller)) return;
+    _unbindController();
+    _boundController = controller;
+    controller.addFitListener(_onFit);
+    controller.addRefitListener(_onRefit);
+    controller.addClearListener(_onClear);
+    controller.addHistoryReplayedListener(_onHistoryReplayed);
+    controller.addHistoryPageStartedListener(_onHistoryPageStarted);
+  }
+
+  void _unbindController() {
+    final c = _boundController;
+    if (c == null) return;
+    c.removeFitListener(_onFit);
+    c.removeRefitListener(_onRefit);
+    c.removeClearListener(_onClear);
+    c.removeHistoryReplayedListener(_onHistoryReplayed);
+    c.removeHistoryPageStartedListener(_onHistoryPageStarted);
+    _boundController = null;
+  }
+
   // The persistent terminal lives on SessionVm, so it can be swapped underneath
   // this State (a session swap reuses the State under the same `triage / <sid>`
   // key). Bind keyboard output through a paired seam so initState and
   // didUpdateWidget can't leave the new terminal's onOutput null.
   void _bindTerminal(xt.Terminal terminal) {
+    _lastIsAltBuffer = terminal.isUsingAltBuffer;
+    _altScrollDeltaAccum = 0.0;
     terminal.onOutput = _onTerminalOutput;
     terminal.addListener(_onTerminalContentChanged);
   }
@@ -380,6 +418,12 @@ class _TerminalPaneState extends State<TerminalPane>
   @override
   void didUpdateWidget(TerminalPane oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.terminalId != widget.terminalId) {
+      if (identical(_mountedPanes[oldWidget.terminalId], this)) {
+        _mountedPanes.remove(oldWidget.terminalId);
+      }
+    }
+    _mountedPanes[widget.terminalId] = this;
     if (oldWidget.bracketedPasteEnabled != widget.bracketedPasteEnabled) {
       _sessionBracketedPasteModes[widget.terminalId] =
           widget.bracketedPasteEnabled;
@@ -396,7 +440,9 @@ class _TerminalPaneState extends State<TerminalPane>
       _clearPageAnchor();
       _pageJumpGeneration++;
       dismissNoOlderScrollback();
-      _saveScrollOffset(oldWidget.terminalId);
+      if (oldWidget.terminalId != widget.terminalId) {
+        _saveScrollOffset(oldWidget.terminalId);
+      }
       _unbindTerminal(oldWidget.terminal);
       _bindTerminal(widget.terminal);
       // The anchor and any in-flight shift-click/drag referenced the previous
@@ -422,6 +468,7 @@ class _TerminalPaneState extends State<TerminalPane>
       }
       // A snap queued for the outgoing session must not land on this one.
       _activePointers.clear();
+      _panZoomActive = false;
       // The last scroll position belongs to the outgoing terminal; a direction
       // measured against it could release the incoming session's pin on its
       // first scroll event.
@@ -431,34 +478,36 @@ class _TerminalPaneState extends State<TerminalPane>
       _ctrlArmed = false;
       _mobileAutoSpace.reset();
       _endDrag();
-      _scrollToCursor(requestFocus: true);
+      final hasSavedScroll =
+          _scrollAnchor.hasAnchor ||
+          _sessionSavedScrollOffsets.containsKey(widget.terminalId);
+      _scrollToCursor(requestFocus: true, forceBottom: !hasSavedScroll);
     }
     if (oldWidget.controller != widget.controller) {
-      _clearPageAnchor();
-      _pageJumpGeneration++;
-      dismissNoOlderScrollback();
-      oldWidget.controller.removeFitListener(_onFit);
-      oldWidget.controller.removeRefitListener(_onRefit);
-      oldWidget.controller.removeClearListener(_onClear);
-      oldWidget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
-      oldWidget.controller.removeHistoryPageStartedListener(
-        _onHistoryPageStarted,
-      );
-      widget.controller.addFitListener(_onFit);
-      widget.controller.addRefitListener(_onRefit);
-      widget.controller.addClearListener(_onClear);
-      widget.controller.addHistoryReplayedListener(_onHistoryReplayed);
-      widget.controller.addHistoryPageStartedListener(_onHistoryPageStarted);
-    }
-    if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
-      if (_pendingBottomSnapOnPointerUp) {
-        _pendingBottomSnapOnPointerUp = false;
-        _scrollToCursor(requestFocus: false, forceBottom: true);
+      final alreadyRebound = identical(_boundController, widget.controller);
+      if (!alreadyRebound) {
+        _clearPageAnchor();
+        _pageJumpGeneration++;
+        dismissNoOlderScrollback();
+        _bindController(widget.controller);
       }
     }
-    if (oldWidget.isObscured != widget.isObscured && widget.isObscured) {
+    if (oldWidget.isLoading != widget.isLoading && !widget.isLoading) {
+      final hasSavedScroll =
+          _scrollAnchor.hasAnchor ||
+          _sessionSavedScrollOffsets.containsKey(widget.terminalId);
+      if (_pendingBottomSnapOnPointerUp || !hasSavedScroll) {
+        _pendingBottomSnapOnPointerUp = false;
+        _scrollToCursor(requestFocus: false, forceBottom: !hasSavedScroll);
+      }
+    }
+    if ((oldWidget.isObscured != widget.isObscured && widget.isObscured) ||
+        (oldWidget.interactionEnabled && !widget.interactionEnabled)) {
       _activePointers.clear();
+      _panZoomActive = false;
       _endDrag();
+      _shiftClickPointer = null;
+      _shiftClickDownPosition = null;
     }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       final pos = _scrollController.hasClients
@@ -486,14 +535,13 @@ class _TerminalPaneState extends State<TerminalPane>
 
   @override
   void dispose() {
+    if (identical(_mountedPanes[widget.terminalId], this)) {
+      _mountedPanes.remove(widget.terminalId);
+    }
     widget.onTerminalResizeBind?.call(null);
     _saveScrollOffset();
     _unbindTerminal(_terminal);
-    widget.controller.removeFitListener(_onFit);
-    widget.controller.removeRefitListener(_onRefit);
-    widget.controller.removeClearListener(_onClear);
-    widget.controller.removeHistoryReplayedListener(_onHistoryReplayed);
-    widget.controller.removeHistoryPageStartedListener(_onHistoryPageStarted);
+    _unbindController();
     _xtermController.removeListener(_recordSelectionAnchor);
     _xtermController.removeListener(_syncCopyTarget);
     _xtermController.dispose();
@@ -504,8 +552,10 @@ class _TerminalPaneState extends State<TerminalPane>
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
-    _suppressScrollSaveTimer?.cancel();
     _clearPointerReleaseTimers();
+    if (runningUnderFlutterTest()) {
+      _lastWorkspaceFittedSize = null;
+    }
     super.dispose();
   }
 
@@ -520,7 +570,6 @@ class _TerminalPaneState extends State<TerminalPane>
         pos.maxScrollExtent <= 0 ||
         pos.pixels >= pos.maxScrollExtent - 0.5;
 
-    _suppressScrollSaveFor(const Duration(milliseconds: 500));
     if (isAtBottom) {
       _scrollAnchor.clear();
       _clearSavedSessionScroll(widget.terminalId);
@@ -531,6 +580,8 @@ class _TerminalPaneState extends State<TerminalPane>
 
   void _onRefit() {
     if (!mounted) return;
+    _sessionLastResizeOutCols.remove(widget.terminalId);
+    _sessionLastResizeOutRows.remove(widget.terminalId);
     final pos = _scrollController.hasClients
         ? _scrollController.position
         : null;
@@ -540,7 +591,6 @@ class _TerminalPaneState extends State<TerminalPane>
         pos.maxScrollExtent <= 0 ||
         pos.pixels >= pos.maxScrollExtent - 0.5;
 
-    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
     if (isAtBottom) {
       _scrollAnchor.clear();
       _clearSavedSessionScroll(widget.terminalId);
@@ -553,10 +603,23 @@ class _TerminalPaneState extends State<TerminalPane>
     if (!mounted) return;
     _pageJumpGeneration++;
     dismissNoOlderScrollback();
-    _suppressScrollSaveFor(const Duration(milliseconds: 1500));
-    _scrollAnchor.clear();
-    _clearSavedSessionScroll(widget.terminalId);
-    _pendingBottomSnapOnPointerUp = true;
+    final pos = _scrollController.hasClients
+        ? _scrollController.position
+        : null;
+    final hasSavedScroll =
+        _scrollAnchor.hasAnchor ||
+        _sessionSavedScrollOffsets.containsKey(widget.terminalId);
+    final isAtBottom =
+        !hasSavedScroll &&
+        (pos == null ||
+            !pos.hasContentDimensions ||
+            pos.maxScrollExtent <= 0 ||
+            pos.pixels >= pos.maxScrollExtent - 0.5);
+    if (isAtBottom) {
+      _scrollAnchor.clear();
+      _clearSavedSessionScroll(widget.terminalId);
+    }
+    _pendingBottomSnapOnPointerUp = isAtBottom;
   }
 
   void _onHistoryReplayed() {
@@ -639,7 +702,6 @@ class _TerminalPaneState extends State<TerminalPane>
           0.0,
           position.maxScrollExtent,
         );
-        _suppressScrollSaveFor(const Duration(milliseconds: 500));
         final wasSuppressed = _suppressAnchorCapture;
         _suppressAnchorCapture = true;
         try {
@@ -675,15 +737,18 @@ class _TerminalPaneState extends State<TerminalPane>
     _clearPageAnchor();
     _pageJumpGeneration++;
     dismissNoOlderScrollback();
+    final hasSavedScroll =
+        _scrollAnchor.hasAnchor ||
+        _sessionSavedScrollOffsets.containsKey(widget.terminalId);
     final isGestureActive =
-        _activePointers.isNotEmpty ||
+        _hasActivePointerOrPanZoom ||
         (_scrollController.hasClients &&
             _scrollController.position.isScrollingNotifier.value);
     if (isGestureActive) {
-      _pendingBottomSnapOnPointerUp = true;
+      _pendingBottomSnapOnPointerUp = !hasSavedScroll;
     } else {
       _pendingBottomSnapOnPointerUp = false;
-      _scrollToCursor(requestFocus: false, forceBottom: true);
+      _scrollToCursor(requestFocus: false, forceBottom: !hasSavedScroll);
     }
   }
 
@@ -805,7 +870,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
-    if (widget.isObscured) return;
+    if (widget.isObscured || !widget.interactionEnabled) return;
     _mobileAutoSpace.reset();
     _activePointers.add(event.pointer);
     // Desktop only: focus on pointer-down so a mouse click focuses the terminal
@@ -873,14 +938,16 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _checkDeferredBottomSnapOnPointerRelease() {
-    if (_activePointers.isEmpty && _pendingBottomSnapOnPointerUp) {
+    if (!_hasActivePointerOrPanZoom && _pendingBottomSnapOnPointerUp) {
       _pendingBottomSnapOnPointerUp = false;
       _scrollToCursor(requestFocus: false, forceBottom: true);
       _clearPointerReleaseTimers();
       for (final ms in const [80, 250]) {
         _pointerReleaseTimers.add(
           Timer(Duration(milliseconds: ms), () {
-            if (mounted && _activePointers.isEmpty) {
+            if (mounted &&
+                !_hasActivePointerOrPanZoom &&
+                !_scrollAnchor.hasAnchor) {
               _scrollToCursor(requestFocus: false, forceBottom: true);
             }
           }),
@@ -909,7 +976,7 @@ class _TerminalPaneState extends State<TerminalPane>
       }
     }
     _checkDeferredBottomSnapOnPointerRelease();
-    if (_activePointers.isEmpty && _scrollAnchor.hasAnchor) {
+    if (!_hasActivePointerOrPanZoom && _scrollAnchor.hasAnchor) {
       _repinScrollAnchor();
     }
     if (event.pointer != _shiftClickPointer) return;
@@ -929,13 +996,116 @@ class _TerminalPaneState extends State<TerminalPane>
       _endDrag();
     }
     _checkDeferredBottomSnapOnPointerRelease();
-    if (_activePointers.isEmpty && _scrollAnchor.hasAnchor) {
+    if (!_hasActivePointerOrPanZoom && _scrollAnchor.hasAnchor) {
       _repinScrollAnchor();
     }
     if (event.pointer == _shiftClickPointer) {
       _shiftClickPointer = null;
       _shiftClickDownPosition = null;
     }
+  }
+
+  bool _lastIsAltBuffer = false;
+  double _altScrollDeltaAccum = 0.0;
+
+  bool get _shouldForwardWheelToTerminal {
+    if (_terminal.isUsingAltBuffer) return true;
+    if (_terminal.mouseMode == xt.MouseMode.none) return false;
+    if (!_scrollController.hasClients) return true;
+    final pos = _scrollController.position;
+    return !pos.hasContentDimensions || pos.maxScrollExtent <= 0;
+  }
+
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (!widget.interactionEnabled) return;
+    if (event is PointerScrollEvent && _shouldForwardWheelToTerminal) {
+      GestureBinding.instance.pointerSignalResolver.register(event, (
+        PointerSignalEvent resolved,
+      ) {
+        if (!mounted || resolved is! PointerScrollEvent) return;
+        _emitAltScrollDelta(resolved.scrollDelta.dy, resolved.position);
+      });
+    }
+  }
+
+  void _handlePointerPanZoomStart(PointerPanZoomStartEvent event) {
+    if (!widget.interactionEnabled) return;
+    _panZoomActive = true;
+    _altScrollDeltaAccum = 0.0;
+  }
+
+  void _handlePointerPanZoomUpdate(PointerPanZoomUpdateEvent event) {
+    if (!widget.interactionEnabled) return;
+    if (_shouldForwardWheelToTerminal) {
+      _emitAltScrollDelta(-event.panDelta.dy, event.position);
+    }
+  }
+
+  void _handlePointerPanZoomEnd(PointerPanZoomEndEvent event) {
+    _panZoomActive = false;
+    _altScrollDeltaAccum = 0.0;
+    _checkDeferredBottomSnapOnPointerRelease();
+    if (!_hasActivePointerOrPanZoom && _scrollAnchor.hasAnchor) {
+      _repinScrollAnchor();
+    }
+  }
+
+  void _emitAltScrollDelta(double scrollDeltaDy, Offset globalPosition) {
+    if (scrollDeltaDy == 0.0) return;
+    if ((_altScrollDeltaAccum < 0 && scrollDeltaDy > 0) ||
+        (_altScrollDeltaAccum > 0 && scrollDeltaDy < 0)) {
+      _altScrollDeltaAccum = 0.0;
+    }
+    _altScrollDeltaAccum += scrollDeltaDy;
+    final lh = (_lineHeight() ?? 18.0).clamp(4.0, 200.0);
+    final steps = (_altScrollDeltaAccum / lh).truncate();
+    if (steps == 0) return;
+    _altScrollDeltaAccum -= steps * lh;
+
+    final rawCell = _cellAtGlobal(globalPosition) ?? const xt.CellOffset(0, 0);
+    final maxCol = (_terminal.viewWidth - 1).clamp(0, 10000);
+    final maxRow = (_terminal.viewHeight - 1).clamp(0, 10000);
+    final cell = xt.CellOffset(
+      rawCell.x.clamp(0, maxCol),
+      rawCell.y.clamp(0, maxRow),
+    );
+    final up = steps < 0;
+    final count = steps.abs().clamp(1, 10);
+    widget.controller.notifyInteraction();
+    for (var i = 0; i < count; i++) {
+      _sendWheelStep(up, cell);
+    }
+  }
+
+  void _sendWheelStep(bool up, xt.CellOffset cell) {
+    if (_terminal.mouseMode.reportScroll) {
+      // xterm.dart's TerminalMouseButton.wheelUp/wheelDown encode 68/69
+      // (64 + 4/5, which sets the Shift modifier bit in XTerm mouse reporting)
+      // instead of 64/65. Emit the standard unshifted wheel IDs directly so
+      // TUIs (Claude Code, tmux, nvim, less) recognize wheel scroll events.
+      final buttonId = up ? 64 : 65;
+      final x = cell.x + 1;
+      final y = cell.y + 1;
+      final String report;
+      switch (_terminal.mouseReportMode) {
+        case xt.MouseReportMode.sgr:
+          report = '\x1b[<$buttonId;$x;${y}M';
+        case xt.MouseReportMode.urxvt:
+          report = '\x1b[${32 + buttonId};$x;${y}M';
+        case xt.MouseReportMode.normal:
+        case xt.MouseReportMode.utf:
+          final maxCoord =
+              _terminal.mouseReportMode == xt.MouseReportMode.normal
+              ? 223
+              : 2015;
+          final col = x <= maxCoord ? String.fromCharCode(32 + x) : '\x00';
+          final row = y <= maxCoord ? String.fromCharCode(32 + y) : '\x00';
+          report = '\x1b[M${String.fromCharCode(32 + buttonId)}$col$row';
+      }
+      widget.controller.sendInput(report);
+      return;
+    }
+    _terminal.keyInput(up ? xt.TerminalKey.arrowUp : xt.TerminalKey.arrowDown);
   }
 
   void _endDrag() {
@@ -1049,13 +1219,26 @@ class _TerminalPaneState extends State<TerminalPane>
   void _onTerminalOutput(String data) {
     // Automated emulator responses (such as Cursor Position Report \x1b[...R,
     // Device Attributes \x1b[?...c, Operating Status \x1b[0n, window size \x1b[8;...t)
-    // are replies to host queries, not user typing. Forward them directly without
-    // resetting scroll state or jumping the viewport.
+    // are replies to host queries, not user typing. The daemon's own terminal
+    // emulator already answers PTY queries on the host side, so drop client-side
+    // auto-responses instead of echoing them into the session as fake input.
     if (isEmulatorQueryResponse(data)) {
-      widget.controller.sendInput(data);
       return;
     }
     if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
+      return;
+    }
+
+    // Mouse report sequences (clicks, drags, wheel scroll in mouse-tracking
+    // TUIs) are pointer interactions, not keyboard typing: forward them without
+    // clearing saved scroll or snapping the scroll view to the bottom.
+    if (isTerminalMouseReport(data)) {
+      final normalized = data
+          .replaceAll('\x1b[<68;', '\x1b[<64;')
+          .replaceAll('\x1b[<69;', '\x1b[<65;')
+          .replaceAll('\x1b[<70;', '\x1b[<66;')
+          .replaceAll('\x1b[<71;', '\x1b[<67;');
+      widget.controller.sendInput(normalized);
       return;
     }
 
@@ -1134,7 +1317,9 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   bool get _isRouteCurrentAndUnobscured {
-    if (!mounted || widget.isObscured) return false;
+    if (!mounted || widget.isObscured || !widget.interactionEnabled) {
+      return false;
+    }
     return ModalRoute.of(context)?.isCurrent != false;
   }
 
@@ -1167,6 +1352,7 @@ class _TerminalPaneState extends State<TerminalPane>
       );
       _sessionLastGridSize[sanitizedId] = (height, width);
       _sessionLastGridSize[widget.terminalId] = (height, width);
+      _lastWorkspaceFittedSize = (height, width);
       // Reflow (reflowEnabled is on) runs only on a column change, moving content
       // between rows and staling the cached shift-click anchor — a buffer
       // coordinate the identity guard in _extendSelectionTo can't detect as stale,
@@ -1194,19 +1380,19 @@ class _TerminalPaneState extends State<TerminalPane>
         _scrollAnchor.clear();
         _clearSavedSessionScroll(widget.terminalId);
         if (_scrollController.hasClients) {
-          scheduleMicrotask(() {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted && _scrollController.hasClients) {
               _snapToBottom(_scrollController.position);
             }
           });
         }
       } else {
-        scheduleMicrotask(() {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted && _scrollController.hasClients) {
             final p = _scrollController.position;
             if (!p.hasContentDimensions || p.maxScrollExtent <= 0) return;
             if (p.isScrollingNotifier.value ||
-                _activePointers.isNotEmpty ||
+                _hasActivePointerOrPanZoom ||
                 _dragSelecting) {
               return;
             }
@@ -1321,21 +1507,26 @@ class _TerminalPaneState extends State<TerminalPane>
     if (_copyTarget != null) {
       _rebuildForCopyButton();
     }
-    if (_suppressAnchorCapture || _suppressScrollSave || _dragSelecting) return;
+    if (_suppressAnchorCapture || _dragSelecting) return;
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
+    if (SchedulerBinding.instance.schedulerPhase !=
+            SchedulerPhase.persistentCallbacks &&
+        position.pixels < position.maxScrollExtent - 0.5) {
+      _scrollToCursorGeneration++;
+      _scrollToCursorTimer?.cancel();
+      _clearPointerReleaseTimers();
+    }
     _captureScrollAnchor();
     // Near the top of the loaded scrollback: ask for older history.
     // Paging coalesces in the session (single-flight + log-start stop),
     // so repeats while a page is in flight are cheap; our own programmatic
     // jumps return at the gate above and never retrigger.
-    if (_scrollController.hasClients) {
-      final position = _scrollController.position;
-      if (position.hasContentDimensions && position.maxScrollExtent > 0) {
-        final lh = _lineHeight() ?? 2.0;
-        if (position.pixels <= lh * 5 &&
-            position.pixels < position.maxScrollExtent - 0.5) {
-          widget.onNearTop?.call();
-        }
-      }
+    final lh = _lineHeight() ?? 2.0;
+    if (position.pixels <= lh * 5 &&
+        position.pixels < position.maxScrollExtent - 0.5) {
+      widget.onNearTop?.call();
     }
   }
 
@@ -1372,6 +1563,7 @@ class _TerminalPaneState extends State<TerminalPane>
   void _captureScrollAnchor() {
     if (!_scrollController.hasClients) return;
     final position = _scrollController.position;
+    if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
     final lineHeight = _lineHeight();
     if (lineHeight != null) {
       if (shouldReleaseScrollPin(
@@ -1390,7 +1582,7 @@ class _TerminalPaneState extends State<TerminalPane>
         _lastScrollPixels = position.pixels;
         if (shouldFinishBottomSnap(
           isScrolling: position.isScrollingNotifier.value,
-          pointerDown: _activePointers.isNotEmpty,
+          pointerDown: _hasActivePointerOrPanZoom,
           pixels: position.pixels,
           maxScrollExtent: position.maxScrollExtent,
           hasAnchor: false,
@@ -1454,6 +1646,11 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _onTerminalContentChanged() {
+    if (_terminal.isUsingAltBuffer != _lastIsAltBuffer) {
+      _lastIsAltBuffer = _terminal.isUsingAltBuffer;
+      _altScrollDeltaAccum = 0.0;
+      _rebuildForCopyButton();
+    }
     // Reposition the copy button as content arrives. The scroll listener alone
     // is not enough: xterm's stick-to-bottom runs through `correctBy` during
     // layout, which moves the viewport without notifying the ScrollController,
@@ -1514,7 +1711,7 @@ class _TerminalPaneState extends State<TerminalPane>
     final position = _scrollController.position;
     if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
     if (position.isScrollingNotifier.value ||
-        _activePointers.isNotEmpty ||
+        _hasActivePointerOrPanZoom ||
         _dragSelecting) {
       return;
     }
@@ -1525,7 +1722,12 @@ class _TerminalPaneState extends State<TerminalPane>
       lineHeight: lineHeight,
     );
     if (desired == null || desired < 0.0) return;
-    if ((desired - position.pixels).abs() < 0.5) return;
+    if (!_scrollAnchor.hasLineShifted) return;
+    if ((desired - position.pixels).abs() < 0.5) {
+      _scrollAnchor.markPinned();
+      return;
+    }
+    _scrollAnchor.markPinned();
     final wasSuppressed = _suppressAnchorCapture;
     _suppressAnchorCapture = true;
     try {
@@ -1540,11 +1742,20 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _scrollToCursor({required bool requestFocus, bool forceBottom = false}) {
+    final scrollGen = ++_scrollToCursorGeneration;
+    var retriesLeft = 8;
     void jump() {
-      if (!mounted) return;
+      if (!mounted || scrollGen != _scrollToCursorGeneration) return;
       if (_scrollController.hasClients) {
         final position = _scrollController.position;
         if (!position.hasContentDimensions || position.maxScrollExtent <= 0) {
+          if (_terminal.buffer.lines.length > _terminal.viewHeight &&
+              retriesLeft > 0) {
+            retriesLeft--;
+            _terminalViewKey.currentState?.renderTerminal.markNeedsLayout();
+            WidgetsBinding.instance.addPostFrameCallback((_) => jump());
+            return;
+          }
           if (requestFocus) {
             _requestTerminalFocus();
           }
@@ -1615,6 +1826,22 @@ class _TerminalPaneState extends State<TerminalPane>
             _suppressAnchorCapture = wasSuppressed;
             _lastScrollPixels = position.pixels;
           }
+        }
+
+        if (!wasScrolledUp && retriesLeft > 0) {
+          retriesLeft--;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted ||
+                scrollGen != _scrollToCursorGeneration ||
+                !_scrollController.hasClients) {
+              return;
+            }
+            final pos = _scrollController.position;
+            if (!pos.hasContentDimensions || pos.maxScrollExtent <= 0) return;
+            if ((pos.pixels - pos.maxScrollExtent).abs() > 0.5) {
+              _snapToBottom(pos);
+            }
+          });
         }
       }
       if (requestFocus) {
@@ -2033,7 +2260,10 @@ class _TerminalPaneState extends State<TerminalPane>
             fit: StackFit.expand,
             children: [
               IgnorePointer(
-                ignoring: widget.isLoading || widget.isObscured,
+                ignoring:
+                    widget.isLoading ||
+                    widget.isObscured ||
+                    !widget.interactionEnabled,
                 child: AnimatedOpacity(
                   opacity: widget.isLoading ? 0.7 : 1.0,
                   duration: const Duration(milliseconds: 150),
@@ -2043,8 +2273,13 @@ class _TerminalPaneState extends State<TerminalPane>
                     onPointerMove: _handlePointerMove,
                     onPointerUp: _handlePointerUp,
                     onPointerCancel: _handlePointerCancel,
+                    onPointerSignal: _handlePointerSignal,
+                    onPointerPanZoomStart: _handlePointerPanZoomStart,
+                    onPointerPanZoomUpdate: _handlePointerPanZoomUpdate,
+                    onPointerPanZoomEnd: _handlePointerPanZoomEnd,
                     child: SingleChildScrollView(
                       controller: _scrollController,
+                      primary: false,
                       padding: const EdgeInsets.all(22),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2142,7 +2377,7 @@ class _TerminalPaneState extends State<TerminalPane>
               // tapping it never enters the pointer paths that drive selection.
               child: TerminalScrollbar(
                 controller: _scrollController,
-                enabled: !_isMobile,
+                enabled: !_isMobile && widget.interactionEnabled,
                 child: Stack(
                   key: _copyOverlayKey,
                   // Without this the terminal would receive loose constraints and
@@ -2151,7 +2386,10 @@ class _TerminalPaneState extends State<TerminalPane>
                   fit: StackFit.expand,
                   children: [
                     IgnorePointer(
-                      ignoring: widget.isLoading || widget.isObscured,
+                      ignoring:
+                          widget.isLoading ||
+                          widget.isObscured ||
+                          !widget.interactionEnabled,
                       child: AnimatedOpacity(
                         opacity: widget.isLoading ? 0.7 : 1.0,
                         duration: const Duration(milliseconds: 150),
@@ -2163,6 +2401,10 @@ class _TerminalPaneState extends State<TerminalPane>
                             onPointerMove: _handlePointerMove,
                             onPointerUp: _handlePointerUp,
                             onPointerCancel: _handlePointerCancel,
+                            onPointerSignal: _handlePointerSignal,
+                            onPointerPanZoomStart: _handlePointerPanZoomStart,
+                            onPointerPanZoomUpdate: _handlePointerPanZoomUpdate,
+                            onPointerPanZoomEnd: _handlePointerPanZoomEnd,
                             child: NotificationListener<ScrollEndNotification>(
                               onNotification: (notification) {
                                 scheduleMicrotask(() {
@@ -2176,7 +2418,7 @@ class _TerminalPaneState extends State<TerminalPane>
                                     final pos = _scrollController.position;
                                     if (pos.hasContentDimensions &&
                                         !pos.isScrollingNotifier.value &&
-                                        _activePointers.isEmpty) {
+                                        !_hasActivePointerOrPanZoom) {
                                       _pendingBottomSnapOnPointerUp = false;
                                       _snapToBottom(pos);
                                     }
@@ -2186,7 +2428,14 @@ class _TerminalPaneState extends State<TerminalPane>
                               },
                               child: ScrollConfiguration(
                                 behavior: ScrollConfiguration.of(context)
-                                    .copyWith(scrollbars: false),
+                                    .copyWith(
+                                      scrollbars: false,
+                                      physics:
+                                          (!_isMobile &&
+                                              _terminal.isUsingAltBuffer)
+                                          ? const NeverScrollableScrollPhysics()
+                                          : null,
+                                    ),
                                 child: xt.TerminalView(
                                   _terminal,
                                   key: _terminalViewKey,

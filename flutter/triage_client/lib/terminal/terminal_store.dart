@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:xterm/xterm.dart' as xt;
 
 import 'debug_log.dart';
 import 'emulator_query_response.dart';
@@ -180,6 +181,19 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
   return indices;
 }
 
+bool _isMode2026Marker(List<int> bytes, int index, int finalByte) {
+  return index >= 0 &&
+      index + 7 < bytes.length &&
+      bytes[index] == 0x1b &&
+      bytes[index + 1] == 0x5b && // [
+      bytes[index + 2] == 0x3f && // ?
+      bytes[index + 3] == 0x32 && // 2
+      bytes[index + 4] == 0x30 && // 0
+      bytes[index + 5] == 0x32 && // 2
+      bytes[index + 6] == 0x36 && // 6
+      bytes[index + 7] == finalByte;
+}
+
 /// Trims a full-replay history payload to its newest complete lines and
 /// reports how many leading raw bytes were dropped (`droppedBytes`).
 ///
@@ -235,6 +249,40 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
         start = byteFloor;
         while (start < bytes.length && (bytes[start] & 0xC0) == 0x80) {
           start++;
+        }
+      }
+    }
+  }
+  if (start > 0) {
+    // Avoid slicing in the middle of a short Mode 2026 synchronized spinner
+    // frame (`\x1b[?2026h ... \x1b[?2026l`): only when a matching `\x1b[?2026h`
+    // opened within 256 bytes before `start` and closes within 256 bytes after
+    // `start`, advance past `\x1b[?2026l`.
+    final backLimit = max(0, start - 256);
+    var openIdx = -1;
+    for (var i = start - 1; i >= backLimit; i--) {
+      if (_isMode2026Marker(bytes, i, 0x6c)) {
+        break;
+      }
+      if (_isMode2026Marker(bytes, i, 0x68)) {
+        openIdx = i;
+        break;
+      }
+    }
+    if (openIdx != -1) {
+      final forwardLimit = min(bytes.length - 7, start + 256);
+      for (var i = max(openIdx + 8, start - 7); i < forwardLimit; i++) {
+        if (_isMode2026Marker(bytes, i, 0x68) && i >= start) {
+          break;
+        }
+        if (_isMode2026Marker(bytes, i, 0x6c)) {
+          final afterClose = i + 8;
+          if (afterClose <= end) {
+            start = afterClose;
+            if (start < end && bytes[start] == 0x0d) start++;
+            if (start < end && bytes[start] == 0x0a) start++;
+          }
+          break;
         }
       }
     }
@@ -430,10 +478,60 @@ const int _kSyncMarkerLength = 8; // length of '\x1b[?2026h' and '\x1b[?2026l'
 const int _kMaxCarryEscapeLength = 32;
 
 // Hoisted out of the per-chunk hot path (`_writeDecoded` runs on every live
-// `Output`): a trailing not-yet-terminated `CSI > …` / `CSI ? 2026 …` and a complete
-// `CSI > … m` private sequence.
-final RegExp _partialEscapeSequence = RegExp(r'\x1b(?:\[(?:[>?]?[0-9;]*)?)?$');
-final RegExp _completePrivateCsi = RegExp(r'\x1b\[(?:>[0-9;]*m|3J)');
+// `Output`): a trailing not-yet-terminated `CSI` sequence and complete
+// private/Kitty `CSI` sequences (`CSI > …`, `CSI < …`, `CSI = …`, `CSI ? … s/u`,
+// `CSI Ps u`, `CSI 3 J`) that `package:xterm` misparses or that clear scrollback.
+final RegExp _partialEscapeSequence = RegExp(
+  r'\x1b(?:\[(?:[?>=<]?[0-9;]*)?)?$',
+);
+final RegExp _completePrivateCsi = RegExp(
+  r'\x1b\[(?:[><=][0-9;]*[A-Za-z@`~]|\?[0-9;]*[su]|[0-9;]+u|3J)',
+);
+
+final RegExp _cbtOrChtSequence = RegExp(r'\x1b\[([0-9]*)([ZI])');
+
+/// Writes [data] to a native `package:xterm` [xt.Terminal], emulating `CSI Ps Z`
+/// (Cursor Backward Tabulation, `CBT`) and `CSI Ps I` (Cursor Forward
+/// Tabulation, `CHT`), which `package:xterm`'s parser leaves unimplemented.
+///
+/// Modern TUIs (such as `agy`, `claude`, and `codex`) emit `\x1b[3Z` / `\x1b[7Z`
+/// after status-bar or multi-line updates to move the cursor back by N tab
+/// stops. When `CBT` is ignored, the cursor stays near the right margin,
+/// causing subsequent output to wrap onto extra rows and vertical cursor-up
+/// redraws (`\x1b[NA`) to land below the top of the block and overwrite earlier
+/// lines.
+void writeToXterm(xt.Terminal terminal, String data) {
+  if (data.isEmpty) return;
+  if (!data.contains('\x1b[') || (!data.contains('Z') && !data.contains('I'))) {
+    terminal.write(data);
+    return;
+  }
+  var lastEnd = 0;
+  for (final match in _cbtOrChtSequence.allMatches(data)) {
+    if (match.start > lastEnd) {
+      terminal.write(data.substring(lastEnd, match.start));
+    }
+    final rawCount = match.group(1)!;
+    final parsed = rawCount.isEmpty ? 1 : (int.tryParse(rawCount) ?? 1);
+    final count = parsed <= 0 ? 1 : parsed;
+    final cmd = match.group(2)!;
+    if (cmd == 'Z') {
+      var x = terminal.buffer.cursorX;
+      for (var step = 0; step < count && x > 0; step++) {
+        x = ((x - 1) ~/ 8) * 8;
+      }
+      terminal.write('\x1b[${x + 1}G');
+    } else {
+      for (var step = 0; step < count; step++) {
+        terminal.tab();
+      }
+    }
+    lastEnd = match.end;
+  }
+  if (lastEnd < data.length) {
+    terminal.write(data.substring(lastEnd));
+  }
+}
 
 /// The single reducer for the terminal pipeline.
 ///
@@ -703,6 +801,7 @@ class TerminalStore extends ChangeNotifier {
         :final rawOutputStart,
         :final windowBytes,
         :final rawOutputPrefix,
+        :final rawOutputViewport,
       ):
         return _reduceHistory(
           s,
@@ -713,6 +812,7 @@ class TerminalStore extends ChangeNotifier {
           rawOutputStart: rawOutputStart,
           windowBytes: windowBytes,
           rawOutputPrefix: rawOutputPrefix,
+          rawOutputViewport: rawOutputViewport,
         );
 
       case LiveBytes(:final bytes, :final outputSeq):
@@ -757,6 +857,7 @@ class TerminalStore extends ChangeNotifier {
     int? rawOutputStart,
     int? windowBytes,
     List<int> rawOutputPrefix = const [],
+    List<int> rawOutputViewport = const [],
   }) {
     // Replay at the client's target grid size ([cols] x [rows], the current
     // emulator/view size chosen by the caller, not the host capture size). A
@@ -983,29 +1084,58 @@ class TerminalStore extends ChangeNotifier {
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
-    if (trimmed.prefixBytes.isNotEmpty) {
-      _writeDecoded(trimmed.prefixBytes);
-      if (trimmed.rawBytes.isNotEmpty) {
-        final trailingNewline = trimmed.prefixBytes.last == 0x0a ? '' : '\r\n';
-        final pushScrollback = rows > 1 ? '\r\n' * (rows - 1) : '';
-        _writeDecoded(
-          utf8.encode('$trailingNewline$pushScrollback\x1b[H\x1b[0m'),
-        );
-      } else if (trimmed.prefixBytes.last != 0x0a) {
-        _writeDecoded(const <int>[0x0d, 0x0a]);
+    final int retainedPrefixBytes;
+    final int rawDropped;
+    final useViewportForRaw =
+        rawOutputPrefix.isNotEmpty &&
+        rawOutputViewport.isNotEmpty &&
+        _collectGenuineNewlineIndices(
+          trimmed.rawBytes,
+          0,
+          trimmed.rawBytes.length,
+        ).isEmpty;
+    if (useViewportForRaw) {
+      final trimmedPrefix = trimHistoryTailWithOffset(
+        rawOutputPrefix,
+        maxLines: budgets.maxLines,
+        maxBytes: budgets.maxBytes,
+      );
+      final replayBytes = _combinePrefixAndViewport(
+        trimmedPrefix.bytes,
+        rawOutputViewport,
+      );
+      _writeDecoded(replayBytes);
+      retainedPrefixBytes = rawOutputPrefix.length - trimmedPrefix.droppedBytes;
+      rawDropped = 0;
+    } else {
+      if (trimmed.prefixBytes.isNotEmpty) {
+        _writeDecoded(trimmed.prefixBytes);
+        if (trimmed.prefixBytes.contains(0x0a)) {
+          if (trimmed.rawBytes.isNotEmpty) {
+            final trailingNewline = trimmed.prefixBytes.last == 0x0a
+                ? ''
+                : '\r\n';
+            final pushScrollback = rows > 1 ? '\r\n' * (rows - 1) : '';
+            _writeDecoded(
+              utf8.encode('$trailingNewline$pushScrollback\x1b[H\x1b[0m'),
+            );
+          } else if (trimmed.prefixBytes.last != 0x0a) {
+            _writeDecoded(const <int>[0x0d, 0x0a]);
+          }
+        }
       }
-    }
-    if (trimmed.rawBytes.isNotEmpty) {
-      final rawToWrite = (rawStart ?? 0) > 0 && trimmed.droppedRawBytes == 0
-          ? _sanitizeRawTailStart(trimmed.rawBytes)
-          : trimmed.rawBytes;
-      _writeDecoded(rawToWrite);
+      if (trimmed.rawBytes.isNotEmpty) {
+        final rawToWrite = (rawStart ?? 0) > 0 && trimmed.droppedRawBytes == 0
+            ? _sanitizeRawTailStart(trimmed.rawBytes)
+            : trimmed.rawBytes;
+        _writeDecoded(rawToWrite);
+      }
+      retainedPrefixBytes = trimmed.retainedPrefixBytes;
+      rawDropped = trimmed.droppedRawBytes;
     }
 
-    _appliedHistoryPrefixBytes = trimmed.retainedPrefixBytes;
-    _appliedHistoryStart = rawStart != null
-        ? rawStart + trimmed.droppedRawBytes
-        : null;
+    _appliedHistoryPrefixBytes = retainedPrefixBytes;
+    _appliedHistoryStart = rawStart != null ? rawStart + rawDropped : null;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;
     } else {
@@ -1014,8 +1144,8 @@ class TerminalStore extends ChangeNotifier {
     _retainedRawBytes.clear();
     _retainedRawStart = _appliedHistoryStart;
     _retainedRawSeq = throughSeq;
-    if (_retainedRawStart != null && bytes.length > trimmed.droppedRawBytes) {
-      _retainedRawBytes.add(bytes.sublist(trimmed.droppedRawBytes));
+    if (_retainedRawStart != null && bytes.length > rawDropped) {
+      _retainedRawBytes.add(bytes.sublist(rawDropped));
     }
 
     next = next.copyWith(
@@ -1034,6 +1164,14 @@ class TerminalStore extends ChangeNotifier {
     _closeSyncBlockAndFlush();
     if (!_disposed) _sink.onHistoryReplayed();
     return next;
+  }
+
+  List<int> _combinePrefixAndViewport(List<int> prefix, List<int> viewport) {
+    if (prefix.isEmpty) return viewport;
+    if (prefix.last == 0x0a || !prefix.contains(0x0a)) {
+      return [...prefix, ...viewport];
+    }
+    return [...prefix, 0x0d, 0x0a, ...viewport];
   }
 
   TerminalState _reduceLive(TerminalState s, List<int> bytes, int? outputSeq) {
@@ -1461,12 +1599,16 @@ class TerminalStore extends ChangeNotifier {
     String text,
     int indexAfterLf,
   ) {
-    if (indexAfterLf + 2 >= text.length) return false;
-    if (text.codeUnitAt(indexAfterLf) != 0x1b ||
-        text.codeUnitAt(indexAfterLf + 1) != 0x5b) {
+    var cursor = indexAfterLf;
+    while (cursor < text.length && text.codeUnitAt(cursor) == 0x0A) {
+      cursor++;
+    }
+    if (cursor + 2 >= text.length) return false;
+    if (text.codeUnitAt(cursor) != 0x1b ||
+        text.codeUnitAt(cursor + 1) != 0x5b) {
       return false;
     }
-    final firstUnit = text.codeUnitAt(indexAfterLf + 2);
+    final firstUnit = text.codeUnitAt(cursor + 2);
     // Reject private/experimental CSI parameter bytes: ?, >, <, =
     if (firstUnit == 0x3f ||
         firstUnit == 0x3e ||
@@ -1474,7 +1616,7 @@ class TerminalStore extends ChangeNotifier {
         firstUnit == 0x3d) {
       return false;
     }
-    var i = indexAfterLf + 2;
+    var i = cursor + 2;
     while (i < text.length &&
         ((text.codeUnitAt(i) >= 48 && text.codeUnitAt(i) <= 57) ||
             text.codeUnitAt(i) == 59)) {
@@ -1482,8 +1624,8 @@ class TerminalStore extends ChangeNotifier {
     }
     if (i < text.length) {
       final finalUnit = text.codeUnitAt(i);
-      if (finalUnit == 0x44 || finalUnit == 0x43) {
-        // 'D' or 'C'
+      if (finalUnit == 0x44 || finalUnit == 0x43 || finalUnit == 0x5a) {
+        // 'D' (CUB), 'C' (CUF), or 'Z' (CBT)
         return true;
       }
     }
@@ -1572,15 +1714,22 @@ class TerminalStore extends ChangeNotifier {
     // growth on a stream that never completes the sequence.
     if (partial != null) {
       var carryStart = (s.length - scanTail.length) + partial.start;
-      // If the partial escape sequence is immediately preceded by a bare LF,
-      // include the LF in the carry so newline translation isn't prematurely
-      // evaluated without its following escape sequence across chunk boundaries.
-      if (carryStart > 0 && s[carryStart - 1] == '\n') {
+      // If the partial escape sequence is immediately preceded by one or more
+      // bare LFs, include that run in the carry so newline translation isn't
+      // prematurely evaluated without its following escape sequence across
+      // chunk boundaries.
+      var lfRunStart = carryStart;
+      while (lfRunStart > 0 && s.codeUnitAt(lfRunStart - 1) == 0x0A) {
+        lfRunStart -= 1;
+      }
+      if (lfRunStart < carryStart) {
         final precededByCr =
-            (carryStart > 1 && s[carryStart - 2] == '\r') ||
-            (carryStart == 1 && _pendingCarriageReturn);
+            (lfRunStart > 0 && s.codeUnitAt(lfRunStart - 1) == 0x0D) ||
+            (lfRunStart == 0 && _pendingCarriageReturn);
         if (!precededByCr) {
-          carryStart -= 1;
+          carryStart = lfRunStart;
+        } else if (carryStart - lfRunStart > 1) {
+          carryStart = lfRunStart + 1;
         }
       }
       _escapeCarry = s.substring(carryStart);

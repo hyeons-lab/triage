@@ -36,15 +36,37 @@ void main() {
     });
 
     test('matches OSC color query responses', () {
+      expect(
+        isEmulatorQueryResponse('\x1b]4;0;rgb:0000/0000/0000\x07'),
+        isTrue,
+      );
       expect(isEmulatorQueryResponse('\x1b]10;rgb:ffff/ffff/ffff\x07'), isTrue);
       expect(
         isEmulatorQueryResponse('\x1b]11;rgb:0000/0000/0000\x1b\\'),
         isTrue,
       );
+      expect(
+        isEmulatorQueryResponse('\x1b]12;rgb:aaaa/bbbb/cccc\x1b\\'),
+        isTrue,
+      );
     });
 
-    test('matches window size reports', () {
+    test(
+      'matches DCS query responses (XTVERSION, DA3, DECRQSS, XTGETTCAP)',
+      () {
+        expect(isEmulatorQueryResponse('\x1bP>|Triage 0.3.0\x1b\\'), isTrue);
+        expect(isEmulatorQueryResponse('\x1bP!|00000000\x1b\\'), isTrue);
+        expect(isEmulatorQueryResponse('\x1bP1\$r0m\x1b\\'), isTrue);
+        expect(
+          isEmulatorQueryResponse('\x1bP1+r544e=787465726d\x1b\\'),
+          isTrue,
+        );
+      },
+    );
+
+    test('matches window and cell size reports', () {
       expect(isEmulatorQueryResponse('\x1b[4;600;800t'), isTrue);
+      expect(isEmulatorQueryResponse('\x1b[6;20;10t'), isTrue);
       expect(isEmulatorQueryResponse('\x1b[8;24;80t'), isTrue);
     });
 
@@ -52,6 +74,12 @@ void main() {
       expect(isEmulatorQueryResponse('\x1b[?1;2c\x1b[24;1R'), isTrue);
       expect(
         isEmulatorQueryResponse('\x1b[?0u\x1b[?2026;2\$y\x1b[1;1R'),
+        isTrue,
+      );
+      expect(
+        isEmulatorQueryResponse(
+          '\x1bP>|Triage 0.3.0\x1b\\\x1b[?65;4;6;18;22;52c\x1b[6;20;10t',
+        ),
         isTrue,
       );
     });
@@ -103,6 +131,23 @@ void main() {
 
       // Shift-Tab (BackTab)
       expect(isEmulatorQueryResponse('\x1b[Z'), isFalse);
+    });
+  });
+
+  group('isTerminalMouseReport', () {
+    test('matches SGR and X10 mouse reports', () {
+      expect(isTerminalMouseReport('\x1b[<0;61;459M'), isTrue);
+      expect(isTerminalMouseReport('\x1b[<0;61;459m'), isTrue);
+      expect(isTerminalMouseReport('\x1b[<0;61;459M\x1b[<0;61;459m'), isTrue);
+      expect(isTerminalMouseReport('\x1b[<35;55;29M\x1b[<35;54;29M'), isTrue);
+      expect(isTerminalMouseReport('\x1b[M !#'), isTrue);
+    });
+
+    test('does NOT match keyboard input or query responses', () {
+      expect(isTerminalMouseReport(''), isFalse);
+      expect(isTerminalMouseReport('a'), isFalse);
+      expect(isTerminalMouseReport('\x1b[A'), isFalse);
+      expect(isTerminalMouseReport('\x1b[?1;2c'), isFalse);
     });
   });
 }

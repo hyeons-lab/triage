@@ -540,6 +540,82 @@ pub(crate) fn read_multi_segment_range(
     Ok((actual_start.unwrap_or_else(|| end.min(offset)), out))
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DecModeTransitions {
+    first_alt: Option<bool>,
+    last_alt: Option<bool>,
+    first_mouse: Option<bool>,
+    last_mouse: Option<bool>,
+}
+
+/// Scans `bytes` for DEC private mode transitions affecting the alternate
+/// screen (`47`, `1047`, `1049`), mouse tracking (`1000`, `1002`, `1003`),
+/// and full terminal reset (`ESC c`).
+fn scan_dec_mode_transitions(bytes: &[u8]) -> DecModeTransitions {
+    let mut out = DecModeTransitions::default();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if bytes[i + 1] == b'c' {
+            if out.first_alt.is_none() {
+                out.first_alt = Some(false);
+            }
+            out.last_alt = Some(false);
+            if out.first_mouse.is_none() {
+                out.first_mouse = Some(false);
+            }
+            out.last_mouse = Some(false);
+            i += 2;
+            continue;
+        }
+        if i + 3 < bytes.len() && bytes[i + 1] == b'[' && bytes[i + 2] == b'?' {
+            let mut j = i + 3;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j > i + 3 && j < bytes.len() && (bytes[j] == b'h' || bytes[j] == b'l') {
+                let enabled = bytes[j] == b'h';
+                for part in bytes[i + 3..j].split(|&b| b == b';') {
+                    let mut num = 0u32;
+                    for &d in part {
+                        num = num.saturating_mul(10).saturating_add((d - b'0') as u32);
+                    }
+                    match num {
+                        47 | 1047 | 1049 => {
+                            if out.first_alt.is_none() {
+                                out.first_alt = Some(enabled);
+                            }
+                            out.last_alt = Some(enabled);
+                        }
+                        1000 | 1002 | 1003 => {
+                            if out.first_mouse.is_none() {
+                                out.first_mouse = Some(enabled);
+                            }
+                            out.last_mouse = Some(enabled);
+                        }
+                        _ => {}
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn contains_tui_frame_markers(bytes: &[u8]) -> bool {
+    bytes
+        .windows(8)
+        .any(|w| w == b"\x1b[?2026h" || w == b"\x1b[?2026l")
+        || bytes.windows(6).any(|w| w == b"\x1b[?25l")
+        || bytes.windows(3).any(|w| w == b"\x1b[H")
+}
+
 /// Reads the trailing `cap` bytes of a session directory for terminal replay during restore or resize.
 ///
 /// Returns `(total_uncompressed_len, tail_bytes)`. Memory usage is bounded strictly by `cap`.
@@ -569,9 +645,13 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
         collected_chunks.push(bytes);
     }
 
+    let tail_segment_count = collected_chunks.len();
     collected_chunks.reverse();
+    let mut dropped_prefix_transitions = DecModeTransitions::default();
     if accumulated_tail_len > cap_usize && !collected_chunks.is_empty() {
         let excess = accumulated_tail_len - cap_usize;
+        let drain_len = excess.min(collected_chunks[0].len());
+        dropped_prefix_transitions = scan_dec_mode_transitions(&collected_chunks[0][..drain_len]);
         if excess < collected_chunks[0].len() {
             collected_chunks[0].drain(..excess);
         } else {
@@ -581,6 +661,114 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
     let mut combined = Vec::with_capacity(accumulated_tail_len.min(cap_usize));
     for chunk in collected_chunks {
         combined.extend_from_slice(&chunk);
+    }
+
+    if total_uncompressed_len > combined.len() as u64 && !combined.is_empty() {
+        let tail_transitions = scan_dec_mode_transitions(&combined);
+        let mut initial_alt = match tail_transitions.first_alt {
+            Some(false) => Some(true),
+            Some(true) => dropped_prefix_transitions.last_alt,
+            None => dropped_prefix_transitions.last_alt,
+        };
+        let mut initial_mouse = match tail_transitions.first_mouse {
+            Some(false) => Some(true),
+            Some(true) => dropped_prefix_transitions.last_mouse.or(Some(true)),
+            None => dropped_prefix_transitions.last_mouse,
+        };
+
+        let needs_newline_prefix = !combined.contains(&b'\n');
+        let looks_like_tui = tail_transitions.last_mouse == Some(true)
+            || initial_mouse == Some(true)
+            || needs_newline_prefix
+            || contains_tui_frame_markers(&combined);
+        let mut last_newline_segment_bytes: Option<Vec<u8>> = None;
+        if (initial_alt.is_none() || initial_mouse.is_none() || needs_newline_prefix)
+            && looks_like_tui
+            && segments.len() > tail_segment_count
+        {
+            for segment in segments[..segments.len() - tail_segment_count]
+                .iter()
+                .rev()
+                .take(16)
+            {
+                if let Ok(bytes) = read_segment_tail(segment, usize::MAX) {
+                    let trans = scan_dec_mode_transitions(&bytes);
+                    if initial_alt.is_none() && trans.last_alt.is_some() {
+                        initial_alt = trans.last_alt;
+                    }
+                    if initial_mouse.is_none() && trans.last_mouse.is_some() {
+                        initial_mouse = trans.last_mouse;
+                    }
+                    if needs_newline_prefix
+                        && last_newline_segment_bytes.is_none()
+                        && bytes.contains(&b'\n')
+                    {
+                        last_newline_segment_bytes = Some(bytes);
+                        // Once we reach the most recent segment containing line feeds,
+                        // we have scanned past the entire 0-newline spinner desert.
+                        break;
+                    }
+                    if initial_alt == Some(true)
+                        || (initial_alt.is_some()
+                            && initial_mouse.is_some()
+                            && !needs_newline_prefix)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        if initial_alt.is_none()
+            && tail_transitions.last_mouse.or(initial_mouse) == Some(true)
+            && !combined.contains(&b'\n')
+        {
+            initial_alt = Some(true);
+        }
+
+        if initial_alt != Some(true)
+            && needs_newline_prefix
+            && let Some(mut nl_bytes) = last_newline_segment_bytes
+        {
+            let max_combined_after = (total_uncompressed_len as usize)
+                .saturating_sub(1)
+                .min(cap_usize);
+            let prefix_budget = (max_combined_after / 2).max(1);
+            if nl_bytes.len() > prefix_budget {
+                let skip = nl_bytes.len() - prefix_budget;
+                nl_bytes.drain(..skip);
+            }
+            let max_tail = max_combined_after.saturating_sub(nl_bytes.len());
+            if combined.len() > max_tail {
+                let mut trim = combined.len() - max_tail;
+                while trim + 1 < combined.len() && combined[trim] != 0x1b {
+                    trim += 1;
+                }
+                combined.drain(..trim);
+            }
+            nl_bytes.extend_from_slice(&combined);
+            combined = nl_bytes;
+        }
+
+        let mut mode_prefix = Vec::new();
+        if initial_alt == Some(true) && tail_transitions.first_alt != Some(true) {
+            mode_prefix.extend_from_slice(b"\x1b[?1049h");
+        }
+        if initial_mouse == Some(true) && tail_transitions.first_mouse != Some(true) {
+            mode_prefix.extend_from_slice(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        }
+        if !mode_prefix.is_empty() {
+            let max_combined_after = (total_uncompressed_len as usize)
+                .saturating_sub(1)
+                .min(cap_usize);
+            if combined.len() + mode_prefix.len() > max_combined_after {
+                let trim = (combined.len() + mode_prefix.len())
+                    .saturating_sub(max_combined_after)
+                    .min(combined.len());
+                combined.drain(..trim);
+            }
+            mode_prefix.extend_from_slice(&combined);
+            combined = mode_prefix;
+        }
     }
 
     Ok((total_uncompressed_len, combined))
@@ -998,4 +1186,93 @@ pub fn migrate_legacy_session_log(
     let _ = fs::rename(legacy_log_path, migrated_path);
 
     Ok(total_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_dec_mode_transitions_tracks_alt_screen_mouse_and_ris() {
+        let trans = scan_dec_mode_transitions(
+            b"normal\r\n\x1b[?1049h\x1b[?1000;1006hframe1\x1b[?1049l\x1b[?1000l",
+        );
+        assert_eq!(trans.first_alt, Some(true));
+        assert_eq!(trans.last_alt, Some(false));
+        assert_eq!(trans.first_mouse, Some(true));
+        assert_eq!(trans.last_mouse, Some(false));
+
+        let ris = scan_dec_mode_transitions(b"\x1b[?1049h\x1b[?1002h\x1bc");
+        assert_eq!(ris.first_alt, Some(true));
+        assert_eq!(ris.last_alt, Some(false));
+        assert_eq!(ris.first_mouse, Some(true));
+        assert_eq!(ris.last_mouse, Some(false));
+    }
+
+    #[test]
+    fn read_multi_segment_replay_tail_prepends_active_alt_and_mouse_modes_from_older_segments() {
+        let tmp = std::env::temp_dir().join(format!(
+            "triage-storage-mode-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        let seg1 = tmp.join("segment-000001.tlog");
+        let seg2 = tmp.join("segment-000002.tlog");
+        fs::write(&seg1, b"boot\r\n\x1b[?1049h\x1b[?1000h\x1b[?1006h").expect("write seg1");
+        let seg2_payload =
+            b"\x1b[?2026h\x1b[H\x1b[2JClaude Code TUI frame without newlines\x1b[?2026l";
+        fs::write(&seg2, seg2_payload).expect("write seg2");
+
+        let (total_len, tail) = read_multi_segment_replay_tail(&tmp, seg2_payload.len() as u64)
+            .expect("read replay tail");
+        assert!(total_len > tail.len() as u64);
+        assert!(
+            tail.starts_with(b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"),
+            "expected alt-screen and mouse mode prefix at start of replay tail, got: {:?}",
+            String::from_utf8_lossy(&tail)
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_multi_segment_replay_tail_prepends_last_newline_segment_before_normal_screen_spinner_desert()
+     {
+        let tmp = std::env::temp_dir().join(format!(
+            "triage-storage-desert-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        let seg1 = tmp.join("segment-000001.tlog");
+        let seg2 = tmp.join("segment-000002.tlog");
+        let seg3 = tmp.join("segment-000003.tlog");
+        let seg1_payload = b"Recap line 1\r\nRecap line 2\r\n\x1b[1;1HHeader row\x1b[2;1HBody row";
+        let seg2_payload = b"\x1b[35;3H* \x1b[36;3H. \x1b[37;3H* \x1b[38;3H. ";
+        let seg3_payload = b"\x1b[35;3H. \x1b[36;3H* \x1b[37;3H. \x1b[38;3H* ";
+        fs::write(&seg1, seg1_payload).expect("write seg1");
+        fs::write(&seg2, seg2_payload).expect("write seg2");
+        fs::write(&seg3, seg3_payload).expect("write seg3");
+
+        let cap = (seg2_payload.len() + seg3_payload.len()) as u64;
+        let (total_len, tail) =
+            read_multi_segment_replay_tail(&tmp, cap).expect("read replay tail");
+        assert_eq!(
+            total_len,
+            (seg1_payload.len() + seg2_payload.len() + seg3_payload.len()) as u64
+        );
+        assert!(tail.len() as u64 <= cap);
+        assert!(
+            tail.contains(&b'\n'),
+            "expected normal-screen spinner desert tail to include newline segment prefix, got: {:?}",
+            String::from_utf8_lossy(&tail)
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

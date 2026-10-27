@@ -75,19 +75,39 @@ bool shouldReleaseScrollPin({
 class TerminalScrollAnchor {
   xt.BufferLine? _line;
   double _withinLine = 0;
+  int? _lastLineIndex;
 
   /// Whether a live anchor is held. When false the caller should follow the
   /// bottom and leave xterm.dart's stick-to-bottom in control.
   bool get hasAnchor => _line != null;
 
+  /// Whether the anchored buffer line has shifted row index since the anchor
+  /// was last captured or pinned (for example due to scrollback trimming or
+  /// reflow). When false, in-place TUI redraws have not moved the line and
+  /// re-pinning does not need to jump the scroll controller.
+  bool get hasLineShifted {
+    final line = _line;
+    if (line == null || !line.attached || line.index <= 0) return false;
+    return line.index != _lastLineIndex;
+  }
+
+  /// Record the anchored line's current buffer row index after re-pinning.
+  void markPinned() {
+    _lastLineIndex = _line?.index;
+  }
+
   /// Drop the anchor (e.g. on a session/terminal swap).
-  void clear() => _line = null;
+  void clear() {
+    _line = null;
+    _lastLineIndex = null;
+  }
 
   /// Clone this anchor.
   TerminalScrollAnchor clone() {
     final copy = TerminalScrollAnchor();
     copy._line = _line;
     copy._withinLine = _withinLine;
+    copy._lastLineIndex = _lastLineIndex;
     return copy;
   }
 
@@ -95,6 +115,7 @@ class TerminalScrollAnchor {
   void copyFrom(TerminalScrollAnchor other) {
     _line = other._line;
     _withinLine = other._withinLine;
+    _lastLineIndex = other._lastLineIndex;
   }
 
   /// Capture an anchor from the current scroll metrics. Clears the anchor when
@@ -114,15 +135,18 @@ class TerminalScrollAnchor {
         pixels <= 0.0 ||
         pixels >= maxScrollExtent - kNativeScrollSubpixelTolerance) {
       _line = null;
+      _lastLineIndex = null;
       return;
     }
     final topRow = pixels ~/ lineHeight;
     if (topRow <= 0 || topRow >= lineCount) {
       _line = null;
+      _lastLineIndex = null;
       return;
     }
     _line = buffer.lines[topRow];
     _withinLine = pixels - topRow * lineHeight;
+    _lastLineIndex = _line!.index;
   }
 
   /// The scroll offset that keeps the anchored line pinned, clamped to
@@ -137,6 +161,7 @@ class TerminalScrollAnchor {
     if (line == null) return null;
     if (!line.attached) {
       _line = null;
+      _lastLineIndex = null;
       return null;
     }
     // Cleared out of the scrollback rather than aged out, or trimmed up to
@@ -144,12 +169,14 @@ class TerminalScrollAnchor {
     // zero, and pin the viewport to the top of the buffer instead of releasing it.
     if (line.index <= 0) {
       _line = null;
+      _lastLineIndex = null;
       return null;
     }
     if (lineHeight <= 0 || maxScrollExtent <= 0.0) return null;
     final desired = line.index * lineHeight + _withinLine;
     if (desired <= 0.0) {
       _line = null;
+      _lastLineIndex = null;
       return null;
     }
     return desired.clamp(0.0, maxScrollExtent);

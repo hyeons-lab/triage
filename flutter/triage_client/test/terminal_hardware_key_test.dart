@@ -1,9 +1,11 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
-import 'package:xterm/xterm.dart' hide TerminalController;
+import 'package:xterm/xterm.dart' hide TerminalController, TerminalStyle;
 
 void main() {
   group('TerminalPane hardware Tab and Shift+Tab key handling', () {
@@ -570,9 +572,161 @@ void main() {
     }
   });
 
+  group('TerminalPane alt-screen trackpad and mouse wheel scrolling', () {
+    testWidgets(
+      'trackpad pan/zoom and mouse wheel emit SGR wheel reports in alt-screen',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        try {
+          final terminal = Terminal();
+          terminal.write('\x1b[?1049h\x1b[?1000h\x1b[?1006h');
+          final controller = TerminalController();
+          final inputs = <String>[];
+          controller.addInputListener(inputs.add);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: 'test-alt-scroll',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                  bracketedPasteEnabled: false,
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final center = tester.getCenter(find.byType(TerminalPane));
+          final trackpad = TestPointer(1, PointerDeviceKind.trackpad);
+          await tester.sendEventToBinding(trackpad.panZoomStart(center));
+          // Positive panDelta.dy (two-finger swipe down with natural scrolling)
+          // scrolls UP toward older content (wheelUp = button 64).
+          await tester.sendEventToBinding(
+            trackpad.panZoomUpdate(center, pan: const Offset(0, 24)),
+          );
+          await tester.sendEventToBinding(trackpad.panZoomEnd());
+          await tester.pump();
+
+          expect(inputs, contains(startsWith('\x1b[<64;')));
+          inputs.clear();
+
+          // Mouse wheel scroll down (positive scrollDelta.dy) emits wheelDown (65).
+          final mouse = TestPointer(2, PointerDeviceKind.mouse);
+          await tester.sendEventToBinding(mouse.hover(center));
+          await tester.sendEventToBinding(mouse.scroll(const Offset(0, 24)));
+          await tester.pump();
+
+          expect(inputs, contains(startsWith('\x1b[<65;')));
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'placeholder-to-loaded session swap with rebindSessionController stays pinned to bottom',
+      (tester) async {
+        final placeholderTerminal = Terminal();
+        final placeholderController = TerminalController();
+        const terminalId = 'triage / session-swap-scroll';
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 800,
+                height: 400,
+                child: TerminalPane(
+                  terminalId: terminalId,
+                  terminal: placeholderTerminal,
+                  controller: placeholderController,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 1,
+                  bracketedPasteEnabled: false,
+                  isLoading: true,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final loadedTerminal = Terminal();
+        final loadedController = TerminalController();
+        final loadedRows = <StyledRow>[
+          for (var i = 0; i < 120; i++)
+            StyledRow(
+              spans: [
+                StyledSpan(text: 'Line $i', style: const TerminalStyle()),
+              ],
+            ),
+        ];
+        // Simulate _loadDaemonSessionInto: rebind controller and replay history
+        // before the widget rebuilds with the loaded terminal.
+        TerminalPane.rebindSessionController(terminalId, loadedController);
+        loadedController.clear();
+        for (var i = 0; i < 120; i++) {
+          loadedTerminal.write('Line $i\r\n');
+        }
+        loadedController.notifyHistoryReplayed();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 800,
+                height: 400,
+                child: TerminalPane(
+                  terminalId: terminalId,
+                  terminal: loadedTerminal,
+                  controller: loadedController,
+                  fallbackRows: loadedRows,
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 1,
+                  bracketedPasteEnabled: false,
+                  isLoading: false,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final scrollPosition = tester
+            .widget<SingleChildScrollView>(find.byType(SingleChildScrollView))
+            .controller!
+            .position;
+        expect(scrollPosition.maxScrollExtent, greaterThan(0));
+        expect(
+          scrollPosition.pixels,
+          closeTo(scrollPosition.maxScrollExtent, 1.0),
+        );
+
+        // Trigger refit(), then immediately scroll up and emit in-place
+        // spinner output; the viewport must stay at the user's scrolled
+        // offset instead of snapping back.
+        loadedController.refit();
+        await tester.pump();
+        scrollPosition.jumpTo(300.0);
+        await tester.pump();
+        for (var i = 0; i < 10; i++) {
+          loadedTerminal.write('\x1b[10;3H* spinner $i');
+          await tester.pump(const Duration(milliseconds: 16));
+        }
+        expect(scrollPosition.pixels, closeTo(300.0, 1.0));
+      },
+    );
+  });
+
   group('TerminalPane exited, obscured, and modal-route input guards', () {
     testWidgets(
-      'ignores user terminal output and key events when isExited or isObscured while passing emulator query responses',
+      'ignores user terminal output, key events, and emulator query responses when isExited or isObscured',
       (tester) async {
         final terminal = Terminal();
         final controller = TerminalController();
@@ -597,7 +751,7 @@ void main() {
           );
         }
 
-        // 1. Exited session drops user typing and Shift+Enter/Tab, but allows emulator query responses.
+        // 1. Exited session drops user typing, Shift+Enter/Tab, and emulator query responses.
         await tester.pumpWidget(buildHost(isExited: true, isObscured: false));
         await tester.pumpAndSettle();
 
@@ -610,8 +764,7 @@ void main() {
         expect(inputs, isEmpty);
 
         terminal.onOutput?.call('\x1b[1;1R');
-        expect(inputs, ['\x1b[1;1R']);
-        inputs.clear();
+        expect(inputs, isEmpty);
 
         // 2. Obscured session drops user typing and hardware keys.
         await tester.pumpWidget(buildHost(isExited: false, isObscured: true));
@@ -622,10 +775,12 @@ void main() {
         await tester.pump();
         expect(inputs, isEmpty);
 
-        // 3. Unobscured live session accepts input again.
+        // 3. Unobscured live session accepts user input while still dropping emulator query responses.
         await tester.pumpWidget(buildHost(isExited: false, isObscured: false));
         await tester.pumpAndSettle();
 
+        terminal.onOutput?.call('\x1b[1;1R');
+        expect(inputs, isEmpty);
         terminal.onOutput?.call('ok');
         expect(inputs, ['ok']);
       },

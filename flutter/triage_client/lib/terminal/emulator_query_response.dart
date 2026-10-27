@@ -20,10 +20,15 @@ final RegExp _allEmulatorQueryResponses = RegExp(
   r'\[[03]n|' // DSR (Device Status Report, e.g. ESC[0n ok)
   r'\[\?[0-9;]*u|' // Kitty keyboard flags query response (e.g. ESC[?0u)
   r'\[\??[0-9;]*\$y|' // DECRPM mode report (e.g. ESC[?2026;2$y, ESC[2026;2$y)
-  r'\](?:10|11);rgb:[0-9a-fA-F/]+(?:\x07|\x1b\\)|' // OSC 10/11 color reports
-  r'\[(?:4|8);\d+;\d+t|' // Window / text area size reports
+  r'\](?:4;\d+|10|11|12);rgb:[0-9a-fA-F/]+(?:\x07|\x1b\\)|' // OSC 4/10/11/12 color reports
+  r'P(?:>\|[\x20-\x7e]*|!\|[0-9a-fA-F]*|[01]\$[rR][\x20-\x7e]*|[01]\+[rR][0-9a-fA-F=;]*)(?:\x07|\x1b\\)|' // DCS XTVERSION / DA3 / DECRQSS / XTGETTCAP responses
+  r'\[(?:4|6|8);\d+;\d+t|' // Window / cell / text area size reports
   r'\??[0-9;]*\$y' // Raw DECRPM mode fragments preceded by control byte
   r'))+$',
+);
+
+final RegExp _terminalMouseReports = RegExp(
+  r'^(?:\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\x20-\xff]{3})+$',
 );
 
 /// Returns true if [data] is comprised entirely of terminal emulator query responses.
@@ -37,4 +42,13 @@ bool isEmulatorQueryResponse(String data) {
     return false;
   }
   return _allEmulatorQueryResponses.hasMatch(data);
+}
+
+/// Returns true if [data] is comprised entirely of terminal mouse report sequences
+/// (SGR `ESC [ < Cb ; Cx ; Cy M/m` or legacy X10 `ESC [ M Cb Cx Cy`).
+bool isTerminalMouseReport(String data) {
+  if (data.isEmpty || !data.startsWith('\x1b[')) {
+    return false;
+  }
+  return _terminalMouseReports.hasMatch(data);
 }

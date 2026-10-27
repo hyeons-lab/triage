@@ -6641,4 +6641,229 @@ void main() {
       },
     );
   });
+
+  group('SessionRail drag and scroll isolation', () {
+    testWidgets(
+      'dragging the mobile overlay rail scrolls the rail without scrolling the session content',
+      (WidgetTester tester) async {
+        debugForceMobileLayoutForTest = true;
+        addTearDown(() {
+          debugForceMobileLayoutForTest = false;
+        });
+
+        final client = FakeTriageWebSocketClient();
+        client.initialSessions = List.generate(14, (i) => 'session-$i');
+        client.snapshotVisibleRows['session-0'] = List.generate(
+          100,
+          (i) => 'Session 0 line $i',
+        );
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final railListFinder = find.descendant(
+          of: find.byType(SessionRail),
+          matching: find.byType(ReorderableList),
+        );
+        final railList = tester.widget<ReorderableList>(railListFinder);
+        expect(railList.primary, isFalse);
+        expect(railList.controller, isNotNull);
+
+        final terminalScrollFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final terminalScrollView = tester.widget<SingleChildScrollView>(
+          terminalScrollFinder,
+        );
+        expect(terminalScrollView.primary, isFalse);
+        expect(terminalScrollView.controller, isNotNull);
+        expect(
+          identical(railList.controller, terminalScrollView.controller),
+          isFalse,
+        );
+
+        // While the mobile rail overlay is open, TerminalPane interaction is disabled.
+        var pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.interactionEnabled, isFalse);
+
+        final terminalController = terminalScrollView.controller!;
+        final initialTerminalPixels = terminalController.position.pixels;
+        expect(initialTerminalPixels, greaterThan(0));
+        expect(railList.controller!.position.pixels, 0.0);
+
+        // Dragging the side rail scrolls the rail list and leaves the session
+        // content's scroll offset untouched.
+        await tester.drag(railListFinder, const Offset(0, -220));
+        await tester.pumpAndSettle();
+
+        expect(railList.controller!.position.pixels, greaterThan(0));
+        expect(terminalController.position.pixels, initialTerminalPixels);
+
+        // Collapsing the mobile rail re-enables workspace interaction.
+        await tester.tap(find.byTooltip('Minimize sidebar'));
+        await tester.pumpAndSettle();
+
+        pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.interactionEnabled, isTrue);
+      },
+    );
+
+    testWidgets(
+      'drag-reordering in SessionRail disables TerminalPane interaction during the drag and preserves session scroll offset',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          100,
+          (i) => 'Spike line $i',
+        );
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final terminalScrollFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final terminalController = tester
+            .widget<SingleChildScrollView>(terminalScrollFinder)
+            .controller!;
+        final parkedPixels = terminalController.position.maxScrollExtent - 150;
+        terminalController.jumpTo(parkedPixels);
+        await tester.pumpAndSettle();
+        expect(terminalController.position.pixels, parkedPixels);
+
+        var pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.interactionEnabled, isTrue);
+
+        // Start a reorder drag on a rail row.
+        final rowFinder = find.byKey(const ValueKey<String>('main'));
+        final gesture = await tester.startGesture(tester.getCenter(rowFinder));
+        await tester.pump(const Duration(milliseconds: 200));
+        await gesture.moveBy(const Offset(0, -80));
+        await tester.pump(const Duration(milliseconds: 200));
+
+        pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.interactionEnabled, isFalse);
+        expect(terminalController.position.pixels, parkedPixels);
+
+        await gesture.up();
+        await tester.pumpAndSettle();
+
+        pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.interactionEnabled, isTrue);
+        expect(terminalController.position.pixels, parkedPixels);
+
+        // Collapsed rail scroll view also uses an independent non-primary ScrollController.
+        await tester.tap(find.byTooltip('Minimize sidebar'));
+        await tester.pumpAndSettle();
+
+        final collapsedScrollFinder = find.descendant(
+          of: find.byType(SessionRail),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final collapsedScrollView = tester.widget<SingleChildScrollView>(
+          collapsedScrollFinder,
+        );
+        expect(collapsedScrollView.primary, isFalse);
+        expect(collapsedScrollView.controller, isNotNull);
+        expect(
+          identical(collapsedScrollView.controller, terminalController),
+          isFalse,
+        );
+      },
+    );
+  });
+
+  group('Scrollback layout and refit above viewable area', () {
+    test(
+      'SessionVm resizes native terminal to fitted dimensions before replaying history above viewable area',
+      () {
+        final vm = SessionVm(
+          title: 'session-wide-scrollback',
+          status: 'attached',
+          statusColor: const Color(0xff7fd1c7),
+          icon: Icons.terminal,
+          rows: const [],
+          isRemote: true,
+        );
+        addTearDown(vm.dispose);
+
+        // Build a 100-column line that scrolls above a 10-row viewport.
+        // Without resizing `vm.terminal` before `HistoryBytes` replay, this line
+        // would be written while `vm.terminal` is still at its 80x24 default and
+        // wrap at column 80.
+        final wideHeader = 'W' * 100;
+        final payload = StringBuffer('$wideHeader\r\n');
+        for (var i = 0; i < 20; i++) {
+          payload.write('row-$i\r\n');
+        }
+
+        vm.applyHistory(
+          utf8.encode(payload.toString()),
+          throughOutputSeq: 1,
+          rawOutputStart: 0,
+        );
+        vm.noteViewFit(120, 10);
+
+        expect(vm.terminal.viewWidth, 120);
+        expect(vm.terminal.viewHeight, 10);
+        expect(vm.terminal.buffer.lines[0].toString().trimRight(), wideHeader);
+      },
+    );
+
+    testWidgets(
+      'Refit button re-lays out scrollback history above viewable area at the current terminal width',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final wideScrollbackLine = 'S' * 100;
+        final payload = StringBuffer('$wideScrollbackLine\r\n');
+        for (var i = 0; i < 35; i++) {
+          payload.write('visible-or-scrolled-$i\r\n');
+        }
+        final historyBytes = utf8.encode(payload.toString());
+
+        final client = FakeTriageWebSocketClient();
+        client.attachHistoryWindows['flutter-spike'] = {
+          kHistoryFirstWindowBytes: (
+            bytes: historyBytes,
+            start: 0,
+            seq: 5,
+          ),
+        };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        // Simulate an initial 80x24 fit where the 100-col scrollback line wrapped
+        // at column 80 into two lines ('S' * 80 and 'S' * 20).
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+        expect(
+          pane.terminal.buffer.lines[0].toString().trimRight(),
+          'S' * 80,
+        );
+        expect(
+          pane.terminal.buffer.lines[1].toString().trimRight(),
+          'S' * 20,
+        );
+
+        // Now widen the terminal to 120x24 and press Refit in the workspace header.
+        pane.terminal.resize(120, 24);
+        await tester.tap(find.byTooltip('Refit terminal to this device'));
+        await tester.pumpAndSettle();
+
+        expect(
+          pane.terminal.buffer.lines[0].toString().trimRight(),
+          wideScrollbackLine,
+        );
+        expect(
+          pane.terminal.buffer.lines[1].toString().trimRight(),
+          'visible-or-scrolled-0',
+        );
+      },
+    );
+  });
 }
