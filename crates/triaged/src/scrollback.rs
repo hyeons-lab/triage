@@ -29,15 +29,19 @@ use tattoy_wezterm_surface::Line;
 use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::{Intensity, Underline};
 
-/// Encode one emulator line as SGR-tagged bytes terminated by CRLF.
+/// Encode one emulator line as SGR-tagged bytes, terminated by CRLF for
+/// hard-wrapped lines and omitting the trailing CRLF when the line was
+/// soft-wrapped (`line.last_cell_was_wrapped()`).
 ///
 /// The record starts with a reset so rendition state from any previous
 /// record cannot bleed in, then re-emits style runs (attributes first,
 /// then foreground, then background, mirroring `terminal_style` in
 /// `session.rs`) with each run change resetting before applying. Trailing
-/// blank cells in the default style are dropped (wezterm lines are
-/// full-width padded); control characters never survive into the text,
-/// since a stray ESC would corrupt the replay stream.
+/// blank cells without a visible background, reverse video, or underline
+/// (including foreground- or intensity-only blanks) are dropped, while
+/// trailing spaces on soft-wrapped lines are preserved; control characters
+/// never survive into the text, since a stray ESC would corrupt the replay
+/// stream.
 pub fn encode_line(line: &mut Line, palette: &ColorPalette) -> Vec<u8> {
     let wrapped = line.last_cell_was_wrapped();
     // `cells_mut` coerces clustered (RLE) storage to a cell vec first;
@@ -61,8 +65,10 @@ pub fn encode_line(line: &mut Line, palette: &ColorPalette) -> Vec<u8> {
             end = index + 1;
         }
     }
-    if wrapped && end > 0 && end < cells.len() && cells[end].str() == " " {
-        end += 1;
+    if wrapped && end > 0 {
+        while end < cells.len() && cells[end].str() == " " {
+            end += 1;
+        }
     }
     let mut out = Vec::with_capacity(end * 2 + 16);
     out.extend_from_slice(b"\x1b[0m");

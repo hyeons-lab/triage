@@ -149,4 +149,20 @@ void main() {
       expect(s(trimmed.prefixBytes), contains('prefix-49\r\n'));
     },
   );
+
+  test(
+    'trimHistoryTailWithOffset handles 50000 consecutive newlines in linear time',
+    () {
+      final bytes = List<int>.filled(50000, 0x0a);
+      final sw = Stopwatch()..start();
+      final res = trimHistoryTailWithOffset(
+        bytes,
+        maxLines: 1000,
+        maxBytes: 64 * 1024,
+      );
+      sw.stop();
+      expect(res.droppedBytes, 49000);
+      expect(sw.elapsedMilliseconds, lessThan(200));
+    },
+  );
 }

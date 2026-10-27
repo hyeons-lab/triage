@@ -97,23 +97,10 @@ const int kEmulatorMaxScrollbackLines = 50000;
   );
 }
 
-/// Trims a full-replay history payload to its newest complete lines and
-/// reports how many leading raw bytes were dropped (`droppedBytes`).
-///
-/// xterm is append-only, so a replay must still arrive oldest-first; this keeps
-/// the last [maxLines] lines (a trailing newline terminates the last line
-/// rather than starting an empty one) and at most [maxBytes] bytes, so first
-/// paint waits on the viewport instead of the whole tail. A trimmed payload is
-/// prefixed with an SGR reset so rendition state set before the cut cannot
-/// bleed into it; an untrimmed payload (including empty, which the caller
-/// treats as a no-op) is returned untouched.
-///
-/// `droppedBytes` measures the exact cut offset in the caller's input [bytes]
-/// so `rawStart + droppedBytes` is the true log offset of the oldest retained
-/// byte, while the log end offset stays `rawStart + original.length`.
 bool _isCursorPositioningNewline(List<int> bytes, int index, int end) {
   var k = index + 1;
-  while (k < end && (bytes[k] == 0x0a || bytes[k] == 0x0d)) {
+  final maxLookahead = min(end, index + 32);
+  while (k < maxLookahead && (bytes[k] == 0x0a || bytes[k] == 0x0d)) {
     k++;
   }
   if (k + 2 >= end || bytes[k] != 0x1b || bytes[k + 1] != 0x5b) {
@@ -156,6 +143,7 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
         } else if (!seenSeparator) {
           hasFirstParam = true;
           firstParam = firstParam * 10 + (c - 0x30);
+          if (firstParam > 1000) firstParam = 1000;
         }
         p++;
       }
@@ -166,8 +154,8 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
         final finalByte = bytes[p];
         if (privateMarker == 0) {
           if (finalByte == 0x41) {
-            cursorUpDebt +=
-                (!hasFirstParam || firstParam <= 0) ? 1 : firstParam;
+            final step = (!hasFirstParam || firstParam <= 0) ? 1 : firstParam;
+            cursorUpDebt = min(500, cursorUpDebt + min(500, step));
           } else if (finalByte == 0x48 ||
               finalByte == 0x66 ||
               finalByte == 0x4a) {
@@ -188,6 +176,20 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
   return indices;
 }
 
+/// Trims a full-replay history payload to its newest complete lines and
+/// reports how many leading raw bytes were dropped (`droppedBytes`).
+///
+/// xterm is append-only, so a replay must still arrive oldest-first; this keeps
+/// the last [maxLines] lines (a trailing newline terminates the last line
+/// rather than starting an empty one) and at most [maxBytes] bytes, so first
+/// paint waits on the viewport instead of the whole tail. A trimmed payload is
+/// prefixed with an SGR reset so rendition state set before the cut cannot
+/// bleed into it; an untrimmed payload (including empty, which the caller
+/// treats as a no-op) is returned untouched.
+///
+/// `droppedBytes` measures the exact cut offset in the caller's input [bytes]
+/// so `rawStart + droppedBytes` is the true log offset of the oldest retained
+/// byte, while the log end offset stays `rawStart + original.length`.
 ({List<int> bytes, int droppedBytes}) trimHistoryTailWithOffset(
   List<int> bytes, {
   required int maxLines,
@@ -334,7 +336,7 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
 }
 
 final RegExp _leadingTornCsi = RegExp(
-  r'^(?:\[[?>]?[0-9;]*[mHfABCDEFGJKhlr]|[?>][0-9;]+[hlm]|;[0-9;]*[mHfABCDEFGJKhlr]|[0-9]+;[0-9;]*[mHfABCDEFGJKhlr]|[0-9]{1,4}[mABCDEFGJKhl])',
+  r'^(?:\[[?>]?[0-9;]*[mHfABCDEFGJKhlr]|[?>][0-9;]+[hlm]|;[0-9;]*[mHfABCDEFGJKhlr]|[0-9]+;[0-9;]*[mHfABCDEFGJKhlr]|0m)',
 );
 
 List<int> _sanitizeRawTailStart(List<int> bytes) {

@@ -2689,4 +2689,18 @@ void main() {
     expect(sink.written.toString(), contains('line of terminal output\r\n'));
     expect(stopwatch.elapsedMilliseconds, lessThan(2000));
   });
+
+  test('rawOutputStart sanitizer preserves plain alphanumeric tokens at slice boundary', () {
+    store.dispatch(const Attach());
+    store.dispatch(
+      HistoryBytes(
+        b('100m relay and 2D canvas\r\n'),
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 1,
+        rawOutputStart: 100,
+      ),
+    );
+    expect(sink.written.toString(), contains('100m relay and 2D canvas\r\n'));
+  });
 }
