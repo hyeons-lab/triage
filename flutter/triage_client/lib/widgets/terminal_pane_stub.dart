@@ -603,23 +603,9 @@ class _TerminalPaneState extends State<TerminalPane>
     if (!mounted) return;
     _pageJumpGeneration++;
     dismissNoOlderScrollback();
-    final pos = _scrollController.hasClients
-        ? _scrollController.position
-        : null;
-    final hasSavedScroll =
-        _scrollAnchor.hasAnchor ||
-        _sessionSavedScrollOffsets.containsKey(widget.terminalId);
-    final isAtBottom =
-        !hasSavedScroll &&
-        (pos == null ||
-            !pos.hasContentDimensions ||
-            pos.maxScrollExtent <= 0 ||
-            pos.pixels >= pos.maxScrollExtent - 0.5);
-    if (isAtBottom) {
-      _scrollAnchor.clear();
-      _clearSavedSessionScroll(widget.terminalId);
-    }
-    _pendingBottomSnapOnPointerUp = isAtBottom;
+    _scrollAnchor.clear();
+    _clearSavedSessionScroll(widget.terminalId);
+    _pendingBottomSnapOnPointerUp = true;
   }
 
   void _onHistoryReplayed() {

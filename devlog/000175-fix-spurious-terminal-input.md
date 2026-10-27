@@ -1,9 +1,5 @@
 # 000175: fix/spurious-terminal-input
 
-## Agent
-
-Antigravity @ triage branch fix/spurious-terminal-input
-
 ## Intent
 
 Fix spurious escape sequences and random characters (`>|Triage 0.3.0...65;4;6;18;22;52c...`, `0;61;459M0;61;459m`, and `35;55;29M35;54;29M...`) being injected into normal shell sessions after daemon reloads or after a child TUI/agent exits without disabling mouse tracking, and fix text overwriting upper lines as text is typed or streamed (`devlog/plans/000175-01-fix-spurious-terminal-input.md`).
@@ -23,6 +19,7 @@ Fix spurious escape sequences and random characters (`>|Triage 0.3.0...65;4;6;18
 - `2026-10-27T09:47-0700` `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`, `flutter/triage_client/lib/main.dart`, `flutter/triage_client/test/terminal_hardware_key_test.dart`, `crates/triaged/src/handover.rs`, `crates/triaged/src/handover_tests.rs`, `crates/triaged/src/session.rs`: Implement `TerminalPane.rebindSessionController` on native (`_mountedPanes` / `_bindController`) so `clear()` and `notifyHistoryReplayed()` emitted during `_loadDaemonSessionInto` before `didUpdateWidget` reach the mounted pane; avoid saving placeholder scroll offsets when swapping `terminal` for the same `terminalId`, pass `forceBottom: !hasSavedScroll` on terminal swap and `isLoading -> false`, replace `scheduleMicrotask` with `addPostFrameCallback` in `_onTerminalResize`, and retry `_scrollToCursor` across post-frame layout passes when `_terminal.buffer.lines.length > _terminal.viewHeight` while `maxScrollExtent <= 0`; carry `focusCursorRevision` across `_loadDaemonSessionInto` and check `retainedPrefixBytes <= session.historyPrefixBytes` for split-history barren pages in `_pageHistoryUp`; preserve `session_contexts` in `HandoverState` across daemon handover so `list_session_contexts` never briefly returns `None` after reload.
 - `2026-10-27T12:40-0700` `crates/triaged/src/storage.rs`, `crates/triaged/src/session.rs`, `flutter/triage_client/lib/terminal/terminal_scroll_anchor.dart`, `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`, `flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart`, `flutter/triage_client/test/terminal_hardware_key_test.dart`: Prepend the last newline-bearing `.tlog.zst` segment ahead of multi-segment normal-screen 0-newline spinner deserts in `read_multi_segment_replay_tail`; remove the 500ms-1500ms `_suppressScrollSave` timer window in `terminal_pane_stub.dart` so user scrolls immediately after `_onFit` / `_onRefit` / `applyPagedJump` are always recorded; add `hasLineShifted` and `markPinned()` to `TerminalScrollAnchor` so `_repinScrollAnchor` never calls `position.jumpTo` during in-place TUI spinner updates; track `_panZoomActive` and cancel pending `_scrollToCursor` retries when the user scrolls upward; add unit and widget tests.
 - `2026-10-27T13:28-0700` `crates/triaged/src/session.rs`, `crates/triaged/src/storage.rs`: Remove synchronous `ensure_segmented_scrollback_backfilled` on `SnapshotWithHistory` (which called `read_prefix_at_or_older_than(u64::MAX, 1)`, always returning empty because `record.bytes.len() > 1` and re-parsing all `.tlog.zst` segments on every attach) and keep the backward segment scan in `read_multi_segment_replay_tail` bounded to 16 segments.
+- `2026-10-27T14:37-0700` `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Unconditionally clear `_scrollAnchor` and `_clearSavedSessionScroll(widget.terminalId)` and arm `_pendingBottomSnapOnPointerUp = true` in `_onClear()` so explicit `controller.clear()` calls during an active pointer gesture snap to the bottom once the pointer is released.
 
 ## Decisions
 
@@ -48,4 +45,5 @@ Fix spurious escape sequences and random characters (`>|Triage 0.3.0...65;4;6;18
 
 ## Commits
 
-- `HEAD`: fix: prevent spurious terminal input and preserve TUI scrollback
+- `399b632`: fix: prevent spurious terminal input and preserve TUI scrollback
+- `HEAD`: fix(client): restore deferred bottom snap on terminal buffer clear during pointer gesture
