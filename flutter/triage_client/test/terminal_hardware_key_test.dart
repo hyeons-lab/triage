@@ -255,7 +255,70 @@ void main() {
         await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
         await tester.pump();
 
+        // Right-hand Ctrl+Tab, Alt+Tab, and Meta+Tab
+        for (final modifier in [
+          LogicalKeyboardKey.controlRight,
+          LogicalKeyboardKey.altRight,
+          LogicalKeyboardKey.metaRight,
+        ]) {
+          await tester.sendKeyDownEvent(modifier);
+          await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+          await tester.sendKeyUpEvent(modifier);
+          await tester.pump();
+        }
+
         expect(inputs, isEmpty);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('Tab resets scrolled-up viewport back to bottom', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      try {
+        final terminal = Terminal(maxLines: 100);
+        terminal.resize(40, 4);
+        for (var i = 0; i < 30; i++) {
+          terminal.write('line $i\r\n');
+        }
+        final controller = TerminalController();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 400,
+                height: 120,
+                child: TerminalPane(
+                  terminalId: 'test-tab-scroll-reset',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                  bracketedPasteEnabled: false,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final scrollable = tester.state<ScrollableState>(
+          find.descendant(
+            of: find.byType(SingleChildScrollView),
+            matching: find.byType(Scrollable),
+          ),
+        );
+        scrollable.position.jumpTo(120);
+        await tester.pump();
+        expect(scrollable.position.pixels, 120);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+        expect(scrollable.position.pixels, 0);
       } finally {
         debugDefaultTargetPlatformOverride = null;
       }
