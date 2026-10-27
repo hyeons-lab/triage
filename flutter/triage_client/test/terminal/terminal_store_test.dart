@@ -3127,4 +3127,27 @@ void main() {
       }
     },
   );
+
+  test(
+    'writeToXterm emulates CHT and clamps oversized counts to viewport width',
+    () {
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(40, 4);
+
+      writeToXterm(term, 'ab\x1b[2Icd');
+      expect(term.buffer.cursorX, 18);
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(0)), 'a');
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(1)), 'b');
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(16)), 'c');
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(17)), 'd');
+
+      // An oversized CHT count must complete immediately and clamp at the
+      // right margin rather than spinning millions of iterations.
+      final sw = Stopwatch()..start();
+      writeToXterm(term, '\r\x1b[999999I');
+      sw.stop();
+      expect(term.buffer.cursorX, 39);
+      expect(sw.elapsedMilliseconds, lessThan(200));
+    },
+  );
 }

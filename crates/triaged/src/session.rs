@@ -6276,9 +6276,11 @@ fn parse_mouse_reports(bytes: &[u8]) -> Option<bool> {
             if i >= bytes.len() || !matches!(bytes[i], b'M' | b'm') {
                 return None;
             }
+            let final_byte = bytes[i];
             i += 1;
             let button = params[0];
-            let is_hover = (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
+            let is_hover =
+                final_byte == b'M' && (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
             if !is_hover {
                 all_hover_motion_only = false;
             }
@@ -7789,6 +7791,7 @@ impl ActorState {
         if self.exited {
             return;
         }
+        let mut is_hover_motion = false;
         if is_mouse_report_sequence(&bytes) {
             if self.is_root_shell_in_foreground() {
                 if self.output.terminal.is_mouse_grabbed() {
@@ -7796,16 +7799,19 @@ impl ActorState {
                 }
                 return;
             }
-            if is_mouse_motion_only_sequence(&bytes) && !self.output.terminal.is_alt_screen_active()
-            {
+            is_hover_motion = is_mouse_motion_only_sequence(&bytes);
+            if is_hover_motion && !self.output.terminal.is_alt_screen_active() {
                 return;
             }
         }
         // Stamped before the send, like the output stamp in `handle_output`:
         // this is the interaction recency the rail orders by, and a dropped
-        // write still means the user was here.
-        self.last_input_ms
-            .store(now_unix_millis(), Ordering::Relaxed);
+        // write still means the user was here. Passive mouse hover motion does
+        // not count as deliberate user input recency.
+        if !is_hover_motion {
+            self.last_input_ms
+                .store(now_unix_millis(), Ordering::Relaxed);
+        }
         if let Err(err) = self.writer_tx.try_send(bytes) {
             match err {
                 TrySendError::Full(_) => {
@@ -21442,6 +21448,8 @@ mod tests {
         assert!(is_mouse_motion_only_sequence(
             b"\x1b[<35;55;29M\x1b[<35;54;29M\x1b[<35;54;30M"
         ));
+        assert!(is_mouse_report_sequence(b"\x1b[<35;55;29m"));
+        assert!(!is_mouse_motion_only_sequence(b"\x1b[<35;55;29m"));
 
         assert!(is_mouse_report_sequence(b"\x1b[<32;55;29M"));
         assert!(!is_mouse_motion_only_sequence(b"\x1b[<32;55;29M"));

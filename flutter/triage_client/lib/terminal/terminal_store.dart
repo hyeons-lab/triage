@@ -522,7 +522,9 @@ void writeToXterm(xt.Terminal terminal, String data) {
       }
       terminal.write('\x1b[${x + 1}G');
     } else {
-      for (var step = 0; step < count; step++) {
+      final maxTabs = (terminal.viewWidth ~/ 8) + 1;
+      final steps = count > maxTabs ? maxTabs : count;
+      for (var step = 0; step < steps; step++) {
         terminal.tab();
       }
     }
