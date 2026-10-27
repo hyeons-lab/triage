@@ -3019,10 +3019,25 @@ mod tests {
         let bin = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::copy(stub_agent_bin(), &bin).unwrap();
-        let child = std::process::Command::new(&bin)
-            .args(args)
-            .spawn()
-            .expect("spawn stub agent");
+        // On Linux, a concurrent test thread that calls `fork()` while `fs::copy`
+        // holds the destination open for writing briefly inherits that writable
+        // descriptor until `execve()` closes `O_CLOEXEC` fds, which causes
+        // `execve(&bin)` to return `ETXTBSY` (`ExecutableFileBusy`). Retry
+        // across that transient window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let child = loop {
+            match std::process::Command::new(&bin).args(args).spawn() {
+                Ok(child) => break child,
+                Err(err)
+                    if (err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        || err.raw_os_error() == Some(libc::ETXTBSY))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => panic!("spawn stub agent: {err:?}"),
+            }
+        };
         (child, dir)
     }
 

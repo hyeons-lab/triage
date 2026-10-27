@@ -1,11 +1,5 @@
 # 000172: Track foreground AI agents and resume conversations on restore
 
-## Agent
-
-Muse Code (muse-spark) @ triage branch feat/agent-session-restore (2026-09-20T10:26-0700)
-Antigravity (gemini-2.5-pro) @ triage branch feat/agent-session-restore (2026-09-22T17:38-0700)
-Antigravity (gemini-4-argon) @ triage branch feat/agent-session-restore (2026-10-21T08:51-0700)
-
 ## Intent
 
 Track which AI agent (Claude Code, Codex, Antigravity `agy`, Muse) is
@@ -94,6 +88,7 @@ status; exited sessions carry no agent state.
   strip Windows extended-length prefixes (`\\?\`), trim trailing separators,
   and normalize path characters in `claude_project_dir`; and avoid aborting the
   200-line scan in `muse_hit` when an earlier JSONL line lacks `payload.record`.
+- **2026-10-27T14:37-0700** Fixed two CI test failures in `crates/triaged/src/session.rs` and `crates/triaged/src/agent_detect.rs`: updated `flush_agent_updates_keeps_latest_when_persist_fails` to block `sessions.json.tmp` by creating a directory at that staging path (since `set_private_dir_permissions` in `persist_manifest_with_layout` restores `0o700` on `log_dir`), and updated `spawn_stub_agent` to retry `Command::spawn` across transient `ExecutableFileBusy` (`ETXTBSY`) errors when concurrent test threads call `fork()` while `fs::copy` holds the stub binary open for writing on Linux.
 
 ## Decisions
 
@@ -158,7 +153,8 @@ status; exited sessions carry no agent state.
 - 7ea1c8b: test(triaged): gate handover agent serialization test to Unix
 - fb0cde3: fix(triaged): release sessions lock before overlay_manager_fields on historical attach
 - bfbdde7: fix(session): harden agent argv classification, exit detach guards, and generation checks
-- HEAD: fix(session): address PR #177 review findings in agent_detect
+- 05cad92: fix(session): address PR #177 review findings in agent_detect
+- HEAD: test(triaged): harden manifest persist fault and stub-agent spawn against ETXTBSY
 
 ## Progress
 

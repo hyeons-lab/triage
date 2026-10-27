@@ -19986,8 +19986,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn flush_agent_updates_keeps_latest_when_persist_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
         let session_id = manager
@@ -19997,9 +19995,10 @@ mod tests {
         // A failed persist keeps the latest observation live: the
         // tracker never resends an identical report, so a revert could
         // not enable a retry and would only strand stale reads.
-        let mut perms = std::fs::metadata(&log_dir).expect("stat").permissions();
-        perms.set_mode(0o555);
-        std::fs::set_permissions(&log_dir, perms).expect("read-only dir");
+        // Place a directory at the temporary manifest path so `fs::write`
+        // fails even after `set_private_dir_permissions` restores 0o700 on `log_dir`.
+        let temp_manifest = log_dir.join("sessions.json.tmp");
+        std::fs::create_dir_all(&temp_manifest).expect("block temp manifest");
         manager.flush_agent_updates(HashMap::from([(
             session_id.clone(),
             Some(test_attachment()),
@@ -20011,9 +20010,7 @@ mod tests {
         assert_eq!(manifest_agent(&log_dir, &session_id), None);
 
         // The manifest heals on the next successful persist.
-        let mut perms = std::fs::metadata(&log_dir).expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&log_dir, perms).expect("writable dir");
+        std::fs::remove_dir(&temp_manifest).expect("unblock temp manifest");
         let mut refined = test_attachment();
         refined.conversation_id = Some("def".to_string());
         manager.flush_agent_updates(HashMap::from([(session_id.clone(), Some(refined))]));
