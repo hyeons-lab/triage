@@ -121,6 +121,7 @@ pub fn reload_daemon() -> Result<()> {
     #[cfg(unix)]
     {
         use crate::ipc::{IpcClient, default_socket_path};
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::process::CommandExt;
         use triage_core::session::SessionApi;
 
@@ -132,6 +133,8 @@ pub fn reload_daemon() -> Result<()> {
             println!("No running triaged daemon found. Starting service...");
             return platform::start(&ctx);
         }
+
+        let old_ino = std::fs::metadata(&socket_path).ok().map(|m| m.ino());
 
         let mut cmd = std::process::Command::new(&ctx.exe);
         cmd.stdin(std::process::Stdio::null())
@@ -145,22 +148,30 @@ pub fn reload_daemon() -> Result<()> {
             });
         }
 
-        let _child = cmd
+        let mut child = cmd
             .spawn()
             .context("spawning replacement triaged daemon in background")?;
 
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(10);
+        let timeout = std::time::Duration::from_secs(60);
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         while start.elapsed() < timeout {
-            let client = IpcClient::new(socket_path.clone());
-            if let Ok(sessions) = client.list_sessions() {
-                println!(
-                    "triaged daemon reloaded successfully ({} live sessions preserved).",
-                    sessions.len()
-                );
-                return Ok(());
+            let current_ino = std::fs::metadata(&socket_path).ok().map(|m| m.ino());
+            if current_ino.is_some() && current_ino != old_ino {
+                let client = IpcClient::new(socket_path.clone());
+                if let Ok(sessions) = client.list_sessions() {
+                    println!(
+                        "triaged daemon reloaded successfully ({} live sessions preserved).",
+                        sessions.len()
+                    );
+                    return Ok(());
+                }
+            }
+            if let Ok(Some(status)) = child.try_wait()
+                && !status.success()
+            {
+                anyhow::bail!("replacement triaged daemon exited early with {status}");
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
         }

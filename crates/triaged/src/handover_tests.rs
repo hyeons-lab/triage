@@ -1348,6 +1348,7 @@ mod tests {
                 session_ids: vec!["s-recovered".to_string()],
             },
             custom_labels,
+            session_contexts: std::collections::HashMap::new(),
         };
         crate::handover::remember_recovered_handover_for_test(recovered, Vec::new());
 
