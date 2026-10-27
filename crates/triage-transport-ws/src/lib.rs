@@ -217,6 +217,19 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         self
     }
 
+    /// Sets the connection-wide push receiver after authentication completes.
+    pub fn set_global_receiver(&mut self, rx: Receiver<ServerMessage>) {
+        self.global_rx = Some(rx);
+    }
+
+    pub fn has_global_receiver(&self) -> bool {
+        self.global_rx.is_some()
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        !self.authenticator.require_pairing() || self.authenticated
+    }
+
     pub fn handle_text_message(&mut self, message: &str) -> String {
         let response = match serde_json::from_str::<Value>(message) {
             Ok(value) => {

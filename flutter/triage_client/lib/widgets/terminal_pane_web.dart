@@ -962,6 +962,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _toggleCtrl() {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
     _setCtrlArmed(!_ctrlArmed);
   }
 
@@ -969,6 +970,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // (a bare Ctrl toggle arms it via _toggleCtrl instead of coming through here).
   // Does not request focus so tapping shortcuts does not pop open the soft keyboard.
   void _sendAccessory(String bytes) {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
     _sessionInputRouter.sendInput(_sanitizedId, bytes);
     _setCtrlArmed(false);
     _autoSpace.reset();
@@ -1337,6 +1339,12 @@ class _TerminalPaneState extends State<TerminalPane>
           _sessionInputRouter.sendInput(sessionId, data);
           return;
         }
+        final activePane = _containerEventOwners[sessionId] ?? this;
+        if (!activePane.mounted ||
+            activePane.widget.isExited ||
+            !activePane._isRouteCurrentAndUnobscured) {
+          return;
+        }
         _sessionSavedViewportY.remove(sessionId);
         try {
           final term = _sessionTerms[sessionId];
@@ -1344,7 +1352,6 @@ class _TerminalPaneState extends State<TerminalPane>
             js_util.callMethod(term, 'scrollToBottom', []);
           }
         } catch (_) {}
-        final activePane = _containerEventOwners[sessionId] ?? this;
         if (!activePane._initialContentWritten &&
             (activePane._lastFittedCols ?? 0) >= 10 &&
             (activePane._lastFittedRows ?? 0) >= 5) {
@@ -1393,18 +1400,20 @@ class _TerminalPaneState extends State<TerminalPane>
 
     var onResizeSubscription = _sessionOnResizeSubscriptions[_sanitizedId];
     if (onResizeSubscription == null) {
+      final sessionId = _sanitizedId;
       final onResizeCallback = js_util.allowInterop((
         dynamic size, [
         dynamic _,
       ]) {
-        if (!_initialContentWritten) {
+        final activePane = _containerEventOwners[sessionId] ?? this;
+        if (!activePane._initialContentWritten) {
           return;
         }
         final colsNum = js_util.getProperty(size, 'cols') as num;
         final rowsNum = js_util.getProperty(size, 'rows') as num;
         final cols = colsNum.toInt();
         final rows = rowsNum.toInt();
-        _sessionInputRouter.sendResizeOut(_sanitizedId, cols, rows);
+        _sessionInputRouter.sendResizeOut(sessionId, cols, rows);
       });
       onResizeSubscription = js_util.callMethod(_term, 'onResize', [
         onResizeCallback,
@@ -1474,9 +1483,37 @@ class _TerminalPaneState extends State<TerminalPane>
           if (type != null && type != 'keydown') {
             return true;
           }
+          final activePane = _containerEventOwners[sessionId] ?? this;
+          if (!activePane.mounted || !activePane._isRouteCurrentAndUnobscured) {
+            return false;
+          }
           final key = js_util.getProperty(event, 'key') as String?;
           final code = js_util.getProperty(event, 'code') as String?;
           final keyCode = js_util.getProperty(event, 'keyCode') as num?;
+          final ctrlKey =
+              js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
+          final metaKey =
+              js_util.getProperty(event, 'metaKey') as bool? ?? false;
+          if ((ctrlKey || metaKey) && (key == 'c' || key == 'C')) {
+            var selection = '';
+            try {
+              final term = _sessionTerms[sessionId] ?? activePane._term;
+              selection =
+                  js_util.callMethod(term, 'getSelection', []) as String? ?? '';
+            } catch (_) {}
+            if (selection.isNotEmpty) {
+              js_util.callMethod(event, 'preventDefault', []);
+              js_util.callMethod(event, 'stopPropagation', []);
+              activePane._copyTextToClipboard(selection);
+              return false;
+            }
+            if (metaKey && !ctrlKey) {
+              return false;
+            }
+          }
+          if (activePane.widget.isExited) {
+            return false;
+          }
           if (key == 'Enter' ||
               key == '\r' ||
               key == '\n' ||
@@ -1487,12 +1524,8 @@ class _TerminalPaneState extends State<TerminalPane>
             js_util.callMethod(event, 'stopPropagation', []);
             final shiftKey =
                 js_util.getProperty(event, 'shiftKey') as bool? ?? false;
-            final ctrlKey =
-                js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
             final altKey =
                 js_util.getProperty(event, 'altKey') as bool? ?? false;
-            final metaKey =
-                js_util.getProperty(event, 'metaKey') as bool? ?? false;
             final newline = bytesForEnterKey(
               shift: shiftKey,
               ctrl: ctrlKey,
@@ -1525,7 +1558,7 @@ class _TerminalPaneState extends State<TerminalPane>
             try {
               js_util.callMethod(event, 'stopImmediatePropagation', []);
             } catch (_) {}
-            if (_shouldDispatchTab()) {
+            if (activePane._shouldDispatchTab()) {
               final shiftKey =
                   js_util.getProperty(event, 'shiftKey') as bool? ?? false;
               if (shiftKey) {
@@ -1535,31 +1568,6 @@ class _TerminalPaneState extends State<TerminalPane>
               }
             }
             return false;
-          }
-          final ctrlKey =
-              js_util.getProperty(event, 'ctrlKey') as bool? ?? false;
-          final metaKey =
-              js_util.getProperty(event, 'metaKey') as bool? ?? false;
-          if ((ctrlKey || metaKey) && (key == 'c' || key == 'C')) {
-            var selection = '';
-            try {
-              selection =
-                  js_util.callMethod(_term, 'getSelection', []) as String? ??
-                  '';
-            } catch (_) {}
-            if (selection.isNotEmpty) {
-              js_util.callMethod(event, 'preventDefault', []);
-              js_util.callMethod(event, 'stopPropagation', []);
-              html.window.navigator.clipboard?.writeText(selection).catchError((
-                Object error,
-              ) {
-                debugPrint('Terminal copy failed: $error');
-              });
-              return false;
-            }
-            if (metaKey && !ctrlKey) {
-              return false;
-            }
           }
           return true;
         }),
@@ -2603,7 +2611,12 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   Future<void> _handlePaste(String text) async {
-    if (!mounted || text.isEmpty || widget.isExited) return;
+    if (!mounted ||
+        text.isEmpty ||
+        widget.isExited ||
+        !_isRouteCurrentAndUnobscured) {
+      return;
+    }
     final isBracketed = _isBracketedPasteEnabled();
     if (isBracketed || !isMultiLine(text)) {
       _sendInput(formatPasteInput(text, isBracketed));
@@ -2617,7 +2630,10 @@ class _TerminalPaneState extends State<TerminalPane>
     _isPasteDialogShowing = true;
     try {
       final chosenText = await showMultiLinePasteDialog(context, text);
-      if (chosenText != null && mounted && !widget.isExited) {
+      if (chosenText != null &&
+          mounted &&
+          !widget.isExited &&
+          _isRouteCurrentAndUnobscured) {
         _sendInput(formatPasteInput(chosenText, false));
         try {
           js_util.callMethod(_term, 'clearSelection', []);
@@ -2640,6 +2656,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // read only logs in debug builds, leaving the browser textarea paste
   // path untouched.
   Future<void> _pasteFromClipboard() async {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
     if (_isPasting) return;
     _isPasting = true;
     try {
@@ -3531,13 +3548,16 @@ class _TerminalPaneState extends State<TerminalPane>
       focusNode: _focusNode,
       autofocus: _mayTakeFocus,
       onFocusChange: (hasFocus) {
-        if (hasFocus && _initialized) {
+        if (hasFocus && _initialized && _isRouteCurrentAndUnobscured) {
           widget.controller.notifyInteraction();
           _activateTerminal(force: true);
           _scheduleFocusRetries(force: true);
         }
       },
       onKeyEvent: (node, event) {
+        if (widget.isExited || !_isRouteCurrentAndUnobscured) {
+          return KeyEventResult.ignored;
+        }
         if (event.logicalKey == LogicalKeyboardKey.tab) {
           if (event is KeyDownEvent || event is KeyRepeatEvent) {
             if (_shouldDispatchTab()) {

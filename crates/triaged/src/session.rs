@@ -215,6 +215,7 @@ const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_DEVICE_CODE_TTL: Duration = Duration::from_secs(15 * 60);
 const PAIRING_PIN_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_PENDING_PAIRING_CHALLENGES: usize = 64;
+const MAX_PAIRING_PIN_ATTEMPTS: u32 = 5;
 /// How long denied input waits for its client to acquire the lease before it
 /// is dropped. Acquire-on-denial is one round trip, so anything older is from
 /// a client that went away.
@@ -544,6 +545,7 @@ struct PendingPairingChallenge {
 struct PendingPairingPin {
     code: String,
     expires_at: Instant,
+    failed_attempts: u32,
 }
 
 // The `Live` variant intentionally carries the live actor plus its launch
@@ -717,6 +719,7 @@ impl SessionManager {
         });
         let next_session = next_session_sequence(sessions.keys());
         let paired_devices = load_paired_devices(&config.log_dir);
+        #[cfg(not(test))]
         let (require_pairing, tailscale_pair_users) =
             if let Ok(path) = triage_core::config::Config::default_path() {
                 if path.exists() {
@@ -729,6 +732,8 @@ impl SessionManager {
             } else {
                 (true, Vec::new())
             };
+        #[cfg(test)]
+        let (require_pairing, tailscale_pair_users) = (true, Vec::new());
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
@@ -770,6 +775,12 @@ impl SessionManager {
             activity_persistence_started: AtomicBool::new(false),
             _compression_worker: compression_worker,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_require_pairing(mut self, require_pairing: bool) -> Self {
+        self.require_pairing = require_pairing;
+        self
     }
 
     /// Claim the handover slot for the caller. Returns `None` when a handover is
@@ -2134,10 +2145,12 @@ impl SessionManager {
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
+        set_private_dir_permissions(&self.config.log_dir);
         let manifest_path = self.config.manifest_path();
         let temp_path = manifest_path.with_extension("json.tmp");
         fs::write(&temp_path, json)
             .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
+        set_private_file_permissions(&temp_path);
         replace_manifest(&temp_path, &manifest_path)?;
         Ok(())
     }
@@ -2159,9 +2172,11 @@ impl SessionManager {
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
+        set_private_dir_permissions(&self.config.log_dir);
         let temp_path = self.shutdown_manifest_temp_path(session_id);
         fs::write(&temp_path, json)
             .with_context(|| format!("writing session manifest {}", temp_path.display()))?;
+        set_private_file_permissions(&temp_path);
         Ok(temp_path)
     }
 
@@ -2357,7 +2372,7 @@ impl SessionManager {
         let mut challenges = self.pairing_challenges()?;
         prune_expired_pairing_challenges(&mut challenges, now);
 
-        let (pin_code, challenge_expires_at, challenge_expires_at_unix) = {
+        let (existing_pin, challenge_expires_at, challenge_expires_at_unix) = {
             let challenge = challenges
                 .get(&normalized)
                 .with_context(|| "invalid or expired pairing device code")?;
@@ -2366,15 +2381,20 @@ impl SessionManager {
                 bail!("pairing device code has expired");
             }
 
-            let pin_code = match &challenge.pin {
-                Some(pin) if pin.expires_at > now => Some(pin.code.clone()),
+            let existing_pin = match &challenge.pin {
+                Some(pin) if pin.expires_at > now => Some((pin.code.clone(), pin.failed_attempts)),
                 _ => None,
             };
 
-            (pin_code, challenge.expires_at, challenge.expires_at_unix)
+            (
+                existing_pin,
+                challenge.expires_at,
+                challenge.expires_at_unix,
+            )
         };
 
-        let pin_code = pin_code.unwrap_or_else(|| unique_pairing_pin(&challenges));
+        let (pin_code, failed_attempts) =
+            existing_pin.unwrap_or_else(|| (unique_pairing_pin(&challenges), 0));
         let pin_expires_at = std::cmp::min(now + PAIRING_PIN_TTL, challenge_expires_at);
         let pin_expires_at_unix = std::cmp::min(
             now_unix + PAIRING_PIN_TTL.as_secs(),
@@ -2386,6 +2406,7 @@ impl SessionManager {
         challenge.pin = Some(PendingPairingPin {
             code: pin_code.clone(),
             expires_at: pin_expires_at,
+            failed_attempts,
         });
 
         tracing::info!(client_id = %challenge.client_id, "issued pairing PIN for device code");
@@ -3497,6 +3518,7 @@ fn spawn_adopted_pty_runtime(
 
     if let Some(parent) = target_log_path.parent() {
         let _ = fs::create_dir_all(parent);
+        set_private_dir_permissions(parent);
     }
 
     let log = OpenOptions::new()
@@ -3505,6 +3527,7 @@ fn spawn_adopted_pty_runtime(
         .append(true)
         .open(&target_log_path)
         .with_context(|| format!("opening session log {}", target_log_path.display()))?;
+    set_private_file_permissions(&target_log_path);
 
     let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
     let mut output = OutputState {
@@ -5203,6 +5226,47 @@ fn load_paired_devices(log_dir: &Path) -> HashMap<ClientId, String> {
     }
 }
 
+/// Best-effort enforcement of owner-only (`0o700`) directory permissions on Unix.
+pub(crate) fn set_private_dir_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        if let Some(parent) = path.parent()
+            && parent.file_name().and_then(|n| n.to_str()) == Some("sessions")
+        {
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            if let Some(log_dir) = parent.parent() {
+                let _ = fs::set_permissions(log_dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Best-effort enforcement of owner-only (`0o600`) file permissions on Unix.
+pub(crate) fn set_private_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> Result<()> {
     let path = log_dir.join("paired_devices.json");
     let mut raw_map = HashMap::new();
@@ -5212,8 +5276,13 @@ fn save_paired_devices(log_dir: &Path, devices: &HashMap<ClientId, String>) -> R
     let json = serde_json::to_vec_pretty(&raw_map)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        set_private_dir_permissions(parent);
     }
-    fs::write(&path, json)?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, json)?;
+    set_private_file_permissions(&temp_path);
+    replace_manifest(&temp_path, &path)?;
+    set_private_file_permissions(&path);
     Ok(())
 }
 
@@ -6951,8 +7020,11 @@ impl ActorState {
     }
 
     /// A snapshot carrying the raw output-history tail for client-side
-    /// re-emulation (attach / resync / explicit snapshot). Resize broadcasts use
-    /// the plain [`Self::snapshot`] so they never carry history.
+    /// re-emulation (attach / explicit snapshot). Resize and `ResyncRequired`
+    /// broadcasts use the plain [`Self::snapshot`] (omitting raw history so
+    /// WebSocket clients fetch the delta over HTTP while keeping rendered rows
+    /// for the local TUI), and 1 KiB lease/metadata probes use
+    /// [`Self::metadata_snapshot`].
     fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
         overlay_raw_output_history(
             self.snapshot(),
@@ -7823,6 +7895,7 @@ impl OutputState {
             .open(&new_segment_path)
         {
             Ok(new_log) => {
+                set_private_file_permissions(&new_segment_path);
                 let initial_bytes = new_log.metadata().map(|m| m.len()).unwrap_or(0);
                 let old_segment_path = std::mem::replace(&mut self.log_path, new_segment_path);
                 self.log = new_log;
@@ -8182,8 +8255,10 @@ fn spawn_pty_runtime(
                     crate::scrollback::purge_journal_files(&dir);
                 }
                 let _ = fs::create_dir_all(&dir);
+                set_private_dir_permissions(&dir);
             } else if let Some(parent) = config.log_path.parent() {
                 let _ = fs::create_dir_all(parent);
+                set_private_dir_permissions(parent);
             }
             let log = OpenOptions::new()
                 .create(true)
@@ -8191,6 +8266,7 @@ fn spawn_pty_runtime(
                 .truncate(true)
                 .open(&config.log_path)
                 .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+            set_private_file_permissions(&config.log_path);
             let (active_segment_index, _) = config
                 .log_path
                 .file_name()
@@ -8241,6 +8317,7 @@ fn spawn_pty_runtime(
             let terminal = terminal_with_writer(&config.size, writer.clone());
             if let Some(parent) = config.log_path.parent() {
                 let _ = fs::create_dir_all(parent);
+                set_private_dir_permissions(parent);
             }
             let log = OpenOptions::new()
                 .create(true)
@@ -8248,6 +8325,7 @@ fn spawn_pty_runtime(
                 .append(true)
                 .open(&config.log_path)
                 .with_context(|| format!("opening session log {}", config.log_path.display()))?;
+            set_private_file_permissions(&config.log_path);
             let (active_segment_index, _) = config
                 .log_path
                 .file_name()
@@ -8348,14 +8426,17 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
 
     if let Some(parent) = target_log_path.parent() {
         let _ = fs::create_dir_all(parent);
+        set_private_dir_permissions(parent);
     }
 
     let log = if target_log_path.exists() {
-        OpenOptions::new()
+        let f = OpenOptions::new()
             .read(true)
             .append(true)
             .open(&target_log_path)
-            .with_context(|| format!("opening session log {}", target_log_path.display()))?
+            .with_context(|| format!("opening session log {}", target_log_path.display()))?;
+        set_private_file_permissions(&target_log_path);
+        f
     } else if let Some(session_dir) = resolve_segment_session_dir(log_path)
         && let Ok(segments) = crate::storage::list_session_segments(&session_dir)
         && let Some(last) = segments.last()
@@ -8370,12 +8451,14 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
             .open(&last.path)
             .with_context(|| format!("opening historical segment {}", last.path.display()))?
     } else {
-        OpenOptions::new()
+        let f = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&target_log_path)
-            .with_context(|| format!("opening session log {}", target_log_path.display()))?
+            .with_context(|| format!("opening session log {}", target_log_path.display()))?;
+        set_private_file_permissions(&target_log_path);
+        f
     };
 
     let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
@@ -8444,8 +8527,8 @@ fn snapshot_from_output(
         bracketed_paste_enabled: output.terminal.bracketed_paste_enabled(),
         exited,
         // History (raw_output + raw_output_prefix) is attached only on the
-        // attach/resync/snapshot paths via `*_with_history`; resize
-        // broadcasts carry none.
+        // attach/snapshot paths via `*_with_history`; resize broadcasts and
+        // metadata-only `ResyncRequired` snapshots carry none.
         raw_output: Vec::new(),
         raw_output_start: 0,
         raw_output_prefix: Vec::new(),
@@ -8595,8 +8678,8 @@ const _: () = assert!(
 );
 
 /// Overlays the raw output-history tail onto a snapshot for client-side
-/// re-emulation. Used by the attach/resync/snapshot paths; the resize broadcast
-/// keeps the plain `snapshot()` so it never carries the tail.
+/// re-emulation. Used by the attach/snapshot paths; resize and resync broadcasts
+/// keep the plain `snapshot()` so they never carry the tail.
 ///
 /// When a scrollback journal is passed, journaled lines at or older than
 /// the raw window seam ride along in `raw_output_prefix`, ahead of the raw
@@ -10003,7 +10086,7 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
 
         let devices = self.paired_devices()?;
         if let Some(stored_hash) = devices.get(client_id) {
-            Ok(stored_hash == &hash)
+            Ok(constant_time_eq(stored_hash.as_bytes(), hash.as_bytes()))
         } else {
             Ok(false)
         }
@@ -10046,26 +10129,35 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
             let mut challenges = self.pairing_challenges()?;
             challenges.retain(|_, challenge| challenge.expires_at > now);
 
-            let device_code = challenges.iter().find_map(|(device_code, challenge)| {
-                let pin = challenge.pin.as_ref()?;
-                if pin.code == normalized {
-                    Some((
-                        device_code.clone(),
-                        challenge.client_id.clone(),
-                        pin.expires_at,
-                    ))
-                } else {
-                    None
+            let mut matched = None;
+            for (device_code, challenge) in challenges.iter() {
+                if &challenge.client_id == client_id
+                    && let Some(pin) = challenge.pin.as_ref()
+                    && constant_time_eq(pin.code.as_bytes(), normalized.as_bytes())
+                {
+                    matched = Some((device_code.clone(), pin.expires_at));
                 }
-            });
+            }
 
-            let Some((device_code, paired_client_id, pin_expires_at)) = device_code else {
+            let Some((device_code, pin_expires_at)) = matched else {
+                for (_, challenge) in challenges
+                    .iter_mut()
+                    .filter(|(_, challenge)| &challenge.client_id == client_id)
+                {
+                    if let Some(pin) = challenge.pin.as_mut() {
+                        pin.failed_attempts = pin.failed_attempts.saturating_add(1);
+                        if pin.failed_attempts >= MAX_PAIRING_PIN_ATTEMPTS {
+                            tracing::warn!(
+                                client_id = %client_id,
+                                attempts = pin.failed_attempts,
+                                "invalidating pairing PIN after repeated failed attempts"
+                            );
+                            challenge.pin = None;
+                        }
+                    }
+                }
                 bail!("invalid pairing PIN");
             };
-
-            if &paired_client_id != client_id {
-                bail!("pairing PIN was issued for a different device");
-            }
 
             if pin_expires_at <= now {
                 if let Some(challenge) = challenges.get_mut(&device_code) {
@@ -17711,6 +17803,104 @@ mod tests {
             .expect("reject second client")
         );
 
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn pairing_pin_locks_out_after_max_failed_attempts() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client = ClientId::new("browser-lockout").expect("client id");
+
+        let challenge = manager
+            .request_pairing_challenge(&client)
+            .expect("request challenge");
+        let pin = manager
+            .approve_pairing_device_code(&challenge.device_code)
+            .expect("approve challenge");
+
+        // Another client_id presenting the real PIN must neither oracle the PIN nor bypass lockout.
+        let other_client = ClientId::new("attacker-client").expect("other client id");
+        let cross_client_err =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &other_client)
+                .expect_err("PIN for different client must fail with generic error");
+        assert!(cross_client_err.to_string().contains("invalid pairing PIN"));
+
+        for _ in 0..MAX_PAIRING_PIN_ATTEMPTS {
+            let err =
+                triage_transport_ws::WebSocketAuthenticator::pair(&manager, "00000000", &client)
+                    .expect_err("wrong PIN must fail");
+            assert!(err.to_string().contains("invalid pairing PIN"));
+        }
+
+        // The 6th attempt with the real PIN must fail because the PIN was invalidated.
+        let locked_out =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &client)
+                .expect_err("PIN must be invalidated after max failed attempts");
+        assert!(locked_out.to_string().contains("invalid pairing PIN"));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paired_devices_and_manifest_enforce_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let client = ClientId::new("browser-perms").expect("client id");
+        let challenge = manager.request_pairing_challenge(&client).unwrap();
+        let pin = manager
+            .approve_pairing_device_code(&challenge.device_code)
+            .unwrap();
+        let _token =
+            triage_transport_ws::WebSocketAuthenticator::pair(&manager, &pin.pin, &client).unwrap();
+
+        let session_id = manager
+            .start_session(StartSessionRequest {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "printf 'perm-test'; sleep 30".to_string()],
+                cwd: None,
+                size: SessionSize::default(),
+            })
+            .expect("start session");
+
+        let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let paired_mode = std::fs::metadata(log_dir.join("paired_devices.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(paired_mode, 0o600);
+        let manifest_mode = std::fs::metadata(log_dir.join("sessions.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(manifest_mode, 0o600);
+        let sessions_root = log_dir.join("sessions");
+        let sessions_root_mode = std::fs::metadata(&sessions_root)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sessions_root_mode, 0o700);
+        let session_dir = sessions_root.join(session_id.as_str());
+        let session_dir_mode = std::fs::metadata(&session_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(session_dir_mode, 0o700);
+        let segment_mode = std::fs::metadata(session_dir.join("segment-000001.tlog"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(segment_mode, 0o600);
+
+        let _ = manager.shutdown_session(session_id);
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 

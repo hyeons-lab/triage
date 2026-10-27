@@ -12,6 +12,15 @@ impl SessionId {
     pub fn new(id: impl Into<String>) -> Result<Self> {
         let id = id.into();
         ensure!(!id.trim().is_empty(), "session id must be set");
+        ensure!(
+            !id.contains('/')
+                && !id.contains('\\')
+                && !id.contains('\0')
+                && id != "."
+                && id != ".."
+                && !id.contains(".."),
+            "session id must not contain path separators or traversal segments"
+        );
         Ok(Self(id))
     }
 
@@ -1371,6 +1380,27 @@ mod tests {
         let deserialized = compressed_bytes::deserialize(RawBytesDeserializer(raw))
             .expect("deserialize raw bytes");
         assert_eq!(deserialized, raw);
+    }
+
+    #[test]
+    fn session_id_rejects_path_separators_and_traversal_components() {
+        for invalid in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../etc/passwd",
+            "session/1",
+            "session\\1",
+            "session\0id",
+        ] {
+            assert!(
+                SessionId::new(invalid).is_err(),
+                "expected SessionId::new({invalid:?}) to fail"
+            );
+        }
+        assert!(SessionId::new("session-1").is_ok());
+        assert!(SessionId::new("session.v1").is_ok());
     }
 
     #[test]
