@@ -52,6 +52,71 @@ void main() {
       expect(buffer.add('s1', [9]), 1);
     });
 
+    test(
+      'cap truncation preserves UTF-8 boundaries and bracketed paste close',
+      () {
+        final buffer = PendingInputBuffer();
+        buffer.add(
+          's1',
+          List<int>.filled(PendingInputBuffer.capacity - 16, 0x61),
+        );
+        // '\x1b[200~' (6 bytes) + '世' (3 bytes: E4 B8 96) + '界' (3 bytes) + '\x1b[201~' (6 bytes)
+        final paste = <int>[
+          0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e, // \x1b[200~
+          0xe4, 0xb8, 0x96, // 世
+          0xe7, 0x95, 0x8c, // 界
+          0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e, // \x1b[201~
+        ];
+        final dropped = buffer.add('s1', paste);
+        expect(dropped, greaterThan(0));
+        final snap = buffer.snapshot('s1')!;
+        // The closing '\x1b[201~' must still be present at the tail so the
+        // remote application does not stay wedged in bracketed-paste mode,
+        // and no partial UTF-8 sequence may remain before it.
+        expect(snap.sublist(snap.length - 15), [
+          0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e, // \x1b[200~
+          0xe4, 0xb8, 0x96, // 世
+          0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e, // \x1b[201~
+        ]);
+      },
+    );
+
+    test(
+      'cap truncation drops bracketed paste when room < 12 instead of leaving mode 2004 open',
+      () {
+        final paste = <int>[
+          0x1b, 0x5b, 0x32, 0x30, 0x30, 0x7e, // \x1b[200~
+          0x61, // a
+          0x1b, 0x5b, 0x32, 0x30, 0x31, 0x7e, // \x1b[201~
+        ];
+        for (final room in <int>[6, 11]) {
+          final buffer = PendingInputBuffer();
+          final prefixLen = PendingInputBuffer.capacity - room;
+          buffer.add('s1', List<int>.filled(prefixLen, 0x78));
+          final dropped = buffer.add('s1', paste);
+          expect(dropped, paste.length);
+          expect(buffer.snapshot('s1')!.length, prefixLen);
+        }
+      },
+    );
+
+    test(
+      'cap truncation rewinds 4-byte UTF-8 codepoint split at +1, +2, and +3',
+      () {
+        // 'a' + 🦀 (F0 9F A6 80) + 'b'
+        final payload = <int>[0x61, 0xf0, 0x9f, 0xa6, 0x80, 0x62];
+        for (final room in <int>[2, 3, 4]) {
+          final buffer = PendingInputBuffer();
+          final prefixLen = PendingInputBuffer.capacity - room;
+          buffer.add('s1', List<int>.filled(prefixLen, 0x78));
+          final dropped = buffer.add('s1', payload);
+          expect(dropped, payload.length - 1);
+          final snap = buffer.snapshot('s1')!;
+          expect(snap.sublist(prefixLen), <int>[0x61]);
+        }
+      },
+    );
+
     test('sessions are independent and forget/clear are scoped', () {
       final buffer = PendingInputBuffer();
       buffer.add('s1', [1]);
