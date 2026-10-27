@@ -29,33 +29,45 @@ use tattoy_wezterm_surface::Line;
 use tattoy_wezterm_term::color::{ColorAttribute, ColorPalette, SrgbaTuple};
 use tattoy_wezterm_term::{Intensity, Underline};
 
-/// Encode one emulator line as SGR-tagged bytes terminated by CRLF.
+/// Encode one emulator line as SGR-tagged bytes, terminated by CRLF for
+/// hard-wrapped lines and omitting the trailing CRLF when the line was
+/// soft-wrapped (`line.last_cell_was_wrapped()`).
 ///
 /// The record starts with a reset so rendition state from any previous
 /// record cannot bleed in, then re-emits style runs (attributes first,
 /// then foreground, then background, mirroring `terminal_style` in
 /// `session.rs`) with each run change resetting before applying. Trailing
-/// blank cells in the default style are dropped (wezterm lines are
-/// full-width padded); control characters never survive into the text,
-/// since a stray ESC would corrupt the replay stream.
+/// blank cells without a visible background, reverse video, or underline
+/// (including foreground- or intensity-only blanks) are dropped, while
+/// trailing spaces on soft-wrapped lines are preserved; control characters
+/// never survive into the text, since a stray ESC would corrupt the replay
+/// stream.
 pub fn encode_line(line: &mut Line, palette: &ColorPalette) -> Vec<u8> {
+    let wrapped = line.last_cell_was_wrapped();
     // `cells_mut` coerces clustered (RLE) storage to a cell vec first;
     // the immutable accessor panics on clustered lines, which is how
     // rows come back from `lines_in_phys_range`.
     let cells = line.cells_mut();
-    // Last significant cell: anything but a blank in the default style.
-    // Style runs are compared by their encoded params, so "default" is
-    // simply the empty param list. Scratch buffers are reused across
-    // cells: encoding allocates nothing per cell, so scroll spam costs
-    // O(bytes) instead of O(cells × allocs).
+    // Last significant cell: anything non-blank, or a blank cell with a
+    // visible background, reverse video, or underline. Foreground-only SGR
+    // on trailing blanks (stamped by `CSI K` while a foreground color or
+    // intensity attribute is active) is invisible and dropped so full-width
+    // padding does not wrap onto extra blank lines at narrower widths.
     let mut scratch = Vec::with_capacity(32);
     let mut end = 0;
     for (index, cell) in cells.iter().enumerate() {
         let text_blank = cell.str().trim().is_empty();
-        scratch.clear();
-        push_sgr_params(cell.attrs(), palette, &mut scratch);
-        if !text_blank || !scratch.is_empty() {
+        let attrs = cell.attrs();
+        let visible_blank_style = attrs.background() != ColorAttribute::Default
+            || attrs.reverse()
+            || attrs.underline() != Underline::None;
+        if !text_blank || visible_blank_style {
             end = index + 1;
+        }
+    }
+    if wrapped && end > 0 {
+        while end < cells.len() && cells[end].str() == " " {
+            end += 1;
         }
     }
     let mut out = Vec::with_capacity(end * 2 + 16);
@@ -94,7 +106,9 @@ pub fn encode_line(line: &mut Line, palette: &ColorPalette) -> Vec<u8> {
             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
         }
     }
-    out.extend_from_slice(b"\r\n");
+    if !wrapped {
+        out.extend_from_slice(b"\r\n");
+    }
     out
 }
 
@@ -1453,6 +1467,38 @@ mod tests {
     fn empty_line_encodes_reset_and_crlf_only() {
         let term = test_terminal(80, 24);
         assert_eq!(first_line(&term), b"\x1b[0m\r\n");
+    }
+
+    #[test]
+    fn foreground_styled_trailing_blanks_are_dropped_while_background_blanks_survive() {
+        let mut term = test_terminal(80, 24);
+        term.advance_bytes(b"\x1b[1;38;2;255;0;0mred\x1b[K");
+        assert_eq!(first_line(&term), b"\x1b[0m\x1b[1;38;2;255;0;0mred\r\n");
+
+        let mut bg_term = test_terminal(80, 24);
+        bg_term.advance_bytes(b"\x1b[48;2;10;20;30m   \x1b[0m");
+        assert_eq!(first_line(&bg_term), b"\x1b[0m\x1b[48;2;10;20;30m   \r\n");
+    }
+
+    #[test]
+    fn soft_wrapped_lines_omit_crlf_so_they_rejoin_on_replay() {
+        let mut term = test_terminal(10, 24);
+        term.advance_bytes(b"0123456789abcde\r\n");
+        let screen = term.screen();
+        let mut lines = screen.lines_in_phys_range(0..2);
+        let row0 = encode_line(&mut lines[0], &ColorPalette::default());
+        let row1 = encode_line(&mut lines[1], &ColorPalette::default());
+        assert_eq!(row0, b"\x1b[0m0123456789");
+        assert_eq!(row1, b"\x1b[0mabcde\r\n");
+
+        let mut word_term = test_terminal(12, 24);
+        word_term.advance_bytes(b"hello world again\r\n");
+        let word_screen = word_term.screen();
+        let mut word_lines = word_screen.lines_in_phys_range(0..2);
+        let word_row0 = encode_line(&mut word_lines[0], &ColorPalette::default());
+        let word_row1 = encode_line(&mut word_lines[1], &ColorPalette::default());
+        assert_eq!(word_row0, b"\x1b[0mhello world ");
+        assert_eq!(word_row1, b"\x1b[0magain\r\n");
     }
 
     fn unique_journal_dir(tag: &str) -> PathBuf {
