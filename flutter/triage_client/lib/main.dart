@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart'
         defaultTargetPlatform,
         kIsWeb,
         listEquals,
+        mapEquals,
         visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -455,6 +456,11 @@ class SessionVm {
   // Local-LLM longer-form summary for the hover popover / future search. Null
   // until the daemon generates one (or summarization is off).
   String? snippetDetail;
+  // Foreground AI coding agent observed by the daemon (`kind`,
+  // `conversation_id`, `transcript_path`, ...). Null for plain shells,
+  // exited agents, and old hosts. Populated from snapshots of attached
+  // sessions only; the rail list carries no agent data.
+  Map<String, dynamic>? agent;
   // When a `session_snippet_updated` push last brought a non-empty snippet for
   // this session — the closest thing to "last did something" the client can
   // observe for a session it isn't attached to.
@@ -4363,6 +4369,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
       session.snippetDetail = snapshot?['snippet_detail'] as String?;
+      session.agent = snapshot?['agent'] as Map<String, dynamic>?;
       final bracketedPaste =
           snapshot?['bracketed_paste_enabled'] as bool? ?? false;
       session.setBracketedPasteEnabled(bracketedPaste);
@@ -4995,12 +5002,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // "use held" and "use platform budgets"), so the tri-state rides a
     // bool.
     bool unwindowed = false,
+    // True only for manager-served snapshots (attach/resume responses),
+    // whose agent field carries the live attachment or its absence.
+    // Actor-built snapshots (resync) always carry null here, which must
+    // preserve the last known agent rather than clear it.
+    bool agentAuthoritative = false,
   }) async {
     // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
     // _loadDaemonSessions) while the refresh was in flight — applying to a
     // disposed store is a use-after-dispose, and the live same-id object is
     // refreshed by its own load path.
     if (_disposed || !_sessions.contains(session)) return;
+    final prevAgent = session.agent;
+    final snapshotAgent = snapshot['agent'] as Map<String, dynamic>?;
+    if (agentAuthoritative || snapshotAgent != null) {
+      session.agent = snapshotAgent;
+    }
+    final agentChanged = !mapEquals(prevAgent, session.agent);
     final sizeObj = snapshot['size'] as Map<String, dynamic>?;
     // Kept separate from the rendering fallbacks below: the FlatBuffers decoder
     // turns an absent size into an empty map rather than null, so the container
@@ -5110,6 +5128,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         !wasLoaded ||
         replayHistory ||
         rowsChanged ||
+        agentChanged ||
         session.cwd != prevCwd ||
         session.bracketedPasteEnabled != prevBracketedPaste ||
         prevExited != exited ||
@@ -5869,6 +5888,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               includeHistory ||
               (!session.loaded && snapshot['exited'] == true) ||
               revivedNeedsReplay,
+          // finalSnapshot comes from attach/resume responses, whose agent
+          // field is manager-overlaid and authoritative.
+          agentAuthoritative: true,
         );
       }
     } on TriageAuthException {
@@ -6116,6 +6138,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hasInputLease = _attachGrantsInputLease(attachRes);
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
+          session.agent = snapshot?['agent'] as Map<String, dynamic>?;
           final bracketedPaste =
               snapshot?['bracketed_paste_enabled'] as bool? ?? false;
           session.setBracketedPasteEnabled(bracketedPaste);
@@ -7523,6 +7546,7 @@ class _SessionRailState extends State<SessionRail> {
                         cwd: session.cwd,
                         snippet: session.snippet,
                         snippetDetail: session.snippetDetail,
+                        agent: session.agent,
                         activityAt: session.snippetUpdatedAt,
                         pinned: widget.pins.sessionIds.contains(
                           session.remoteSessionId,
@@ -10450,6 +10474,25 @@ class _CustomLabelDialogState extends State<_CustomLabelDialog> {
   }
 }
 
+/// Rail badge text for an observed agent map: kind plus a short conversation
+/// id, or `(recent)` when only the kind is known (restore falls back to the
+/// agent's most-recent conversation).
+String _agentBadgeText(Map<String, dynamic> agent) {
+  // Display names match the TUI badge (`primary_binary` style), not the
+  // raw serde kind strings, so both clients render one identity. Unknown
+  // kinds render raw on the JSON path, and degrade to a null kind (shown
+  // here as 'agent') on the FlatBuffers path, so a future agent stays
+  // recognizable on both transports.
+  final rawKind = agent['kind'] as String? ?? 'agent';
+  final kind = rawKind == 'antigravity' ? 'agy' : rawKind;
+  final id = agent['conversation_id'] as String?;
+  if (id == null || id.isEmpty) return '$kind (recent)';
+  // Rune-based truncation matches the TUI badge's 8 chars exactly, even
+  // for non-ASCII ids (substring would count UTF-16 code units).
+  final short = String.fromCharCodes(id.runes.take(8));
+  return '$kind $short';
+}
+
 class SessionListTile extends StatefulWidget {
   const SessionListTile({
     super.key,
@@ -10466,6 +10509,7 @@ class SessionListTile extends StatefulWidget {
     this.cwd,
     this.snippet,
     this.snippetDetail,
+    this.agent,
     this.activityAt,
     this.pinned = false,
     this.onUnpin,
@@ -10502,6 +10546,8 @@ class SessionListTile extends StatefulWidget {
   final String? snippet;
   // Local-LLM longer-form summary, shown in the hover popover.
   final String? snippetDetail;
+  // Foreground AI coding agent observed by the daemon; hidden when null.
+  final Map<String, dynamic>? agent;
   // When this session last produced a summary; renders as a compact relative
   // time. Null when unknown, which is the normal state until the session moves
   // (see [SessionVm.snippetUpdatedAt]).
@@ -10594,6 +10640,7 @@ class _SessionListTileState extends State<SessionListTile> {
               cwd: widget.cwd,
               snippet: widget.snippet,
               detail: widget.snippetDetail,
+              agent: widget.agent,
             ),
           ),
         ),
@@ -10759,6 +10806,33 @@ class _SessionListTileState extends State<SessionListTile> {
                             ],
                           ),
                         ],
+                        // Foreground agent badge: kind plus a short
+                        // conversation id, identifying which agent (and
+                        // conversation) the session will resume into.
+                        if (widget.agent != null) ...[
+                          const SizedBox(height: 3),
+                          Row(
+                            children: [
+                              const Icon(
+                                Icons.smart_toy_outlined,
+                                size: 12,
+                                color: Color(0xff7fd1c7),
+                              ),
+                              const SizedBox(width: 5),
+                              Expanded(
+                                child: Text(
+                                  _agentBadgeText(widget.agent!),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: Color(0xff8b9799),
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                         // Outranks the status line: for two sessions on one
                         // branch this is the only field that differs, where
                         // every row shares a status.
@@ -10833,6 +10907,7 @@ class _SessionGlanceCard extends StatelessWidget {
     required this.cwd,
     required this.snippet,
     required this.detail,
+    required this.agent,
     this.customLabel,
   });
 
@@ -10846,6 +10921,7 @@ class _SessionGlanceCard extends StatelessWidget {
   final String? cwd;
   final String? snippet;
   final String? detail;
+  final Map<String, dynamic>? agent;
 
   @override
   Widget build(BuildContext context) {
@@ -10859,13 +10935,16 @@ class _SessionGlanceCard extends StatelessWidget {
     final hasBranch = branch != null && branch!.isNotEmpty;
     final hasWorktree = worktreeName != null && worktreeName != branch;
     final hasCwd = cwd != null && cwd!.isNotEmpty;
+    final transcriptPath = agent?['transcript_path'] as String?;
+    final hasTranscript = transcriptPath != null && transcriptPath.isNotEmpty;
     final showCustomLabelRow = hasCustomLabel && title != custom;
     final hasDetails =
         showCustomLabelRow ||
         repoName != null ||
         hasBranch ||
         hasWorktree ||
-        hasCwd;
+        hasCwd ||
+        agent != null;
     return Material(
       color: Colors.transparent,
       child: Container(
@@ -10932,6 +11011,18 @@ class _SessionGlanceCard extends StatelessWidget {
               _GlanceRow(
                 icon: Icons.subdirectory_arrow_right,
                 label: cwd!,
+                wrap: true,
+              ),
+            // The observed foreground agent and, when known, its transcript.
+            if (agent != null)
+              _GlanceRow(
+                icon: Icons.smart_toy_outlined,
+                label: _agentBadgeText(agent!),
+              ),
+            if (hasTranscript)
+              _GlanceRow(
+                icon: Icons.description_outlined,
+                label: transcriptPath,
                 wrap: true,
               ),
             if (hasDetails)
