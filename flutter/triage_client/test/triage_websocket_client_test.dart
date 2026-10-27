@@ -1650,7 +1650,7 @@ void main() {
           Uri.parse('ws://100.64.0.1:7777/ws'),
         );
         final cleartextUri = cleartextClient.buildHistoryUri(
-          'feat/my session',
+          'feat:my session',
           windowBytes: 65536,
           afterByte: 1024,
           afterSeq: 7,
@@ -1659,7 +1659,7 @@ void main() {
         expect(cleartextUri.scheme, 'http');
         expect(cleartextUri.host, '100.64.0.1');
         expect(cleartextUri.port, 7777);
-        expect(cleartextUri.path, '/api/sessions/feat%2Fmy%20session/history');
+        expect(cleartextUri.path, '/api/sessions/feat:my%20session/history');
         expect(cleartextUri.queryParameters, {
           'window_bytes': '65536',
           'after_byte': '1024',
@@ -1804,6 +1804,7 @@ void main() {
       'fetchSessionHistory falls back to WebSocket attachSession on HTTP 404 or SPA text/html response',
       () async {
         var returnSpaHtml = false;
+        var throwTransportError = false;
         final sink = RecordingWebSocketSink();
         final channel = FakeWebSocketChannel(
           sink: sink,
@@ -1813,6 +1814,9 @@ void main() {
           Uri.parse('ws://127.0.0.1:7777/ws'),
           channelFactory: (_) => channel,
           httpFetcher: (uri, {required headers}) async {
+            if (throwTransportError) {
+              throw Exception('HTTP connection reset');
+            }
             if (returnSpaHtml) {
               return (
                 statusCode: 200,
@@ -1893,6 +1897,39 @@ void main() {
         );
         final snap2 = await fallbackFuture2;
         expect(snap2['output_seq'], 8);
+
+        // 3. Transport exception on HTTP fetch also falls back to attachSession.
+        throwTransportError = true;
+        final fallbackFuture3 = client.fetchSessionHistory(
+          sessionId: 'main',
+          clientId: 'client-1',
+          windowBytes: 16384,
+        );
+        await Future<void>.delayed(Duration.zero);
+        final attachReq3 =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        expect(attachReq3['type'], 'attach_session');
+        expect(attachReq3['request']['history_bytes'], 16384);
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'response',
+            'id': attachReq3['id'],
+            'result': {
+              'type': 'attach_session',
+              'response': {
+                'snapshot': {
+                  'output_seq': 9,
+                  'bytes_logged': 18,
+                  'raw_output': base64Encode(utf8.encode('ws-fallback-3\n')),
+                  'raw_output_start': 0,
+                  'exited': false,
+                },
+              },
+            },
+          }),
+        );
+        final snap3 = await fallbackFuture3;
+        expect(snap3['output_seq'], 9);
       },
     );
   });

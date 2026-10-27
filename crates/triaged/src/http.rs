@@ -372,7 +372,7 @@ where
                 let io = hyper_util::rt::TokioIo::new(upgraded);
                 let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
                     max_message_size: Some(4 * 1024 * 1024),
-                    max_frame_size: Some(1024 * 1024),
+                    max_frame_size: Some(4 * 1024 * 1024),
                     ..Default::default()
                 };
                 let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
@@ -439,14 +439,11 @@ fn extract_origin_host(origin: &str) -> Option<&str> {
     Some(authority.split(':').next().unwrap_or(authority))
 }
 
-fn extract_host_header_hostname(host_header: &str) -> &str {
-    let trimmed = host_header.trim();
-    if let Some(bracketed) = trimmed.strip_prefix('[')
-        && let Some(host_end) = bracketed.find(']')
-    {
-        return &trimmed[..=host_end + 1];
-    }
-    trimmed.split(':').next().unwrap_or(trimmed)
+fn extract_origin_authority(origin: &str) -> Option<&str> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    rest.split('/').next()
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -469,13 +466,12 @@ fn is_allowed_unpaired_origin(headers: &header::HeaderMap) -> bool {
     if is_loopback_host(origin_host) {
         return true;
     }
-    if let Some(host_val) = headers.get(header::HOST)
+    if let Some(origin_authority) = extract_origin_authority(origin_str.trim())
+        && let Some(host_val) = headers.get(header::HOST)
         && let Ok(host_str) = host_val.to_str()
+        && origin_authority.eq_ignore_ascii_case(host_str.trim())
     {
-        let req_host = extract_host_header_hostname(host_str);
-        if origin_host.eq_ignore_ascii_case(req_host) {
-            return true;
-        }
+        return true;
     }
     false
 }
@@ -1209,6 +1205,36 @@ mod history_http_tests {
             .await
             .unwrap();
         assert_eq!(evil_ws_res.status(), StatusCode::FORBIDDEN);
+
+        // Cross-port origin on a non-loopback host is rejected.
+        let cross_port_req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/sessions/{session_id}/history?window_bytes=64"
+            ))
+            .header(header::HOST, "192.168.1.100:8742")
+            .header(header::ORIGIN, "http://192.168.1.100:3000")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let cross_port_res = serve_http(cross_port_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(cross_port_res.status(), StatusCode::FORBIDDEN);
+
+        // Same host:port on a non-loopback host is allowed.
+        let same_authority_req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/api/sessions/{session_id}/history?window_bytes=64"
+            ))
+            .header(header::HOST, "192.168.1.100:8742")
+            .header(header::ORIGIN, "http://192.168.1.100:8742")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let same_authority_res = serve_http(same_authority_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(same_authority_res.status(), StatusCode::OK);
 
         // Loopback origin is allowed.
         let loopback_history_req = Request::builder()

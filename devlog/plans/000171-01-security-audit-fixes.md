@@ -1,4 +1,4 @@
-# Plan: 000170-02-security-audit-fixes
+# Plan: 000171-01-security-audit-fixes
 
 ## Thinking
 
@@ -47,4 +47,4 @@ Following the security audit of the HTTP session history branch (`feat/http-sess
    - Harden Unix permissions (`0o700` for directories, `0o600` for `paired_devices.json`, `sessions.json`, session logs, and `scrollback.journal`).
 5. Update `flutter/triage_client/lib/services/history_http_io.dart` and `flutter/triage_client/lib/services/triage_websocket_client.dart`:
    - Cap decompressed HTTP history response buffering and `decodeHistoryFrame` payloads at 16 MiB; add unit test coverage.
-6. Format, lint, test, update `devlog/000170-feat-http-session-history.md`, commit, push, and reload local `triaged`.
+6. Format, lint, test, update `devlog/000171-fix-security-audit-hardening.md`, commit, push, and reload local `triaged`.

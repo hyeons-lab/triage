@@ -1173,7 +1173,25 @@ class TriageWebSocketClient {
         'Authorization': 'Bearer $_authToken',
     };
     final fetcher = _httpFetcher ?? getHistoryHttp;
-    final response = await fetcher(targetUri, headers: headers);
+    final HistoryHttpResponse response;
+    try {
+      response = await fetcher(targetUri, headers: headers);
+    } catch (e) {
+      if (e is TriageAuthException) rethrow;
+      if (_channel != null) {
+        final attachRes = await attachSession(
+          sessionId: sessionId,
+          clientId: effectiveClientId,
+          mode: 'Observer',
+          historyBytes: windowBytes,
+        );
+        final responseObj = attachRes['response'] as Map<String, dynamic>?;
+        return responseObj?['snapshot'] as Map<String, dynamic>? ??
+            attachRes['snapshot'] as Map<String, dynamic>? ??
+            <String, dynamic>{};
+      }
+      rethrow;
+    }
     if (response.statusCode == 401) {
       var message = 'authentication required';
       try {
