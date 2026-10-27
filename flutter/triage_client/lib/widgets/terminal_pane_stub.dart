@@ -1650,10 +1650,7 @@ class _TerminalPaneState extends State<TerminalPane>
       }
       if (event is KeyDownEvent || event is KeyRepeatEvent) {
         widget.controller.notifyInteraction();
-        _sessionSavedScrollOffsets.remove(widget.terminalId);
-        _sessionSavedScrollAnchors.remove(widget.terminalId);
-        _sessionSavedDistanceFromBottom.remove(widget.terminalId);
-        _sessionSavedScrollFractions.remove(widget.terminalId);
+        _clearSavedSessionScroll(widget.terminalId);
         _scrollAnchor.clear();
         if (_scrollController.hasClients &&
             _scrollController.position.hasContentDimensions) {

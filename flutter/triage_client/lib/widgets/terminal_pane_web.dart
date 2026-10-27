@@ -851,9 +851,6 @@ class _TerminalPaneState extends State<TerminalPane>
           // character is delivered immediately to shell autocomplete and prevented
           // from escaping focus or bubbling to Flutter.
           if (event.key == 'Tab' || event.code == 'Tab' || event.keyCode == 9) {
-            if (widget.isExited) {
-              return;
-            }
             if (event.ctrlKey || event.altKey || event.metaKey) {
               return;
             }
@@ -1623,13 +1620,8 @@ class _TerminalPaneState extends State<TerminalPane>
             return false;
           }
           if (key == 'Tab' || code == 'Tab' || keyCode == 9) {
-            final owner = _containerEventOwners[sessionId];
-            if (owner?.widget.isExited == true ||
-                owner?._isRouteCurrentAndUnobscured == false) {
-              return true;
-            }
             if (ctrlKey || altKey || metaKey) {
-              return true;
+              return false;
             }
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
@@ -1637,22 +1629,7 @@ class _TerminalPaneState extends State<TerminalPane>
               js_util.callMethod(event, 'stopImmediatePropagation', []);
             } catch (_) {}
             if (_shouldDispatchTab()) {
-              if (owner != null && owner.mounted) {
-                owner._dispatchTabInput(shiftKey: shiftKey);
-              } else {
-                _sessionSavedViewportY.remove(sessionId);
-                final term = _sessionTerms[sessionId];
-                if (term != null) {
-                  try {
-                    js_util.callMethod(term, 'scrollToBottom', []);
-                  } catch (_) {}
-                }
-                _sessionInputRouter.notifyInteraction(sessionId);
-                _sessionInputRouter.sendInput(
-                  sessionId,
-                  shiftKey ? '\x1b[Z' : '\t',
-                );
-              }
+              activePane._dispatchTabInput(shiftKey: shiftKey);
             }
             return false;
           }
