@@ -1642,9 +1642,28 @@ class _TerminalPaneState extends State<TerminalPane>
       if (widget.isExited) {
         return KeyEventResult.ignored;
       }
+      final keyboard = HardwareKeyboard.instance;
+      if (keyboard.isControlPressed ||
+          keyboard.isAltPressed ||
+          keyboard.isMetaPressed) {
+        return KeyEventResult.ignored;
+      }
       if (event is KeyDownEvent || event is KeyRepeatEvent) {
         widget.controller.notifyInteraction();
-        final shiftKey = HardwareKeyboard.instance.isShiftPressed;
+        _sessionSavedScrollOffsets.remove(widget.terminalId);
+        _sessionSavedScrollAnchors.remove(widget.terminalId);
+        _sessionSavedDistanceFromBottom.remove(widget.terminalId);
+        _sessionSavedScrollFractions.remove(widget.terminalId);
+        _scrollAnchor.clear();
+        if (_scrollController.hasClients &&
+            _scrollController.position.hasContentDimensions) {
+          try {
+            _scrollController.jumpTo(
+              _scrollController.position.maxScrollExtent,
+            );
+          } catch (_) {}
+        }
+        final shiftKey = keyboard.isShiftPressed;
         widget.controller.sendInput(shiftKey ? '\x1b[Z' : '\t');
       }
       return KeyEventResult.handled;
@@ -2169,9 +2188,8 @@ class _TerminalPaneState extends State<TerminalPane>
                                 return false;
                               },
                               child: ScrollConfiguration(
-                                behavior: ScrollConfiguration.of(
-                                  context,
-                                ).copyWith(scrollbars: false),
+                                behavior: ScrollConfiguration.of(context)
+                                    .copyWith(scrollbars: false),
                                 child: xt.TerminalView(
                                   _terminal,
                                   key: _terminalViewKey,
