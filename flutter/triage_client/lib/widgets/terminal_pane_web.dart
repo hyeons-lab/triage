@@ -354,9 +354,9 @@ class _TerminalPaneState extends State<TerminalPane>
 
   double? _lastWidth;
   double? _lastHeight;
-  bool _tabDispatchInProgress = false;
+  static bool _tabDispatchInProgress = false;
 
-  bool _shouldDispatchTab() {
+  static bool _shouldDispatchTab() {
     if (_tabDispatchInProgress) {
       return false;
     }
@@ -365,6 +365,12 @@ class _TerminalPaneState extends State<TerminalPane>
       _tabDispatchInProgress = false;
     });
     return true;
+  }
+
+  void _dispatchTabInput({required bool shiftKey}) {
+    widget.controller.notifyInteraction();
+    _sendInput(shiftKey ? '\x1b[Z' : '\t');
+    _activateTerminal();
   }
 
   int? _lastFittedRows;
@@ -624,9 +630,9 @@ class _TerminalPaneState extends State<TerminalPane>
         cachedFitAddon != null &&
         cachedContainer.children.isNotEmpty) {
       _container = cachedContainer as html.DivElement;
-      _terminalWrapper =
-          _container.children.firstWhere((el) => el is html.DivElement)
-              as html.DivElement;
+      _terminalWrapper = _container.children.firstWhere(
+        (el) => el is html.DivElement,
+      ) as html.DivElement;
       _unmaskTerminalAfterReplay();
       _term = cachedTerm;
       _fitAddon = cachedFitAddon;
@@ -845,16 +851,16 @@ class _TerminalPaneState extends State<TerminalPane>
           // character is delivered immediately to shell autocomplete and prevented
           // from escaping focus or bubbling to Flutter.
           if (event.key == 'Tab' || event.code == 'Tab' || event.keyCode == 9) {
+            if (event.ctrlKey || event.altKey || event.metaKey) {
+              return;
+            }
             event.preventDefault();
             event.stopPropagation();
             try {
               event.stopImmediatePropagation();
             } catch (_) {}
             if (_shouldDispatchTab()) {
-              widget.controller.notifyInteraction();
-              final shiftKey = event.shiftKey;
-              _sendInput(shiftKey ? '\x1b[Z' : '\t');
-              _activateTerminal();
+              _dispatchTabInput(shiftKey: event.shiftKey);
             }
             return;
           }
@@ -1614,17 +1620,16 @@ class _TerminalPaneState extends State<TerminalPane>
             return false;
           }
           if (key == 'Tab' || code == 'Tab' || keyCode == 9) {
+            if (ctrlKey || altKey || metaKey) {
+              return false;
+            }
             js_util.callMethod(event, 'preventDefault', []);
             js_util.callMethod(event, 'stopPropagation', []);
             try {
               js_util.callMethod(event, 'stopImmediatePropagation', []);
             } catch (_) {}
-            if (activePane._shouldDispatchTab()) {
-              if (shiftKey) {
-                _sessionInputRouter.sendInput(sessionId, '\x1b[Z');
-              } else {
-                _sessionInputRouter.sendInput(sessionId, '\t');
-              }
+            if (_shouldDispatchTab()) {
+              activePane._dispatchTabInput(shiftKey: shiftKey);
             }
             return false;
           }
@@ -3667,12 +3672,15 @@ class _TerminalPaneState extends State<TerminalPane>
           return KeyEventResult.ignored;
         }
         if (event.logicalKey == LogicalKeyboardKey.tab) {
+          final keyboard = HardwareKeyboard.instance;
+          if (keyboard.isControlPressed ||
+              keyboard.isAltPressed ||
+              keyboard.isMetaPressed) {
+            return KeyEventResult.ignored;
+          }
           if (event is KeyDownEvent || event is KeyRepeatEvent) {
             if (_shouldDispatchTab()) {
-              widget.controller.notifyInteraction();
-              final shiftKey = HardwareKeyboard.instance.isShiftPressed;
-              _sendInput(shiftKey ? '\x1b[Z' : '\t');
-              _activateTerminal();
+              _dispatchTabInput(shiftKey: keyboard.isShiftPressed);
             }
           }
           return KeyEventResult.handled;

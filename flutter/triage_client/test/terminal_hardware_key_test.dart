@@ -7,11 +7,7 @@ import 'package:xterm/xterm.dart' hide TerminalController;
 
 void main() {
   group('TerminalPane hardware Tab and Shift+Tab key handling', () {
-    for (final platform in [
-      TargetPlatform.macOS,
-      TargetPlatform.linux,
-      TargetPlatform.windows,
-    ]) {
+    for (final platform in TargetPlatform.values) {
       testWidgets('receives Shift+Tab and Tab on $platform', (tester) async {
         debugDefaultTargetPlatformOverride = platform;
         try {
@@ -199,6 +195,278 @@ void main() {
           tester.element(find.byType(SingleChildScrollView)),
         );
         expect(terminalFocus.hasFocus, isTrue);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('ignores Ctrl+Tab, Alt+Tab, and Cmd/Meta+Tab chords', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      try {
+        final terminal = Terminal();
+        final controller = TerminalController();
+        final inputs = <String>[];
+        controller.addInputListener((data) {
+          inputs.add(data);
+        });
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: TerminalPane(
+                terminalId: 'test-session',
+                terminal: terminal,
+                controller: controller,
+                fallbackRows: const [],
+                onTerminalResizeBind: (_) {},
+                focusCursorRevision: 0,
+                bracketedPasteEnabled: false,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Ctrl+Tab
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+
+        // Alt+Tab
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
+        await tester.pump();
+
+        // Meta+Tab
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+        await tester.pump();
+
+        // Ctrl+Shift+Tab
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+
+        // Right-hand Ctrl+Tab, Alt+Tab, and Meta+Tab
+        for (final modifier in [
+          LogicalKeyboardKey.controlRight,
+          LogicalKeyboardKey.altRight,
+          LogicalKeyboardKey.metaRight,
+        ]) {
+          await tester.sendKeyDownEvent(modifier);
+          await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+          await tester.sendKeyUpEvent(modifier);
+          await tester.pump();
+        }
+
+        expect(inputs, isEmpty);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('Tab resets scrolled-up viewport back to bottom', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      try {
+        final terminal = Terminal(maxLines: 100);
+        terminal.resize(40, 4);
+        for (var i = 0; i < 30; i++) {
+          terminal.write('line $i\r\n');
+        }
+        final controller = TerminalController();
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 400,
+                height: 120,
+                child: TerminalPane(
+                  terminalId: 'test-tab-scroll-reset',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                  bracketedPasteEnabled: false,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final scrollable = tester.state<ScrollableState>(
+          find.descendant(
+            of: find.byType(SingleChildScrollView),
+            matching: find.byType(Scrollable),
+          ),
+        );
+        scrollable.position.jumpTo(120);
+        await tester.pump();
+        expect(scrollable.position.pixels, 120);
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+        expect(scrollable.position.pixels, 0);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('notifies interaction when Tab and Shift+Tab are pressed', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      try {
+        final terminal = Terminal();
+        final controller = TerminalController();
+        var interactions = 0;
+        controller.addInteractionListener(() {
+          interactions++;
+        });
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: TerminalPane(
+                terminalId: 'test-session',
+                terminal: terminal,
+                controller: controller,
+                fallbackRows: const [],
+                onTerminalResizeBind: (_) {},
+                focusCursorRevision: 0,
+                bracketedPasteEnabled: false,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+        expect(interactions, 1);
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+        await tester.pump();
+        expect(interactions, 2);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('ignores Tab when session is exited', (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      try {
+        final terminal = Terminal();
+        final controller = TerminalController();
+        final inputs = <String>[];
+        controller.addInputListener((data) {
+          inputs.add(data);
+        });
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Column(
+                children: [
+                  ElevatedButton(
+                    onPressed: () {},
+                    child: const Text('Top Button'),
+                  ),
+                  Expanded(
+                    child: TerminalPane(
+                      terminalId: 'test-session',
+                      terminal: terminal,
+                      controller: controller,
+                      fallbackRows: const [],
+                      onTerminalResizeBind: (_) {},
+                      focusCursorRevision: 0,
+                      bracketedPasteEnabled: false,
+                      isExited: true,
+                    ),
+                  ),
+                  ElevatedButton(
+                    onPressed: () {},
+                    child: const Text('Bottom Button'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+
+        expect(inputs, isEmpty);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
+
+    testWidgets('ignores Tab when a modal route is active', (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      try {
+        final terminal = Terminal();
+        final controller = TerminalController();
+        final inputs = <String>[];
+        controller.addInputListener((data) {
+          inputs.add(data);
+        });
+        late BuildContext savedContext;
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (context) {
+                  savedContext = context;
+                  return TerminalPane(
+                    terminalId: 'test-session',
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 0,
+                    bracketedPasteEnabled: false,
+                  );
+                },
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Push a modal dialog over the terminal
+        showDialog<void>(
+          context: savedContext,
+          builder: (context) => const AlertDialog(
+            title: Text('Modal Dialog'),
+            content: Text('Dialog Content'),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Press Tab while dialog is active
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pump();
+
+        // ModalRoute is not current for the terminal, so Tab is ignored
+        expect(inputs, isEmpty);
       } finally {
         debugDefaultTargetPlatformOverride = null;
       }
