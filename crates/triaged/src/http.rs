@@ -793,17 +793,46 @@ mod history_http_tests {
             .expect("start session");
 
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut prev_bytes_logged = None;
         loop {
             let snap = manager.snapshot_session(session_id.clone()).unwrap();
-            if snap.bytes_logged >= 16 {
-                break;
+            if snap
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("0123456789abcdef"))
+            {
+                if prev_bytes_logged == Some(snap.bytes_logged) {
+                    break;
+                }
+                prev_bytes_logged = Some(snap.bytes_logged);
             }
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for session output"
             );
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(50));
         }
+        let full_snap = manager
+            .attach_session(AttachSessionRequest {
+                session_id: session_id.clone(),
+                client_id: client_id.clone(),
+                mode: AttachMode::Observer,
+                history_bytes: None,
+            })
+            .expect("full history attach")
+            .snapshot;
+        let full_raw = full_snap.raw_output;
+        let total_bytes = full_snap.bytes_logged;
+        let total_len = full_raw.len();
+        let output_seq = full_snap.output_seq;
+        assert_eq!(total_len as u64, total_bytes);
+        assert!(total_bytes >= 16);
+        assert!(
+            full_raw.windows(16).any(|w| w == b"0123456789abcdef"),
+            "raw output must contain printed payload"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(full_raw, b"0123456789abcdef");
 
         // 1. Missing auth returns 401 Unauthorized.
         let unauth_req = Request::builder()
@@ -828,9 +857,11 @@ mod history_http_tests {
         assert!(probe_attach.snapshot.visible_rows.is_empty());
         assert!(probe_attach.snapshot.styled_rows.is_empty());
         assert!(probe_attach.snapshot.raw_output.is_empty());
+        assert_eq!(probe_attach.snapshot.raw_output_start, total_bytes);
+        #[cfg(not(windows))]
         assert_eq!(probe_attach.snapshot.raw_output_start, 16);
 
-        // 3. Tail window mode returns the trailing 6 bytes ("abcdef").
+        // 3. Tail window mode returns the trailing 6 bytes ("abcdef" on Unix).
         let tail_req = Request::builder()
             .method("GET")
             .uri(format!("/api/sessions/{session_id}/history?window_bytes=6"))
@@ -845,16 +876,21 @@ mod history_http_tests {
         let tail_bytes = tail_res.into_body().collect().await.unwrap().to_bytes();
         let (tail_meta, tail_prefix, tail_raw) = decode_test_frame(&tail_bytes);
         assert!(tail_prefix.is_empty());
+        assert_eq!(tail_raw, &full_raw[total_len - 6..]);
+        #[cfg(not(windows))]
         assert_eq!(tail_raw, b"abcdef");
-        assert_eq!(tail_meta["raw_output_start"].as_u64(), Some(10));
-        assert_eq!(tail_meta["raw_output_end"].as_u64(), Some(16));
+        assert_eq!(
+            tail_meta["raw_output_start"].as_u64(),
+            Some(total_bytes - 6)
+        );
+        assert_eq!(tail_meta["raw_output_end"].as_u64(), Some(total_bytes));
         assert_eq!(tail_meta["raw_output_truncated"].as_bool(), Some(false));
 
-        // 4. Forward delta mode when unchanged returns 0 bytes at raw_output_start == 16.
+        // 4. Forward delta mode when unchanged returns 0 bytes at raw_output_start == total_bytes.
         let idle_delta_req = Request::builder()
             .method("GET")
             .uri(format!(
-                "/api/sessions/{session_id}/history?window_bytes=64&after_byte=16&after_seq=1"
+                "/api/sessions/{session_id}/history?window_bytes=64&after_byte={total_bytes}&after_seq={output_seq}"
             ))
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header("x-triage-client-id", client_id.as_str())
@@ -872,15 +908,16 @@ mod history_http_tests {
             .to_bytes();
         let (idle_meta, _, idle_raw) = decode_test_frame(&idle_delta_bytes);
         assert!(idle_raw.is_empty());
-        assert_eq!(idle_meta["raw_output_start"].as_u64(), Some(16));
-        assert_eq!(idle_meta["raw_output_end"].as_u64(), Some(16));
+        assert_eq!(idle_meta["raw_output_start"].as_u64(), Some(total_bytes));
+        assert_eq!(idle_meta["raw_output_end"].as_u64(), Some(total_bytes));
         assert_eq!(idle_meta["raw_output_truncated"].as_bool(), Some(false));
 
-        // 5. Forward delta mode when behind returns only the missing slice [12..16] ("cdef").
+        // 5. Forward delta mode when behind returns only the missing 4-byte slice.
         let slice_delta_req = Request::builder()
             .method("GET")
             .uri(format!(
-                "/api/sessions/{session_id}/history?window_bytes=64&after_byte=12&after_seq=1"
+                "/api/sessions/{session_id}/history?window_bytes=64&after_byte={}&after_seq={output_seq}",
+                total_bytes - 4
             ))
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header("x-triage-client-id", client_id.as_str())
@@ -896,17 +933,23 @@ mod history_http_tests {
             .unwrap()
             .to_bytes();
         let (slice_meta, _, slice_raw) = decode_test_frame(&slice_delta_bytes);
+        assert_eq!(slice_raw, &full_raw[total_len - 4..]);
+        #[cfg(not(windows))]
         assert_eq!(slice_raw, b"cdef");
-        assert_eq!(slice_meta["raw_output_start"].as_u64(), Some(12));
-        assert_eq!(slice_meta["raw_output_end"].as_u64(), Some(16));
+        assert_eq!(
+            slice_meta["raw_output_start"].as_u64(),
+            Some(total_bytes - 4)
+        );
+        assert_eq!(slice_meta["raw_output_end"].as_u64(), Some(total_bytes));
         assert_eq!(slice_meta["raw_output_truncated"].as_bool(), Some(false));
 
-        // 6. Backward page mode returns only the older slice [4..10] ("456789") when holding [10..16]
+        // 6. Backward page mode returns only the older 6-byte slice when holding the trailing 6 bytes
         //    with window_bytes=12.
         let back_req = Request::builder()
             .method("GET")
             .uri(format!(
-                "/api/sessions/{session_id}/history?window_bytes=12&before_byte=10&after_byte=16&after_seq=1"
+                "/api/sessions/{session_id}/history?window_bytes=12&before_byte={}&after_byte={total_bytes}&after_seq={output_seq}",
+                total_bytes - 6
             ))
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .header("x-triage-client-id", client_id.as_str())
@@ -917,9 +960,14 @@ mod history_http_tests {
             .unwrap();
         let back_bytes = back_res.into_body().collect().await.unwrap().to_bytes();
         let (back_meta, _, back_raw) = decode_test_frame(&back_bytes);
+        assert_eq!(back_raw, &full_raw[total_len - 12..total_len - 6]);
+        #[cfg(not(windows))]
         assert_eq!(back_raw, b"456789");
-        assert_eq!(back_meta["raw_output_start"].as_u64(), Some(4));
-        assert_eq!(back_meta["raw_output_end"].as_u64(), Some(10));
+        assert_eq!(
+            back_meta["raw_output_start"].as_u64(),
+            Some(total_bytes - 12)
+        );
+        assert_eq!(back_meta["raw_output_end"].as_u64(), Some(total_bytes - 6));
         assert_eq!(back_meta["raw_output_truncated"].as_bool(), Some(true));
 
         let _ = manager.shutdown_session(session_id);
