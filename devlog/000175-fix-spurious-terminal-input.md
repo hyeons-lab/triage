@@ -20,6 +20,7 @@ Fix spurious escape sequences and random characters (`>|Triage 0.3.0...65;4;6;18
 - `2026-10-27T12:40-0700` `crates/triaged/src/storage.rs`, `crates/triaged/src/session.rs`, `flutter/triage_client/lib/terminal/terminal_scroll_anchor.dart`, `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`, `flutter/triage_client/test/terminal/terminal_scroll_anchor_test.dart`, `flutter/triage_client/test/terminal_hardware_key_test.dart`: Prepend the last newline-bearing `.tlog.zst` segment ahead of multi-segment normal-screen 0-newline spinner deserts in `read_multi_segment_replay_tail`; remove the 500ms-1500ms `_suppressScrollSave` timer window in `terminal_pane_stub.dart` so user scrolls immediately after `_onFit` / `_onRefit` / `applyPagedJump` are always recorded; add `hasLineShifted` and `markPinned()` to `TerminalScrollAnchor` so `_repinScrollAnchor` never calls `position.jumpTo` during in-place TUI spinner updates; track `_panZoomActive` and cancel pending `_scrollToCursor` retries when the user scrolls upward; add unit and widget tests.
 - `2026-10-27T13:28-0700` `crates/triaged/src/session.rs`, `crates/triaged/src/storage.rs`: Remove synchronous `ensure_segmented_scrollback_backfilled` on `SnapshotWithHistory` (which called `read_prefix_at_or_older_than(u64::MAX, 1)`, always returning empty because `record.bytes.len() > 1` and re-parsing all `.tlog.zst` segments on every attach) and keep the backward segment scan in `read_multi_segment_replay_tail` bounded to 16 segments.
 - `2026-10-27T14:37-0700` `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`: Unconditionally clear `_scrollAnchor` and `_clearSavedSessionScroll(widget.terminalId)` and arm `_pendingBottomSnapOnPointerUp = true` in `_onClear()` so explicit `controller.clear()` calls during an active pointer gesture snap to the bottom once the pointer is released.
+- `2026-10-27T15:12-0700` `crates/triaged/src/session.rs`, `flutter/triage_client/lib/terminal/terminal_store.dart`, `flutter/triage_client/test/terminal/terminal_store_test.dart`: Require `final_byte == b'M'` when classifying SGR hover motion in `parse_mouse_reports` so release events (`'m'`) are never treated as passive motion, skip stamping `last_input_ms` on passive mouse hover motion in `ActorState::write_input`, and clamp `writeToXterm` `CHT` (`CSI Ps I`) tab counts to `(terminal.viewWidth ~/ 8) + 1`.
 
 ## Decisions
 
@@ -46,4 +47,5 @@ Fix spurious escape sequences and random characters (`>|Triage 0.3.0...65;4;6;18
 ## Commits
 
 - `399b632`: fix: prevent spurious terminal input and preserve TUI scrollback
-- `HEAD`: fix(client): restore deferred bottom snap on terminal buffer clear during pointer gesture
+- `f1864ee`: fix(client): restore deferred bottom snap on terminal buffer clear during pointer gesture
+- `HEAD`: fix: harden SGR mouse motion classification and clamp CHT tab count
