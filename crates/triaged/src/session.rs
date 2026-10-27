@@ -1786,6 +1786,227 @@ impl SessionManager {
         Ok(all_hits)
     }
 
+    /// Reads session scrollback history off the actor thread and off the
+    /// sessions mutex. Supports three modes:
+    /// - Forward delta (`after_byte` with `before_byte == None`): returns 0
+    ///   bytes when nothing new has been persisted, or the slice
+    ///   `[after_byte..logged_tail_bytes]` when within `window_bytes` and
+    ///   unregressed; falls back to the full tail window otherwise.
+    /// - Backward paging (`before_byte` when unregressed and within the log):
+    ///   returns only the older slice ending at `before_byte` (`raw_output_end =
+    ///   before_byte`, `raw_output_truncated = true`) plus the scrollback
+    ///   journal prefix at or older than the new seam.
+    /// - Full tail window: returns the trailing `window_bytes` of raw output
+    ///   plus the scrollback journal prefix.
+    pub fn fetch_session_history(
+        &self,
+        query: &SessionHistoryQuery,
+    ) -> Result<SessionHistoryResponse> {
+        let resolved = {
+            let sessions = self.sessions()?;
+            let session = sessions
+                .get(&query.session_id)
+                .with_context(|| format!("session {} not found", query.session_id))?;
+            match session {
+                ManagedSession::Live { actor, .. } => Resolved::Live(actor.tx.clone()),
+                ManagedSession::Historical { session, .. } => {
+                    Resolved::Ready(session.history_coordinates())
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", query.session_id)
+                }
+            }
+        };
+        let coords = match resolved {
+            Resolved::Ready(coords) => coords,
+            Resolved::Live(tx) => request_history_coordinates(&tx)?,
+        };
+        let (snippet, snippet_detail) = self.snippet_for(&query.session_id);
+        let history_cap = effective_attach_history_cap(query.window_bytes);
+        let seq_regressed = query
+            .after_seq
+            .is_some_and(|after_seq| coords.logged_output_seq < after_seq);
+
+        let build_response = |output_seq: u64,
+                              raw_output_start: u64,
+                              raw_output_end: u64,
+                              raw_output_truncated: bool,
+                              raw_output_prefix: Vec<u8>,
+                              raw_output: Vec<u8>|
+         -> SessionHistoryResponse {
+            SessionHistoryResponse {
+                session_id: query.session_id.clone(),
+                output_seq,
+                bytes_logged: coords.bytes_logged,
+                raw_output_start,
+                raw_output_end,
+                raw_output_truncated,
+                raw_output_prefix,
+                raw_output,
+                size: coords.size.clone(),
+                exited: coords.exited,
+                bracketed_paste_enabled: coords.bracketed_paste_enabled,
+                current_working_directory: coords.current_working_directory.clone(),
+                context: coords.context.clone(),
+                snippet: snippet.clone(),
+                snippet_detail: snippet_detail.clone(),
+            }
+        };
+
+        // Mode A: Forward delta since `after_byte`.
+        if query.before_byte.is_none()
+            && !seq_regressed
+            && let Some(after_byte) = query.after_byte
+            && after_byte <= coords.logged_tail_bytes
+        {
+            let delta_len = coords.logged_tail_bytes - after_byte;
+            if delta_len == 0 {
+                return Ok(build_response(
+                    coords.logged_output_seq,
+                    after_byte,
+                    coords.logged_tail_bytes,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+            if delta_len <= history_cap
+                && let Some((start, raw)) =
+                    read_raw_output_range(&coords.log_path, after_byte, coords.logged_tail_bytes)
+                && start == after_byte
+                && start + raw.len() as u64 == coords.logged_tail_bytes
+            {
+                return Ok(build_response(
+                    coords.logged_output_seq,
+                    start,
+                    coords.logged_tail_bytes,
+                    false,
+                    Vec::new(),
+                    raw,
+                ));
+            }
+        }
+
+        // Mode B: Backward range paging ending at `before_byte`.
+        if !seq_regressed
+            && let Some(before_byte) = query.before_byte
+            && before_byte <= coords.logged_tail_bytes
+        {
+            let already_held = query
+                .after_byte
+                .filter(|after| *after >= before_byte && *after <= coords.logged_tail_bytes)
+                .map_or(0, |after| after - before_byte);
+            let read_valid_before = |cap: u64| -> Option<(u64, Vec<u8>)> {
+                if before_byte == 0 || cap == 0 {
+                    return Some((before_byte, Vec::new()));
+                }
+                let target_start = before_byte.saturating_sub(cap);
+                match read_raw_output_range(&coords.log_path, target_start, before_byte) {
+                    Some((start, raw)) if start + raw.len() as u64 == before_byte => {
+                        Some((start, raw))
+                    }
+                    Some(_) | None => None,
+                }
+            };
+            let full_older_cap = history_cap.saturating_sub(already_held);
+            if let Some(journal) = coords.journal.as_ref() {
+                let probe_budget = (history_cap / 2).min(usize::MAX as u64) as usize;
+                let probe = journal.read_prefix_at_or_older_than(before_byte, probe_budget);
+                if probe.is_empty() {
+                    if let Some((start, raw)) = read_valid_before(full_older_cap) {
+                        return Ok(build_response(
+                            coords.logged_output_seq,
+                            start,
+                            before_byte,
+                            true,
+                            Vec::new(),
+                            raw,
+                        ));
+                    }
+                } else {
+                    let total_raw_cap = history_cap.saturating_sub(probe.len() as u64);
+                    let older_raw_cap = total_raw_cap.saturating_sub(already_held);
+                    if let Some((seam, raw)) = read_valid_before(older_raw_cap) {
+                        let raw_len = raw.len() as u64;
+                        let prefix = journal.read_prefix_at_or_older_than(seam, probe.len());
+                        if prefix.is_empty() && raw_len == older_raw_cap {
+                            if let Some((full_start, full_raw)) = read_valid_before(full_older_cap)
+                            {
+                                return Ok(build_response(
+                                    coords.logged_output_seq,
+                                    full_start,
+                                    before_byte,
+                                    true,
+                                    Vec::new(),
+                                    full_raw,
+                                ));
+                            }
+                        } else {
+                            return Ok(build_response(
+                                coords.logged_output_seq,
+                                seam,
+                                before_byte,
+                                true,
+                                prefix,
+                                raw,
+                            ));
+                        }
+                    }
+                }
+            } else if let Some((start, raw)) = read_valid_before(full_older_cap) {
+                return Ok(build_response(
+                    coords.logged_output_seq,
+                    start,
+                    before_byte,
+                    true,
+                    Vec::new(),
+                    raw,
+                ));
+            }
+        }
+
+        // Mode C: Full tail window up to `history_cap`.
+        let base = SessionSnapshot {
+            output_seq: coords.logged_output_seq,
+            bytes_logged: coords.bytes_logged,
+            size: coords.size.clone(),
+            styled_rows: Vec::new(),
+            styled_rows_start: 0,
+            visible_rows: Vec::new(),
+            cursor: TerminalCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+            current_working_directory: coords.current_working_directory.clone(),
+            context: coords.context.clone(),
+            bracketed_paste_enabled: coords.bracketed_paste_enabled,
+            exited: coords.exited,
+            raw_output: Vec::new(),
+            raw_output_start: 0,
+            raw_output_prefix: Vec::new(),
+            snippet: None,
+            snippet_detail: None,
+        };
+        let overlaid = overlay_raw_output_history(
+            base,
+            &coords.log_path,
+            coords.logged_tail_bytes,
+            coords.logged_output_seq,
+            history_cap,
+            coords.journal.as_ref(),
+        );
+        let raw_output_end = overlaid.raw_output_start + overlaid.raw_output.len() as u64;
+        Ok(build_response(
+            overlaid.output_seq,
+            overlaid.raw_output_start,
+            raw_output_end,
+            false,
+            overlaid.raw_output_prefix,
+            overlaid.raw_output,
+        ))
+    }
+
     /// Reclaims session logs that nothing refers to any more.
     ///
     /// Deliberately *not* run from `restore_sessions`. At manifest-load time the
@@ -3574,6 +3795,7 @@ impl SessionApi for SessionManager {
             .get_mut(&request.session_id)
             .with_context(|| format!("session {} not found", request.session_id))?;
 
+        let metadata_only = request.history_bytes == Some(LEASE_PROBE_HISTORY_BYTES);
         let history_cap = effective_attach_history_cap(request.history_bytes);
         match session {
             ManagedSession::Live { actor, lease, .. } => {
@@ -3593,14 +3815,22 @@ impl SessionApi for SessionManager {
                 let lease = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 drop(sessions);
-                let snapshot = request_snapshot_with_history(&cmd_tx, history_cap)?;
+                let snapshot = if metadata_only {
+                    request_metadata_snapshot(&cmd_tx)?
+                } else {
+                    request_snapshot_with_history(&cmd_tx, history_cap)?
+                };
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
                     lease,
                 })
             }
             ManagedSession::Historical { session, lease } => {
-                let snapshot = session.snapshot_with_history(history_cap);
+                let snapshot = if metadata_only {
+                    session.metadata_snapshot()
+                } else {
+                    session.snapshot_with_history(history_cap)
+                };
                 let lease = lease.clone();
                 Ok(AttachSessionResponse {
                     snapshot: self.overlay_snippet(snapshot, &request.session_id),
@@ -5587,6 +5817,35 @@ impl HistoricalSession {
         )
     }
 
+    fn metadata_snapshot(&self) -> SessionSnapshot {
+        metadata_snapshot_from_output(
+            &self.output,
+            &self.size,
+            self.current_working_directory.clone(),
+            self.context.clone(),
+            true,
+        )
+    }
+
+    fn history_coordinates(&self) -> SessionHistoryCoordinates {
+        SessionHistoryCoordinates {
+            log_path: self.persisted.log_path.clone(),
+            logged_tail_bytes: self.output.logged_tail_bytes,
+            logged_output_seq: self.output.logged_output_seq,
+            bytes_logged: self.output.bytes_logged,
+            size: self.size.clone(),
+            exited: true,
+            bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
+            current_working_directory: self.current_working_directory.clone(),
+            context: self.context.clone(),
+            journal: self
+                .output
+                .scrollback
+                .as_ref()
+                .map(crate::scrollback::ScrollbackJournal::reader_clone),
+        }
+    }
+
     /// As [`Self::snapshot`], but carrying the raw output-history tail for
     /// client-side re-emulation. Historical sessions are only ever read on the
     /// attach/snapshot paths, so this is always history-bearing.
@@ -6064,6 +6323,12 @@ enum ActorCommand {
     Snapshot {
         response: Sender<ActorResult<SessionSnapshot>>,
     },
+    MetadataSnapshot {
+        response: Sender<ActorResult<SessionSnapshot>>,
+    },
+    HistoryCoordinates {
+        response: Sender<ActorResult<SessionHistoryCoordinates>>,
+    },
     SnapshotWithHistory {
         history_cap: u64,
         response: Sender<ActorResult<SessionSnapshot>>,
@@ -6517,6 +6782,14 @@ impl ActorState {
                 let _ = response.send(Ok(self.snapshot()));
                 false
             }
+            ActorCommand::MetadataSnapshot { response } => {
+                let _ = response.send(Ok(self.metadata_snapshot()));
+                false
+            }
+            ActorCommand::HistoryCoordinates { response } => {
+                let _ = response.send(Ok(self.history_coordinates()));
+                false
+            }
             ActorCommand::SnapshotWithHistory {
                 history_cap,
                 response,
@@ -6646,6 +6919,35 @@ impl ActorState {
             self.context.clone(),
             self.exited,
         )
+    }
+
+    fn metadata_snapshot(&self) -> SessionSnapshot {
+        metadata_snapshot_from_output(
+            &self.output,
+            &self.size,
+            self.current_working_directory.clone(),
+            self.context.clone(),
+            self.exited,
+        )
+    }
+
+    fn history_coordinates(&self) -> SessionHistoryCoordinates {
+        SessionHistoryCoordinates {
+            log_path: self.output.log_path.clone(),
+            logged_tail_bytes: self.output.logged_tail_bytes,
+            logged_output_seq: self.output.logged_output_seq,
+            bytes_logged: self.output.bytes_logged,
+            size: self.size.clone(),
+            exited: self.exited,
+            bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
+            current_working_directory: self.current_working_directory.clone(),
+            context: self.context.clone(),
+            journal: self
+                .output
+                .scrollback
+                .as_ref()
+                .map(crate::scrollback::ScrollbackJournal::reader_clone),
+        }
     }
 
     /// A snapshot carrying the raw output-history tail for client-side
@@ -6810,7 +7112,7 @@ impl ActorState {
             event: SessionEvent::ResyncRequired {
                 session_id,
                 latest_event_seq,
-                snapshot: self.snapshot_with_history(RAW_OUTPUT_TAIL_CAP),
+                snapshot: self.snapshot(),
             },
         }
     }
@@ -8154,6 +8456,80 @@ fn snapshot_from_output(
     }
 }
 
+fn metadata_snapshot_from_output(
+    output: &OutputState,
+    size: &SessionSize,
+    current_working_directory: Option<PathBuf>,
+    context: Option<SessionContext>,
+    exited: bool,
+) -> SessionSnapshot {
+    SessionSnapshot {
+        output_seq: output.logged_output_seq,
+        bytes_logged: output.bytes_logged,
+        size: size.clone(),
+        styled_rows: Vec::new(),
+        styled_rows_start: 0,
+        visible_rows: Vec::new(),
+        cursor: terminal_cursor(&output.terminal),
+        current_working_directory,
+        context,
+        bracketed_paste_enabled: output.terminal.bracketed_paste_enabled(),
+        exited,
+        raw_output: Vec::new(),
+        raw_output_start: output.logged_tail_bytes,
+        raw_output_prefix: Vec::new(),
+        snippet: None,
+        snippet_detail: None,
+    }
+}
+
+/// Sentinel `history_bytes` value sent by clients on WebSocket `AttachSession`
+/// when only lease/metadata state is needed (or when history is fetched via the
+/// HTTP history endpoint). Skips rendering `visible_rows`/`styled_rows` and
+/// skips disk history reads.
+pub const LEASE_PROBE_HISTORY_BYTES: u64 = 1024;
+
+#[derive(Debug, Clone)]
+pub struct SessionHistoryQuery {
+    pub session_id: SessionId,
+    pub window_bytes: Option<u64>,
+    pub after_byte: Option<u64>,
+    pub after_seq: Option<u64>,
+    pub before_byte: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionHistoryResponse {
+    pub session_id: SessionId,
+    pub output_seq: u64,
+    pub bytes_logged: u64,
+    pub raw_output_start: u64,
+    pub raw_output_end: u64,
+    pub raw_output_truncated: bool,
+    pub raw_output_prefix: Vec<u8>,
+    pub raw_output: Vec<u8>,
+    pub size: SessionSize,
+    pub exited: bool,
+    pub bracketed_paste_enabled: bool,
+    pub current_working_directory: Option<PathBuf>,
+    pub context: Option<SessionContext>,
+    pub snippet: Option<String>,
+    pub snippet_detail: Option<String>,
+}
+
+struct SessionHistoryCoordinates {
+    log_path: PathBuf,
+    logged_tail_bytes: u64,
+    logged_output_seq: u64,
+    bytes_logged: u64,
+    size: SessionSize,
+    exited: bool,
+    bracketed_paste_enabled: bool,
+    current_working_directory: Option<PathBuf>,
+    context: Option<SessionContext>,
+    journal: Option<crate::scrollback::ScrollbackJournal>,
+}
+
 /// Size at which a live session log is trimmed back to
 /// [`SESSION_LOG_RETAIN_BYTES`]. Without this a long-lived session grows without
 /// bound: logs of ~100 MB, and gigabytes across a session directory, are what
@@ -8371,6 +8747,49 @@ fn resolve_segment_session_dir(log_path: &Path) -> Option<PathBuf> {
 /// stay unserved. A write-failure episode leaves a permanent gap in the
 /// middle of the stream (the failed bytes exist nowhere on disk). `File`
 /// writes are unbuffered, so the on-disk tail is current.
+fn read_raw_output_range(log_path: &Path, start: u64, end: u64) -> Option<(u64, Vec<u8>)> {
+    if end == 0 || start >= end {
+        return Some((start.min(end), Vec::new()));
+    }
+
+    if let Some(session_dir) = resolve_segment_session_dir(log_path) {
+        return match crate::storage::read_multi_segment_range(&session_dir, start, end) {
+            Ok(tail) => Some(tail),
+            Err(err) => {
+                tracing::error!(
+                    session_dir = %session_dir.display(),
+                    ?err,
+                    "failed to read segmented output range; serving empty history"
+                );
+                None
+            }
+        };
+    }
+
+    let read = (|| -> std::io::Result<(u64, Vec<u8>)> {
+        let mut file = File::open(log_path)?;
+        let effective_end = end.min(file.metadata()?.len());
+        let clamped_start = start.min(effective_end);
+        file.seek(SeekFrom::Start(clamped_start))?;
+        let mut buf = Vec::new();
+        std::io::Read::by_ref(&mut file)
+            .take(effective_end - clamped_start)
+            .read_to_end(&mut buf)?;
+        Ok((clamped_start, buf))
+    })();
+    match read {
+        Ok(tail) => Some(tail),
+        Err(error) => {
+            tracing::warn!(
+                log_path = %log_path.display(),
+                ?error,
+                "failed to read raw output range; sending empty history"
+            );
+            None
+        }
+    }
+}
+
 fn read_raw_output_tail(log_path: &Path, end: u64, cap: u64) -> Option<(u64, Vec<u8>)> {
     if end == 0 {
         return Some((0, Vec::new()));
@@ -8723,6 +9142,20 @@ fn request_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
     recv_actor_result(resp_rx, "reading session snapshot")
 }
 
+fn request_metadata_snapshot(tx: &Sender<ActorCommand>) -> Result<SessionSnapshot> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::MetadataSnapshot { response: resp_tx })
+        .context("sending session metadata snapshot command")?;
+    recv_actor_result(resp_rx, "reading session metadata snapshot")
+}
+
+fn request_history_coordinates(tx: &Sender<ActorCommand>) -> Result<SessionHistoryCoordinates> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::HistoryCoordinates { response: resp_tx })
+        .context("sending session history coordinates command")?;
+    recv_actor_result(resp_rx, "reading session history coordinates")
+}
+
 fn effective_attach_history_cap(requested: Option<u64>) -> u64 {
     requested
         .filter(|cap| *cap > 0)
@@ -8763,6 +9196,12 @@ fn reject_command_during_shutdown(command: ActorCommand) {
             let _ = response.send(Err(error));
         }
         ActorCommand::Snapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::MetadataSnapshot { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::HistoryCoordinates { response } => {
             let _ = response.send(Err(error));
         }
         ActorCommand::SnapshotWithHistory { response, .. } => {

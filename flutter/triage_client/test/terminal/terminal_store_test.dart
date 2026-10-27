@@ -528,22 +528,25 @@ void main() {
     });
   });
 
-  test('capacity cap close with a held escape carry still releases the tail', () {
-    fakeAsync((async) {
-      store.dispatch(const Attach());
-      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
-      // A frame past the 1 MiB cap force-flushes through the shared close
-      // while the strip pass still holds the chunk's trailing partial: the
-      // close must re-arm rather than strand it.
-      const tail = 'ok\x1b[38;2;118;123;131;4';
-      final frame = '\x1b[?2026h${'F' * (1024 * 1024)}$tail';
-      store.dispatch(LiveBytes(b(frame)));
-      expect(sink.written.length, greaterThan(1024 * 1024));
-      expect(sink.written.toString().endsWith('ok'), isTrue);
-      async.elapse(kSyncOutputWatchdogTimeout * 2);
-      expect(sink.written.toString().endsWith(tail), isTrue);
-    });
-  });
+  test(
+    'capacity cap close with a held escape carry still releases the tail',
+    () {
+      fakeAsync((async) {
+        store.dispatch(const Attach());
+        store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+        // A frame past the 1 MiB cap force-flushes through the shared close
+        // while the strip pass still holds the chunk's trailing partial: the
+        // close must re-arm rather than strand it.
+        const tail = 'ok\x1b[38;2;118;123;131;4';
+        final frame = '\x1b[?2026h${'F' * (1024 * 1024)}$tail';
+        store.dispatch(LiveBytes(b(frame)));
+        expect(sink.written.length, greaterThan(1024 * 1024));
+        expect(sink.written.toString().endsWith('ok'), isTrue);
+        async.elapse(kSyncOutputWatchdogTimeout * 2);
+        expect(sink.written.toString().endsWith(tail), isTrue);
+      });
+    },
+  );
 
   test('re-delivered live outputSeq is dropped (re-delivery de-dup)', () {
     store.dispatch(const Attach());
@@ -815,11 +818,9 @@ void main() {
       sink.ops.clear();
       store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 5));
       async.elapse(kSyncOutputWatchdogTimeout * 2);
-      expect(
-        sink.ops,
-        ['write:bbb\nccc'],
-        reason: 'no \\r may be injected into a synchronized-output frame',
-      );
+      expect(sink.ops, [
+        'write:bbb\nccc',
+      ], reason: 'no \\r may be injected into a synchronized-output frame');
     });
   });
 
@@ -839,11 +840,9 @@ void main() {
       // content: the application owns cursor placement until it says otherwise.
       sink.ops.clear();
       store.dispatch(LiveBytes(b('bbb\nccc'), outputSeq: 2));
-      expect(
-        sink.ops,
-        ['write:bbb\nccc'],
-        reason: 'no \\r may be injected while the frame is open on the wire',
-      );
+      expect(sink.ops, [
+        'write:bbb\nccc',
+      ], reason: 'no \\r may be injected while the frame is open on the wire');
 
       // Once the frame really closes, ordinary newline translation resumes.
       sink.ops.clear();
@@ -1240,9 +1239,7 @@ void main() {
           rawOutputPrefix: b('\x1b[0mold scrollback\r\n'),
         ),
       );
-      store.dispatch(
-        LiveBytes(b('\x1b[?2026h\x1b[2J\x1b[3'), outputSeq: 6),
-      );
+      store.dispatch(LiveBytes(b('\x1b[?2026h\x1b[2J\x1b[3'), outputSeq: 6));
       store.dispatch(
         LiveBytes(b('J\x1b[Hupdated frame\x1b[?2026l'), outputSeq: 7),
       );
@@ -2059,34 +2056,36 @@ void main() {
     },
   );
 
-  test('empty snapshot without coordinates on a live store is a pure no-op',
-      () {
-    final emptySink = FakeTerminalSink();
-    final emptyStore = TerminalStore(emptySink);
-    addTearDown(emptyStore.dispose);
-    emptyStore.dispatch(const Resize(80, 24));
-    emptyStore.dispatch(
-      HistoryBytes(
-        b('a' * 50),
-        cols: 80,
-        rows: 24,
-        throughOutputSeq: 5,
-        rawOutputStart: 0,
-      ),
-    );
-    emptyStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
-    expect(emptyStore.appliedLogBytes, 80);
-    final opCount = emptySink.ops.length;
+  test(
+    'empty snapshot without coordinates on a live store is a pure no-op',
+    () {
+      final emptySink = FakeTerminalSink();
+      final emptyStore = TerminalStore(emptySink);
+      addTearDown(emptyStore.dispose);
+      emptyStore.dispatch(const Resize(80, 24));
+      emptyStore.dispatch(
+        HistoryBytes(
+          b('a' * 50),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 0,
+        ),
+      );
+      emptyStore.dispatch(LiveBytes(b('b' * 30), outputSeq: 8));
+      expect(emptyStore.appliedLogBytes, 80);
+      final opCount = emptySink.ops.length;
 
-    emptyStore.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      emptyStore.dispatch(const HistoryBytes([], cols: 80, rows: 24));
 
-    expect(emptySink.ops.where((op) => op == 'clear').length, 1);
-    expect(emptySink.ops.length, opCount);
-    expect(emptyStore.appliedLogBytes, 80);
-    expect(emptyStore.appliedLiveSeq, 8);
-    expect(emptyStore.state.historyHighWaterSeq, 5);
-    expect(emptySink.historyReplayedCount, 1);
-  });
+      expect(emptySink.ops.where((op) => op == 'clear').length, 1);
+      expect(emptySink.ops.length, opCount);
+      expect(emptyStore.appliedLogBytes, 80);
+      expect(emptyStore.appliedLiveSeq, 8);
+      expect(emptyStore.state.historyHighWaterSeq, 5);
+      expect(emptySink.historyReplayedCount, 1);
+    },
+  );
 
   test('empty ahead-seq snapshot neither clears nor drops late live', () {
     final aheadSink = FakeTerminalSink();
@@ -2154,8 +2153,13 @@ void main() {
     final opCount = atSink.ops.length;
 
     atStore.dispatch(
-      const HistoryBytes([], cols: 80, rows: 24, throughOutputSeq: 5,
-          rawOutputStart: 50),
+      const HistoryBytes(
+        [],
+        cols: 80,
+        rows: 24,
+        throughOutputSeq: 5,
+        rawOutputStart: 50,
+      ),
     );
 
     expect(atSink.ops.where((op) => op == 'clear').length, 1);
@@ -2260,8 +2264,7 @@ void main() {
     expect(store.appliedLiveSeq, 10);
   });
 
-  test('negative live seq at a large baseline neither resets nor poisons',
-      () {
+  test('negative live seq at a large baseline neither resets nor poisons', () {
     store.dispatch(const Attach());
     store.dispatch(
       HistoryBytes(b('OLD'), cols: 80, rows: 24, throughOutputSeq: 1999),
@@ -2419,8 +2422,7 @@ void main() {
     expect(bcStore.appliedLiveSeq, 8);
   });
 
-  test('empty snapshot past the head then its tail replays without a gap',
-      () {
+  test('empty snapshot past the head then its tail replays without a gap', () {
     final gapSink = FakeTerminalSink();
     final gapStore = TerminalStore(gapSink);
     addTearDown(gapStore.dispose);
@@ -2673,34 +2675,96 @@ void main() {
     expect(reentrantSink.ops, contains('dispose'));
   });
 
-  test('large payload newline translation completes quickly without stalling', () {
-    store.dispatch(const Attach());
-    store.dispatch(
-      HistoryBytes(b('init'), cols: 80, rows: 24, throughOutputSeq: 1),
-    );
-    sink.ops.clear();
+  test(
+    'large payload newline translation completes quickly without stalling',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(
+        HistoryBytes(b('init'), cols: 80, rows: 24, throughOutputSeq: 1),
+      );
+      sink.ops.clear();
 
-    final pattern = 'line of terminal output\nand another line\r\n';
-    final repeated = pattern * 10000;
-    final stopwatch = Stopwatch()..start();
-    store.dispatch(LiveBytes(utf8.encode(repeated), outputSeq: 2));
-    stopwatch.stop();
+      final pattern = 'line of terminal output\nand another line\r\n';
+      final repeated = pattern * 10000;
+      final stopwatch = Stopwatch()..start();
+      store.dispatch(LiveBytes(utf8.encode(repeated), outputSeq: 2));
+      stopwatch.stop();
 
-    expect(sink.written.toString(), contains('line of terminal output\r\n'));
-    expect(stopwatch.elapsedMilliseconds, lessThan(2000));
-  });
+      expect(sink.written.toString(), contains('line of terminal output\r\n'));
+      expect(stopwatch.elapsedMilliseconds, lessThan(2000));
+    },
+  );
 
-  test('rawOutputStart sanitizer preserves plain alphanumeric tokens at slice boundary', () {
-    store.dispatch(const Attach());
-    store.dispatch(
-      HistoryBytes(
-        b('100m relay and 2D canvas\r\n'),
-        cols: 80,
-        rows: 24,
-        throughOutputSeq: 1,
-        rawOutputStart: 100,
-      ),
-    );
-    expect(sink.written.toString(), contains('100m relay and 2D canvas\r\n'));
-  });
+  test(
+    'rawOutputStart sanitizer preserves plain alphanumeric tokens at slice boundary',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(
+        HistoryBytes(
+          b('100m relay and 2D canvas\r\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 100,
+        ),
+      );
+      expect(sink.written.toString(), contains('100m relay and 2D canvas\r\n'));
+    },
+  );
+
+  test(
+    'spliceBackwardHistoryPage prepends older slice onto retained tail and preserves in-flight live chunks',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const Resize(80, 24));
+      store.dispatch(
+        HistoryBytes(
+          b('mid-tail\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 100,
+        ),
+      );
+      store.dispatch(LiveBytes(b('pre-page-live\n'), outputSeq: 11));
+      expect(store.retainedRawStart, 100);
+      expect(store.appliedLogBytes, 123);
+
+      store.beginHistoryPaging();
+      store.dispatch(LiveBytes(b('in-flight-live\n'), outputSeq: 12));
+
+      final spliced = store.spliceBackwardHistoryPage(
+        b('older-slice\n'),
+        rawOutputStart: 88,
+        rawOutputEnd: 100,
+      );
+      expect(spliced, isNotNull);
+      expect(
+        utf8.decode(spliced!.bytes),
+        'older-slice\nmid-tail\npre-page-live\n',
+      );
+      expect(spliced.throughOutputSeq, 11);
+
+      sink.ops.clear();
+      sink.written.clear();
+      store.dispatch(const Attach(preservePendingLive: true));
+      store.dispatch(
+        HistoryBytes(
+          spliced.bytes,
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: spliced.throughOutputSeq,
+          rawOutputStart: 88,
+        ),
+      );
+      store.endHistoryPaging();
+
+      expect(
+        sink.written.toString(),
+        'older-slice\r\nmid-tail\r\npre-page-live\r\nin-flight-live\r\n',
+      );
+      expect(store.retainedRawStart, 88);
+      expect(store.appliedLogBytes, 123 + 'in-flight-live\n'.length);
+    },
+  );
 }

@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:triage_client/generated/triage_triage.generated_generated.dart'
     as fbs;
+import 'package:triage_client/services/history_http.dart';
 
 typedef WebSocketChannelFactory = WebSocketChannel Function(Uri uri);
 
@@ -140,8 +141,9 @@ DaemonStatsRecord mergeDaemonStats(
     diskFreeBytes: hasDisk ? incoming.diskFreeBytes : previous.diskFreeBytes,
     diskTotalBytes: hasDisk ? incoming.diskTotalBytes : previous.diskTotalBytes,
     cpuPercent: incoming.cpuPercent ?? previous.cpuPercent,
-    batteryPercent:
-        hasBattery ? incoming.batteryPercent : previous.batteryPercent,
+    batteryPercent: hasBattery
+        ? incoming.batteryPercent
+        : previous.batteryPercent,
     batteryState: hasBattery ? incoming.batteryState : previous.batteryState,
   );
 }
@@ -252,16 +254,70 @@ Uint8List historyBytesFromField(dynamic raw) {
   return Uint8List(0);
 }
 
+/// Decodes a `THS1` binary history frame into a snapshot-compatible map with
+/// `raw_output_prefix` and `raw_output` populated as zero-copy [Uint8List]
+/// subviews.
+Map<String, dynamic> decodeHistoryFrame(Uint8List bytes) {
+  if (bytes.length < 16 ||
+      bytes[0] != 0x54 ||
+      bytes[1] != 0x48 ||
+      bytes[2] != 0x53 ||
+      bytes[3] != 0x31) {
+    throw const FormatException('Invalid THS1 history frame header');
+  }
+  final header = ByteData.sublistView(bytes, 0, 16);
+  final metaLen = header.getUint32(4, Endian.little);
+  final prefixLen = header.getUint32(8, Endian.little);
+  final rawLen = header.getUint32(12, Endian.little);
+  final expectedTotal = 16 + metaLen + prefixLen + rawLen;
+  if (bytes.length < expectedTotal) {
+    throw FormatException(
+      'Truncated THS1 history frame (${bytes.length} < $expectedTotal)',
+    );
+  }
+  const metaOffset = 16;
+  final prefixOffset = metaOffset + metaLen;
+  final rawOffset = prefixOffset + prefixLen;
+  final metaJson = utf8.decode(
+    Uint8List.sublistView(bytes, metaOffset, prefixOffset),
+  );
+  final decoded = jsonDecode(metaJson);
+  final result = decoded is Map<String, dynamic>
+      ? Map<String, dynamic>.from(decoded)
+      : <String, dynamic>{};
+  result['raw_output_prefix'] = Uint8List.sublistView(
+    bytes,
+    prefixOffset,
+    rawOffset,
+  );
+  result['raw_output'] = Uint8List.sublistView(
+    bytes,
+    rawOffset,
+    rawOffset + rawLen,
+  );
+  return result;
+}
+
 class TriageWebSocketClient {
-  TriageWebSocketClient(this.uri, {WebSocketChannelFactory? channelFactory})
-    : _channelFactory =
-          channelFactory ??
-          ((uri) =>
-              WebSocketChannel.connect(uri, protocols: websocketSubprotocols));
+  TriageWebSocketClient(
+    this.uri, {
+    WebSocketChannelFactory? channelFactory,
+    HistoryHttpFetcher? httpFetcher,
+  }) : _channelFactory =
+           channelFactory ??
+           ((uri) =>
+               WebSocketChannel.connect(uri, protocols: websocketSubprotocols)),
+       _httpFetcher = httpFetcher;
 
   final Uri uri;
   final WebSocketChannelFactory _channelFactory;
+  final HistoryHttpFetcher? _httpFetcher;
   WebSocketChannel? _channel;
+  String? _authClientId;
+  String? _authToken;
+
+  /// True when a dedicated HTTP history transport is available for this client.
+  bool get hasHttpHistoryTransport => _channel != null || _httpFetcher != null;
   // The current channel's listener, kept so it can be cancelled when the channel
   // is retired. A half-open socket never ends its own stream, so without this
   // the subscription — and the channel and socket it holds — would outlive every
@@ -543,6 +599,12 @@ class TriageWebSocketClient {
   }
 
   Future<Map<String, dynamic>> hello({String? clientId, String? token}) async {
+    if (clientId != null && clientId.isNotEmpty) {
+      _authClientId = clientId;
+    }
+    if (token != null && token.isNotEmpty) {
+      _authToken = token;
+    }
     return _send('hello', {
       if (clientId != null) 'client_id': clientId,
       if (token != null) 'token': token,
@@ -550,8 +612,13 @@ class TriageWebSocketClient {
   }
 
   Future<String> pair({required String code, required String clientId}) async {
+    _authClientId = clientId;
     final response = await _send('pair', {'code': code, 'client_id': clientId});
-    return response['token']?.toString() ?? '';
+    final token = response['token']?.toString() ?? '';
+    if (token.isNotEmpty) {
+      _authToken = token;
+    }
+    return token;
   }
 
   Future<Map<String, dynamic>> pairingChallenge({
@@ -563,10 +630,13 @@ class TriageWebSocketClient {
   /// Pairs by Tailscale identity: the daemon whoises this connection's peer
   /// and mints a token only for allowlisted tailnet users. No code, no PIN.
   Future<String> pairViaTailscale({required String clientId}) async {
-    final response = await _send('pair_via_tailscale', {
-      'client_id': clientId,
-    });
-    return response['token']?.toString() ?? '';
+    _authClientId = clientId;
+    final response = await _send('pair_via_tailscale', {'client_id': clientId});
+    final token = response['token']?.toString() ?? '';
+    if (token.isNotEmpty) {
+      _authToken = token;
+    }
+    return token;
   }
 
   Future<String> startSession({
@@ -1015,6 +1085,135 @@ class TriageWebSocketClient {
         if (historyBytes != null) 'history_bytes': historyBytes,
       },
     });
+  }
+
+  /// Derives the HTTP(S) history endpoint URI from the WebSocket [uri],
+  /// preserving any reverse-proxy prefix before `/ws`. Supports both cleartext
+  /// `http://` (from `ws://`) and TLS `https://` (from `wss://`).
+  Uri buildHistoryUri(
+    String sessionId, {
+    int? windowBytes,
+    int? afterByte,
+    int? afterSeq,
+    int? beforeByte,
+  }) {
+    final httpScheme = switch (uri.scheme.toLowerCase()) {
+      'wss' || 'https' => 'https',
+      _ => 'http',
+    };
+    final segments = List<String>.from(uri.pathSegments);
+    while (segments.isNotEmpty && segments.last.isEmpty) {
+      segments.removeLast();
+    }
+    if (segments.isNotEmpty && segments.last == 'ws') {
+      segments.removeLast();
+    }
+    segments.addAll(['api', 'sessions', sessionId, 'history']);
+    final queryParameters = <String, String>{
+      if (windowBytes != null) 'window_bytes': windowBytes.toString(),
+      if (afterByte != null) 'after_byte': afterByte.toString(),
+      if (afterSeq != null) 'after_seq': afterSeq.toString(),
+      if (beforeByte != null) 'before_byte': beforeByte.toString(),
+    };
+    return uri.replace(
+      scheme: httpScheme,
+      pathSegments: segments,
+      queryParameters: queryParameters.isEmpty ? null : queryParameters,
+    );
+  }
+
+  /// Fetches session scrollback history over HTTP (`GET /api/sessions/{id}/history`).
+  ///
+  /// Supports full tail windows ([windowBytes]), forward deltas ([afterByte],
+  /// [afterSeq]), and backward range paging ([beforeByte]). Automatically falls
+  /// back to an `Observer` WebSocket [attachSession] when [hasHttpHistoryTransport]
+  /// is false or when connected to an older daemon whose HTTP server falls back
+  /// to `index.html`.
+  Future<Map<String, dynamic>> fetchSessionHistory({
+    required String sessionId,
+    String? clientId,
+    int? windowBytes,
+    int? afterByte,
+    int? afterSeq,
+    int? beforeByte,
+  }) async {
+    final effectiveClientId = clientId ?? _authClientId ?? '';
+    if (!hasHttpHistoryTransport) {
+      final attachRes = await attachSession(
+        sessionId: sessionId,
+        clientId: effectiveClientId,
+        mode: 'Observer',
+        historyBytes: windowBytes,
+      );
+      final responseObj = attachRes['response'] as Map<String, dynamic>?;
+      return responseObj?['snapshot'] as Map<String, dynamic>? ??
+          attachRes['snapshot'] as Map<String, dynamic>? ??
+          <String, dynamic>{};
+    }
+
+    final targetUri = buildHistoryUri(
+      sessionId,
+      windowBytes: windowBytes,
+      afterByte: afterByte,
+      afterSeq: afterSeq,
+      beforeByte: beforeByte,
+    );
+    final headers = <String, String>{
+      'Accept': 'application/x-triage-history',
+      if (effectiveClientId.isNotEmpty) 'X-Triage-Client-Id': effectiveClientId,
+      if (_authToken != null && _authToken!.isNotEmpty)
+        'Authorization': 'Bearer $_authToken',
+    };
+    final fetcher = _httpFetcher ?? getHistoryHttp;
+    final response = await fetcher(targetUri, headers: headers);
+    if (response.statusCode == 401) {
+      var message = 'authentication required';
+      try {
+        final decoded = jsonDecode(utf8.decode(response.body));
+        if (decoded is Map) {
+          final error = decoded['error'];
+          if (error is Map && error['message'] != null) {
+            message = error['message'].toString();
+          }
+        }
+      } catch (_) {}
+      throw TriageAuthException(message);
+    }
+
+    final contentType = response.contentType.toLowerCase();
+    if (response.statusCode == 404 || contentType.contains('text/html')) {
+      if (_channel != null) {
+        final attachRes = await attachSession(
+          sessionId: sessionId,
+          clientId: effectiveClientId,
+          mode: 'Observer',
+          historyBytes: windowBytes,
+        );
+        final responseObj = attachRes['response'] as Map<String, dynamic>?;
+        return responseObj?['snapshot'] as Map<String, dynamic>? ??
+            attachRes['snapshot'] as Map<String, dynamic>? ??
+            <String, dynamic>{};
+      }
+      throw Exception(
+        'Session $sessionId history not found (HTTP ${response.statusCode})',
+      );
+    }
+
+    if (response.statusCode != 200) {
+      var message = 'HTTP ${response.statusCode}';
+      try {
+        final decoded = jsonDecode(utf8.decode(response.body));
+        if (decoded is Map) {
+          final error = decoded['error'];
+          if (error is Map && error['message'] != null) {
+            message = error['message'].toString();
+          }
+        }
+      } catch (_) {}
+      throw Exception(message);
+    }
+
+    return decodeHistoryFrame(response.body);
   }
 
   Future<String> subscribeSessionEvents({

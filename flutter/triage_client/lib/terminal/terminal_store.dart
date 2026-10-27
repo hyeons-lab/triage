@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 
@@ -84,13 +85,16 @@ const int kEmulatorMaxScrollbackLines = 50000;
   int? windowBytes, {
   required bool web,
 }) {
-  final platformLines = web ? kHistoryReplayWebMaxLines : kHistoryReplayMaxLines;
-  final platformBytes = web ? kHistoryReplayWebMaxBytes : kHistoryReplayMaxBytes;
+  final platformLines = web
+      ? kHistoryReplayWebMaxLines
+      : kHistoryReplayMaxLines;
+  final platformBytes = web
+      ? kHistoryReplayWebMaxBytes
+      : kHistoryReplayMaxBytes;
   if (windowBytes == null || windowBytes <= 0) {
     return (maxLines: platformLines, maxBytes: platformBytes);
   }
-  final scaledLines =
-      platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
+  final scaledLines = platformLines * windowBytes ~/ kHistoryFirstWindowBytes;
   return (
     maxLines: scaledLines.clamp(platformLines, kEmulatorMaxScrollbackLines),
     maxBytes: min(windowBytes, platformBytes),
@@ -239,10 +243,7 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
     return (bytes: bytes, droppedBytes: 0);
   }
   const reset = <int>[0x1b, 0x5b, 0x30, 0x6d]; // ESC [ 0 m
-  return (
-    bytes: [...reset, ...bytes.sublist(start)],
-    droppedBytes: start,
-  );
+  return (bytes: [...reset, ...bytes.sublist(start)], droppedBytes: start);
 }
 
 ({
@@ -250,7 +251,8 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
   List<int> rawBytes,
   int retainedPrefixBytes,
   int droppedRawBytes,
-}) trimHistoryReplay({
+})
+trimHistoryReplay({
   required List<int> rawOutputPrefix,
   required List<int> rawOutput,
   required int maxLines,
@@ -364,12 +366,11 @@ List<int> trimHistoryTail(
   List<int> bytes, {
   required int maxLines,
   required int maxBytes,
-}) =>
-    trimHistoryTailWithOffset(
-      bytes,
-      maxLines: maxLines,
-      maxBytes: maxBytes,
-    ).bytes;
+}) => trimHistoryTailWithOffset(
+  bytes,
+  maxLines: maxLines,
+  maxBytes: maxBytes,
+).bytes;
 
 /// How far below the dedup baseline an `output_seq` may fall and still be a
 /// re-delivery rather than a fresh numbering epoch.
@@ -515,6 +516,38 @@ class TerminalStore extends ChangeNotifier {
   // Number of journaled prefix bytes retained by the last full history replay.
   int _appliedHistoryPrefixBytes = 0;
 
+  // Retained raw tail bytes `[appliedHistoryStart..appliedLogBytes]` so HTTP
+  // backward range pages (`before_byte = appliedHistoryStart`) can prepend only
+  // the older slice without re-downloading the already-held tail.
+  final BytesBuilder _retainedRawBytes = BytesBuilder(copy: false);
+  int? _retainedRawStart;
+  int? _retainedRawSeq;
+
+  /// Absolute log byte offset where the retained raw tail begins, if available.
+  int? get retainedRawStart => _retainedRawStart;
+
+  /// Splices an older raw byte slice `[rawOutputStart..rawOutputEnd]` ahead of
+  /// the retained raw tail when `rawOutputEnd == _retainedRawStart`.
+  ({Uint8List bytes, int? throughOutputSeq})? spliceBackwardHistoryPage(
+    List<int> olderBytes, {
+    required int rawOutputStart,
+    required int rawOutputEnd,
+  }) {
+    final retainedStart = _retainedRawStart;
+    if (retainedStart == null || rawOutputEnd != retainedStart) {
+      return null;
+    }
+    final retained = _retainedRawBytes.toBytes();
+    final combined = Uint8List(olderBytes.length + retained.length);
+    combined.setRange(0, olderBytes.length, olderBytes);
+    combined.setRange(olderBytes.length, combined.length, retained);
+    return (
+      bytes: combined,
+      throughOutputSeq:
+          _retainedRawSeq ?? _appliedLiveSeq ?? _state.historyHighWaterSeq,
+    );
+  }
+
   // True while we are programmatically resizing the sink, so its onResize echo
   // does not loop back through the reducer.
   bool _applyingResize = false;
@@ -568,8 +601,14 @@ class TerminalStore extends ChangeNotifier {
   /// Disarms shadow-buffering once the backward history page RPC finishes and
   /// drops any shadow-queued chunks if the page bailed out without replaying.
   void endHistoryPaging() {
+    final wasPaging = _pagingHistory;
     _pagingHistory = false;
     if (_state.phase == AttachPhase.live && _state.sized) {
+      if (wasPaging && _pendingLive.isNotEmpty) {
+        for (final q in _pendingLive) {
+          _appendRetainedRaw(q.bytes, q.outputSeq);
+        }
+      }
       _clearPendingLive();
     }
   }
@@ -606,6 +645,9 @@ class TerminalStore extends ChangeNotifier {
         _appliedLogBytes = null;
         _appliedHistoryStart = null;
         _appliedHistoryPrefixBytes = 0;
+        _retainedRawBytes.clear();
+        _retainedRawStart = null;
+        _retainedRawSeq = null;
         return s.copyWith(
           phase: AttachPhase.awaitingHistory,
           exited: false,
@@ -640,6 +682,9 @@ class TerminalStore extends ChangeNotifier {
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
         _appliedHistoryStart = null;
+        _retainedRawBytes.clear();
+        _retainedRawStart = null;
+        _retainedRawSeq = null;
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -828,6 +873,11 @@ class TerminalStore extends ChangeNotifier {
             _appliedLiveSeq = _appliedLiveSeq == null
                 ? throughSeq
                 : max(_appliedLiveSeq!, throughSeq);
+            if (!_pagingHistory) {
+              _retainedRawSeq = _retainedRawSeq == null
+                  ? throughSeq
+                  : max(_retainedRawSeq!, throughSeq);
+            }
           }
           if (next.sized) {
             _flushPendingLive(resolvedSeq);
@@ -876,6 +926,11 @@ class TerminalStore extends ChangeNotifier {
         _appliedLiveSeq = _appliedLiveSeq == null
             ? throughSeq
             : max(_appliedLiveSeq!, throughSeq);
+        if (!_pagingHistory) {
+          _retainedRawSeq = _retainedRawSeq == null
+              ? throughSeq
+              : max(_retainedRawSeq!, throughSeq);
+        }
         if (next.sized) {
           _flushPendingLive(resolvedSeq);
         }
@@ -928,8 +983,7 @@ class TerminalStore extends ChangeNotifier {
     if (trimmed.prefixBytes.isNotEmpty) {
       _writeDecoded(trimmed.prefixBytes);
       if (trimmed.rawBytes.isNotEmpty) {
-        final trailingNewline =
-            trimmed.prefixBytes.last == 0x0a ? '' : '\r\n';
+        final trailingNewline = trimmed.prefixBytes.last == 0x0a ? '' : '\r\n';
         final pushScrollback = rows > 1 ? '\r\n' * (rows - 1) : '';
         _writeDecoded(
           utf8.encode('$trailingNewline$pushScrollback\x1b[H\x1b[0m'),
@@ -939,20 +993,26 @@ class TerminalStore extends ChangeNotifier {
       }
     }
     if (trimmed.rawBytes.isNotEmpty) {
-      final rawToWrite =
-          (rawStart ?? 0) > 0 && trimmed.droppedRawBytes == 0
-              ? _sanitizeRawTailStart(trimmed.rawBytes)
-              : trimmed.rawBytes;
+      final rawToWrite = (rawStart ?? 0) > 0 && trimmed.droppedRawBytes == 0
+          ? _sanitizeRawTailStart(trimmed.rawBytes)
+          : trimmed.rawBytes;
       _writeDecoded(rawToWrite);
     }
 
     _appliedHistoryPrefixBytes = trimmed.retainedPrefixBytes;
-    _appliedHistoryStart =
-        rawStart != null ? rawStart + trimmed.droppedRawBytes : null;
+    _appliedHistoryStart = rawStart != null
+        ? rawStart + trimmed.droppedRawBytes
+        : null;
     if (rawStart != null) {
       _appliedLogBytes = rawStart + bytes.length;
     } else {
       _appliedLogBytes = bytes.length;
+    }
+    _retainedRawBytes.clear();
+    _retainedRawStart = _appliedHistoryStart;
+    _retainedRawSeq = throughSeq;
+    if (_retainedRawStart != null && trimmed.rawBytes.isNotEmpty) {
+      _retainedRawBytes.add(trimmed.rawBytes);
     }
 
     next = next.copyWith(
@@ -1084,6 +1144,27 @@ class TerminalStore extends ChangeNotifier {
       _appliedLiveSeq = _appliedLiveSeq == null
           ? outputSeq
           : max(_appliedLiveSeq!, outputSeq);
+    }
+    if (!_pagingHistory) {
+      _appendRetainedRaw(bytes, outputSeq);
+    }
+  }
+
+  void _appendRetainedRaw(List<int> bytes, int? outputSeq) {
+    if (_retainedRawStart != null && bytes.isNotEmpty) {
+      _retainedRawBytes.add(bytes);
+      final total = _retainedRawBytes.length;
+      if (total > kHistoryReplayMaxBytes) {
+        final drop = total - kHistoryReplayMaxBytes;
+        final current = _retainedRawBytes.takeBytes();
+        _retainedRawBytes.add(Uint8List.sublistView(current, drop));
+        _retainedRawStart = _retainedRawStart! + drop;
+      }
+    }
+    if (outputSeq != null) {
+      _retainedRawSeq = _retainedRawSeq == null
+          ? outputSeq
+          : max(_retainedRawSeq!, outputSeq);
     }
   }
 

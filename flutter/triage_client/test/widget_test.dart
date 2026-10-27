@@ -111,6 +111,71 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   @override
   bool get isConnected => _connected;
 
+  bool enableHttpHistory = false;
+
+  @override
+  bool get hasHttpHistoryTransport => enableHttpHistory;
+
+  final List<
+    ({
+      String sessionId,
+      int? windowBytes,
+      int? afterByte,
+      int? afterSeq,
+      int? beforeByte,
+    })
+  >
+  fetchSessionHistoryCalls = [];
+
+  Map<String, dynamic> Function({
+    required String sessionId,
+    int? windowBytes,
+    int? afterByte,
+    int? afterSeq,
+    int? beforeByte,
+  })?
+  httpHistoryBuilder;
+
+  @override
+  Future<Map<String, dynamic>> fetchSessionHistory({
+    required String sessionId,
+    String? clientId,
+    int? windowBytes,
+    int? afterByte,
+    int? afterSeq,
+    int? beforeByte,
+  }) async {
+    fetchSessionHistoryCalls.add((
+      sessionId: sessionId,
+      windowBytes: windowBytes,
+      afterByte: afterByte,
+      afterSeq: afterSeq,
+      beforeByte: beforeByte,
+    ));
+    final builder = httpHistoryBuilder;
+    if (builder != null) {
+      return builder(
+        sessionId: sessionId,
+        windowBytes: windowBytes,
+        afterByte: afterByte,
+        afterSeq: afterSeq,
+        beforeByte: beforeByte,
+      );
+    }
+    return {
+      'session_id': sessionId,
+      'size': {'rows': 24, 'cols': 80},
+      'exited': false,
+      'output_seq': 1,
+      'bytes_logged': 0,
+      'raw_output_start': 0,
+      'raw_output_end': 0,
+      'raw_output_truncated': false,
+      'raw_output': const <int>[],
+      'raw_output_prefix': const <int>[],
+    };
+  }
+
   final List<String> startSessionCalls = [];
   final List<String> startSessionCommands = [];
   final List<List<String>> startSessionArgs = [];
@@ -6371,6 +6436,144 @@ void main() {
           client.attachSessionModes.sublist(modesBeforeInput),
           contains('InteractiveController'),
         );
+      },
+    );
+
+    testWidgets(
+      'HTTP history transport probes lease over WebSocket, loads initial window over HTTP, and splices backward range pages',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
+        client.httpHistoryBuilder =
+            ({
+              required sessionId,
+              windowBytes,
+              afterByte,
+              afterSeq,
+              beforeByte,
+            }) {
+              if (beforeByte != null) {
+                return {
+                  'session_id': sessionId,
+                  'size': {'rows': 24, 'cols': 80},
+                  'exited': false,
+                  'output_seq': 5,
+                  'bytes_logged': 100020,
+                  'raw_output_start': 0,
+                  'raw_output_end': beforeByte,
+                  'raw_output_truncated': true,
+                  'raw_output': utf8.encode('http-older-slice\r\n'),
+                  'raw_output_prefix': const <int>[],
+                };
+              }
+              return {
+                'session_id': sessionId,
+                'size': {'rows': 24, 'cols': 80},
+                'exited': false,
+                'output_seq': 5,
+                'bytes_logged': 100020,
+                'raw_output_start': 100000,
+                'raw_output_end': 100020,
+                'raw_output_truncated': false,
+                'raw_output': utf8.encode('http-initial-tail\r\n'),
+                'raw_output_prefix': const <int>[],
+              };
+            };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        // Initial attach uses the 1 KiB metadata/lease probe over WebSocket
+        // and fetches the 64 KiB initial window over HTTP.
+        expect(client.attachSessionHistoryBytes, [kHistoryLeaseProbeBytes]);
+        expect(client.fetchSessionHistoryCalls.length, 1);
+        expect(
+          client.fetchSessionHistoryCalls.single.windowBytes,
+          kHistoryFirstWindowBytes,
+        );
+        expect(client.fetchSessionHistoryCalls.single.beforeByte, isNull);
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Near-top scroll pages backward over HTTP using before_byte without
+        // issuing another WebSocket attachSession call.
+        final attachesBeforePage = client.attachSessionCalls.length;
+        pane.onNearTop!();
+        await tester.pumpAndSettle();
+
+        expect(client.attachSessionCalls.length, attachesBeforePage);
+        expect(client.fetchSessionHistoryCalls.length, 2);
+        final pageCall = client.fetchSessionHistoryCalls.last;
+        expect(pageCall.windowBytes, kHistoryFirstWindowBytes * 2);
+        expect(pageCall.beforeByte, 100000);
+        expect(pageCall.afterByte, 100000 + 'http-initial-tail\r\n'.length);
+        expect(pageCall.afterSeq, 5);
+
+        final lines = pane.terminal.buffer.lines;
+        final bufferText = [
+          for (var i = 0; i < lines.length; i++) lines[i].toString(),
+        ].join('\n');
+        expect(bufferText, contains('http-older-slice'));
+        expect(bufferText, contains('http-initial-tail'));
+      },
+    );
+
+    testWidgets(
+      'obscured SessionWorkspace ignores drag gestures so mobile rail overlay does not move session content',
+      (WidgetTester tester) async {
+        final session = SessionVm(
+          title: 'triage / obscured-test',
+          sessionId: 'obscured-test',
+          status: 'attached',
+          statusColor: const Color(0xff7fd1c7),
+          icon: Icons.terminal,
+          rows: [
+            for (var i = 0; i < 80; i++)
+              StyledRow(
+                spans: [
+                  StyledSpan(text: 'line-$i', style: const TerminalStyle()),
+                ],
+              ),
+          ],
+          loaded: true,
+        );
+        addTearDown(session.dispose);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SessionWorkspace(
+                session: session,
+                connected: true,
+                isObscured: true,
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.isObscured, isTrue);
+
+        final scrollable = tester.state<ScrollableState>(
+          find
+              .descendant(
+                of: find.byType(TerminalPane),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
+        final beforePixels = scrollable.position.pixels;
+
+        await tester.drag(
+          find.byType(TerminalPane),
+          const Offset(0, 200),
+          warnIfMissed: false,
+        );
+        await tester.pumpAndSettle();
+
+        expect(scrollable.position.pixels, beforePixels);
       },
     );
   });
