@@ -622,9 +622,15 @@ class TerminalStore extends ChangeNotifier {
   final BytesBuilder _retainedRawBytes = BytesBuilder(copy: false);
   int? _retainedRawStart;
   int? _retainedRawSeq;
+  Uint8List _retainedRawViewport = Uint8List(0);
 
   /// Absolute log byte offset where the retained raw tail begins, if available.
   int? get retainedRawStart => _retainedRawStart;
+
+  /// Retained ANSI-encoded viewport from the last snapshot carrying `styled_rows`,
+  /// so HTTP backward history pages (which omit `styled_rows`) keep the bottom
+  /// viewport intact when replaying split history.
+  Uint8List get retainedRawViewport => _retainedRawViewport;
 
   /// Splices an older raw byte slice `[rawOutputStart..rawOutputEnd]` ahead of
   /// the retained raw tail when `rawOutputEnd == _retainedRawStart`.
@@ -737,6 +743,7 @@ class TerminalStore extends ChangeNotifier {
         if (!preservePendingLive) {
           _pagingHistory = false;
           _clearPendingLive();
+          _retainedRawViewport = Uint8List(0);
         }
         _appliedLiveSeq = null;
         _appliedLogBytes = null;
@@ -782,6 +789,7 @@ class TerminalStore extends ChangeNotifier {
         _retainedRawBytes.clear();
         _retainedRawStart = null;
         _retainedRawSeq = null;
+        _retainedRawViewport = Uint8List(0);
         return s.copyWith(scrollbackReady: false);
 
       case Resize(:final cols, :final rows):
@@ -1088,9 +1096,17 @@ class TerminalStore extends ChangeNotifier {
     );
     final int retainedPrefixBytes;
     final int rawDropped;
+    final effectiveViewport = rawOutputViewport.isNotEmpty
+        ? rawOutputViewport
+        : _retainedRawViewport;
+    if (rawOutputViewport.isNotEmpty) {
+      _retainedRawViewport = rawOutputViewport is Uint8List
+          ? rawOutputViewport
+          : Uint8List.fromList(rawOutputViewport);
+    }
     final useViewportForRaw =
         rawOutputPrefix.isNotEmpty &&
-        rawOutputViewport.isNotEmpty &&
+        effectiveViewport.isNotEmpty &&
         _collectGenuineNewlineIndices(
           trimmed.rawBytes,
           0,
@@ -1104,7 +1120,7 @@ class TerminalStore extends ChangeNotifier {
       );
       final replayBytes = _combinePrefixAndViewport(
         trimmedPrefix.bytes,
-        rawOutputViewport,
+        effectiveViewport,
       );
       _writeDecoded(replayBytes);
       retainedPrefixBytes = rawOutputPrefix.length - trimmedPrefix.droppedBytes;

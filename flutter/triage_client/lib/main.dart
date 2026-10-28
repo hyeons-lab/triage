@@ -5729,6 +5729,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       var rawOutput = _rawOutputFromSnapshot(snapshot);
       var rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
       var rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
+      if (rawOutputViewport.isEmpty &&
+          session.store.retainedRawViewport.isNotEmpty) {
+        rawOutputViewport = session.store.retainedRawViewport;
+      }
       var rawOutputStart = snapshot['raw_output_start'] as int?;
       if (rawOutputStart == null) return;
       var throughOutputSeq = snapshot['output_seq'] as int?;
@@ -5760,6 +5764,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           rawOutput = _rawOutputFromSnapshot(fallback);
           rawOutputPrefix = _rawOutputPrefixFromSnapshot(fallback);
           rawOutputViewport = _rawOutputViewportFromSnapshot(fallback);
+          if (rawOutputViewport.isEmpty &&
+              session.store.retainedRawViewport.isNotEmpty) {
+            rawOutputViewport = session.store.retainedRawViewport;
+          }
           rawOutputStart = fallbackStart;
           throughOutputSeq = fallback['output_seq'] as int?;
         } else {

@@ -955,5 +955,279 @@ void main() {
         }
       },
     );
+
+    testWidgets(
+      'mobile touch drag on alternate-screen mouse-tracking terminal emits unshifted SGR wheel 64/65',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        try {
+          final terminal = Terminal(maxLines: 100);
+          terminal.resize(47, 41);
+          terminal.write(
+            '\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h',
+          );
+          final sentInputs = <String>[];
+          final controller = TerminalController();
+          controller.addInputListener(sentInputs.add);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 470,
+                  height: 820,
+                  child: TerminalPane(
+                    terminalId: 'test-android-alt-scroll',
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 0,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          // Drag finger downward (scrolling up into older history) -> wheelUp (64).
+          final gesture = await tester.startGesture(const Offset(200, 300));
+          await gesture.moveBy(const Offset(0, 60));
+          await gesture.up();
+          await tester.pump();
+
+          expect(
+            sentInputs.any((s) => s.startsWith('\x1b[<64;')),
+            isTrue,
+            reason: 'Expected SGR wheelUp (64), got: $sentInputs',
+          );
+
+          sentInputs.clear();
+          // Drag finger upward (scrolling down toward newer output) -> wheelDown (65).
+          final gestureDown = await tester.startGesture(const Offset(200, 300));
+          await gestureDown.moveBy(const Offset(0, -60));
+          await gestureDown.up();
+          await tester.pump();
+
+          expect(
+            sentInputs.any((s) => s.startsWith('\x1b[<65;')),
+            isTrue,
+            reason: 'Expected SGR wheelDown (65), got: $sentInputs',
+          );
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'native TerminalView stays pinned to bottom across loading, history replay, session swaps, and live output without phantom onNearTop paging',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        TerminalPane.debugForceNativeTerminalView = true;
+        try {
+          var nearTopCount = 0;
+          final termA = Terminal(maxLines: 500);
+          final ctrlA = TerminalController();
+          final termB = Terminal(maxLines: 500);
+          final ctrlB = TerminalController();
+
+          Widget buildPane({
+            required String id,
+            required Terminal terminal,
+            required TerminalController controller,
+            required bool isLoading,
+            required int focusRev,
+          }) {
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 300,
+                  child: TerminalPane(
+                    terminalId: id,
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: focusRev,
+                    isLoading: isLoading,
+                    onNearTop: () {
+                      nearTopCount++;
+                      return false;
+                    },
+                  ),
+                ),
+              ),
+            );
+          }
+
+          // 1. Mount session A while loading with an empty buffer (maxScrollExtent == 0).
+          await tester.pumpWidget(
+            buildPane(
+              id: 'native-scroll-a',
+              terminal: termA,
+              controller: ctrlA,
+              isLoading: true,
+              focusRev: 1,
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 60));
+
+          // Replay 120 lines of history into session A and finish loading.
+          for (var i = 0; i < 120; i++) {
+            termA.write('session A line $i\r\n');
+          }
+          ctrlA.notifyHistoryReplayed();
+          await tester.pumpWidget(
+            buildPane(
+              id: 'native-scroll-a',
+              terminal: termA,
+              controller: ctrlA,
+              isLoading: false,
+              focusRev: 1,
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 100));
+
+          final scrollableFinder = find.descendant(
+            of: find.byType(TerminalView),
+            matching: find.byType(Scrollable),
+          );
+          ScrollPosition pos() =>
+              tester.state<ScrollableState>(scrollableFinder).position;
+
+          expect(pos().maxScrollExtent, greaterThan(0));
+          expect(pos().pixels, closeTo(pos().maxScrollExtent, 1.0));
+          expect(nearTopCount, 0);
+
+          // 2. Scroll session A up to the middle so RenderTerminal._stickToBottom
+          // becomes false and session A records a saved scroll offset.
+          final midA = pos().maxScrollExtent * 0.4;
+          pos().jumpTo(midA);
+          await tester.pump();
+          expect(pos().pixels, closeTo(midA, 1.0));
+          expect(nearTopCount, 0);
+
+          // 3. Switch to session B while it is loading and still has an empty
+          // buffer (maxScrollExtent shrinks from session A's extent to 0),
+          // then replay 80 lines of history and stream live output.
+          await tester.pumpWidget(
+            buildPane(
+              id: 'native-scroll-b',
+              terminal: termB,
+              controller: ctrlB,
+              isLoading: true,
+              focusRev: 2,
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 30));
+          expect(nearTopCount, 0);
+
+          for (var i = 0; i < 80; i++) {
+            termB.write('session B line $i\r\n');
+          }
+          ctrlB.notifyHistoryReplayed();
+          await tester.pumpWidget(
+            buildPane(
+              id: 'native-scroll-b',
+              terminal: termB,
+              controller: ctrlB,
+              isLoading: false,
+              focusRev: 2,
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 100));
+
+          final extentBBeforeLive = pos().maxScrollExtent;
+          expect(extentBBeforeLive, greaterThan(0));
+          expect(pos().pixels, closeTo(extentBBeforeLive, 1.0));
+          expect(nearTopCount, 0);
+
+          // 4. Write additional live output to session B and verify that
+          // RenderTerminal._stickToBottom is true and advances pixels to the
+          // new bottom extent.
+          for (var i = 80; i < 110; i++) {
+            termB.write('session B live $i\r\n');
+          }
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+
+          expect(pos().maxScrollExtent, greaterThan(extentBBeforeLive));
+          expect(pos().pixels, closeTo(pos().maxScrollExtent, 1.0));
+          expect(nearTopCount, 0);
+
+          // 5. Switch back to session A and verify its scrolled-up offset is
+          // restored on the very first frame (no 1-frame snap to bottom) and
+          // stays pinned across live output without triggering onNearTop.
+          await tester.pumpWidget(
+            buildPane(
+              id: 'native-scroll-a',
+              terminal: termA,
+              controller: ctrlA,
+              isLoading: false,
+              focusRev: 3,
+            ),
+          );
+          await tester.pump();
+          expect(pos().pixels, closeTo(midA, 1.0));
+          await tester.pump(const Duration(milliseconds: 60));
+          expect(pos().pixels, closeTo(midA, 1.0));
+          for (var i = 0; i < 5; i++) {
+            termA.write('session A live while scrolled up $i\r\n');
+          }
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          expect(pos().pixels, closeTo(midA, 1.0));
+          expect(nearTopCount, 0);
+
+          // 6. Explicitly scroll session A to top (0.0); onNearTop fires once,
+          // and a large backward history page (where addedLines * lh exceeds
+          // the previous maxScrollExtent) re-seats the viewport on the same
+          // content without flipping RenderTerminal._stickToBottom to true or
+          // re-triggering onNearTop.
+          pos().jumpTo(0.0);
+          await tester.pump();
+          expect(nearTopCount, 1);
+
+          ctrlA.notifyHistoryPageStarted();
+          ctrlA.clear();
+          termA.useMainBuffer();
+          termA.mainBuffer.clear();
+          termA.altBuffer.clear();
+          termA.write('\x1b[H\x1b[2J\x1b[3J');
+          for (var i = 0; i < 280; i++) {
+            termA.write('session A paged line $i\r\n');
+          }
+          ctrlA.notifyHistoryReplayed();
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 60));
+
+          final pagedPixels = pos().pixels;
+          expect(pagedPixels, greaterThan(0.0));
+          expect(pagedPixels, lessThan(pos().maxScrollExtent - 100.0));
+          expect(nearTopCount, 1);
+
+          // Live output after paging must keep the viewport pinned at
+          // pagedPixels rather than snapping to bottom.
+          for (var i = 0; i < 5; i++) {
+            termA.write('session A live after page $i\r\n');
+          }
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 50));
+          expect(pos().pixels, closeTo(pagedPixels, 1.0));
+          expect(nearTopCount, 1);
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('native-scroll-a');
+          TerminalPane.destroySession('native-scroll-b');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }

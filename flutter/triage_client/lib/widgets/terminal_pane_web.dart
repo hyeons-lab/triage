@@ -2500,11 +2500,17 @@ class _TerminalPaneState extends State<TerminalPane>
       // touch stream must not veto the fallback (else swipes scroll nothing
       // on quiet sessions). `modes` needs the proposed API, already enabled.
       var forceDrive = false;
+      String? mouseMode;
+      String? activeType;
       try {
         final modes = js_util.getProperty(term, 'modes');
-        final mouseMode =
-            js_util.getProperty(modes, 'mouseTrackingMode') as String?;
-        forceDrive = mouseMode != null && mouseMode != 'none';
+        mouseMode = js_util.getProperty(modes, 'mouseTrackingMode') as String?;
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        activeType = js_util.getProperty(active, 'type') as String?;
+        forceDrive =
+            (mouseMode != null && mouseMode != 'none') ||
+            activeType == 'alternate';
       } catch (_) {}
       final rowsToScroll = _touchScrollTakeover.onPointerMove(
         nowMs: DateTime.now().millisecondsSinceEpoch,
@@ -2517,15 +2523,26 @@ class _TerminalPaneState extends State<TerminalPane>
       try {
         final buffer = js_util.getProperty(term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
-        final activeType = js_util.getProperty(active, 'type') as String?;
+        activeType ??= js_util.getProperty(active, 'type') as String?;
         final viewportY = (js_util.getProperty(active, 'viewportY') as num)
             .toInt();
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
         if (forceDrive && (baseY <= 0 || activeType == 'alternate')) {
-          final btn = rowsToScroll < 0 ? 64 : 65;
           final count = rowsToScroll.abs().clamp(1, 10);
-          final seq = '\x1b[<$btn;1;1M' * count;
-          _containerEventOwners[_sanitizedId]?._sendInput(seq);
+          if (mouseMode != null && mouseMode != 'none') {
+            final btn = rowsToScroll < 0 ? 64 : 65;
+            final cols =
+                (js_util.getProperty(term, 'cols') as num?)?.toInt() ?? 80;
+            final rows =
+                (js_util.getProperty(term, 'rows') as num?)?.toInt() ?? 24;
+            final col = (cols ~/ 2).clamp(1, cols > 0 ? cols : 1);
+            final row = (rows ~/ 2).clamp(1, rows > 0 ? rows : 1);
+            final seq = '\x1b[<$btn;$col;${row}M' * count;
+            _containerEventOwners[_sanitizedId]?._sendInput(seq);
+          } else if (activeType == 'alternate') {
+            final key = rowsToScroll < 0 ? '\x1b[A' : '\x1b[B';
+            _containerEventOwners[_sanitizedId]?._sendInput(key * count);
+          }
           return;
         }
         final target = (viewportY + rowsToScroll).clamp(0, baseY);
