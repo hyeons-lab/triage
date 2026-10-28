@@ -3125,6 +3125,41 @@ void main() {
       for (var i = 0; i < 4; i++) {
         expect(term.buffer.lines[6 + i].toString().trimRight(), 'vis-$i');
       }
+
+      // Subsequent backward history page (e.g. via HTTP /api/sessions/{id}/history)
+      // omits styled_rows (rawOutputViewport is empty). The store must preserve
+      // the retained viewport across Attach(preservePendingLive: true) so the
+      // bottom viewport is not overwritten by cursor-addressed raw_output.
+      final widerPrefix = List.generate(
+        10,
+        (i) => '\x1b[0mprefix-row-$i\r\n',
+      ).join();
+      sink.written.clear();
+      store.dispatch(const Attach(preservePendingLive: true));
+      store.dispatch(
+        HistoryBytes(
+          b(rawTail),
+          cols: 40,
+          rows: 4,
+          throughOutputSeq: 5,
+          rawOutputStart: 400,
+          rawOutputPrefix: b(widerPrefix),
+        ),
+      );
+
+      final pagedTerm = xt.Terminal(maxLines: 100);
+      pagedTerm.resize(40, 4);
+      writeToXterm(pagedTerm, sink.written.toString());
+      expect(pagedTerm.buffer.lines.length, 14);
+      for (var i = 0; i < 10; i++) {
+        expect(
+          pagedTerm.buffer.lines[i].toString().trimRight(),
+          'prefix-row-$i',
+        );
+      }
+      for (var i = 0; i < 4; i++) {
+        expect(pagedTerm.buffer.lines[10 + i].toString().trimRight(), 'vis-$i');
+      }
     },
   );
 
