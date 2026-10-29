@@ -3505,7 +3505,7 @@ impl SessionManager {
                     child,
                     process_identity,
                     is_interactive_shell,
-                    writer,
+                    _writer: writer,
                     writer_tx,
                     output,
                     size,
@@ -6783,7 +6783,7 @@ impl SessionActor {
                     child,
                     process_identity,
                     is_interactive_shell,
-                    writer,
+                    _writer: writer,
                     writer_tx,
                     output,
                     size,
@@ -6954,7 +6954,7 @@ struct ActorState {
     child: Box<dyn Child + Send + Sync>,
     process_identity: Option<crate::handover::HandoverProcessIdentity>,
     is_interactive_shell: bool,
-    writer: SharedPtyWriter,
+    _writer: SharedPtyWriter,
     writer_tx: SyncSender<Vec<u8>>,
     output: OutputState,
     size: SessionSize,
@@ -7832,10 +7832,22 @@ impl ActorState {
 
     fn resize(&mut self, size: SessionSize) -> Result<SessionSnapshot> {
         size.validate()?;
-        self.master
-            .resize(pty_size(&size))
-            .context("resizing PTY")?;
-        self.output.reflow_from_log(&size, self.writer.clone())?;
+        if size.cols != self.size.cols
+            || size.rows != self.size.rows
+            || size.pixel_width != self.size.pixel_width
+            || size.pixel_height != self.size.pixel_height
+        {
+            self.master
+                .resize(pty_size(&size))
+                .context("resizing PTY")?;
+        }
+        // `wezterm_term::Terminal::resize` rewraps soft-wrapped lines in place on
+        // the primary screen (`Screen::rewrap_lines`) and resizes the alternate
+        // screen in memory without reading or re-emulating the 16 MiB session log.
+        self.output.terminal.resize(terminal_size(&size));
+        if size.cols != self.size.cols {
+            self.output.scroll_seq_baseline = None;
+        }
         self.size = size;
         let snapshot = self.snapshot();
         if let Some(session_id) = self.event_session_id.clone() {
@@ -9014,6 +9026,7 @@ impl OutputState {
         Ok(current_working_directory)
     }
 
+    #[cfg(test)]
     fn reflow_from_log(&mut self, size: &SessionSize, writer: SharedPtyWriter) -> Result<()> {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
@@ -9058,26 +9071,32 @@ impl OutputState {
             self.cwd_sequence_buffer.extend_from_slice(bytes);
         }
         let mut current_working_directory = None;
+        let mut cursor = 0usize;
 
-        while let Some(start) = find_bytes(&self.cwd_sequence_buffer, b"\x1b]7;file://") {
-            if start > 0 {
-                self.cwd_sequence_buffer.drain(..start);
-            }
-
-            let Some(terminator) = find_osc_terminator(&self.cwd_sequence_buffer) else {
+        while let Some(rel_start) =
+            find_bytes(&self.cwd_sequence_buffer[cursor..], b"\x1b]7;file://")
+        {
+            let start = cursor + rel_start;
+            let slice = &self.cwd_sequence_buffer[start..];
+            let Some(terminator) = find_osc_terminator(slice) else {
+                cursor = start;
                 break;
             };
-            let payload = &self.cwd_sequence_buffer[b"\x1b]7;file://".len()..terminator];
+            let payload = &slice[b"\x1b]7;file://".len()..terminator];
             if let Some(path) = cwd_from_osc7_payload(payload) {
                 current_working_directory = Some(path);
             }
 
-            let drain_to = if self.cwd_sequence_buffer[terminator] == 0x07 {
+            let drain_to = if slice[terminator] == 0x07 {
                 terminator + 1
             } else {
                 terminator + 2
             };
-            self.cwd_sequence_buffer.drain(..drain_to);
+            cursor = start + drain_to;
+        }
+
+        if cursor > 0 {
+            self.cwd_sequence_buffer.drain(..cursor);
         }
 
         if !self.cwd_sequence_buffer.is_empty()
@@ -10518,10 +10537,12 @@ struct ReplayGateWriter {
     state: Arc<ReplayGateState>,
 }
 
+#[cfg(test)]
 struct SharedPtyWriterProxy {
     writer: SharedPtyWriter,
 }
 
+#[cfg(test)]
 impl Write for SharedPtyWriterProxy {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.writer
@@ -20575,7 +20596,7 @@ mod tests {
             master,
             child,
             process_identity,
-            writer,
+            _writer: writer,
             writer_tx,
             output,
             size,
