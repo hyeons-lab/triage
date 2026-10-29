@@ -1229,5 +1229,71 @@ void main() {
         }
       },
     );
+
+    testWidgets(
+      'mobile keyboard animation coalesces per-frame resize into a single settled resizeOut',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        TerminalPane.debugForceNativeTerminalView = true;
+        TerminalPane.destroySession('mobile-kbd-resize');
+        try {
+          final term = Terminal(maxLines: 500);
+          final ctrl = TerminalController();
+          final resizeOuts = <(int, int)>[];
+          ctrl.addResizeOutListener((cols, rows) {
+            resizeOuts.add((cols, rows));
+          });
+
+          Widget buildWithHeight(double height) {
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: height,
+                  child: TerminalPane(
+                    terminalId: 'mobile-kbd-resize',
+                    terminal: term,
+                    controller: ctrl,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 1,
+                  ),
+                ),
+              ),
+            );
+          }
+
+          await tester.pumpWidget(buildWithHeight(600));
+          await tester.pump(const Duration(milliseconds: 150));
+          final initialRows = term.viewHeight;
+          resizeOuts.clear();
+
+          // Simulate 10 intermediate frames of soft keyboard sliding up over 160ms
+          // (16ms per frame), shrinking the pane from 600px down to 300px.
+          for (var step = 1; step <= 10; step++) {
+            final h = 600.0 - step * 30.0;
+            tester.binding.handleMetricsChanged();
+            await tester.pumpWidget(buildWithHeight(h));
+            await tester.pump(const Duration(milliseconds: 16));
+          }
+
+          // While the keyboard animation is still in flight, neither the terminal
+          // grid nor resizeOut should have churned through intermediate row counts.
+          expect(term.viewHeight, initialRows);
+          expect(resizeOuts, isEmpty);
+
+          // Once the metrics settle timer (80ms) elapses, the terminal resizes
+          // once to the final settled height and emits a single resizeOut.
+          await tester.pump(const Duration(milliseconds: 100));
+          expect(term.viewHeight, lessThan(initialRows));
+          expect(resizeOuts.length, 1);
+          expect(resizeOuts.single.$2, term.viewHeight);
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('mobile-kbd-resize');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }

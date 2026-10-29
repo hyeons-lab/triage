@@ -225,6 +225,8 @@ class _TerminalPaneState extends State<TerminalPane>
   int? _mobileAltScrollPointer;
   Offset? _mobileAltScrollLastPosition;
   bool _metricsRestoreInFlight = false;
+  bool _metricsResizeSettling = false;
+  Timer? _metricsSettleTimer;
 
   Timer? _resizeOutDebounceTimer;
   Timer? _scrollToCursorTimer;
@@ -591,6 +593,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
     _focusNode.dispose();
+    _metricsSettleTimer?.cancel();
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
@@ -1461,7 +1464,11 @@ class _TerminalPaneState extends State<TerminalPane>
         if (_scrollController.hasClients) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted && _scrollController.hasClients) {
-              _snapToBottom(_scrollController.position);
+              final p = _scrollController.position;
+              if (p.hasContentDimensions &&
+                  p.pixels < p.maxScrollExtent - 0.5) {
+                _snapToBottom(p);
+              }
             }
           });
         }
@@ -1489,6 +1496,9 @@ class _TerminalPaneState extends State<TerminalPane>
   void _scheduleResizeOut(int cols, int rows) {
     if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
         _sessionLastResizeOutRows[widget.terminalId] == rows) {
+      _resizeOutDebounceTimer?.cancel();
+      _pendingResizeOutCols = null;
+      _pendingResizeOutRows = null;
       return;
     }
     _pendingResizeOutCols = cols;
@@ -1567,6 +1577,19 @@ class _TerminalPaneState extends State<TerminalPane>
   void didChangeMetrics() {
     super.didChangeMetrics();
     if (!mounted) return;
+    // Soft keyboard animations and window/foldable metric transitions fire
+    // didChangeMetrics on every frame (~25-30 frames over 300ms). Pause
+    // TerminalView's per-frame autoResize while the viewport is animating so
+    // we don't reflow the terminal buffer or fire resize callbacks on every
+    // intermediate boundary; apply the settled grid size once when it stops.
+    if (!_metricsResizeSettling) {
+      setState(() => _metricsResizeSettling = true);
+    }
+    _metricsSettleTimer?.cancel();
+    _metricsSettleTimer = Timer(
+      const Duration(milliseconds: 80),
+      _finishMetricsResizeSettle,
+    );
     final hasSavedScroll =
         _scrollAnchor.hasAnchor ||
         _sessionSavedScrollOffsets.containsKey(widget.terminalId);
@@ -1586,6 +1609,48 @@ class _TerminalPaneState extends State<TerminalPane>
         _restoreSavedScrollPosition(_lineHeight() ?? 2.0);
       });
     });
+  }
+
+  void _finishMetricsResizeSettle() {
+    _metricsSettleTimer = null;
+    if (!mounted) return;
+    if (_metricsResizeSettling) {
+      setState(() => _metricsResizeSettling = false);
+    }
+    _syncTerminalSizeToRender();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_metricsResizeSettling) {
+        _syncTerminalSizeToRender();
+      }
+    });
+  }
+
+  void _syncTerminalSizeToRender() {
+    try {
+      final render = _terminalViewKey.currentState?.renderTerminal;
+      if (render != null && render.hasSize) {
+        final cell = render.cellSize;
+        if (cell.width > 0 &&
+            cell.height > 0 &&
+            render.size.width > cell.width &&
+            render.size.height > cell.height) {
+          final cols = render.size.width ~/ cell.width;
+          final rows = render.size.height ~/ cell.height;
+          if (cols > 0 && rows > 0) {
+            if (cols != _terminal.viewWidth || rows != _terminal.viewHeight) {
+              _terminal.resize(
+                cols,
+                rows,
+                cell.width.round(),
+                cell.height.round(),
+              );
+            }
+            _sendResizeOutNow(cols, rows);
+            render.markNeedsLayout();
+          }
+        }
+      }
+    } catch (_) {}
   }
 
   void _restoreSavedScrollPosition(double lh) {
@@ -1617,11 +1682,10 @@ class _TerminalPaneState extends State<TerminalPane>
         : null;
     if (target != null && target >= 0.0) {
       final atBottom = target >= maxExtent - 0.5;
-      _jumpPositionTo(
-        p,
-        atBottom ? maxExtent : target,
-        stickToBottom: atBottom,
-      );
+      final desired = atBottom ? maxExtent : target;
+      if ((p.pixels - desired).abs() > 0.5) {
+        _jumpPositionTo(p, desired, stickToBottom: atBottom);
+      }
     }
   }
 
@@ -2668,39 +2732,48 @@ class _TerminalPaneState extends State<TerminalPane>
                                           ? const NeverScrollableScrollPhysics()
                                           : const _TerminalScrollPhysics(),
                                     ),
-                                child: xt.TerminalView(
-                                  _terminal,
-                                  key: _terminalViewKey,
-                                  controller: _xtermController,
-                                  theme: _theme,
-                                  focusNode: _focusNode,
-                                  autofocus: _mayTakeFocus,
-                                  scrollController: _scrollController,
-                                  onKeyEvent: _handleTerminalKeyEvent,
-                                  textStyle: _textStyle,
-                                  // Desktop always takes the hardware-keyboard path
-                                  // instead of xterm's hidden IME TextInput connection:
-                                  // on macOS the IME path desyncs Flutter's
-                                  // HardwareKeyboard state ("physical key already
-                                  // pressed") and swallows keystrokes. Mobile must use
-                                  // the IME path, though: it is what raises the soft
-                                  // keyboard, so disabling it leaves a phone unable to
-                                  // type — which is exactly what the soft-keyboard kill
-                                  // switch asks for.
-                                  hardwareKeyboardOnly:
-                                      terminalHardwareKeyboardOnly(
-                                        isMobile: _isMobile,
-                                        softKeyboardEnabled:
-                                            widget.softKeyboardEnabled,
-                                      ),
-                                  readOnly:
-                                      !terminalHardwareKeyboardOnly(
-                                        isMobile: _isMobile,
-                                        softKeyboardEnabled:
-                                            widget.softKeyboardEnabled,
-                                      ) &&
-                                      (widget.isExited ||
-                                          !_isRouteCurrentAndUnobscured),
+                                child: MediaQuery(
+                                  // Shield TerminalView from MediaQuery.of(context) rebuilds on every
+                                  // frame of soft keyboard viewInsets animations.
+                                  data: const MediaQueryData(),
+                                  child: xt.TerminalView(
+                                    _terminal,
+                                    key: _terminalViewKey,
+                                    controller: _xtermController,
+                                    theme: _theme,
+                                    focusNode: _focusNode,
+                                    autofocus: _mayTakeFocus,
+                                    autoResize: !_metricsResizeSettling,
+                                    scrollController: _scrollController,
+                                    onKeyEvent: _handleTerminalKeyEvent,
+                                    textStyle: _textStyle,
+                                    textScaler: MediaQuery.textScalerOf(
+                                      context,
+                                    ),
+                                    // Desktop always takes the hardware-keyboard path
+                                    // instead of xterm's hidden IME TextInput connection:
+                                    // on macOS the IME path desyncs Flutter's
+                                    // HardwareKeyboard state ("physical key already
+                                    // pressed") and swallows keystrokes. Mobile must use
+                                    // the IME path, though: it is what raises the soft
+                                    // keyboard, so disabling it leaves a phone unable to
+                                    // type — which is exactly what the soft-keyboard kill
+                                    // switch asks for.
+                                    hardwareKeyboardOnly:
+                                        terminalHardwareKeyboardOnly(
+                                          isMobile: _isMobile,
+                                          softKeyboardEnabled:
+                                              widget.softKeyboardEnabled,
+                                        ),
+                                    readOnly:
+                                        !terminalHardwareKeyboardOnly(
+                                          isMobile: _isMobile,
+                                          softKeyboardEnabled:
+                                              widget.softKeyboardEnabled,
+                                        ) &&
+                                        (widget.isExited ||
+                                            !_isRouteCurrentAndUnobscured),
+                                  ),
                                 ),
                               ),
                             ),

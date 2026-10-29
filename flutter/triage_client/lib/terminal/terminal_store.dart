@@ -506,32 +506,76 @@ void writeToXterm(xt.Terminal terminal, String data) {
     terminal.write(data);
     return;
   }
-  var lastEnd = 0;
-  for (final match in _cbtOrChtSequence.allMatches(data)) {
-    if (match.start > lastEnd) {
-      terminal.write(data.substring(lastEnd, match.start));
-    }
-    final rawCount = match.group(1)!;
-    final parsed = rawCount.isEmpty ? 1 : (int.tryParse(rawCount) ?? 1);
-    final count = parsed <= 0 ? 1 : parsed;
-    final cmd = match.group(2)!;
-    if (cmd == 'Z') {
-      var x = terminal.buffer.cursorX;
-      for (var step = 0; step < count && x > 0; step++) {
-        x = ((x - 1) ~/ 8) * 8;
-      }
-      terminal.write('\x1b[${x + 1}G');
-    } else {
-      final maxTabs = (terminal.viewWidth ~/ 8) + 1;
-      final steps = count > maxTabs ? maxTabs : count;
-      for (var step = 0; step < steps; step++) {
-        terminal.tab();
-      }
-    }
-    lastEnd = match.end;
+  final matches = _cbtOrChtSequence.allMatches(data).toList(growable: false);
+  if (matches.isEmpty) {
+    terminal.write(data);
+    return;
   }
-  if (lastEnd < data.length) {
-    terminal.write(data.substring(lastEnd));
+  final maxTabs = (terminal.viewWidth ~/ 8) + 1;
+  final hasCbt = matches.any((m) => m.group(2) == 'Z');
+  if (!hasCbt) {
+    final buf = StringBuffer();
+    var lastEnd = 0;
+    for (final match in matches) {
+      if (match.start > lastEnd) {
+        buf.write(data.substring(lastEnd, match.start));
+      }
+      final rawCount = match.group(1)!;
+      final parsed = rawCount.isEmpty ? 1 : (int.tryParse(rawCount) ?? 1);
+      final count = parsed <= 0 ? 1 : parsed;
+      final steps = count > maxTabs ? maxTabs : count;
+      buf.write('\t' * steps);
+      lastEnd = match.end;
+    }
+    if (lastEnd < data.length) {
+      buf.write(data.substring(lastEnd));
+    }
+    terminal.write(buf.toString());
+    return;
+  }
+
+  final coalesceSync =
+      !terminal.synchronizedUpdateMode && !data.contains('\x1b[?2026');
+  if (coalesceSync) {
+    terminal.setSynchronizedUpdateMode(true);
+  }
+  try {
+    final pending = StringBuffer();
+    var lastEnd = 0;
+    for (final match in matches) {
+      if (match.start > lastEnd) {
+        pending.write(data.substring(lastEnd, match.start));
+      }
+      final rawCount = match.group(1)!;
+      final parsed = rawCount.isEmpty ? 1 : (int.tryParse(rawCount) ?? 1);
+      final count = parsed <= 0 ? 1 : parsed;
+      final cmd = match.group(2)!;
+      if (cmd == 'Z') {
+        if (pending.isNotEmpty) {
+          terminal.write(pending.toString());
+          pending.clear();
+        }
+        var x = terminal.buffer.cursorX;
+        for (var step = 0; step < count && x > 0; step++) {
+          x = ((x - 1) ~/ 8) * 8;
+        }
+        pending.write('\x1b[${x + 1}G');
+      } else {
+        final steps = count > maxTabs ? maxTabs : count;
+        pending.write('\t' * steps);
+      }
+      lastEnd = match.end;
+    }
+    if (lastEnd < data.length) {
+      pending.write(data.substring(lastEnd));
+    }
+    if (pending.isNotEmpty) {
+      terminal.write(pending.toString());
+    }
+  } finally {
+    if (coalesceSync) {
+      terminal.setSynchronizedUpdateMode(false);
+    }
   }
 }
 

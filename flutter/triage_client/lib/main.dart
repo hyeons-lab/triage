@@ -2343,7 +2343,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId != null &&
           !session.isExited &&
           session.status != 'exited') {
-        ++session.resizeRequestSeq;
+        final reqSeq = ++session.resizeRequestSeq;
+        final generation = _connectGeneration;
         // Tell the host its new PTY size; the program repaints and the live
         // byte stream self-heals the view. No history replay on resize.
         unawaited(() async {
@@ -2353,6 +2354,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               cols: cols,
               rows: rows,
             );
+            if (!_isStale(generation) && reqSeq == session.resizeRequestSeq) {
+              session.hostSizeCols = cols;
+              session.hostSizeRows = rows;
+            }
           } catch (_) {}
         }());
       }
@@ -5421,7 +5426,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           ),
         );
       }
-    } else if (session.loaded &&
+    } else if (kIsWeb &&
+        session.loaded &&
         session.isRemote &&
         !session.isExited &&
         _clientForeground &&
@@ -6789,7 +6795,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
     } else {
       final isNarrow =
-          !runningUnderFlutterTest() && MediaQuery.of(context).size.width < 768;
+          !runningUnderFlutterTest() && MediaQuery.sizeOf(context).width < 768;
       final isMobile = isMobilePlatform() || isNarrow;
       final hasSelectedSession =
           _selectedIndex >= 0 && _selectedIndex < _sessions.length;
@@ -6944,7 +6950,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
 
       if (isMobile) {
-        final screenWidth = MediaQuery.of(context).size.width;
+        final screenWidth = MediaQuery.sizeOf(context).width;
         final overlayWidth = screenWidth < _sessionRailExpandedWidth
             ? screenWidth
             : _sessionRailExpandedWidth;
