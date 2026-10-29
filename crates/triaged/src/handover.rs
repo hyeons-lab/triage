@@ -120,6 +120,12 @@ pub struct HandoverState {
     /// Preserved session custom labels.
     #[serde(default)]
     pub custom_labels: std::collections::HashMap<String, String>,
+    /// Preserved git contexts (repository root, worktree root, branch) of live
+    /// sessions so adopted actors serve their known context immediately on
+    /// reconnect while `resolve_adopted_contexts` refreshes them off-lock.
+    #[serde(default)]
+    pub session_contexts:
+        std::collections::HashMap<SessionId, triage_core::session::SessionContext>,
 }
 
 /// Result of asking a running daemon to hand over (Phase 1, before the successor
@@ -1814,6 +1820,11 @@ mod unix_impl {
         if !fresh_state.judge_history.is_empty() {
             retained_state.judge_history = fresh_state.judge_history;
         }
+        if !fresh_state.session_contexts.is_empty() {
+            for (sid, ctx) in fresh_state.session_contexts {
+                retained_state.session_contexts.insert(sid, ctx);
+            }
+        }
         retained_state.sends_teardown_commit = fresh_state.sends_teardown_commit;
         retained_state.handover_owner_token = fresh_state.handover_owner_token;
         retained_state.handover_lineage_token = fresh_state.handover_lineage_token;
@@ -1882,6 +1893,11 @@ mod unix_impl {
             if !recovered_state.custom_labels.is_empty() {
                 for (sid, label) in std::mem::take(&mut recovered_state.custom_labels) {
                     state.custom_labels.entry(sid).or_insert(label);
+                }
+            }
+            if !recovered_state.session_contexts.is_empty() {
+                for (sid, ctx) in std::mem::take(&mut recovered_state.session_contexts) {
+                    state.session_contexts.entry(sid).or_insert(ctx);
                 }
             }
             let mut raw_fds = recovered_fds.into_raw();

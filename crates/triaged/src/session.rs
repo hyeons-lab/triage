@@ -2252,13 +2252,18 @@ impl SessionManager {
             snippet_detail: None,
             agent: None,
         };
-        let overlaid = overlay_raw_output_history(
+        let mut overlaid = overlay_raw_output_history(
             base,
             &coords.log_path,
             coords.logged_tail_bytes,
             coords.logged_output_seq,
             history_cap,
             coords.journal.as_ref(),
+        );
+        inject_active_terminal_modes(
+            &mut overlaid,
+            coords.is_alt_screen_active,
+            coords.is_mouse_grabbed,
         );
         let raw_output_end = overlaid.raw_output_start + overlaid.raw_output.len() as u64;
         Ok(build_response(
@@ -2799,6 +2804,7 @@ impl SessionManager {
 
         let mut handover_sessions = Vec::new();
         let mut fds = Vec::new();
+        let mut session_contexts = HashMap::new();
 
         // Ask everyone first, then collect. The commands go out before any waiting
         // starts, so every actor works on its answer at the same time and the whole
@@ -2884,12 +2890,16 @@ impl SessionManager {
                 Self::parked_input_for_handover(&parked, &id)
             };
 
+            if let Some(context) = ext.context {
+                session_contexts.insert(id.clone(), context);
+            }
+
             handover_sessions.push(crate::handover::HandoverSession {
                 id,
                 command: launch.command,
                 args: launch.args,
                 cwd: launch.cwd,
-                size: launch.size,
+                size: ext.size,
                 log_path: ext.log_path,
                 output_seq: ext.output_seq,
                 bytes_logged: ext.bytes_logged,
@@ -2953,6 +2963,7 @@ impl SessionManager {
             judge_history: history_records,
             pins,
             custom_labels,
+            session_contexts,
         };
 
         Ok(SerializedHandover { state, fds })
@@ -3272,7 +3283,9 @@ impl SessionManager {
                 }
             };
 
-            match self.adopt_one_session(&mut sessions, &mut h_sess, attempt_fd) {
+            let inherited_context = state.session_contexts.remove(&h_sess.id);
+            match self.adopt_one_session(&mut sessions, &mut h_sess, attempt_fd, inherited_context)
+            {
                 Ok(pending_context) => {
                     pending_contexts.push(pending_context);
                     // SAFETY: `pending.take_next` transferred sole ownership of
@@ -3368,6 +3381,7 @@ impl SessionManager {
         sessions: &mut HashMap<SessionId, ManagedSession>,
         h_sess: &mut crate::handover::HandoverSession,
         fd: std::os::unix::io::RawFd,
+        inherited_context: Option<SessionContext>,
     ) -> Result<PendingSessionContext> {
         let canonical_id = Self::original_session_id(&h_sess.id);
         if canonical_id != h_sess.id {
@@ -3409,6 +3423,7 @@ impl SessionManager {
 
         let mut runtime = spawn_adopted_pty_runtime(h_sess, fd)?;
         runtime.output.compression_tx = self.compression_tx();
+        h_sess.size = runtime.size.clone();
 
         if let Some(sequence) = generated_session_sequence(&h_sess.id) {
             self.next_session
@@ -3419,7 +3434,7 @@ impl SessionManager {
             command: h_sess.command.clone(),
             args: h_sess.args.clone(),
             cwd: h_sess.cwd.clone(),
-            size: h_sess.size.clone(),
+            size: runtime.size.clone(),
             log_path: runtime.output.log_path.clone(),
         };
 
@@ -3471,7 +3486,13 @@ impl SessionManager {
             })
             .context("spawning session actor reader thread")?;
 
+        let initial_context = inherited_context.or_else(|| match sessions.get(&h_sess.id) {
+            Some(ManagedSession::Historical { session, .. }) => session.context.clone(),
+            _ => None,
+        });
+
         let (writer_tx, writer_handle) = spawn_pty_writer(writer.clone())?;
+        let is_interactive_shell = is_interactive_shell_launch(&h_sess.command, &h_sess.args);
 
         // Owned before the `move` spawn: `h_sess` is borrowed from the adoption
         // batch and is read again after the actor starts.
@@ -3483,7 +3504,8 @@ impl SessionManager {
                     master,
                     child,
                     process_identity,
-                    writer,
+                    is_interactive_shell,
+                    _writer: writer,
                     writer_tx,
                     output,
                     size,
@@ -3491,9 +3513,11 @@ impl SessionManager {
                     output_closed: false,
                     exit_broadcasted: false,
                     current_working_directory: initial_working_directory,
-                    // Resolved off-lock by `adopt_sessions` once every session is
-                    // installed; see `PendingSessionContext`.
-                    context: None,
+                    // Seeded from the transferred or manifest context so
+                    // `list_session_contexts` is populated immediately on
+                    // reconnect, and refreshed off-lock by `adopt_sessions`
+                    // once every session is installed; see `PendingSessionContext`.
+                    context: initial_context,
                     event_session_id,
                     dirty_tx,
                     last_activity_ms: actor_last_activity_ms,
@@ -3777,11 +3801,30 @@ impl Drop for UnadoptedFds {
 }
 
 #[cfg(unix)]
+fn adopted_pty_size(fd: std::os::unix::io::RawFd, fallback: &SessionSize) -> SessionSize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        let candidate = SessionSize {
+            rows: usize::from(ws.ws_row),
+            cols: usize::from(ws.ws_col),
+            ..fallback.clone()
+        };
+        if candidate.validate().is_ok() {
+            return candidate;
+        }
+    }
+    fallback.clone()
+}
+
+#[cfg(unix)]
 fn spawn_adopted_pty_runtime(
     h_sess: &crate::handover::HandoverSession,
     fd: std::os::unix::io::RawFd,
 ) -> Result<PtyRuntime> {
     use crate::handover::{AdoptedChild, AdoptedMasterPty};
+
+    let adopted_size = adopted_pty_size(fd, &h_sess.size);
 
     // SAFETY: `UnadoptedFds::take_next` gave up its claim on this descriptor so
     // the master can own it; nothing else holds or will close it.
@@ -3794,9 +3837,9 @@ fn spawn_adopted_pty_runtime(
     let process_identity = child.process_identity();
     let child = Box::new(child);
 
-    let writer = shared_pty_writer(master.take_writer().context("taking PTY writer")?);
+    let (writer, replay_gate) = replay_gated_pty_writer();
 
-    let terminal = terminal_with_writer(&h_sess.size, writer.clone());
+    let terminal = terminal_with_writer(&adopted_size, writer.clone());
     let (target_log_path, active_segment_index, active_segment_bytes) =
         if let Some(session_dir) = resolve_segment_session_dir(&h_sess.log_path) {
             crate::storage::resolve_active_segment(&session_dir)?
@@ -3862,6 +3905,10 @@ fn spawn_adopted_pty_runtime(
         None
     } else {
         let cwd = output.replay_tail(replay_len, &replay)?;
+        let replay_writes = replay_gate.dropped_write_count();
+        let replay_flushes = replay_gate.dropped_flush_count();
+        output.terminal.advance_bytes(b"\x1b[c");
+        replay_gate.wait_for_dropped_activity_quiet_after(replay_writes, replay_flushes)?;
         output.output_seq = h_sess.output_seq;
         // The replay restored the sequences as if every byte were logged;
         // adoption must keep the outgoing daemon's persistence watermarks,
@@ -3870,12 +3917,20 @@ fn spawn_adopted_pty_runtime(
         output.logged_tail_bytes = h_sess.logged_tail_bytes().min(output.bytes_logged);
         cwd
     };
+    replay_gate.enable(master.take_writer().context("taking PTY writer")?)?;
+    let foreground_pgid = pty_foreground_pgid(fd);
     let current_working_directory = adopted_session_cwd(
         h_sess.pid,
-        pty_foreground_pgid(fd),
+        foreground_pgid,
         replayed_working_directory,
         h_sess.cwd.clone(),
     );
+    if is_interactive_shell_launch(&h_sess.command, &h_sess.args)
+        && foreground_pgid == Some(h_sess.pid)
+        && output.terminal.is_mouse_grabbed()
+    {
+        let _ = output.ingest(MOUSE_TRACKING_RESET_BYTES);
+    }
 
     Ok(PtyRuntime {
         master,
@@ -3884,7 +3939,7 @@ fn spawn_adopted_pty_runtime(
         reader,
         writer,
         output,
-        size: h_sess.size.clone(),
+        size: adopted_size,
         current_working_directory,
     })
 }
@@ -4325,7 +4380,12 @@ impl SessionApi for SessionManager {
                 }
             }
         };
-        let snapshot = request_resize(&cmd_tx, request.size)?;
+        let snapshot = request_resize(&cmd_tx, request.size.clone())?;
+        if let Ok(mut sessions) = self.sessions()
+            && let Some(ManagedSession::Live { launch, .. }) = sessions.get_mut(&request.session_id)
+        {
+            launch.size = request.size;
+        }
         Ok(self.overlay_manager_fields(snapshot, &request.session_id))
     }
 
@@ -6146,8 +6206,15 @@ fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u
         .map_or(1, |sequence| sequence.saturating_add(1))
 }
 
+const MOUSE_TRACKING_RESET_BYTES: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1005l\x1b[?1015l";
+
 fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
-    let Some(command_name) = Path::new(&persisted.command)
+    is_interactive_shell_launch(&persisted.command, &persisted.args)
+}
+
+fn is_interactive_shell_launch(command: &str, args: &[String]) -> bool {
+    let Some(command_name) = Path::new(command)
         .file_name()
         .and_then(|name| name.to_str())
     else {
@@ -6161,9 +6228,88 @@ fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
         return false;
     }
 
-    persisted.args.is_empty()
-        || matches!(persisted.args.as_slice(), [flag] if flag == "-l")
-        || is_triage_default_shell_wrapper(&persisted.args)
+    args.is_empty()
+        || matches!(args, [flag] if flag == "-l")
+        || is_triage_default_shell_wrapper(args)
+}
+
+fn contains_mouse_tracking_enable(bytes: &[u8]) -> bool {
+    find_bytes(bytes, b"\x1b[?1000h").is_some()
+        || find_bytes(bytes, b"\x1b[?1002h").is_some()
+        || find_bytes(bytes, b"\x1b[?1003h").is_some()
+}
+
+/// Parses one or more concatenated SGR (`ESC [ < Cb ; Cx ; Cy M/m`) or X10
+/// (`ESC [ M Cb Cx Cy`) mouse report sequences. Returns `Some(true)` if the
+/// entire slice consists of hover-only motion reports (no button pressed and
+/// not a wheel event), `Some(false)` if it consists of mouse reports that
+/// include at least one click/drag/wheel report, or `None` if `bytes` is not
+/// purely mouse report sequences.
+fn parse_mouse_reports(bytes: &[u8]) -> Option<bool> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let mut all_hover_motion_only = true;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"\x1b[<") {
+            i += 3;
+            let mut params = [0u32; 3];
+            for (param_idx, slot) in params.iter_mut().enumerate() {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    *slot = slot
+                        .checked_mul(10)?
+                        .checked_add((bytes[i] - b'0') as u32)?;
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                if param_idx < 2 {
+                    if i >= bytes.len() || bytes[i] != b';' {
+                        return None;
+                    }
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() || !matches!(bytes[i], b'M' | b'm') {
+                return None;
+            }
+            let final_byte = bytes[i];
+            i += 1;
+            let button = params[0];
+            let is_hover =
+                final_byte == b'M' && (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
+            if !is_hover {
+                all_hover_motion_only = false;
+            }
+        } else if bytes[i..].starts_with(b"\x1b[M") && i + 6 <= bytes.len() {
+            let cb = bytes[i + 3];
+            let cx = bytes[i + 4];
+            let cy = bytes[i + 5];
+            if cb < 32 || cx < 32 || cy < 32 {
+                return None;
+            }
+            i += 6;
+            let button = (cb - 32) as u32;
+            let is_hover = (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
+            if !is_hover {
+                all_hover_motion_only = false;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(all_hover_motion_only)
+}
+
+fn is_mouse_report_sequence(bytes: &[u8]) -> bool {
+    parse_mouse_reports(bytes).is_some()
+}
+
+fn is_mouse_motion_only_sequence(bytes: &[u8]) -> bool {
+    parse_mouse_reports(bytes) == Some(true)
 }
 
 fn is_triage_default_shell_wrapper(args: &[String]) -> bool {
@@ -6445,6 +6591,8 @@ impl HistoricalSession {
     }
 
     fn history_coordinates(&self) -> SessionHistoryCoordinates {
+        let is_alt_screen_active = self.output.terminal.is_alt_screen_active();
+        let is_mouse_grabbed = self.output.terminal.is_mouse_grabbed();
         SessionHistoryCoordinates {
             log_path: self.persisted.log_path.clone(),
             logged_tail_bytes: self.output.logged_tail_bytes,
@@ -6453,12 +6601,13 @@ impl HistoricalSession {
             size: self.size.clone(),
             exited: true,
             bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
+            is_alt_screen_active,
+            is_mouse_grabbed,
             current_working_directory: self.current_working_directory.clone(),
             context: self.context.clone(),
-            journal: self
-                .output
-                .scrollback
-                .as_ref()
+            journal: (!is_alt_screen_active)
+                .then_some(self.output.scrollback.as_ref())
+                .flatten()
                 .map(crate::scrollback::ScrollbackJournal::reader_clone),
         }
     }
@@ -6467,13 +6616,11 @@ impl HistoricalSession {
     /// client-side re-emulation. Historical sessions are only ever read on the
     /// attach/snapshot paths, so this is always history-bearing.
     fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
-        overlay_raw_output_history(
+        output_snapshot_with_history(
+            &self.output,
             self.snapshot(),
             &self.persisted.log_path,
-            self.output.logged_tail_bytes,
-            self.output.logged_output_seq,
             history_cap,
-            self.output.scrollback.as_ref(),
         )
     }
 
@@ -6590,6 +6737,7 @@ impl SessionActor {
         log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
+        let is_interactive_shell = is_interactive_shell_launch(&config.command, &config.args);
         let mut runtime = spawn_pty_runtime(config, log_initialization)?;
         runtime.output.compression_tx = compression_tx;
         let PtyRuntime {
@@ -6634,7 +6782,8 @@ impl SessionActor {
                     master,
                     child,
                     process_identity,
-                    writer,
+                    is_interactive_shell,
+                    _writer: writer,
                     writer_tx,
                     output,
                     size,
@@ -6804,7 +6953,8 @@ struct ActorState {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     process_identity: Option<crate::handover::HandoverProcessIdentity>,
-    writer: SharedPtyWriter,
+    is_interactive_shell: bool,
+    _writer: SharedPtyWriter,
     writer_tx: SyncSender<Vec<u8>>,
     output: OutputState,
     size: SessionSize,
@@ -7044,11 +7194,13 @@ pub struct ExtractedHandover {
     pub fd: std::os::unix::io::OwnedFd,
     pub pid: u32,
     pub process_identity: Option<crate::handover::HandoverProcessIdentity>,
+    pub size: SessionSize,
     pub log_path: PathBuf,
     pub output_seq: u64,
     pub bytes_logged: u64,
     pub logged_output_seq: u64,
     pub logged_tail_bytes: u64,
+    pub context: Option<SessionContext>,
 }
 
 type ActorResult<T> = Result<T>;
@@ -7159,11 +7311,13 @@ impl ActorState {
             fd: unsafe { std::os::unix::io::FromRawFd::from_raw_fd(dup_fd) },
             pid,
             process_identity: self.process_identity,
+            size: self.size.clone(),
             log_path: self.output.log_path.clone(),
             output_seq: self.output.output_seq,
             bytes_logged: self.output.bytes_logged,
             logged_output_seq: self.output.logged_output_seq,
             logged_tail_bytes: self.output.logged_tail_bytes,
+            context: self.context.clone(),
         })
     }
 
@@ -7340,6 +7494,9 @@ impl ActorState {
         if self.exited || self.output_closed {
             return;
         }
+        if self.output.terminal.is_mouse_grabbed() && self.is_root_shell_in_foreground() {
+            self.emit_mouse_tracking_reset();
+        }
         if let Some(cwd) = self.poll_child_cwd() {
             self.apply_polled_cwd(cwd);
         }
@@ -7373,6 +7530,56 @@ impl ActorState {
             return pty_foreground_pgid(fd);
         }
         None
+    }
+
+    fn root_pid(&self) -> Option<u32> {
+        self.process_identity
+            .map(|identity| identity.pid)
+            .or_else(|| self.child.process_id())
+    }
+
+    /// True when this session was launched as an interactive shell and that
+    /// root shell's process group currently owns the terminal foreground
+    /// (meaning no foreground child job such as `claude`, `vim`, or `htop` is
+    /// running).
+    fn is_root_shell_in_foreground(&self) -> bool {
+        if !self.is_interactive_shell {
+            return false;
+        }
+        let (Some(root_pid), Some(fg_pgid)) = (self.root_pid(), self.foreground_pgid()) else {
+            return false;
+        };
+        root_pid == fg_pgid
+    }
+
+    fn emit_mouse_tracking_reset(&mut self) {
+        if !self.output.terminal.is_mouse_grabbed() {
+            return;
+        }
+        if let Err(error) = self.output.ingest(MOUSE_TRACKING_RESET_BYTES) {
+            tracing::warn!(error = ?error, "failed to ingest mouse tracking reset sequence");
+            return;
+        }
+        if let Some(session_id) = self.event_session_id.clone() {
+            self.broadcast(SessionEvent::Output {
+                session_id,
+                output_seq: self.output.output_seq,
+                bytes: MOUSE_TRACKING_RESET_BYTES.to_vec(),
+            });
+        }
+    }
+
+    fn reset_stale_mouse_tracking_after_output(&mut self, bytes: &[u8]) {
+        if !self.output.terminal.is_mouse_grabbed() {
+            return;
+        }
+        let root_shell_foreground = self.is_root_shell_in_foreground();
+        let zsh_prompt_without_mouse_enable = !self.output.terminal.is_alt_screen_active()
+            && rfind_bytes(bytes, b"\x1b[?1h\x1b=\x1b[?2004h")
+                .is_some_and(|pos| !contains_mouse_tracking_enable(&bytes[pos..]));
+        if root_shell_foreground || zsh_prompt_without_mouse_enable {
+            self.emit_mouse_tracking_reset();
+        }
     }
 
     /// Refreshes only the active git branch name when the working directory is
@@ -7455,9 +7662,10 @@ impl ActorState {
                         self.broadcast(SessionEvent::Output {
                             session_id,
                             output_seq: self.output.output_seq,
-                            bytes,
+                            bytes: bytes.clone(),
                         });
                     }
+                    self.reset_stale_mouse_tracking_after_output(&bytes);
                 }
                 Err(error) => tracing::warn!(error = ?error, "failed to ingest PTY output"),
             },
@@ -7583,11 +7791,27 @@ impl ActorState {
         if self.exited {
             return;
         }
+        let mut is_hover_motion = false;
+        if is_mouse_report_sequence(&bytes) {
+            if self.is_root_shell_in_foreground() {
+                if self.output.terminal.is_mouse_grabbed() {
+                    self.emit_mouse_tracking_reset();
+                }
+                return;
+            }
+            is_hover_motion = is_mouse_motion_only_sequence(&bytes);
+            if is_hover_motion && !self.output.terminal.is_alt_screen_active() {
+                return;
+            }
+        }
         // Stamped before the send, like the output stamp in `handle_output`:
         // this is the interaction recency the rail orders by, and a dropped
-        // write still means the user was here.
-        self.last_input_ms
-            .store(now_unix_millis(), Ordering::Relaxed);
+        // write still means the user was here. Passive mouse hover motion does
+        // not count as deliberate user input recency.
+        if !is_hover_motion {
+            self.last_input_ms
+                .store(now_unix_millis(), Ordering::Relaxed);
+        }
         if let Err(err) = self.writer_tx.try_send(bytes) {
             match err {
                 TrySendError::Full(_) => {
@@ -7608,10 +7832,22 @@ impl ActorState {
 
     fn resize(&mut self, size: SessionSize) -> Result<SessionSnapshot> {
         size.validate()?;
-        self.master
-            .resize(pty_size(&size))
-            .context("resizing PTY")?;
-        self.output.reflow_from_log(&size, self.writer.clone())?;
+        if size.cols != self.size.cols
+            || size.rows != self.size.rows
+            || size.pixel_width != self.size.pixel_width
+            || size.pixel_height != self.size.pixel_height
+        {
+            self.master
+                .resize(pty_size(&size))
+                .context("resizing PTY")?;
+        }
+        // `wezterm_term::Terminal::resize` rewraps soft-wrapped lines in place on
+        // the primary screen (`Screen::rewrap_lines`) and resizes the alternate
+        // screen in memory without reading or re-emulating the 16 MiB session log.
+        self.output.terminal.resize(terminal_size(&size));
+        if size.cols != self.size.cols {
+            self.output.scroll_seq_baseline = None;
+        }
         self.size = size;
         let snapshot = self.snapshot();
         if let Some(session_id) = self.event_session_id.clone() {
@@ -7644,6 +7880,8 @@ impl ActorState {
     }
 
     fn history_coordinates(&self) -> SessionHistoryCoordinates {
+        let is_alt_screen_active = self.output.terminal.is_alt_screen_active();
+        let is_mouse_grabbed = self.output.terminal.is_mouse_grabbed();
         SessionHistoryCoordinates {
             log_path: self.output.log_path.clone(),
             logged_tail_bytes: self.output.logged_tail_bytes,
@@ -7652,12 +7890,13 @@ impl ActorState {
             size: self.size.clone(),
             exited: self.exited,
             bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
+            is_alt_screen_active,
+            is_mouse_grabbed,
             current_working_directory: self.current_working_directory.clone(),
             context: self.context.clone(),
-            journal: self
-                .output
-                .scrollback
-                .as_ref()
+            journal: (!is_alt_screen_active)
+                .then_some(self.output.scrollback.as_ref())
+                .flatten()
                 .map(crate::scrollback::ScrollbackJournal::reader_clone),
         }
     }
@@ -7669,13 +7908,11 @@ impl ActorState {
     /// for the local TUI), and 1 KiB lease/metadata probes use
     /// [`Self::metadata_snapshot`].
     fn snapshot_with_history(&self, history_cap: u64) -> SessionSnapshot {
-        overlay_raw_output_history(
+        output_snapshot_with_history(
+            &self.output,
             self.snapshot(),
             &self.output.log_path,
-            self.output.logged_tail_bytes,
-            self.output.logged_output_seq,
             history_cap,
-            self.output.scrollback.as_ref(),
         )
     }
 
@@ -7952,7 +8189,12 @@ impl ActorState {
 const MAX_CARRY_ESCAPE_LEN: usize = 32;
 
 fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
-    let Some(rest) = slice.strip_prefix(b"\x1b[") else {
+    let skipped = slice.iter().take_while(|&&b| b == b'\n').count();
+    let after_lf = &slice[skipped..];
+    if after_lf.starts_with(b"\x08") || after_lf.starts_with(b"\x1b[?2026l") {
+        return true;
+    }
+    let Some(rest) = after_lf.strip_prefix(b"\x1b[") else {
         return false;
     };
     if rest.is_empty() || matches!(rest[0], b'?' | b'>' | b'<' | b'=') {
@@ -7962,11 +8204,12 @@ fn is_followed_by_relative_cursor_movement(slice: &[u8]) -> bool {
         .iter()
         .take_while(|&&b| b.is_ascii_digit() || b == b';')
         .count();
-    matches!(rest.get(param_len), Some(b'D' | b'C'))
+    matches!(rest.get(param_len), Some(b'A' | b'B' | b'C' | b'D' | b'Z'))
 }
 
-/// True if `slice` begins with `\x1b` or `\x1b[<digits;]*` but has not yet
-/// received its terminating command character.
+/// True if `slice` begins with `\x1b` or `\x1b[<digits;]*` (or a partial
+/// `\x1b[?2026l` synchronized-output footer) but has not yet received its
+/// terminating command character.
 ///
 /// The length is bounded to at most [`MAX_CARRY_ESCAPE_LEN`] bytes to avoid holding back arbitrarily
 /// long data streams if an invalid or non-standard sequence is encountered.
@@ -7980,8 +8223,13 @@ fn is_partial_relative_cursor_prefix(slice: &[u8]) -> bool {
     if slice[1] != b'[' {
         return false;
     }
-    if slice.len() >= 3 && matches!(slice[2], b'?' | b'>' | b'<' | b'=') {
-        return false;
+    if slice.len() >= 3 {
+        if slice[2] == b'?' {
+            return b"?2026l".starts_with(&slice[2..]) && slice.len() < 8;
+        }
+        if matches!(slice[2], b'>' | b'<' | b'=') {
+            return false;
+        }
     }
     let mut i = 2;
     while i < slice.len() && (slice[i].is_ascii_digit() || slice[i] == b';') {
@@ -7996,10 +8244,17 @@ fn find_trailing_partial_relative_cursor_split(input: &[u8], pending_cr: bool) -
         if input[i] == 0x1b {
             let slice = &input[i..];
             if is_partial_relative_cursor_prefix(slice) {
-                if i > 0 && input[i - 1] == b'\n' {
-                    let preceded_by_cr = (i > 1 && input[i - 2] == b'\r') || (i == 1 && pending_cr);
+                let mut lf_run_start = i;
+                while lf_run_start > 0 && input[lf_run_start - 1] == b'\n' {
+                    lf_run_start -= 1;
+                }
+                if lf_run_start < i {
+                    let preceded_by_cr = (lf_run_start > 0 && input[lf_run_start - 1] == b'\r')
+                        || (lf_run_start == 0 && pending_cr);
                     if !preceded_by_cr {
-                        return i - 1;
+                        return lf_run_start;
+                    } else if i - lf_run_start > 1 {
+                        return lf_run_start + 1;
                     }
                 }
                 return i;
@@ -8058,6 +8313,72 @@ enum CacheReseedOutcome {
     Seeded,
     Inapplicable,
     RetryLater,
+}
+
+fn trim_incomplete_utf8_tail(bytes: &[u8]) -> &[u8] {
+    let len = bytes.len();
+    if len == 0 {
+        return bytes;
+    }
+    let start_limit = len.saturating_sub(4);
+    for start in (start_limit..len).rev() {
+        let b = bytes[start];
+        let expected_len = if b < 0x80 {
+            1
+        } else if (0xC2..=0xDF).contains(&b) {
+            2
+        } else if (0xE0..=0xEF).contains(&b) {
+            3
+        } else if (0xF0..=0xF4).contains(&b) {
+            4
+        } else {
+            continue;
+        };
+        let available = len - start;
+        if available >= expected_len {
+            return bytes;
+        }
+        if bytes[start + 1..]
+            .iter()
+            .all(|&c| (0x80..=0xBF).contains(&c))
+        {
+            return &bytes[..start];
+        }
+        return bytes;
+    }
+    bytes
+}
+
+fn trim_incomplete_replay_tail(bytes: &[u8]) -> &[u8] {
+    let bytes = trim_incomplete_utf8_tail(bytes);
+    let check_start = bytes.len().saturating_sub(MAX_CARRY_ESCAPE_LEN);
+    for esc_idx in (check_start..bytes.len()).rev() {
+        if bytes[esc_idx] != 0x1b {
+            continue;
+        }
+        let tail = &bytes[esc_idx..];
+        if tail.len() == 1 {
+            return &bytes[..esc_idx];
+        }
+        match tail[1] {
+            b'[' => {
+                if tail[2..].iter().all(|&b| (0x20..=0x3F).contains(&b)) {
+                    return &bytes[..esc_idx];
+                }
+            }
+            b']' | b'P' | b'_' | b'^' | b'X' => {
+                if find_osc_terminator(tail).is_none() {
+                    return &bytes[..esc_idx];
+                }
+            }
+            0x20..=0x2F if tail[2..].iter().all(|&b| (0x20..=0x2F).contains(&b)) => {
+                return &bytes[..esc_idx];
+            }
+            _ => {}
+        }
+        break;
+    }
+    bytes
 }
 
 impl OutputState {
@@ -8676,7 +8997,7 @@ impl OutputState {
                 self.log_cache = None;
             }
         }
-        let cwd = self.advance_replayed_bytes(bytes);
+        let cwd = self.advance_replayed_bytes(trim_incomplete_replay_tail(bytes));
         self.flush_replayed_pending_translated_bytes();
         Ok(cwd)
     }
@@ -8705,14 +9026,17 @@ impl OutputState {
         Ok(current_working_directory)
     }
 
+    #[cfg(test)]
     fn reflow_from_log(&mut self, size: &SessionSize, writer: SharedPtyWriter) -> Result<()> {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
         self.scroll_seq_baseline = None;
         self.cwd_sequence_buffer.clear();
+        self.pending_carriage_return = false;
+        self.pending_escape_buffer.clear();
 
         if let Some(cache) = self.log_cache.clone() {
-            self.advance_replayed_bytes(&cache);
+            self.advance_replayed_bytes(trim_incomplete_replay_tail(&cache));
         } else {
             self.log
                 .flush()
@@ -8721,7 +9045,7 @@ impl OutputState {
             // agree on how much of a log a replay covers. Trimming keeps logs
             // within `REPLAY_TAIL_CAP`, so this is normally the whole file.
             let (_, replay) = read_replay_tail(&self.log_path)?;
-            self.advance_replayed_bytes(&replay);
+            self.advance_replayed_bytes(trim_incomplete_replay_tail(&replay));
         }
         self.flush_replayed_pending_translated_bytes();
 
@@ -8747,26 +9071,32 @@ impl OutputState {
             self.cwd_sequence_buffer.extend_from_slice(bytes);
         }
         let mut current_working_directory = None;
+        let mut cursor = 0usize;
 
-        while let Some(start) = find_bytes(&self.cwd_sequence_buffer, b"\x1b]7;file://") {
-            if start > 0 {
-                self.cwd_sequence_buffer.drain(..start);
-            }
-
-            let Some(terminator) = find_osc_terminator(&self.cwd_sequence_buffer) else {
+        while let Some(rel_start) =
+            find_bytes(&self.cwd_sequence_buffer[cursor..], b"\x1b]7;file://")
+        {
+            let start = cursor + rel_start;
+            let slice = &self.cwd_sequence_buffer[start..];
+            let Some(terminator) = find_osc_terminator(slice) else {
+                cursor = start;
                 break;
             };
-            let payload = &self.cwd_sequence_buffer[b"\x1b]7;file://".len()..terminator];
+            let payload = &slice[b"\x1b]7;file://".len()..terminator];
             if let Some(path) = cwd_from_osc7_payload(payload) {
                 current_working_directory = Some(path);
             }
 
-            let drain_to = if self.cwd_sequence_buffer[terminator] == 0x07 {
+            let drain_to = if slice[terminator] == 0x07 {
                 terminator + 1
             } else {
                 terminator + 2
             };
-            self.cwd_sequence_buffer.drain(..drain_to);
+            cursor = start + drain_to;
+        }
+
+        if cursor > 0 {
+            self.cwd_sequence_buffer.drain(..cursor);
         }
 
         if !self.cwd_sequence_buffer.is_empty()
@@ -9010,6 +9340,11 @@ fn spawn_pty_runtime(
             } else {
                 output.replay_tail(replay_len, &replay)?
             };
+            if is_interactive_shell_launch(&config.command, &config.args)
+                && output.terminal.is_mouse_grabbed()
+            {
+                let _ = output.ingest(MOUSE_TRACKING_RESET_BYTES);
+            }
             let current_working_directory =
                 restorable_cwd(replayed_working_directory, config.cwd.clone());
             let replay_writes = replay_gate.dropped_write_count();
@@ -9255,6 +9590,8 @@ struct SessionHistoryCoordinates {
     size: SessionSize,
     exited: bool,
     bracketed_paste_enabled: bool,
+    is_alt_screen_active: bool,
+    is_mouse_grabbed: bool,
     current_working_directory: Option<PathBuf>,
     context: Option<SessionContext>,
     journal: Option<crate::scrollback::ScrollbackJournal>,
@@ -9418,6 +9755,52 @@ fn overlay_raw_output_history(
         return snapshot;
     }
     snapshot.raw_output_prefix = prefix;
+    snapshot
+}
+
+fn inject_active_terminal_modes(snapshot: &mut SessionSnapshot, is_alt: bool, is_mouse: bool) {
+    if !is_alt && !is_mouse {
+        return;
+    }
+    let mut mode_bytes = Vec::new();
+    if is_alt {
+        mode_bytes.extend_from_slice(b"\x1b[?1049h");
+    }
+    if is_mouse {
+        mode_bytes.extend_from_slice(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+    }
+    if snapshot.raw_output_prefix.is_empty() {
+        if is_alt || !snapshot.raw_output.contains(&b'\n') {
+            snapshot.raw_output_prefix = mode_bytes;
+        }
+    } else if snapshot.raw_output_prefix.ends_with(b"\r\n") {
+        let cut = snapshot.raw_output_prefix.len() - 2;
+        snapshot
+            .raw_output_prefix
+            .splice(cut..cut, mode_bytes.iter().copied());
+    } else {
+        snapshot.raw_output_prefix.extend_from_slice(&mode_bytes);
+    }
+}
+
+fn output_snapshot_with_history(
+    output: &OutputState,
+    snapshot: SessionSnapshot,
+    log_path: &Path,
+    history_cap: u64,
+) -> SessionSnapshot {
+    let is_alt = output.terminal.is_alt_screen_active();
+    let is_mouse = output.terminal.is_mouse_grabbed();
+    let scrollback = (!is_alt).then_some(output.scrollback.as_ref()).flatten();
+    let mut snapshot = overlay_raw_output_history(
+        snapshot,
+        log_path,
+        output.logged_tail_bytes,
+        output.logged_output_seq,
+        history_cap,
+        scrollback,
+    );
+    inject_active_terminal_modes(&mut snapshot, is_alt, is_mouse);
     snapshot
 }
 
@@ -10154,10 +10537,12 @@ struct ReplayGateWriter {
     state: Arc<ReplayGateState>,
 }
 
+#[cfg(test)]
 struct SharedPtyWriterProxy {
     writer: SharedPtyWriter,
 }
 
+#[cfg(test)]
 impl Write for SharedPtyWriterProxy {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.writer
@@ -10750,6 +11135,12 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 fn find_osc_terminator(bytes: &[u8]) -> Option<usize> {
@@ -18579,11 +18970,13 @@ mod tests {
                         fd: unsafe { std::os::unix::io::OwnedFd::from_raw_fd(file.into_raw_fd()) },
                         pid: std::process::id(),
                         process_identity: None,
+                        size: SessionSize::default(),
                         log_path: probe,
                         output_seq: 7,
                         bytes_logged: 11,
                         logged_output_seq: 7,
                         logged_tail_bytes: 11,
+                        context: None,
                     }));
                 })
             })
@@ -20203,7 +20596,7 @@ mod tests {
             master,
             child,
             process_identity,
-            writer,
+            _writer: writer,
             writer_tx,
             output,
             size,
@@ -20212,6 +20605,7 @@ mod tests {
             exit_broadcasted: false,
             current_working_directory,
             context: None,
+            is_interactive_shell: false,
             event_session_id: Some(SessionId::new("session-exit-race").expect("session id")),
             dirty_tx: None,
             last_activity_ms: Arc::new(AtomicU64::new(1)),
@@ -21060,5 +21454,305 @@ mod tests {
             .expect("shutdown session");
         let _ = std::fs::remove_dir_all(&log_dir);
         let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn mouse_report_parser_classifies_sgr_x10_and_keyboard_sequences() {
+        assert!(is_mouse_report_sequence(b"\x1b[<0;61;459M\x1b[<0;61;459m"));
+        assert!(!is_mouse_motion_only_sequence(
+            b"\x1b[<0;61;459M\x1b[<0;61;459m"
+        ));
+
+        assert!(is_mouse_report_sequence(
+            b"\x1b[<35;55;29M\x1b[<35;54;29M\x1b[<35;54;30M"
+        ));
+        assert!(is_mouse_motion_only_sequence(
+            b"\x1b[<35;55;29M\x1b[<35;54;29M\x1b[<35;54;30M"
+        ));
+        assert!(is_mouse_report_sequence(b"\x1b[<35;55;29m"));
+        assert!(!is_mouse_motion_only_sequence(b"\x1b[<35;55;29m"));
+
+        assert!(is_mouse_report_sequence(b"\x1b[<32;55;29M"));
+        assert!(!is_mouse_motion_only_sequence(b"\x1b[<32;55;29M"));
+
+        assert!(is_mouse_report_sequence(b"\x1b[<64;55;29M"));
+        assert!(!is_mouse_motion_only_sequence(b"\x1b[<64;55;29M"));
+
+        assert!(is_mouse_report_sequence(b"\x1b[M !#"));
+        assert!(!is_mouse_motion_only_sequence(b"\x1b[M !#"));
+
+        assert!(is_mouse_report_sequence(b"\x1b[MC!#"));
+        assert!(is_mouse_motion_only_sequence(b"\x1b[MC!#"));
+
+        assert!(!is_mouse_report_sequence(b""));
+        assert!(!is_mouse_report_sequence(b"ls -la\n"));
+        assert!(!is_mouse_report_sequence(b"\x1b[A"));
+        assert!(!is_mouse_report_sequence(b"\x1b[1;5A"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_adopted_pty_runtime_gates_replay_terminal_query_responses() {
+        let temp = unique_log_dir();
+        let session_dir = temp.join("sessions").join("session-adopted-queries");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        let seg1 = session_dir.join("segment-000001.tlog");
+        let historical_queries = b"\x1b[>q\x1b[?2026$p\x1b[16t\x1b[?1016$p\x1b[c";
+        std::fs::write(&seg1, historical_queries).expect("write segment");
+
+        let h_sess = crate::handover::HandoverSession {
+            id: SessionId::new("session-adopted-queries").unwrap(),
+            command: "/bin/sh".into(),
+            args: vec!["-lc".into(), "exec \"${SHELL:-/bin/sh}\"".into()],
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: seg1,
+            output_seq: 5,
+            bytes_logged: historical_queries.len() as u64,
+            logged_output_seq: Some(5),
+            logged_tail_bytes: Some(historical_queries.len() as u64),
+            last_activity_ms: 0,
+            last_input_ms: 0,
+            pid: std::process::id(),
+            process_identity: None,
+            judge_override: None,
+            lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
+            agent: None,
+        };
+
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        let ret = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(ret, 0, "openpty failed");
+        unsafe {
+            let flags = libc::fcntl(slave, libc::F_GETFL);
+            libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        let _runtime = spawn_adopted_pty_runtime(&h_sess, master).expect("spawn adopted");
+
+        let mut leaked = [0u8; 256];
+        let n = unsafe { libc::read(slave, leaked.as_mut_ptr().cast(), leaked.len()) };
+        unsafe {
+            libc::close(slave);
+        }
+        assert!(
+            n <= 0,
+            "adopted replay must not leak terminal query replies into the live PTY slave, got {:?}",
+            String::from_utf8_lossy(&leaked[..n.max(0) as usize])
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_prompt_on_main_screen_clears_stale_child_mouse_tracking() {
+        let log_dir = unique_log_dir();
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("session-stale-mouse.log");
+
+        let config = SessionConfig {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1006h'; \
+                 printf '\\033[?1h\\033=\\033[?2004hprompt> '; \
+                 sleep 5"
+                    .into(),
+            ],
+            cwd: None,
+            size: SessionSize::default(),
+            log_path: log_path.clone(),
+            session_id: Some(SessionId::new("session-stale-mouse").unwrap()),
+        };
+
+        let actor = SessionActor::spawn(config).expect("spawn actor");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut reset_logged = false;
+        while Instant::now() < deadline {
+            if let Ok(bytes) = std::fs::read(&log_path)
+                && find_bytes(&bytes, MOUSE_TRACKING_RESET_BYTES).is_some()
+            {
+                reset_logged = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = actor.shutdown();
+        let _ = std::fs::remove_dir_all(&log_dir);
+        assert!(
+            reset_logged,
+            "expected main-screen zsh prompt sequence to emit and log MOUSE_TRACKING_RESET_BYTES"
+        );
+    }
+
+    #[test]
+    fn newline_translation_preserves_multi_lf_and_cbt_relative_movements() {
+        assert_eq!(
+            translate_newlines_with_state(b"Row 1\n\n\x1b[24DRow 3\n\x1b[3Z", false).as_ref(),
+            b"Row 1\n\n\x1b[24DRow 3\n\x1b[3Z"
+        );
+        assert_eq!(
+            find_trailing_partial_relative_cursor_split(b"Row 1\n\n\x1b[24", false),
+            5
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handover_preserves_resized_pty_dimensions() {
+        let temp = unique_log_dir();
+        let session_dir = temp.join("sessions").join("session-handover-size");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        let log_path = session_dir.join("segment-000001.tlog");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"012345678901234567890123456789\r\n");
+        for idx in 0..6 {
+            payload.extend_from_slice(format!("row-{idx}\r\n").as_bytes());
+        }
+        std::fs::write(&log_path, &payload).expect("write log");
+
+        let h_sess = crate::handover::HandoverSession {
+            id: SessionId::new("session-handover-size").unwrap(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "cat".into()],
+            cwd: None,
+            size: SessionSize {
+                rows: 4,
+                cols: 20,
+                ..SessionSize::default()
+            },
+            log_path: log_path.clone(),
+            output_seq: 1,
+            bytes_logged: payload.len() as u64,
+            logged_output_seq: Some(1),
+            logged_tail_bytes: Some(payload.len() as u64),
+            last_activity_ms: 0,
+            last_input_ms: 0,
+            pid: std::process::id(),
+            process_identity: None,
+            judge_override: None,
+            lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
+            agent: None,
+        };
+
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let ws = libc::winsize {
+            ws_row: 4,
+            ws_col: 40,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let ret = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &ws as *const libc::winsize as *mut libc::winsize,
+            )
+        };
+        assert_eq!(ret, 0, "openpty failed");
+
+        let runtime = spawn_adopted_pty_runtime(&h_sess, master).expect("spawn adopted");
+        unsafe {
+            libc::close(slave);
+        }
+
+        assert_eq!(
+            runtime.size,
+            SessionSize {
+                rows: 4,
+                cols: 40,
+                ..SessionSize::default()
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn output_snapshot_with_history_injects_active_alt_screen_and_mouse_modes() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 4,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size.clone());
+        output
+            .ingest(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h")
+            .expect("enter alt and mouse");
+        output
+            .ingest(b"\x1b[Halt-frame-0123456789")
+            .expect("write alt frame");
+
+        let base = snapshot_from_output(&output, &size, None, None, false);
+        // Request a small history_cap that only covers the trailing frame,
+        // dropping the startup `\x1b[?1049h\x1b[?1000h\x1b[?1006h` from `raw_output`.
+        let snap = output_snapshot_with_history(&output, base, &path, 16);
+        assert!(snap.raw_output_start > 0);
+        assert_eq!(
+            snap.raw_output_prefix,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reflow_from_log_trims_trailing_incomplete_utf8_and_escape_without_hanging() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 4,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size.clone());
+        // Write a valid UTF-8 box-drawing rune (`─`, \xe2\x94\x80) followed by
+        // an incomplete 2-byte prefix (\xe2\x94) of the next `─`.
+        output
+            .ingest(b"rule:\xe2\x94\x80\xe2\x94")
+            .expect("ingest incomplete utf8");
+        output
+            .reflow_from_log(&size, shared_pty_writer(Box::new(std::io::sink())))
+            .expect("reflow should not time out on incomplete utf8");
+        let rows = visible_rows(&output.terminal);
+        assert!(
+            !rows.iter().any(|r| r.contains("[c")),
+            "DA1 sentinel must not leak as literal [c: {rows:?}"
+        );
+
+        // Also test trailing incomplete CSI sequence (\x1b[38;2;).
+        output
+            .ingest(b"\x80\r\nnext\x1b[38;2;")
+            .expect("ingest incomplete csi");
+        output
+            .reflow_from_log(&size, shared_pty_writer(Box::new(std::io::sink())))
+            .expect("reflow should not time out on incomplete csi");
+        let rows_after_csi = visible_rows(&output.terminal);
+        assert!(
+            !rows_after_csi.iter().any(|r| r.contains("[c")),
+            "DA1 sentinel must not leak after incomplete CSI: {rows_after_csi:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

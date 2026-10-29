@@ -9,6 +9,7 @@ import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/widgets/terminal_pane.dart'
     show TerminalController;
+import 'package:xterm/xterm.dart' as xt;
 
 /// Records every sink op in order so tests assert on the *single ordered write
 /// path* the reducer is supposed to produce.
@@ -2779,6 +2780,32 @@ void main() {
   );
 
   test(
+    'strips Kitty keyboard protocol CSI u sequences so xterm does not restoreCursor to (0,0)',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      store.dispatch(
+        LiveBytes(
+          b(
+            'line 1\r\nline 2: \x1b[?u\x1b[>1u\x1b[=1u\x1b[<1u\x1b[<u\x1b[1uok',
+          ),
+          outputSeq: 1,
+        ),
+      );
+      expect(sink.written.toString(), 'line 1\r\nline 2: ok');
+
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(80, 24);
+      writeToXterm(term, sink.written.toString());
+      expect(term.buffer.cursorY, 1);
+      expect(term.buffer.lines[0].toString().trim(), 'line 1');
+      expect(term.buffer.lines[1].toString().trim(), 'line 2: ok');
+    },
+  );
+
+  test(
     'trimmed history does not leak synthetic reset prefix into retained raw byte coordinates',
     () {
       store.dispatch(const Attach());
@@ -2965,6 +2992,197 @@ void main() {
         sink.written.toString(),
         'older-slice\r\npre-restart\r\nold-epoch-501\r\nnew-epoch-1\r\nnew-epoch-2\r\n',
       );
+    },
+  );
+
+  test(
+    'writeToXterm emulates CBT (CSI Ps Z) so prompt and multi-line redraws do not wrap and overwrite upper lines',
+    () {
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(62, 19);
+
+      // Simulate the prompt-box redraw emitted by agy on typing the first word:
+      // write "> create" (to col 8), move down 2 rows and tab to col 27 for the
+      // status bar, then move up 2 rows (\x1b[2A) and back 3 tab stops (\x1b[3Z)
+      // to return to col 8 before typing " a worktree".
+      writeToXterm(
+        term,
+        '> create\n\n\t\t \x1b[1K \x1b[32ma\x1b[m\x1b[2A\x1b[3Z',
+      );
+      expect(term.buffer.cursorY, 0);
+      expect(term.buffer.cursorX, 8);
+
+      writeToXterm(term, ' a worktree');
+      expect(term.buffer.cursorY, 0);
+      expect(
+        term.buffer.lines[0].toString().trimRight(),
+        '> create a worktree',
+      );
+    },
+  );
+
+  test(
+    'multi-LF relative cursor movements and CBT preserve bare LFs across chunks',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const HistoryBytes([], cols: 80, rows: 24));
+      sink.ops.clear();
+
+      store.dispatch(LiveBytes(b('Row 1\n\n\x1b[24DRow 3\n\x1b[3Z')));
+      expect(sink.written.toString(), 'Row 1\n\n\x1b[24DRow 3\n\x1b[3Z');
+
+      sink.written.clear();
+      store.dispatch(LiveBytes(b('Split\n\n\x1b[2')));
+      store.dispatch(LiveBytes(b('4DNext')));
+      expect(sink.written.toString(), 'Split\n\n\x1b[24DNext');
+    },
+  );
+
+  test(
+    'trimHistoryTailWithOffset ignores newlines inside Mode 2026 spinner frames and avoids mid-frame cuts',
+    () {
+      final prefixLines = List.generate(
+        5,
+        (i) => '\x1b[0mscrollback-line-$i\r\n',
+      ).join();
+      final spinnerFrame =
+          '\x1b[?2026h\r\x1b[3ARunning command...\n\n\n\x1b[17D\x1b[?2026l';
+      final spinnerStream = List.filled(20, spinnerFrame).join();
+      final combined = b('$prefixLines$spinnerStream');
+
+      // 20 spinner frames contain 60 LFs inside Mode 2026 blocks; maxLines: 10
+      // must ignore those in-place redraw LFs and retain all 5 scrollback lines.
+      final trimmed = trimHistoryTailWithOffset(
+        combined,
+        maxLines: 10,
+        maxBytes: 65536,
+      );
+      expect(trimmed.droppedBytes, 0);
+      expect(
+        utf8.decode(trimmed.bytes),
+        startsWith('\x1b[0mscrollback-line-0'),
+      );
+
+      // When maxBytes forces a cut inside a Mode 2026 block, start advances past
+      // the closing \x1b[?2026l so orphan LFs are never replayed without \x1b[3A.
+      final byteCut = trimHistoryTailWithOffset(
+        b(spinnerStream),
+        maxLines: 1000,
+        maxBytes: spinnerFrame.length * 3 + 15,
+      );
+      final decodedCut = utf8.decode(byteCut.bytes);
+      expect(decodedCut, startsWith('\x1b[0m\x1b[?2026h'));
+
+      // When a large Mode 2026 conversation repaint opened before the window
+      // boundary (so only the closing \x1b[?2026l is present in the window),
+      // real scrolled lines before \x1b[?2026l must still be counted and kept.
+      final repaintTail =
+          '${List.generate(10, (i) => 'repaint-line-$i\r\n').join()}\x1b[?2026l';
+      final trimmedRepaint = trimHistoryTailWithOffset(
+        b('$prefixLines$repaintTail'),
+        maxLines: 12,
+        maxBytes: 65536,
+      );
+      final decodedRepaint = utf8.decode(trimmedRepaint.bytes);
+      expect(decodedRepaint, contains('repaint-line-0'));
+      expect(decodedRepaint, contains('scrollback-line-4'));
+    },
+  );
+
+  test(
+    'split history with rawOutputViewport pushes prefix into scrollback without raw_output cursor overwrite',
+    () {
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(40, 4);
+
+      final prefix = List.generate(6, (i) => '\x1b[0mprefix-row-$i\r\n').join();
+      // Raw tail uses cursor-up + erase-in-display that would overwrite the
+      // last 3 rows of prefix if replayed directly after prefix.
+      final rawTail = '\x1b[3A\x1b[Jcorrupted-by-raw-tail';
+      final viewport =
+          '\x1b[?7l\x1b[0mvis-0\x1b[0m\r\n\x1b[0mvis-1\x1b[0m\r\n'
+          '\x1b[0mvis-2\x1b[0m\r\n\x1b[0mvis-3\x1b[0m\x1b[?7h\x1b[4;6H\x1b[?25h';
+
+      store.dispatch(const Resize(40, 4));
+      store.dispatch(const Attach());
+      store.dispatch(
+        HistoryBytes(
+          b(rawTail),
+          cols: 40,
+          rows: 4,
+          throughOutputSeq: 5,
+          rawOutputStart: 500,
+          rawOutputPrefix: b(prefix),
+          rawOutputViewport: b(viewport),
+        ),
+      );
+
+      writeToXterm(term, sink.written.toString());
+      expect(term.buffer.lines.length, 10);
+      for (var i = 0; i < 6; i++) {
+        expect(term.buffer.lines[i].toString().trimRight(), 'prefix-row-$i');
+      }
+      for (var i = 0; i < 4; i++) {
+        expect(term.buffer.lines[6 + i].toString().trimRight(), 'vis-$i');
+      }
+
+      // Subsequent backward history page (e.g. via HTTP /api/sessions/{id}/history)
+      // omits styled_rows (rawOutputViewport is empty). The store must preserve
+      // the retained viewport across Attach(preservePendingLive: true) so the
+      // bottom viewport is not overwritten by cursor-addressed raw_output.
+      final widerPrefix = List.generate(
+        10,
+        (i) => '\x1b[0mprefix-row-$i\r\n',
+      ).join();
+      sink.written.clear();
+      store.dispatch(const Attach(preservePendingLive: true));
+      store.dispatch(
+        HistoryBytes(
+          b(rawTail),
+          cols: 40,
+          rows: 4,
+          throughOutputSeq: 5,
+          rawOutputStart: 400,
+          rawOutputPrefix: b(widerPrefix),
+        ),
+      );
+
+      final pagedTerm = xt.Terminal(maxLines: 100);
+      pagedTerm.resize(40, 4);
+      writeToXterm(pagedTerm, sink.written.toString());
+      expect(pagedTerm.buffer.lines.length, 14);
+      for (var i = 0; i < 10; i++) {
+        expect(
+          pagedTerm.buffer.lines[i].toString().trimRight(),
+          'prefix-row-$i',
+        );
+      }
+      for (var i = 0; i < 4; i++) {
+        expect(pagedTerm.buffer.lines[10 + i].toString().trimRight(), 'vis-$i');
+      }
+    },
+  );
+
+  test(
+    'writeToXterm emulates CHT and clamps oversized counts to viewport width',
+    () {
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(40, 4);
+
+      writeToXterm(term, 'ab\x1b[2Icd');
+      expect(term.buffer.cursorX, 18);
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(0)), 'a');
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(1)), 'b');
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(16)), 'c');
+      expect(String.fromCharCode(term.buffer.lines[0].getCodePoint(17)), 'd');
+
+      // An oversized CHT count must complete immediately and clamp at the
+      // right margin rather than spinning millions of iterations.
+      final sw = Stopwatch()..start();
+      writeToXterm(term, '\r\x1b[999999I');
+      sw.stop();
+      expect(term.buffer.cursorX, 39);
+      expect(sw.elapsedMilliseconds, lessThan(200));
     },
   );
 }
