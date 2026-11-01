@@ -51,15 +51,18 @@ on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 ## Available Tools
 
 The observation tools are **read-only**: they never spawn sessions, write
-input, or otherwise mutate the daemon. The messaging tools are the exception:
-they queue and acknowledge coordination mail between sessions, but still
-cannot drive a terminal.
+input, or otherwise mutate the daemon. The messaging tools queue, wait for, and
+acknowledge coordination mail between sessions; when `send_session_message` is
+called with `wake: true`, the daemon can also send a single-line inbox check
+nudge to an idle agent session so cross-session delegation does not require
+manual user prompting.
 
 | Tool | Arguments | Returns |
 | ---- | --------- | ------- |
-| `list_sessions` | — | Every daemon-owned session, each with its custom label (if set) and current snapshot. |
+| `list_sessions` | none | Every daemon-owned session, each with its custom label (if set) and current snapshot. |
 | `snapshot_session` | `session_id` | The current daemon snapshot for one session. |
 | `styled_rows` | `session_id`, `start`, `end` | Styled cells for a visible row range (`start` inclusive, `end` exclusive). |
-| `send_session_message` | `from_session_id`, `to_session_id`, `body` | The queued message's id. |
+| `send_session_message` | `from_session_id`, `to_session_id`, `body`, `wake` (optional) | `{message_id, woke}`. When `wake: true`, wakes a blocked `wait_for_session_message` call or nudges an idle agent prompt to check its inbox. |
 | `receive_session_messages` | `session_id` | Unacked inbox mail, oldest first. Unacked mail is returned again on the next call. |
+| `wait_for_session_message` | `session_id`, `timeout_ms` (optional, default 30000, max 300000) | Blocks until unacked inbox mail is available or `timeout_ms` elapses, then returns the unacked messages (`[]` on timeout). |
 | `ack_session_messages` | `session_id`, `message_ids` | `{ok: true}`. Unknown ids are ignored. |

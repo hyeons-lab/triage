@@ -12,6 +12,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,13 +33,15 @@ use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputControllerKind,
     InputLeaseRequest, InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest,
-    RestoreSessionRequest, SessionApi, SessionContext, SessionContextRow, SessionEvent,
-    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionPins,
-    SessionSize, SessionSnapshot, StartSessionRequest, StyledRow, StyledRowsRequest,
-    StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest, TerminalColor, TerminalCursor,
-    TerminalStyle, WriteInputRequest,
+    RestoreSessionRequest, SendSessionMessageRequest, SendSessionMessageResponse, SessionApi,
+    SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope, SessionEventReceiver,
+    SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot, StartSessionRequest,
+    StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest,
+    TerminalColor, TerminalCursor, TerminalStyle, WaitForSessionMessagesRequest, WriteInputRequest,
 };
-use triage_core::session::{SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN};
+use triage_core::session::{
+    SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN, SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
+};
 use triage_transport_ws::ServerMessage;
 use unicode_width::UnicodeWidthStr;
 
@@ -346,12 +349,29 @@ struct ParkedInput {
     parked_at: Instant,
 }
 
+#[derive(Default)]
+struct SessionInbox {
+    messages: VecDeque<SessionMessage>,
+    active_waiters: usize,
+    last_wake_at: Option<Instant>,
+    removed: bool,
+}
+
+impl SessionInbox {
+    fn is_reclaimable(&self) -> bool {
+        self.messages.is_empty() && self.active_waiters == 0 && self.last_wake_at.is_none()
+    }
+}
+
 pub struct SessionManager {
     config: SessionManagerConfig,
     next_session: AtomicU64,
     /// Side inboxes for session-to-session coordination mail (agents via
     /// MCP). In-memory only: not persisted, not carried across handover.
-    inboxes: Mutex<HashMap<SessionId, VecDeque<SessionMessage>>>,
+    inboxes: Mutex<HashMap<SessionId, SessionInbox>>,
+    /// Wakes `wait_for_session_messages` callers when mail arrives or a
+    /// session is removed.
+    inbox_signal: Condvar,
     /// Input bytes denied by the lease, parked per session and client until
     /// the denied client acquires the lease (then flushed to the actor) or
     /// the TTL lapses. In-memory only: a denied write returns its error
@@ -734,6 +754,7 @@ impl SessionManager {
             config,
             next_session: AtomicU64::new(next_session),
             inboxes: Mutex::new(HashMap::new()),
+            inbox_signal: Condvar::new(),
             parked_input: Mutex::new(HashMap::new()),
             next_message_id: AtomicU64::new(1),
             sessions: Mutex::new(sessions),
@@ -1179,9 +1200,50 @@ impl SessionManager {
     /// mail for a removed session is unreachable, since receive and ack gate
     /// on session membership, so without this it leaks for the daemon lifetime.
     fn forget_inbox(&self, session_id: &SessionId) {
-        if let Ok(mut inboxes) = self.inboxes.lock() {
-            inboxes.remove(session_id);
+        if let Ok(mut inboxes) = self.inboxes.lock()
+            && let Some(inbox) = inboxes.get_mut(session_id)
+        {
+            if inbox.active_waiters == 0 {
+                inboxes.remove(session_id);
+            } else {
+                inbox.messages.clear();
+                inbox.last_wake_at = None;
+                inbox.removed = true;
+                self.inbox_signal.notify_all();
+            }
         }
+    }
+
+    fn try_wake_session_for_inbox(&self, session_id: &SessionId) -> bool {
+        let target = {
+            let Ok(sessions) = self.sessions() else {
+                return false;
+            };
+            let Some(ManagedSession::Live { actor, launch, .. }) = sessions.get(session_id) else {
+                return false;
+            };
+            let is_interactive_shell = is_interactive_shell_launch(&launch.command, &launch.args);
+            (actor.tx.clone(), is_interactive_shell)
+        };
+        let (tx, is_interactive_shell) = target;
+        let (resp_tx, resp_rx) = mpsc::channel();
+        if tx
+            .send(ActorCommand::WakeForInbox {
+                is_interactive_shell,
+                response: resp_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(true) = resp_rx.recv_timeout(WAKE_ACTOR_TIMEOUT) else {
+            return false;
+        };
+        thread::sleep(WAKE_SUBMIT_DELAY);
+        let _ = tx.send(ActorCommand::WriteInput {
+            bytes: b"\r".to_vec(),
+        });
+        true
     }
 
     /// Drops a session's custom label in memory on shutdown/removal (the
@@ -1860,9 +1922,7 @@ impl SessionManager {
             .map_err(|_| anyhow!("session manager lock poisoned"))
     }
 
-    fn inboxes(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<SessionId, VecDeque<SessionMessage>>>> {
+    fn inboxes(&self) -> Result<std::sync::MutexGuard<'_, HashMap<SessionId, SessionInbox>>> {
         self.inboxes
             .lock()
             .map_err(|_| anyhow!("session inbox lock poisoned"))
@@ -3944,47 +4004,175 @@ impl SessionApi for SessionManager {
     }
 
     fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
+        Ok(self
+            .send_session_message_with_options(SendSessionMessageRequest {
+                from,
+                to,
+                body,
+                wake: false,
+            })?
+            .message_id)
+    }
+
+    fn send_session_message_with_options(
+        &self,
+        request: SendSessionMessageRequest,
+    ) -> Result<SendSessionMessageResponse> {
         ensure!(
-            !body.trim().is_empty(),
+            !request.body.trim().is_empty(),
             "session message body must not be empty"
         );
         ensure!(
-            body.len() <= SESSION_MESSAGE_MAX_BODY_LEN,
+            request.body.len() <= SESSION_MESSAGE_MAX_BODY_LEN,
             "session message body exceeds {SESSION_MESSAGE_MAX_BODY_LEN} bytes"
         );
-        self.require_known_session(&from)?;
-        self.require_known_session(&to)?;
-        let mut inboxes = self.inboxes()?;
-        let inbox = inboxes.entry(to).or_default();
-        ensure!(
-            inbox.len() < SESSION_INBOX_CAPACITY,
-            "session inbox is full ({SESSION_INBOX_CAPACITY} unacked messages); retry later"
-        );
-        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
-        inbox.push_back(SessionMessage {
-            id,
-            from,
-            body,
-            sent_at_ms: now_unix_millis(),
-        });
-        Ok(id)
+        self.require_known_session(&request.from)?;
+        self.require_known_session(&request.to)?;
+        let (id, has_active_waiters, cooldown_active) = {
+            let mut inboxes = self.inboxes()?;
+            let inbox = inboxes.entry(request.to.clone()).or_default();
+            inbox.removed = false;
+            ensure!(
+                inbox.messages.len() < SESSION_INBOX_CAPACITY,
+                "session inbox is full ({SESSION_INBOX_CAPACITY} unacked messages); retry later"
+            );
+            let id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
+            inbox.messages.push_back(SessionMessage {
+                id,
+                from: request.from,
+                body: request.body,
+                sent_at_ms: now_unix_millis(),
+            });
+            let has_active_waiters = inbox.active_waiters > 0;
+            let cooldown_active = inbox.last_wake_at.is_some_and(|last| {
+                Instant::now().saturating_duration_since(last) < WAKE_NUDGE_COOLDOWN
+            });
+            self.inbox_signal.notify_all();
+            (id, has_active_waiters, cooldown_active)
+        };
+
+        let woke = if !request.wake {
+            false
+        } else if has_active_waiters {
+            true
+        } else if cooldown_active {
+            false
+        } else if self.try_wake_session_for_inbox(&request.to) {
+            if let Ok(mut inboxes) = self.inboxes()
+                && let Some(inbox) = inboxes.get_mut(&request.to)
+            {
+                inbox.last_wake_at = Some(Instant::now());
+            }
+            true
+        } else {
+            false
+        };
+
+        Ok(SendSessionMessageResponse {
+            message_id: id,
+            woke,
+        })
     }
 
     fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
         self.require_known_session(&session_id)?;
-        let inboxes = self.inboxes()?;
-        Ok(inboxes
-            .get(&session_id)
-            .map(|queue| queue.iter().cloned().collect())
-            .unwrap_or_default())
+        let mut inboxes = self.inboxes()?;
+        let Some(inbox) = inboxes.get_mut(&session_id) else {
+            return Ok(Vec::new());
+        };
+        inbox.last_wake_at = None;
+        let messages = inbox.messages.iter().cloned().collect();
+        if inbox.is_reclaimable() {
+            inboxes.remove(&session_id);
+        }
+        Ok(messages)
+    }
+
+    fn wait_for_session_messages(
+        &self,
+        request: WaitForSessionMessagesRequest,
+    ) -> Result<Vec<SessionMessage>> {
+        ensure!(
+            request.timeout_ms <= SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
+            "wait_for_session_messages timeout_ms exceeds {SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS} ms"
+        );
+        self.require_known_session(&request.session_id)?;
+        let mut inboxes = self.inboxes()?;
+        if let Some(inbox) = inboxes.get_mut(&request.session_id)
+            && !inbox.removed
+            && !inbox.messages.is_empty()
+        {
+            inbox.last_wake_at = None;
+            return Ok(inbox.messages.iter().cloned().collect());
+        }
+        if request.timeout_ms == 0 {
+            if let Some(inbox) = inboxes.get_mut(&request.session_id) {
+                inbox.last_wake_at = None;
+                if inbox.is_reclaimable() {
+                    inboxes.remove(&request.session_id);
+                }
+            }
+            return Ok(Vec::new());
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+        {
+            let inbox = inboxes.entry(request.session_id.clone()).or_default();
+            inbox.removed = false;
+            inbox.last_wake_at = None;
+            inbox.active_waiters += 1;
+        }
+
+        loop {
+            if let Some(inbox) = inboxes.get_mut(&request.session_id) {
+                if inbox.removed {
+                    inbox.active_waiters = inbox.active_waiters.saturating_sub(1);
+                    if inbox.active_waiters == 0 {
+                        inboxes.remove(&request.session_id);
+                    }
+                    bail!("session {} not found", request.session_id);
+                }
+                if !inbox.messages.is_empty() {
+                    inbox.last_wake_at = None;
+                    inbox.active_waiters = inbox.active_waiters.saturating_sub(1);
+                    let messages = inbox.messages.iter().cloned().collect();
+                    if inbox.is_reclaimable() {
+                        inboxes.remove(&request.session_id);
+                    }
+                    return Ok(messages);
+                }
+            } else {
+                bail!("session {} not found", request.session_id);
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Some(inbox) = inboxes.get_mut(&request.session_id) {
+                    inbox.active_waiters = inbox.active_waiters.saturating_sub(1);
+                    if inbox.is_reclaimable() {
+                        inboxes.remove(&request.session_id);
+                    }
+                }
+                return Ok(Vec::new());
+            }
+
+            let (guard, _) = self
+                .inbox_signal
+                .wait_timeout(inboxes, remaining)
+                .map_err(|_| anyhow!("session inbox lock poisoned"))?;
+            inboxes = guard;
+        }
     }
 
     fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
         self.require_known_session(&session_id)?;
         let mut inboxes = self.inboxes()?;
         if let Some(inbox) = inboxes.get_mut(&session_id) {
-            inbox.retain(|message| !message_ids.contains(&message.id));
-            if inbox.is_empty() {
+            inbox
+                .messages
+                .retain(|message| !message_ids.contains(&message.id));
+            inbox.last_wake_at = None;
+            if inbox.is_reclaimable() {
                 inboxes.remove(&session_id);
             }
         }
@@ -5364,8 +5552,20 @@ fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u
         .map_or(1, |sequence| sequence.saturating_add(1))
 }
 
+const WAKE_NUDGE_COOLDOWN: Duration = Duration::from_secs(5);
+const WAKE_ACTOR_TIMEOUT: Duration = Duration::from_secs(2);
+const WAKE_SUBMIT_DELAY: Duration = Duration::from_millis(25);
+const WAKE_BUSY_SPINNER_QUIET_MS: u64 = 2_000;
+const WAKE_STREAMING_QUIET_MS: u64 = 200;
+const WAKE_INBOX_PROMPT_TEXT: &[u8] =
+    b"Check your Triage inbox with receive_session_messages and process any new messages.";
+
 fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
-    let Some(command_name) = Path::new(&persisted.command)
+    is_interactive_shell_launch(&persisted.command, &persisted.args)
+}
+
+fn is_interactive_shell_launch(command: &str, args: &[String]) -> bool {
+    let Some(command_name) = Path::new(command)
         .file_name()
         .and_then(|name| name.to_str())
     else {
@@ -5379,9 +5579,57 @@ fn is_restorable_shell_launch(persisted: &PersistedSession) -> bool {
         return false;
     }
 
-    persisted.args.is_empty()
-        || matches!(persisted.args.as_slice(), [flag] if flag == "-l")
-        || is_triage_default_shell_wrapper(&persisted.args)
+    args.is_empty()
+        || matches!(args, [flag] if flag == "-l")
+        || is_triage_default_shell_wrapper(args)
+}
+
+fn has_active_turn_indicator(rows: &[String]) -> bool {
+    rows.iter().any(|row| {
+        let lower = row.to_ascii_lowercase();
+        lower.contains("esc to interrupt")
+            || lower.contains("esc to cancel")
+            || lower.contains("ctrl+c to interrupt")
+            || lower.contains("ctrl+c to cancel")
+            || row
+                .chars()
+                .any(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+    })
+}
+
+fn looks_like_waiting_for_input_prompt(rows: &[String]) -> bool {
+    let Some(last_non_empty) = rows
+        .iter()
+        .rev()
+        .map(|row| row.trim())
+        .find(|row| !row.is_empty())
+    else {
+        return false;
+    };
+    last_non_empty.starts_with('>')
+        || last_non_empty.starts_with('❯')
+        || last_non_empty.starts_with('›')
+        || last_non_empty.ends_with('>')
+        || last_non_empty.ends_with('❯')
+        || last_non_empty.ends_with('›')
+        || last_non_empty.ends_with('?')
+        || last_non_empty.ends_with(':')
+        || last_non_empty.ends_with('$')
+        || last_non_empty.ends_with('%')
+        || last_non_empty.ends_with('#')
+}
+
+fn is_session_ready_for_wake_nudge(rows: &[String], output_seq: u64, quiet_ms: u64) -> bool {
+    if output_seq == 0 {
+        return true;
+    }
+    if quiet_ms < WAKE_BUSY_SPINNER_QUIET_MS && has_active_turn_indicator(rows) {
+        return false;
+    }
+    if quiet_ms < WAKE_STREAMING_QUIET_MS && !looks_like_waiting_for_input_prompt(rows) {
+        return false;
+    }
+    true
 }
 
 fn is_triage_default_shell_wrapper(args: &[String]) -> bool {
@@ -6057,6 +6305,10 @@ enum ActorCommand {
     WriteInput {
         bytes: Vec<u8>,
     },
+    WakeForInbox {
+        is_interactive_shell: bool,
+        response: Sender<bool>,
+    },
     Resize {
         size: SessionSize,
         response: Sender<ActorResult<SessionSnapshot>>,
@@ -6509,6 +6761,13 @@ impl ActorState {
                 self.write_input(bytes);
                 false
             }
+            ActorCommand::WakeForInbox {
+                is_interactive_shell,
+                response,
+            } => {
+                let _ = response.send(self.wake_for_inbox(is_interactive_shell));
+                false
+            }
             ActorCommand::Resize { size, response } => {
                 let _ = response.send(self.resize(size));
                 false
@@ -6619,6 +6878,46 @@ impl ActorState {
                 }
             }
         }
+    }
+
+    fn root_pid(&self) -> Option<u32> {
+        self.process_identity
+            .map(|identity| identity.pid)
+            .or_else(|| self.child.process_id())
+    }
+
+    fn is_root_shell_in_foreground(&self, is_interactive_shell: bool) -> bool {
+        if !is_interactive_shell {
+            return false;
+        }
+        let (Some(root_pid), Some(fg_pgid)) = (self.root_pid(), self.foreground_pgid()) else {
+            return false;
+        };
+        root_pid == fg_pgid
+    }
+
+    fn wake_for_inbox(&mut self, is_interactive_shell: bool) -> bool {
+        if self.exited || self.output_closed {
+            return false;
+        }
+        if self.is_root_shell_in_foreground(is_interactive_shell) {
+            return false;
+        }
+        let rows = visible_rows(&self.output.terminal);
+        let now_ms = now_unix_millis();
+        let last_activity = self.last_activity_ms.load(Ordering::Relaxed);
+        let quiet_ms = if last_activity == 0 {
+            u64::MAX
+        } else {
+            now_ms.saturating_sub(last_activity)
+        };
+        if !is_session_ready_for_wake_nudge(&rows, self.output.output_seq, quiet_ms) {
+            return false;
+        }
+        self.last_input_ms.store(now_ms, Ordering::Relaxed);
+        self.writer_tx
+            .try_send(WAKE_INBOX_PROMPT_TEXT.to_vec())
+            .is_ok()
     }
 
     fn resize(&mut self, size: SessionSize) -> Result<SessionSnapshot> {
@@ -8757,6 +9056,9 @@ fn reject_command_during_shutdown(command: ActorCommand) {
     match command {
         // No response channel to fail: dropping these is the whole rejection.
         ActorCommand::WriteInput { .. } => {}
+        ActorCommand::WakeForInbox { response, .. } => {
+            let _ = response.send(false);
+        }
         #[cfg(unix)]
         ActorCommand::SetContext { .. } => {}
         ActorCommand::Resize { response, .. } => {
@@ -9805,6 +10107,170 @@ mod tests {
         manager
             .send_session_message(from.clone(), to.clone(), "fits now".to_string())
             .expect("send after ack");
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn session_messaging_wait_blocks_until_mail_arrives_or_times_out() {
+        let log_dir = unique_log_dir();
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let (from, to) = two_live_sessions(&manager);
+
+        let timed_out = manager
+            .wait_for_session_messages(WaitForSessionMessagesRequest::new(to.clone(), 40))
+            .expect("wait on empty inbox");
+        assert!(timed_out.is_empty());
+
+        let wait_manager = Arc::clone(&manager);
+        let wait_target = to.clone();
+        let waiter = std::thread::spawn(move || {
+            wait_manager
+                .wait_for_session_messages(WaitForSessionMessagesRequest::new(wait_target, 5_000))
+                .expect("wait for incoming message")
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let waiters = manager
+                .inboxes
+                .lock()
+                .expect("inbox lock")
+                .get(&to)
+                .map(|inbox| inbox.active_waiters)
+                .unwrap_or(0);
+            if waiters == 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "waiter did not register in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let response = manager
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(
+                    from.clone(),
+                    to.clone(),
+                    "coordinated reply".to_string(),
+                )
+                .with_wake(true),
+            )
+            .expect("send message to waiting session");
+        assert!(
+            response.woke,
+            "send with wake=true must report woke=true when a waiter is blocked"
+        );
+
+        let delivered = waiter.join().expect("join waiter");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].id, response.message_id);
+        assert_eq!(delivered[0].body, "coordinated reply");
+
+        // Waiting again while the message is still unacked returns immediately.
+        let start = Instant::now();
+        let immediate = manager
+            .wait_for_session_messages(WaitForSessionMessagesRequest::new(to.clone(), 5_000))
+            .expect("immediate wait on unacked mail");
+        assert_eq!(immediate.len(), 1);
+        assert!(start.elapsed() < Duration::from_millis(500));
+
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_messaging_wake_nudges_idle_agent_and_skips_bare_shell() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+        let shell_sender = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start shell sender");
+        let shell_target = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start bare shell target");
+
+        // A bare interactive shell with no child agent process must not be nudged.
+        let bare_shell_res = manager
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(
+                    shell_sender.clone(),
+                    shell_target,
+                    "do not type into bare shell".to_string(),
+                )
+                .with_wake(true),
+            )
+            .expect("send to bare shell");
+        assert!(!bare_shell_res.woke);
+
+        // A non-shell foreground process (such as `cat`, standing in for a direct agent CLI)
+        // that is idle/waiting for input should receive the wakeup prompt once and coalesce
+        // follow-up nudges until the inbox is read.
+        let agent_target = manager
+            .start_session(StartSessionRequest::new("cat"))
+            .expect("start cat target");
+
+        let first = manager
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(
+                    shell_sender.clone(),
+                    agent_target.clone(),
+                    "first task".to_string(),
+                )
+                .with_wake(true),
+            )
+            .expect("send first message with wake");
+        assert!(first.woke);
+
+        let second = manager
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(
+                    shell_sender,
+                    agent_target.clone(),
+                    "second task".to_string(),
+                )
+                .with_wake(true),
+            )
+            .expect("send second message within cooldown");
+        assert!(
+            !second.woke,
+            "second wake within cooldown should coalesce until inbox is read"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = manager
+                .snapshot_session(agent_target.clone())
+                .expect("snapshot cat target");
+            if snapshot
+                .visible_rows
+                .iter()
+                .any(|row| row.contains("receive_session_messages"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for wake prompt in target output: {:?}",
+                snapshot.visible_rows
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Reading the inbox resets the wake cooldown timestamp.
+        let mail = manager
+            .receive_session_messages(agent_target.clone())
+            .expect("receive agent mail");
+        assert_eq!(mail.len(), 2);
+        let cooldown_cleared = manager
+            .inboxes
+            .lock()
+            .expect("inbox lock")
+            .get(&agent_target)
+            .and_then(|inbox| inbox.last_wake_at)
+            .is_none();
+        assert!(cooldown_cleared);
 
         let _ = std::fs::remove_dir_all(&log_dir);
     }
