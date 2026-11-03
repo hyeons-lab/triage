@@ -768,6 +768,9 @@ where
                 "pixel_height": history.size.pixel_height,
                 "dpi": history.size.dpi,
             },
+            "styled_rows": history.styled_rows,
+            "styled_rows_start": history.styled_rows_start,
+            "cursor": history.cursor,
             "exited": history.exited,
             "bracketed_paste_enabled": history.bracketed_paste_enabled,
             "current_working_directory": history
@@ -1003,6 +1006,13 @@ mod history_http_tests {
         );
         assert_eq!(tail_meta["raw_output_end"].as_u64(), Some(total_bytes));
         assert_eq!(tail_meta["raw_output_truncated"].as_bool(), Some(false));
+        assert!(
+            tail_meta["styled_rows"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "HTTP history meta must include styled_rows for split-history viewport rendering"
+        );
+        assert!(tail_meta["cursor"].is_object());
 
         // 4. Forward delta mode when unchanged returns 0 bytes at raw_output_start == total_bytes.
         let idle_delta_req = Request::builder()

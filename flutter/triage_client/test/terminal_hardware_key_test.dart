@@ -1295,5 +1295,70 @@ void main() {
         }
       },
     );
+
+    testWidgets(
+      'desktop primary click and wheel use 0-based viewport cell coordinates when mouse reporting is active',
+      (WidgetTester tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        TerminalPane.debugForceNativeTerminalView = true;
+        try {
+          final term = Terminal(maxLines: 500);
+          final ctrl = TerminalController();
+          final sentInput = <String>[];
+          ctrl.addInputListener(sentInput.add);
+
+          // Populate 60 lines of scrollback on the main buffer, then enable
+          // SGR mouse button + wheel reporting (?1000h ?1002h ?1006h) as a
+          // fullscreen TUI (or an adopted session before alt-screen entry) does.
+          for (var i = 0; i < 60; i++) {
+            term.write('scrollback line $i\r\n');
+          }
+          term.write('\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 800,
+                  height: 500,
+                  child: TerminalPane(
+                    terminalId: 'desktop-mouse-click-chip',
+                    terminal: term,
+                    controller: ctrl,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 1,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 100));
+          sentInput.clear();
+
+          // Click near the top-left of the viewport (row ~2, not clamped to
+          // viewHeight - 1 by scrollback lineOffset).
+          final paneRect = tester.getRect(find.byType(TerminalPane));
+          final topTarget = paneRect.topLeft + const Offset(45, 45);
+          await tester.tapAt(topTarget);
+          await tester.pump(const Duration(milliseconds: 350));
+
+          expect(sentInput.length, greaterThanOrEqualTo(2));
+          final downReport = sentInput.first;
+          final upReport = sentInput.last;
+          expect(downReport, matches(RegExp(r'^\x1b\[<0;\d+;\d+M$')));
+          expect(upReport, matches(RegExp(r'^\x1b\[<0;\d+;\d+m$')));
+          final downRow = int.parse(
+            RegExp(r'^\x1b\[<0;\d+;(\d+)M$').firstMatch(downReport)!.group(1)!,
+          );
+          expect(downRow, lessThan(10));
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('desktop-mouse-click-chip');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }
