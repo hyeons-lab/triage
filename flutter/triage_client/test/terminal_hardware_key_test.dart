@@ -1360,5 +1360,71 @@ void main() {
         }
       },
     );
+
+    testWidgets(
+      'mobile single-finger tap emits SGR mouse click at viewport cell while swipe scrolls without clicking',
+      (WidgetTester tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        TerminalPane.debugForceNativeTerminalView = true;
+        try {
+          final term = Terminal(maxLines: 500);
+          final ctrl = TerminalController();
+          final sentInput = <String>[];
+          ctrl.addInputListener(sentInput.add);
+
+          term.write('\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 500,
+                  child: TerminalPane(
+                    terminalId: 'mobile-mouse-tap-chip',
+                    terminal: term,
+                    controller: ctrl,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 1,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 100));
+          sentInput.clear();
+
+          // 1. Tap near the bottom scroll chip area on mobile.
+          final paneRect = tester.getRect(find.byType(TerminalPane));
+          final chipTarget = Offset(paneRect.center.dx, paneRect.bottom - 70);
+          await tester.tapAt(chipTarget);
+          await tester.pump(const Duration(milliseconds: 350));
+
+          expect(sentInput.length, 2);
+          expect(sentInput[0], matches(RegExp(r'^\x1b\[<0;\d+;\d+M$')));
+          expect(sentInput[1], matches(RegExp(r'^\x1b\[<0;\d+;\d+m$')));
+
+          // 2. A vertical swipe scrolls via wheel events (64/65) without
+          // emitting a spurious left-button click (0;col;rowM).
+          sentInput.clear();
+          await tester.dragFrom(paneRect.center, const Offset(0, -90));
+          await tester.pump(const Duration(milliseconds: 350));
+
+          expect(sentInput, isNotEmpty);
+          expect(
+            sentInput.every(
+              (s) => RegExp(r'^\x1b\[<6[45];\d+;\d+M$').hasMatch(s),
+            ),
+            isTrue,
+          );
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('mobile-mouse-tap-chip');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }
