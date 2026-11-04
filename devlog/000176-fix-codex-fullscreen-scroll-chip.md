@@ -17,6 +17,7 @@ Fix two issues in native and remote TUI sessions:
 - `2026-11-03T11:27-0800` `flutter/triage_client/lib/terminal/terminal_store.dart`: Preserve `cursorUpDebt` across `CSI J` (`Erase Below`) and increment `cursorUpDebt` on `CSI Ps F` (`CPL`) in `_collectGenuineNewlineIndices`, and use `effectiveViewport` (`styled_rows`) whenever `rawOutputPrefix` and `effectiveViewport` are both non-empty so split-history sessions render clean journaled scrollback plus the rewrapped viewport instead of replaying width-dependent raw `.tlog` cursor jumps.
 - `2026-11-03T11:27-0800` `flutter/triage_client/lib/main.dart`: Reset DEC mouse/private modes in `SessionVm`'s clear listener; in `_refreshSessionSnapshot`, overlay `size`, `styled_rows`, `styled_rows_start`, `visible_rows`, and `cursor` from the `resizeSession` response and trigger a full-window HTTP history fetch and full replay when the host PTY is resized on the primary screen (`_onSessionViewFit` / `_selectSession`).
 - `2026-11-03T11:27-0800` `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`, `flutter/triage_client/test/terminal_hardware_key_test.dart`: Add `_viewportCellAtGlobal` to convert pointer positions into 0-based viewport cell coordinates `(col, row)`, use it in `_emitAltScrollDelta`, and forward primary mouse button press, drag, and release events to `_terminal.mouseInput` when `_terminal.mouseMode != xt.MouseMode.none` and `Shift` is not held.
+- `2026-11-04T07:47-0800` `flutter/triage_client/lib/widgets/terminal_pane_stub.dart`, `flutter/triage_client/test/terminal_hardware_key_test.dart`: Track single-finger mobile tap candidates (`_mobileTapPointer`, `_mobileTapDownPosition`, `_mobileTapDownCell`) in `_handlePointerDown` when `_terminal.mouseMode != xt.MouseMode.none`, cancel the tap candidate if the pointer moves beyond `kTouchSlop` or emits an alternate-scroll step, and emit left mouse button press and release at the tapped viewport cell on `_handlePointerUp` so tapping TUI controls such as the Codex bottom scroll chip works on Android and iOS without interfering with touch swipe scrolling.
 
 ## Decisions
 
@@ -25,4 +26,5 @@ Fix two issues in native and remote TUI sessions:
 
 ## Commits
 
-- `HEAD` - fix: forward desktop TUI mouse clicks and reflow HTTP split history
+- `d9e163b` - fix: forward desktop TUI mouse clicks and reflow HTTP split history
+- `HEAD` - fix(mobile): emit TUI mouse click on single-finger tap
