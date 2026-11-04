@@ -11,7 +11,8 @@ import 'package:flutter/gestures.dart'
         PointerPanZoomUpdateEvent,
         PointerScrollEvent,
         PointerSignalEvent,
-        kPrimaryButton;
+        kPrimaryButton,
+        kTouchSlop;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollDirection;
 import 'package:flutter/scheduler.dart' show SchedulerBinding, SchedulerPhase;
@@ -308,6 +309,11 @@ class _TerminalPaneState extends State<TerminalPane>
   xt.CellOffset? _dragAnchorCell;
   bool _dragSelecting = false;
   bool _dragExtendScheduled = false;
+  int? _mouseReportPointer;
+  xt.CellOffset? _mouseReportLastCell;
+  int? _mobileTapPointer;
+  Offset? _mobileTapDownPosition;
+  xt.CellOffset? _mobileTapDownCell;
   Timer? _autoScrollTimer;
   double _autoScrollVelocity = 0;
   // Distance from the top/bottom viewport edge that triggers auto-scroll, the
@@ -490,6 +496,11 @@ class _TerminalPaneState extends State<TerminalPane>
       _panZoomActive = false;
       _mobileAltScrollPointer = null;
       _mobileAltScrollLastPosition = null;
+      _mobileTapPointer = null;
+      _mobileTapDownPosition = null;
+      _mobileTapDownCell = null;
+      _mouseReportPointer = null;
+      _mouseReportLastCell = null;
       // The last scroll position belongs to the outgoing terminal; a direction
       // measured against it could release the incoming session's pin on its
       // first scroll event.
@@ -540,6 +551,11 @@ class _TerminalPaneState extends State<TerminalPane>
       _panZoomActive = false;
       _mobileAltScrollPointer = null;
       _mobileAltScrollLastPosition = null;
+      _mobileTapPointer = null;
+      _mobileTapDownPosition = null;
+      _mobileTapDownCell = null;
+      _mouseReportPointer = null;
+      _mouseReportLastCell = null;
       _endDrag();
       _shiftClickPointer = null;
       _shiftClickDownPosition = null;
@@ -908,6 +924,31 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  // Hit-test a global pointer position to a 0-based viewport cell (col, row),
+  // independent of scrollback offset (`lineOffset`). Mouse reporting (clicks,
+  // drags, and wheel events) requires viewport-relative coordinates, whereas
+  // `render.getCellOffset` adds `lineOffset` and returns an absolute buffer row.
+  xt.CellOffset? _viewportCellAtGlobal(Offset globalPosition) {
+    final state = _terminalViewKey.currentState;
+    if (state == null) return null;
+    try {
+      final render = state.renderTerminal;
+      final local = render.globalToLocal(globalPosition);
+      final cellSize = render.cellSize;
+      final cellW = cellSize.width > 0 ? cellSize.width : 9.0;
+      final cellH = cellSize.height > 0
+          ? cellSize.height
+          : (_lineHeight() ?? 18.0);
+      final maxCol = (_terminal.viewWidth - 1).clamp(0, 10000);
+      final maxRow = (_terminal.viewHeight - 1).clamp(0, 10000);
+      final col = (local.dx / cellW).floor().clamp(0, maxCol);
+      final row = (local.dy / cellH).floor().clamp(0, maxRow);
+      return xt.CellOffset(col, row);
+    } catch (_) {
+      return null;
+    }
+  }
+
   // Track a shift+primary press (keyed by pointer id) so pointer-up can tell a
   // shift-click from a drag. xterm's own tap-down clears any live selection
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
@@ -933,6 +974,18 @@ class _TerminalPaneState extends State<TerminalPane>
         _mobileAltScrollPointer = null;
         _mobileAltScrollLastPosition = null;
       }
+      if (_activePointers.length == 1 &&
+          (event.buttons & kPrimaryButton) != 0 &&
+          !widget.isExited &&
+          _terminal.mouseMode != xt.MouseMode.none) {
+        _mobileTapPointer = event.pointer;
+        _mobileTapDownPosition = event.position;
+        _mobileTapDownCell = _viewportCellAtGlobal(event.position);
+      } else {
+        _mobileTapPointer = null;
+        _mobileTapDownPosition = null;
+        _mobileTapDownCell = null;
+      }
     }
     if ((event.buttons & kPrimaryButton) == 0) return;
     // Touch: let the terminal's own gestures handle scrolling (a swipe) and
@@ -947,6 +1000,17 @@ class _TerminalPaneState extends State<TerminalPane>
       // Shift+primary: a click extends the existing selection on pointer-up.
       _shiftClickPointer = event.pointer;
       _shiftClickDownPosition = event.position;
+    } else if (!widget.isExited && _terminal.mouseMode != xt.MouseMode.none) {
+      final cell = _viewportCellAtGlobal(event.position);
+      if (cell == null) return;
+      _mouseReportPointer = event.pointer;
+      _mouseReportLastCell = cell;
+      widget.controller.notifyInteraction();
+      _terminal.mouseInput(
+        xt.TerminalMouseButton.left,
+        xt.TerminalMouseButtonState.down,
+        cell,
+      );
     } else {
       // Plain primary: a potential drag-select. The anchor is the cell under the
       // press; we don't start selecting until the pointer moves past the slop.
@@ -964,6 +1028,16 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _handlePointerMove(PointerMoveEvent event) {
+    if (event.pointer == _mobileTapPointer) {
+      final downPos = _mobileTapDownPosition;
+      if (_activePointers.length != 1 ||
+          downPos == null ||
+          (event.position - downPos).distance > kTouchSlop) {
+        _mobileTapPointer = null;
+        _mobileTapDownPosition = null;
+        _mobileTapDownCell = null;
+      }
+    }
     if (event.pointer == _mobileAltScrollPointer) {
       if (_activePointers.length != 1 || !_shouldForwardWheelToTerminal) {
         _mobileAltScrollPointer = null;
@@ -975,6 +1049,26 @@ class _TerminalPaneState extends State<TerminalPane>
       if (lastPos != null) {
         _emitAltScrollDelta(lastPos.dy - event.position.dy, event.position);
       }
+      return;
+    }
+    if (event.pointer == _mouseReportPointer) {
+      if (widget.isExited || _terminal.mouseMode == xt.MouseMode.none) {
+        _mouseReportPointer = null;
+        _mouseReportLastCell = null;
+        return;
+      }
+      if (_terminal.mouseMode != xt.MouseMode.upDownScrollDrag &&
+          _terminal.mouseMode != xt.MouseMode.upDownScrollMove) {
+        return;
+      }
+      final cell = _viewportCellAtGlobal(event.position);
+      if (cell == null || cell == _mouseReportLastCell) return;
+      _mouseReportLastCell = cell;
+      _terminal.mouseInput(
+        xt.TerminalMouseButton.left,
+        xt.TerminalMouseButtonState.down,
+        cell,
+      );
       return;
     }
     if (event.pointer != _dragPointer) return;
@@ -1029,6 +1123,51 @@ class _TerminalPaneState extends State<TerminalPane>
       _mobileAltScrollLastPosition = null;
       _altScrollDeltaAccum = 0.0;
     }
+    if (event.pointer == _mobileTapPointer) {
+      final downPos = _mobileTapDownPosition;
+      final downCell = _mobileTapDownCell;
+      _mobileTapPointer = null;
+      _mobileTapDownPosition = null;
+      _mobileTapDownCell = null;
+      if (downPos != null &&
+          (event.position - downPos).distance <= kTouchSlop &&
+          !widget.isExited &&
+          _terminal.mouseMode != xt.MouseMode.none) {
+        final cell =
+            downCell ??
+            _viewportCellAtGlobal(event.position) ??
+            _viewportCellAtGlobal(downPos);
+        if (cell != null) {
+          widget.controller.notifyInteraction();
+          _terminal.mouseInput(
+            xt.TerminalMouseButton.left,
+            xt.TerminalMouseButtonState.down,
+            cell,
+          );
+          _terminal.mouseInput(
+            xt.TerminalMouseButton.left,
+            xt.TerminalMouseButtonState.up,
+            cell,
+          );
+        }
+      }
+    }
+    if (event.pointer == _mouseReportPointer) {
+      final lastCell = _mouseReportLastCell;
+      _mouseReportPointer = null;
+      _mouseReportLastCell = null;
+      if (!widget.isExited && _terminal.mouseMode != xt.MouseMode.none) {
+        final cell =
+            _viewportCellAtGlobal(event.position) ??
+            lastCell ??
+            const xt.CellOffset(0, 0);
+        _terminal.mouseInput(
+          xt.TerminalMouseButton.left,
+          xt.TerminalMouseButtonState.up,
+          cell,
+        );
+      }
+    }
     if (event.pointer == _dragPointer) {
       final wasDragSelecting = _dragSelecting;
       final anchor = _dragAnchorCell;
@@ -1067,6 +1206,15 @@ class _TerminalPaneState extends State<TerminalPane>
       _mobileAltScrollPointer = null;
       _mobileAltScrollLastPosition = null;
       _altScrollDeltaAccum = 0.0;
+    }
+    if (event.pointer == _mobileTapPointer) {
+      _mobileTapPointer = null;
+      _mobileTapDownPosition = null;
+      _mobileTapDownCell = null;
+    }
+    if (event.pointer == _mouseReportPointer) {
+      _mouseReportPointer = null;
+      _mouseReportLastCell = null;
     }
     if (event.pointer == _dragPointer) {
       _endDrag();
@@ -1137,14 +1285,12 @@ class _TerminalPaneState extends State<TerminalPane>
     final steps = (_altScrollDeltaAccum / lh).truncate();
     if (steps == 0) return;
     _altScrollDeltaAccum -= steps * lh;
+    _mobileTapPointer = null;
+    _mobileTapDownPosition = null;
+    _mobileTapDownCell = null;
 
-    final rawCell = _cellAtGlobal(globalPosition) ?? const xt.CellOffset(0, 0);
-    final maxCol = (_terminal.viewWidth - 1).clamp(0, 10000);
-    final maxRow = (_terminal.viewHeight - 1).clamp(0, 10000);
-    final cell = xt.CellOffset(
-      rawCell.x.clamp(0, maxCol),
-      rawCell.y.clamp(0, maxRow),
-    );
+    final cell =
+        _viewportCellAtGlobal(globalPosition) ?? const xt.CellOffset(0, 0);
     final up = steps < 0;
     final count = steps.abs().clamp(1, 10);
     widget.controller.notifyInteraction();

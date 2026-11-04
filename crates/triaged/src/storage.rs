@@ -689,7 +689,7 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
             for segment in segments[..segments.len() - tail_segment_count]
                 .iter()
                 .rev()
-                .take(16)
+                .take(32)
             {
                 if let Ok(bytes) = read_segment_tail(segment, usize::MAX) {
                     let trans = scan_dec_mode_transitions(&bytes);
@@ -704,14 +704,16 @@ pub fn read_multi_segment_replay_tail(session_dir: &Path, cap: u64) -> Result<(u
                         && bytes.contains(&b'\n')
                     {
                         last_newline_segment_bytes = Some(bytes);
-                        // Once we reach the most recent segment containing line feeds,
-                        // we have scanned past the entire 0-newline spinner desert.
-                        break;
+                        if initial_alt.is_some()
+                            || tail_transitions.last_mouse.or(initial_mouse) != Some(true)
+                        {
+                            break;
+                        }
                     }
                     if initial_alt == Some(true)
                         || (initial_alt.is_some()
                             && initial_mouse.is_some()
-                            && !needs_newline_prefix)
+                            && (!needs_newline_prefix || last_newline_segment_bytes.is_some()))
                     {
                         break;
                     }
