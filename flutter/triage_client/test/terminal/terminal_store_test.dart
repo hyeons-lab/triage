@@ -3185,4 +3185,24 @@ void main() {
       expect(sw.elapsedMilliseconds, lessThan(200));
     },
   );
+
+  test(
+    'writeToXterm strips Mode 2026 markers so open-frame flushes notify immediately',
+    () {
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(40, 4);
+      var notifications = 0;
+      term.addListener(() {
+        notifications++;
+      });
+
+      writeToXterm(term, '\x1b[?2026hstreaming partial frame');
+      expect(notifications, 1);
+      expect(
+        term.buffer.lines[0].toString().trimRight(),
+        'streaming partial frame',
+      );
+      term.dispose();
+    },
+  );
 }

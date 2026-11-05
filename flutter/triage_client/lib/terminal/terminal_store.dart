@@ -212,6 +212,7 @@ bool _isMode2026Marker(List<int> bytes, int index, int finalByte) {
   List<int> bytes, {
   required int maxLines,
   required int maxBytes,
+  List<int>? precomputedNewlineIndices,
 }) {
   if (bytes.isEmpty || maxLines <= 0 || maxBytes <= 0) {
     return (
@@ -221,9 +222,14 @@ bool _isMode2026Marker(List<int> bytes, int index, int finalByte) {
   }
   var end = bytes.length;
   if (bytes[end - 1] == 0x0a) end--;
-  final newlineIndices = _collectGenuineNewlineIndices(bytes, 0, end);
-  var start = newlineIndices.length >= maxLines
-      ? newlineIndices[newlineIndices.length - maxLines] + 1
+  final newlineIndices =
+      precomputedNewlineIndices ?? _collectGenuineNewlineIndices(bytes, 0, end);
+  var newlineCount = newlineIndices.length;
+  while (newlineCount > 0 && newlineIndices[newlineCount - 1] >= end) {
+    newlineCount--;
+  }
+  var start = newlineCount >= maxLines
+      ? newlineIndices[newlineCount - maxLines] + 1
       : 0;
   final byteFloor = bytes.length - maxBytes;
   if (byteFloor > start) {
@@ -344,27 +350,36 @@ trimHistoryReplay({
     );
   }
 
-  final prefixNewlines = _collectGenuineNewlineIndices(
+  final prefixAllNewlines = _collectGenuineNewlineIndices(
     rawOutputPrefix,
     0,
     rawOutputPrefix.length,
-  ).length;
+  );
+  final prefixNewlines = prefixAllNewlines.length;
   final prefixByteReserve = min(rawOutputPrefix.length, maxBytes ~/ 2);
   final prefixLineReserve = min(prefixNewlines, maxLines ~/ 2);
   final rawByteBudget = max(1, maxBytes - prefixByteReserve);
   final rawLineBudget = max(1, maxLines - prefixLineReserve);
 
+  final rawAllNewlines = _collectGenuineNewlineIndices(
+    rawOutput,
+    0,
+    rawOutput.length,
+  );
   final trimmedRaw = trimHistoryTailWithOffset(
     rawOutput,
     maxLines: rawLineBudget,
     maxBytes: rawByteBudget,
+    precomputedNewlineIndices: rawAllNewlines,
   );
   final retainedRawBytes = rawOutput.length - trimmedRaw.droppedBytes;
-  final retainedRawNewlines = _collectGenuineNewlineIndices(
-    rawOutput,
-    trimmedRaw.droppedBytes,
-    rawOutput.length,
-  ).length;
+  final retainedRawNewlines = trimmedRaw.droppedBytes == 0
+      ? rawAllNewlines.length
+      : _collectGenuineNewlineIndices(
+          rawOutput,
+          trimmedRaw.droppedBytes,
+          rawOutput.length,
+        ).length;
 
   final remainingBytes = max(0, maxBytes - retainedRawBytes);
   final remainingLines = max(0, maxLines - retainedRawNewlines);
@@ -372,6 +387,7 @@ trimHistoryReplay({
     rawOutputPrefix,
     maxLines: remainingLines,
     maxBytes: remainingBytes,
+    precomputedNewlineIndices: prefixAllNewlines,
   );
   final retainedPrefix = rawOutputPrefix.length > trimmedPrefix.droppedBytes
       ? rawOutputPrefix.length - trimmedPrefix.droppedBytes
@@ -488,10 +504,23 @@ final RegExp _completePrivateCsi = RegExp(
   r'\x1b\[(?:[><=][0-9;]*[A-Za-z@`~]|\?[0-9;]*[su]|[0-9;]+u|3J)',
 );
 
+final RegExp _kSyncModeMarkers = RegExp(r'\x1b\[\?2026[hl]');
+
 /// Writes [data] to a native `package:xterm2` [xt.Terminal].
+///
+/// [TerminalStore] already buffers DEC Mode 2026 synchronized output frames and
+/// flushes open frames on its 50ms watchdog, 100ms live-flush interval, or at
+/// the end of history replay. Stripping `\x1b[?2026h` and `\x1b[?2026l` before
+/// forwarding to `package:xterm2` prevents `xt.Terminal` from allocating its
+/// own per-frame 150ms watchdog timer and from suppressing `notifyListeners()`
+/// when [TerminalStore] intentionally flushes an open frame.
 void writeToXterm(xt.Terminal terminal, String data) {
   if (data.isEmpty) return;
-  terminal.write(data);
+  final sanitized = data.contains(_kSyncPrefix)
+      ? data.replaceAll(_kSyncModeMarkers, '')
+      : data;
+  if (sanitized.isEmpty) return;
+  terminal.write(sanitized);
 }
 
 /// The single reducer for the terminal pipeline.
@@ -1047,12 +1076,6 @@ class TerminalStore extends ChangeNotifier {
     // prefix sheds its oldest lines first; windowed replays then still
     // fit the raw tail, while unwindowed ones trim it as before.
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
-    final trimmed = trimHistoryReplay(
-      rawOutputPrefix: rawOutputPrefix,
-      rawOutput: bytes,
-      maxLines: budgets.maxLines,
-      maxBytes: budgets.maxBytes,
-    );
     final int retainedPrefixBytes;
     final int rawDropped;
     final effectiveViewport = rawOutputViewport.isNotEmpty
@@ -1079,6 +1102,12 @@ class TerminalStore extends ChangeNotifier {
       retainedPrefixBytes = rawOutputPrefix.length - trimmedPrefix.droppedBytes;
       rawDropped = 0;
     } else {
+      final trimmed = trimHistoryReplay(
+        rawOutputPrefix: rawOutputPrefix,
+        rawOutput: bytes,
+        maxLines: budgets.maxLines,
+        maxBytes: budgets.maxBytes,
+      );
       if (trimmed.prefixBytes.isNotEmpty) {
         _writeDecoded(trimmed.prefixBytes);
         if (trimmed.prefixBytes.contains(0x0a)) {
@@ -1392,8 +1421,6 @@ class TerminalStore extends ChangeNotifier {
               'TerminalStore: synchronized output buffer exceeded $_kSyncBufferCap bytes; force-flushing',
             );
             _closeSyncBlockAndFlush();
-          } else {
-            _rearmSyncWatchdog();
           }
         }
       } else {
@@ -1406,14 +1433,16 @@ class TerminalStore extends ChangeNotifier {
           _frameOpenOnWire = true;
           _syncBuffer.write(_kSyncStart);
           cursor = startIdx + _kSyncMarkerLength;
-          _armSyncLiveFlush();
-          _rearmSyncWatchdog();
         } else {
           final text = cursor == 0 ? input : input.substring(cursor);
           _writeDirect(text);
           cursor = input.length;
         }
       }
+    }
+    if (_inSynchronizedOutput) {
+      _armSyncLiveFlush();
+      _rearmSyncWatchdog();
     }
   }
 

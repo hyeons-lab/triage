@@ -218,9 +218,17 @@ bool _isDefaultBlankSpanStyle(dynamic style) {
 /// `\x1b[?7l`) advances the emulator by `rows - 1` lines (pushing 100% of
 /// `raw_output_prefix` into scrollback above visible row 0) and paints the
 /// exact visible screen and cursor position.
-Uint8List rawOutputViewportFromSnapshot(Map<String, dynamic> snapshot) {
-  final prefix = rawOutputPrefixFromSnapshot(snapshot);
-  if (prefix.isEmpty || rawOutputFromSnapshot(snapshot).isEmpty) {
+Uint8List rawOutputViewportFromSnapshot(
+  Map<String, dynamic> snapshot, {
+  Uint8List? decodedPrefix,
+  Uint8List? decodedRawOutput,
+}) {
+  final prefix = decodedPrefix ?? rawOutputPrefixFromSnapshot(snapshot);
+  if (prefix.isEmpty) {
+    return Uint8List(0);
+  }
+  final rawOutput = decodedRawOutput ?? rawOutputFromSnapshot(snapshot);
+  if (rawOutput.isEmpty) {
     return Uint8List(0);
   }
   final styledRows = snapshot['styled_rows'];
