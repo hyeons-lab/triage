@@ -369,26 +369,18 @@ class SessionVm {
        // a lazy placeholder seeds an immutable empty list.
        rows = List<StyledRow>.of(rows),
        terminalController = TerminalController() {
-    terminal = xt.Terminal(
-      maxLines: 50000,
-      // Re-wrap the whole buffer on resize, like a real terminal — otherwise
-      // scrollback keeps its old wrap points and a full-screen TUI's in-place
-      // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
-      // tolerates reflow replacing line objects: it drops a detached anchor
-      // line (`BufferLine.attached`) and falls back to following the bottom.
-      reflowEnabled: true,
-      onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
-    );
     if (!kIsWeb) {
       terminalController.addWriteListener((data) {
         writeToXterm(terminal, data);
       });
       terminalController.addClearListener(() {
+        final t = _terminal;
+        if (t == null) return;
         try {
-          terminal.useMainBuffer();
-          terminal.mainBuffer.clear();
-          terminal.altBuffer.clear();
-          terminal.write(
+          t.useMainBuffer();
+          t.mainBuffer.clear();
+          t.altBuffer.clear();
+          t.write(
             '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
             '\x1b[?2004l\x1b[?1l\x1b[?7h\x1b[?25h\x1b[H\x1b[2J\x1b[3J',
           );
@@ -397,6 +389,9 @@ class SessionVm {
       terminalController.addResizeListener((cols, rows) {
         terminal.resize(cols, rows);
       });
+      terminalController.addHistoryReplayedListener(
+        _finishTerminalHistoryBatch,
+      );
     }
     store = TerminalStore(TerminalControllerSink(terminalController));
     // Seed the inferred worktree from the constructor's own context so an attach
@@ -491,9 +486,12 @@ class SessionVm {
 
   void setBracketedPasteEnabled(bool enabled) {
     bracketedPasteEnabled = enabled;
-    try {
-      terminal.setBracketedPasteMode(enabled);
-    } catch (_) {}
+    final t = _terminal;
+    if (t != null) {
+      try {
+        t.setBracketedPasteMode(enabled);
+      } catch (_) {}
+    }
     TerminalPane.setBracketedPasteMode(title, enabled);
   }
 
@@ -815,7 +813,29 @@ class SessionVm {
   int? inFlightRows;
   int resizeRequestSeq = 0;
 
-  late final xt.Terminal terminal;
+  xt.Terminal? _terminal;
+  xt.Terminal get terminal => _terminal ??= _createTerminal();
+  bool get isUsingAltBuffer => _terminal?.isUsingAltBuffer ?? false;
+
+  xt.Terminal _createTerminal() {
+    final created = xt.Terminal(
+      maxLines: 50000,
+      // Re-wrap the whole buffer on resize, like a real terminal; otherwise
+      // scrollback keeps its old wrap points and a full-screen TUI's in-place
+      // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
+      // tolerates reflow replacing line objects: it drops a detached anchor
+      // line (`BufferLine.attached`) and falls back to following the bottom.
+      reflowEnabled: true,
+      onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
+    );
+    if (bracketedPasteEnabled) {
+      try {
+        created.setBracketedPasteMode(true);
+      } catch (_) {}
+    }
+    return created;
+  }
+
   // The single, ordered write path for all terminal output (live + history).
   // The sink wraps the controller, so both platform views render through their
   // existing listeners; decoding/buffering/CRLF/dedup all live in the store.
@@ -823,6 +843,7 @@ class SessionVm {
   // Guards dispose against the second call: every teardown site disposes the
   // whole view model, and ChangeNotifier.dispose asserts on reuse.
   bool _disposed = false;
+  bool _replayingHistoryOnTerminal = false;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
 
   // Deferred history: replay must wait until the view is laid out and fitted, so
@@ -908,29 +929,45 @@ class SessionVm {
     _flushPendingHistory();
   }
 
+  void _finishTerminalHistoryBatch() {
+    if (!_replayingHistoryOnTerminal) return;
+    _replayingHistoryOnTerminal = false;
+    _terminal?.setSynchronizedUpdateMode(false);
+  }
+
   void _flushPendingHistory() {
     final pending = _pendingHistory;
     if (pending == null) return;
     _pendingHistory = null;
-    if (!kIsWeb &&
-        (pending.rawOutput.isNotEmpty || pending.rawOutputPrefix.isNotEmpty) &&
-        _viewCols >= kMinTerminalCols &&
-        _viewRows >= kMinTerminalRows &&
-        (terminal.viewWidth != _viewCols || terminal.viewHeight != _viewRows)) {
-      terminal.resize(_viewCols, _viewRows);
+    final batchTerminalWrites =
+        !kIsWeb &&
+        (pending.rawOutput.isNotEmpty || pending.rawOutputPrefix.isNotEmpty);
+    if (batchTerminalWrites) {
+      if (_viewCols >= kMinTerminalCols &&
+          _viewRows >= kMinTerminalRows &&
+          (terminal.viewWidth != _viewCols ||
+              terminal.viewHeight != _viewRows)) {
+        terminal.resize(_viewCols, _viewRows);
+      }
+      _replayingHistoryOnTerminal = true;
+      terminal.setSynchronizedUpdateMode(true);
     }
-    store.dispatch(
-      HistoryBytes(
-        pending.rawOutput,
-        cols: _viewCols,
-        rows: _viewRows,
-        throughOutputSeq: pending.throughOutputSeq,
-        rawOutputStart: pending.rawOutputStart,
-        windowBytes: pending.windowBytes,
-        rawOutputPrefix: pending.rawOutputPrefix,
-        rawOutputViewport: pending.rawOutputViewport,
-      ),
-    );
+    try {
+      store.dispatch(
+        HistoryBytes(
+          pending.rawOutput,
+          cols: _viewCols,
+          rows: _viewRows,
+          throughOutputSeq: pending.throughOutputSeq,
+          rawOutputStart: pending.rawOutputStart,
+          windowBytes: pending.windowBytes,
+          rawOutputPrefix: pending.rawOutputPrefix,
+          rawOutputViewport: pending.rawOutputViewport,
+        ),
+      );
+    } finally {
+      _finishTerminalHistoryBatch();
+    }
     if (isExited) {
       markExited();
     }
@@ -958,14 +995,16 @@ class SessionVm {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _finishTerminalHistoryBatch();
     store.dispose();
     terminalController.dispose();
+    _terminal?.dispose();
   }
 }
 
 /// Staged attach/resync history awaiting the view's first fit.
 class _PendingHistory {
-  const _PendingHistory(
+  _PendingHistory(
     this.rawOutput,
     this.throughOutputSeq, {
     this.rawOutputStart,
@@ -981,7 +1020,12 @@ class _PendingHistory {
   final List<int> rawOutputPrefix;
   final List<int> rawOutputViewport;
 
+  bool _computedEffectiveStart = false;
+  int? _cachedEffectiveStart;
+
   int? get effectiveStart {
+    if (_computedEffectiveStart) return _cachedEffectiveStart;
+    _computedEffectiveStart = true;
     final start = rawOutputStart;
     if (start == null) return null;
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
@@ -991,7 +1035,7 @@ class _PendingHistory {
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
-    return start + trimmed.droppedRawBytes;
+    return _cachedEffectiveStart = start + trimmed.droppedRawBytes;
   }
 }
 
@@ -4096,7 +4140,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       status: loading ? 'loading' : 'idle',
       statusColor: loading ? const Color(0xffffc857) : const Color(0xff7f8b8d),
       icon: Icons.terminal,
-      rows: loading ? [_plainRow('Loading session $sessionId...')] : const [],
+      rows: (loading && runningUnderFlutterTest())
+          ? [_plainRow('Loading session $sessionId...')]
+          : const [],
       isRemote: true,
     );
   }
@@ -4299,9 +4345,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (existingIndex == -1) return;
         _sessions[existingIndex].status = 'load failed';
         _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
-        _sessions[existingIndex].rows
-          ..clear()
-          ..add(_plainRow('Failed to load session $sid'));
+        if (runningUnderFlutterTest()) {
+          _sessions[existingIndex].rows
+            ..clear()
+            ..add(_plainRow('Failed to load session $sid'));
+        }
       });
       // With the stack: this catch spans the whole load — attach, the swap
       // setState, regroup, drain, resize — so the message alone does not say
@@ -4468,9 +4516,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         status: exited ? 'exited' : 'attached',
         statusColor: exited ? const Color(0xff7f8b8d) : const Color(0xff7fd1c7),
         icon: Icons.terminal,
-        rows: plainRows.isEmpty
-            ? [_plainRow('Attached to session $sid')]
-            : plainRows,
+        rows: plainRows.isNotEmpty
+            ? plainRows
+            : (runningUnderFlutterTest()
+                  ? [_plainRow('Attached to session $sid')]
+                  : const []),
         isRemote: true,
         isExited: exited,
       );
@@ -4498,13 +4548,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Replay the raw output-history tail through the single write path. Live
       // chunks already covered by this snapshot are dropped by output_seq.
       final rawOutputStart = snapshot?['raw_output_start'] as int?;
+      final snapMap = snapshot ?? const <String, dynamic>{};
+      final rawOutput = _rawOutputFromSnapshot(snapMap);
+      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapMap);
+      final rawOutputViewport = _rawOutputViewportFromSnapshot(
+        snapMap,
+        decodedPrefix: rawOutputPrefix,
+        decodedRawOutput: rawOutput,
+      );
       session.applyHistory(
-        _rawOutputFromSnapshot(snapshot ?? const {}),
+        rawOutput,
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
         windowBytes: kHistoryFirstWindowBytes,
-        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
-        rawOutputViewport: _rawOutputViewportFromSnapshot(snapshot ?? const {}),
+        rawOutputPrefix: rawOutputPrefix,
+        rawOutputViewport: rawOutputViewport,
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -5187,7 +5245,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (replayHistory || !session.loaded) {
       final rawOutput = _rawOutputFromSnapshot(snapshot);
       final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      final rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
+      final rawOutputViewport = _rawOutputViewportFromSnapshot(
+        snapshot,
+        decodedPrefix: rawOutputPrefix,
+        decodedRawOutput: rawOutput,
+      );
       session.applyHistory(
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
@@ -5316,14 +5378,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
       rawOutputPrefixFromSnapshot(snapshot);
 
-  Uint8List _rawOutputViewportFromSnapshot(Map<String, dynamic> snapshot) =>
-      rawOutputViewportFromSnapshot(snapshot);
+  Uint8List _rawOutputViewportFromSnapshot(
+    Map<String, dynamic> snapshot, {
+    Uint8List? decodedPrefix,
+    Uint8List? decodedRawOutput,
+  }) => rawOutputViewportFromSnapshot(
+    snapshot,
+    decodedPrefix: decodedPrefix,
+    decodedRawOutput: decodedRawOutput,
+  );
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.
   /// Prefers visible_rows, falling back to the flattened text of styled_rows.
   List<StyledRow> _plainRowsFromSnapshot(Map<String, dynamic>? snapshot) {
-    if (snapshot == null) return const <StyledRow>[];
+    if (snapshot == null || !runningUnderFlutterTest()) {
+      return const <StyledRow>[];
+    }
     final visible = snapshot['visible_rows'] as List<dynamic>?;
     if (visible != null && visible.isNotEmpty) {
       return visible.map((row) => _plainRow(row?.toString() ?? '')).toList();
@@ -5650,7 +5721,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected || !session.isRemote || !session.loaded) {
       return null;
     }
-    if (session.pagingHistory || session.terminal.isUsingAltBuffer) {
+    if (session.pagingHistory || session.isUsingAltBuffer) {
       return null;
     }
     final start = session.historyStart;
@@ -5738,10 +5809,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (currentStart == null || currentStart <= 0) {
         return;
       }
-      if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
+      if (snapshot == null) return;
       var rawOutput = _rawOutputFromSnapshot(snapshot);
       var rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      var rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
+      if (rawOutput.isEmpty && rawOutputPrefix.isEmpty) return;
+      var rawOutputViewport = _rawOutputViewportFromSnapshot(
+        snapshot,
+        decodedPrefix: rawOutputPrefix,
+        decodedRawOutput: rawOutput,
+      );
       if (rawOutputViewport.isEmpty &&
           session.store.retainedRawViewport.isNotEmpty) {
         rawOutputViewport = session.store.retainedRawViewport;
@@ -5770,13 +5846,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               !session.store.isPagingHistory) {
             return;
           }
-          if (!snapshotCarriesHistory(fallback)) return;
+          final fallbackRawOutput = _rawOutputFromSnapshot(fallback);
+          final fallbackRawOutputPrefix = _rawOutputPrefixFromSnapshot(
+            fallback,
+          );
+          if (fallbackRawOutput.isEmpty && fallbackRawOutputPrefix.isEmpty) {
+            return;
+          }
           final fallbackStart = fallback['raw_output_start'] as int?;
           if (fallbackStart == null) return;
           snapshot = fallback;
-          rawOutput = _rawOutputFromSnapshot(fallback);
-          rawOutputPrefix = _rawOutputPrefixFromSnapshot(fallback);
-          rawOutputViewport = _rawOutputViewportFromSnapshot(fallback);
+          rawOutput = fallbackRawOutput;
+          rawOutputPrefix = fallbackRawOutputPrefix;
+          rawOutputViewport = _rawOutputViewportFromSnapshot(
+            fallback,
+            decodedPrefix: rawOutputPrefix,
+            decodedRawOutput: rawOutput,
+          );
           if (rawOutputViewport.isEmpty &&
               session.store.retainedRawViewport.isNotEmpty) {
             rawOutputViewport = session.store.retainedRawViewport;
