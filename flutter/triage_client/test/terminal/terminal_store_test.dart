@@ -9,7 +9,7 @@ import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/widgets/terminal_pane.dart'
     show TerminalController;
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// Records every sink op in order so tests assert on the *single ordered write
 /// path* the reducer is supposed to produce.

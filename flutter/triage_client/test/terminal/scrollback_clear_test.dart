@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// Drives a real `ESC[3J` through the emulator rather than simulating a trim,
 /// so these cover the behaviour the terminal actually produces.
@@ -18,33 +18,21 @@ void main() {
   }
 
   group('after a scrollback clear', () {
-    test(
-      'a trimmed line stays attached but reports a row before the buffer',
-      () {
-        final terminal = terminalWithScrollback();
-        final top = terminal.buffer.lines[0];
-        expect(top.attached, isTrue);
-        expect(top.index, 0);
+    test('a trimmed line is detached from the buffer', () {
+      final terminal = terminalWithScrollback();
+      final top = terminal.buffer.lines[0];
+      expect(top.attached, isTrue);
+      expect(top.index, 0);
 
-        terminal.write('\x1b[3J');
+      terminal.write('\x1b[3J');
 
-        // The premise the rest of this rests on: xterm deliberately does not
-        // detach these, so `attached` cannot be used to spot them.
-        expect(top.attached, isTrue);
-        expect(
-          top.index,
-          lessThan(0),
-          reason: 'a cleared line sits before the start of the buffer',
-        );
-      },
-    );
+      expect(top.attached, isFalse);
+    });
 
     test('surviving lines keep reporting their true row', () {
       final terminal = terminalWithScrollback();
       terminal.write('\x1b[3J');
 
-      // This is what the fork's trimStart fix buys: without it every survivor
-      // reads high by the number trimmed.
       for (var row = 0; row < terminal.buffer.lines.length; row++) {
         expect(terminal.buffer.lines[row].index, row);
       }
@@ -67,8 +55,6 @@ void main() {
 
       terminal.write('\x1b[3J');
 
-      // Without the negative-row guard this clamps to 0.0 and pins the viewport
-      // to the top of the buffer rather than letting it follow the bottom.
       expect(
         anchor.desiredOffset(maxScrollExtent: 200, lineHeight: lineHeight),
         isNull,
@@ -90,9 +76,17 @@ void main() {
       terminal.write('\x1b[3J');
 
       final after = controller.selection;
-      // The controller still offers a range, which is exactly the trap.
-      expect(after, isNotNull);
-      expect(terminalSelectionIsLive(terminal.buffer, after!), isFalse);
+      expect(after, isNull);
+      expect(
+        terminalSelectionIsLive(
+          terminal.buffer,
+          xt.BufferRangeLine(
+            const xt.CellOffset(0, -1),
+            const xt.CellOffset(6, -1),
+          ),
+        ),
+        isFalse,
+      );
     });
 
     test('a selection over surviving rows stays live', () {

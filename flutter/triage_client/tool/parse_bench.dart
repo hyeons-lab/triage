@@ -1,6 +1,5 @@
-// Phase −1 gate: headless 1 MiB / 256 KiB replay comparison of the xterm 4.0
-// fork (status quo) vs xterm2 5.2.0. Pure Dart: `dart tool/parse_bench.dart`
-// (JIT) or AOT via `dart compile exe tool/parse_bench.dart`.
+// Headless 1 MiB / 256 KiB replay benchmark for xterm2 5.2.0. Pure Dart:
+// `dart tool/parse_bench.dart` (JIT) or AOT via `dart compile exe tool/parse_bench.dart`.
 //
 // Payload mimics daemon replay bytes: SGR-heavy agent output with CRLF line
 // endings, 256-color segments, box drawing, and occasional wide chars.
@@ -8,7 +7,6 @@
 import 'dart:convert';
 import 'dart:math';
 
-import 'package:xterm/core.dart' as xterm4;
 import 'package:xterm2/core.dart' as xterm2;
 
 import 'bench_payload.dart';
@@ -56,35 +54,12 @@ void _benchSize(int sizeBytes, int rounds) {
     '(${payload.length} chars, $payloadUtf8Bytes UTF-8 bytes) ---',
   );
   _runArm(
-    label: 'xterm4 one-shot ',
-    payloadUtf8Bytes: payloadUtf8Bytes,
-    rounds: rounds,
-    makeTerminalAndWrite: () {
-      final t = xterm4.Terminal(maxLines: kMaxLines);
-      t.write(payload);
-      return t.mainBuffer.lines.length;
-    },
-  );
-  _runArm(
     label: 'xterm2 one-shot ',
     payloadUtf8Bytes: payloadUtf8Bytes,
     rounds: rounds,
     makeTerminalAndWrite: () {
       final t = xterm2.Terminal(maxLines: kMaxLines);
       t.write(payload);
-      return t.mainBuffer.lines.length;
-    },
-  );
-  _runArm(
-    label: 'xterm4 chunked  ',
-    payloadUtf8Bytes: payloadUtf8Bytes,
-    rounds: rounds,
-    makeTerminalAndWrite: () {
-      final t = xterm4.Terminal(maxLines: kMaxLines);
-      for (var i = 0; i < payload.length; i += kChunkBytes) {
-        final end = min(i + kChunkBytes, payload.length);
-        t.write(payload.substring(i, end));
-      }
       return t.mainBuffer.lines.length;
     },
   );
