@@ -4,7 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 import 'debug_log.dart';
 import 'emulator_query_response.dart';
@@ -488,95 +488,10 @@ final RegExp _completePrivateCsi = RegExp(
   r'\x1b\[(?:[><=][0-9;]*[A-Za-z@`~]|\?[0-9;]*[su]|[0-9;]+u|3J)',
 );
 
-final RegExp _cbtOrChtSequence = RegExp(r'\x1b\[([0-9]*)([ZI])');
-
-/// Writes [data] to a native `package:xterm` [xt.Terminal], emulating `CSI Ps Z`
-/// (Cursor Backward Tabulation, `CBT`) and `CSI Ps I` (Cursor Forward
-/// Tabulation, `CHT`), which `package:xterm`'s parser leaves unimplemented.
-///
-/// Modern TUIs (such as `agy`, `claude`, and `codex`) emit `\x1b[3Z` / `\x1b[7Z`
-/// after status-bar or multi-line updates to move the cursor back by N tab
-/// stops. When `CBT` is ignored, the cursor stays near the right margin,
-/// causing subsequent output to wrap onto extra rows and vertical cursor-up
-/// redraws (`\x1b[NA`) to land below the top of the block and overwrite earlier
-/// lines.
+/// Writes [data] to a native `package:xterm2` [xt.Terminal].
 void writeToXterm(xt.Terminal terminal, String data) {
   if (data.isEmpty) return;
-  if (!data.contains('\x1b[') || (!data.contains('Z') && !data.contains('I'))) {
-    terminal.write(data);
-    return;
-  }
-  final matches = _cbtOrChtSequence.allMatches(data).toList(growable: false);
-  if (matches.isEmpty) {
-    terminal.write(data);
-    return;
-  }
-  final maxTabs = (terminal.viewWidth ~/ 8) + 1;
-  final hasCbt = matches.any((m) => m.group(2) == 'Z');
-  if (!hasCbt) {
-    final buf = StringBuffer();
-    var lastEnd = 0;
-    for (final match in matches) {
-      if (match.start > lastEnd) {
-        buf.write(data.substring(lastEnd, match.start));
-      }
-      final rawCount = match.group(1)!;
-      final parsed = rawCount.isEmpty ? 1 : (int.tryParse(rawCount) ?? 1);
-      final count = parsed <= 0 ? 1 : parsed;
-      final steps = count > maxTabs ? maxTabs : count;
-      buf.write('\t' * steps);
-      lastEnd = match.end;
-    }
-    if (lastEnd < data.length) {
-      buf.write(data.substring(lastEnd));
-    }
-    terminal.write(buf.toString());
-    return;
-  }
-
-  final coalesceSync =
-      !terminal.synchronizedUpdateMode && !data.contains('\x1b[?2026');
-  if (coalesceSync) {
-    terminal.setSynchronizedUpdateMode(true);
-  }
-  try {
-    final pending = StringBuffer();
-    var lastEnd = 0;
-    for (final match in matches) {
-      if (match.start > lastEnd) {
-        pending.write(data.substring(lastEnd, match.start));
-      }
-      final rawCount = match.group(1)!;
-      final parsed = rawCount.isEmpty ? 1 : (int.tryParse(rawCount) ?? 1);
-      final count = parsed <= 0 ? 1 : parsed;
-      final cmd = match.group(2)!;
-      if (cmd == 'Z') {
-        if (pending.isNotEmpty) {
-          terminal.write(pending.toString());
-          pending.clear();
-        }
-        var x = terminal.buffer.cursorX;
-        for (var step = 0; step < count && x > 0; step++) {
-          x = ((x - 1) ~/ 8) * 8;
-        }
-        pending.write('\x1b[${x + 1}G');
-      } else {
-        final steps = count > maxTabs ? maxTabs : count;
-        pending.write('\t' * steps);
-      }
-      lastEnd = match.end;
-    }
-    if (lastEnd < data.length) {
-      pending.write(data.substring(lastEnd));
-    }
-    if (pending.isNotEmpty) {
-      terminal.write(pending.toString());
-    }
-  } finally {
-    if (coalesceSync) {
-      terminal.setSynchronizedUpdateMode(false);
-    }
-  }
+  terminal.write(data);
 }
 
 /// The single reducer for the terminal pipeline.

@@ -34,7 +34,7 @@ dependencies:
 
   web_socket_channel: ^3.0.1
   flat_buffers: ^25.9.23
-  xterm: ^4.0.0
+  xterm2: ^5.4.0
   archive: ^4.0.0
 
   # The following adds the Cupertino Icons font to your application.
@@ -44,89 +44,6 @@ dependencies:
   flutter_secure_storage: ^10.3.1
   shared_preferences: ^2.3.2
 
-# Pinned to a fork of the released 4.0.0. Against the release, `lib/` differs by
-# exactly one file, `src/utils/circular_buffer.dart`, carrying the fixes below
-# and nothing else. The branch's other commits are tests, corrections to the
-# comments on those fixes, and a dev-dependency removal; the tests and the dev
-# dependency are outside `lib/`, and pub never resolves them for a non-root
-# package, so they cannot reach this app either way. Verify with:
-#
-#   git diff v4.0.0..<ref> -- lib/
-#
-# rather than by commit count, which has drifted from this comment more than
-# once.
-#
-# 1. `IndexAwareCircularBuffer.trimStart` advances the list's start without
-# advancing the absolute start it measures indices from, so after `ESC[3J`
-# (what `clear` emits) every surviving scrollback line reports a row too high
-# by the number trimmed, while lines written afterwards report correctly.
-# `BufferLine.index` is what pins our scrollback viewport (see
-# TerminalScrollAnchor) and what selection anchors resolve through, so the
-# effect is a viewport that jumps and a selection that reads the wrong rows
-# after any clear.
-#
-# It is fixed upstream only in PR 225, unmerged since 2026-05-08 against a
-# release that is two years old, so there is no published version to move to.
-# The fork is that PR's approach: advance the absolute start, and deliberately
-# do not detach the trimmed lines, because anchors still holding them guard
-# access with `assert(attached)` alone and would throw in release builds where
-# that assert is stripped. Retiring those anchors is left to us, in
-# `terminal_scroll_anchor.dart` and the panes.
-#
-# 2a. `replaceWith` clears the slots it is about to reuse without detaching
-# what they held, because after a trim those are lines fix 1 deliberately left
-# attached. Detaching them is the release-build crash fix 1 exists to avoid.
-# This also replaces a loop that dropped buffer slots on an oversized
-# replacement, which indexed the list rather than the replacement and could
-# reach those same lines.
-#
-# 2b. `replaceWith` adopted the reflowed lines through the rotated start and
-# only reset that start afterwards, so it wrote them at one rotation and read
-# them back at another, leaving the buffer rotated against itself. This is not
-# specific to a clear: `push` rotates the array every time it evicts from a
-# full scrollback, so writing past `maxLines` and then changing the width is
-# enough. Every row then answers with a different row's line and reports the
-# wrong index. When the reflow result is also shorter than the buffer (widening
-# a window whose lines were wrapped) it leaves rows the reflow never wrote, so a
-# row can hand back a cleared line or throw a null check error instead. Not in
-# PR 225; it is ours, and it is also what makes the rule the guards here rely on
-# ("a negative row means cleared away") hold on the resize path.
-#
-# 3. `Buffer.resize` previously dropped bottom lines on height shrink even if they
-# contained active content, and advanced cursorY on expand into blank space. It also
-# did not reposition the cursor across width reflow. The fork preserves cursor
-# coordinates relative to content, tracks cursor during width reflow with an anchor,
-# and only trims trailing empty lines below the cursor.
-#
-# 4. `RenderTerminal` layout race condition where `_stickToBottom` was cleared during
-# `applyContentDimensions` before `correctBy` executed during viewport resizing.
-#
-# 5. Support DEC Private Mode 2026 (Synchronized Output) to buffer UI listener
-# notifications during synchronized batches, and guard OS IME caret rect
-# notifications when the cursor is hidden or during synchronized updates.
-#
-# 6. Support CSI s (Save Cursor) and CSI u (Restore Cursor) in escape parser, fix
-# 1-based indexing for ANSI Cursor Position Report (CPR), and preserve initial
-# scroll offset in RenderTerminal layout without forced jump to bottom.
-#
-# Branched from the `v4.0.0` tag rather than upstream master. Master carries
-# unreleased commits beyond the tag, two of them behavioural (colour rendering
-# in `palette_builder.dart`, Android enter-key handling in `terminal_view.dart`),
-# and taking those unreviewed alongside a scrollback fix is not a trade this
-# needs to make.
-#
-# Pinned by commit, not by branch name: a branch ref would let a force-push or
-# a new commit change the terminal emulator this app ships with no diff here.
-#
-# Fix 1 can be dropped once a release contains PR 225. Fixes 2, 3, 4, 5, and 6 have
-# not been filed upstream yet, so nothing will carry them until that happens;
-# drop the override only once a release contains all of them.
-dependency_overrides:
-  xterm:
-    git:
-      url: https://github.com/hyeons-lab/xterm.dart.git
-      ref: 7e867fe15be8e76cca5651f3def8876d801df9a7
-
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -134,7 +51,6 @@ dev_dependencies:
     sdk: flutter
   flutter_driver:
     sdk: flutter
-  xterm2: ^5.2.0
   fake_async: ^1.3.1
   flutter_launcher_icons: ^0.14.1
   flutter_lints: ^6.0.0

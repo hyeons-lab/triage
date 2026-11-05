@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/main.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// A session with no seeded rows — enough to reach its live `terminal`, which is
 /// the object the reflow flag is set on.

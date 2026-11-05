@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 const _viewHeight = 5;
 

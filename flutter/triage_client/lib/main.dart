@@ -17,7 +17,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:triage_client/daemon_disk_stats.dart';
 import 'package:triage_client/daemon_host_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/models/daemon_server.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';

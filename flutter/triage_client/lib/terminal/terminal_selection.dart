@@ -1,4 +1,4 @@
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// Whether [range] still refers to rows that are inside [buffer].
 ///

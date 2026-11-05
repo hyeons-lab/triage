@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 // Builds a single buffer line of [width] cells from a compact spec: each entry
 // is either a single-character glyph or `null` for a blank (codePoint 0) cell —

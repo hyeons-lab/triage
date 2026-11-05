@@ -1,4 +1,4 @@
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// How close to the bottom a downward scroll must land before the pin is
 /// released. Wider than the single line `TerminalScrollAnchor.capture` uses to
