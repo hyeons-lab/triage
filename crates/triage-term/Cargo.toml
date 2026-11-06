@@ -1,0 +1,21 @@
+[package]
+name = "triage-term"
+description = "C-ABI VT terminal engine for Triage clients wrapping tattoy-wezterm-term."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+tattoy-wezterm-term.workspace = true
+tattoy-wezterm-surface.workspace = true
+
+[lints]
+workspace = true

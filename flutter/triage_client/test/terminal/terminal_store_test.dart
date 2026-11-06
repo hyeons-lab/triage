@@ -9,7 +9,7 @@ import 'package:triage_client/terminal/terminal_state.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/widgets/terminal_pane.dart'
     show TerminalController;
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// Records every sink op in order so tests assert on the *single ordered write
 /// path* the reducer is supposed to produce.
@@ -3183,6 +3183,26 @@ void main() {
       sw.stop();
       expect(term.buffer.cursorX, 39);
       expect(sw.elapsedMilliseconds, lessThan(200));
+    },
+  );
+
+  test(
+    'writeToXterm strips Mode 2026 markers so open-frame flushes notify immediately',
+    () {
+      final term = xt.Terminal(maxLines: 100);
+      term.resize(40, 4);
+      var notifications = 0;
+      term.addListener(() {
+        notifications++;
+      });
+
+      writeToXterm(term, '\x1b[?2026hstreaming partial frame');
+      expect(notifications, 1);
+      expect(
+        term.buffer.lines[0].toString().trimRight(),
+        'streaming partial frame',
+      );
+      term.dispose();
     },
   );
 }

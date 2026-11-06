@@ -17,7 +17,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:triage_client/daemon_disk_stats.dart';
 import 'package:triage_client/daemon_host_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/models/daemon_server.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
@@ -32,6 +32,7 @@ import 'package:triage_client/terminal/size_drift.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
+import 'package:triage_client/terminal/triage_term_ffi.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
 // the web client — which has no `dart:io` — compiles against web stubs.
 import 'package:triage_client/platform_env_io.dart'
@@ -369,34 +370,34 @@ class SessionVm {
        // a lazy placeholder seeds an immutable empty list.
        rows = List<StyledRow>.of(rows),
        terminalController = TerminalController() {
-    terminal = xt.Terminal(
-      maxLines: 50000,
-      // Re-wrap the whole buffer on resize, like a real terminal — otherwise
-      // scrollback keeps its old wrap points and a full-screen TUI's in-place
-      // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
-      // tolerates reflow replacing line objects: it drops a detached anchor
-      // line (`BufferLine.attached`) and falls back to following the bottom.
-      reflowEnabled: true,
-      onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
-    );
     if (!kIsWeb) {
       terminalController.addWriteListener((data) {
         writeToXterm(terminal, data);
       });
       terminalController.addClearListener(() {
+        final t = _terminal;
+        if (t == null) return;
+        beginTerminalWriteBatch();
         try {
-          terminal.useMainBuffer();
-          terminal.mainBuffer.clear();
-          terminal.altBuffer.clear();
-          terminal.write(
-            '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
+          t.clear();
+          t.useMainBuffer();
+          t.mainBuffer.clear();
+          t.altBuffer.clear();
+          t.write(
+            '\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
             '\x1b[?2004l\x1b[?1l\x1b[?7h\x1b[?25h\x1b[H\x1b[2J\x1b[3J',
           );
-        } catch (_) {}
+        } catch (_) {
+        } finally {
+          endTerminalWriteBatch();
+        }
       });
       terminalController.addResizeListener((cols, rows) {
         terminal.resize(cols, rows);
       });
+      terminalController.addHistoryReplayedListener(
+        _finishTerminalHistoryBatch,
+      );
     }
     store = TerminalStore(TerminalControllerSink(terminalController));
     // Seed the inferred worktree from the constructor's own context so an attach
@@ -491,9 +492,12 @@ class SessionVm {
 
   void setBracketedPasteEnabled(bool enabled) {
     bracketedPasteEnabled = enabled;
-    try {
-      terminal.setBracketedPasteMode(enabled);
-    } catch (_) {}
+    final t = _terminal;
+    if (t != null) {
+      try {
+        t.setBracketedPasteMode(enabled);
+      } catch (_) {}
+    }
     TerminalPane.setBracketedPasteMode(title, enabled);
   }
 
@@ -815,7 +819,29 @@ class SessionVm {
   int? inFlightRows;
   int resizeRequestSeq = 0;
 
-  late final xt.Terminal terminal;
+  xt.Terminal? _terminal;
+  xt.Terminal get terminal => _terminal ??= _createTerminal();
+  bool get isUsingAltBuffer => _terminal?.isUsingAltBuffer ?? false;
+
+  xt.Terminal _createTerminal() {
+    final created = createTriageTerminal(
+      maxLines: 50000,
+      // Re-wrap the whole buffer on resize, like a real terminal; otherwise
+      // scrollback keeps its old wrap points and a full-screen TUI's in-place
+      // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
+      // tolerates reflow replacing line objects: it drops a detached anchor
+      // line (`BufferLine.attached`) and falls back to following the bottom.
+      reflowEnabled: true,
+      onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
+    );
+    if (bracketedPasteEnabled) {
+      try {
+        created.setBracketedPasteMode(true);
+      } catch (_) {}
+    }
+    return created;
+  }
+
   // The single, ordered write path for all terminal output (live + history).
   // The sink wraps the controller, so both platform views render through their
   // existing listeners; decoding/buffering/CRLF/dedup all live in the store.
@@ -823,7 +849,25 @@ class SessionVm {
   // Guards dispose against the second call: every teardown site disposes the
   // whole view model, and ChangeNotifier.dispose asserts on reuse.
   bool _disposed = false;
+  bool _replayingHistoryOnTerminal = false;
+  int _terminalBatchDepth = 0;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
+
+  void beginTerminalWriteBatch() {
+    if (kIsWeb || _disposed) return;
+    _terminalBatchDepth += 1;
+    if (_terminalBatchDepth == 1) {
+      terminal.setSynchronizedUpdateMode(true);
+    }
+  }
+
+  void endTerminalWriteBatch() {
+    if (kIsWeb || _terminalBatchDepth <= 0) return;
+    _terminalBatchDepth -= 1;
+    if (_terminalBatchDepth == 0 && !_disposed) {
+      _terminal?.setSynchronizedUpdateMode(false);
+    }
+  }
 
   // Deferred history: replay must wait until the view is laid out and fitted, so
   // it re-emulates at the real terminal size. Writing before the first fit
@@ -908,29 +952,47 @@ class SessionVm {
     _flushPendingHistory();
   }
 
+  void _finishTerminalHistoryBatch() {
+    if (!_replayingHistoryOnTerminal) return;
+    _replayingHistoryOnTerminal = false;
+    endTerminalWriteBatch();
+    if (_terminalBatchDepth > 0 && !_disposed) {
+      _terminal?.setSynchronizedUpdateMode(false);
+      _terminal?.setSynchronizedUpdateMode(true);
+    }
+  }
+
   void _flushPendingHistory() {
     final pending = _pendingHistory;
     if (pending == null) return;
     _pendingHistory = null;
-    if (!kIsWeb &&
-        (pending.rawOutput.isNotEmpty || pending.rawOutputPrefix.isNotEmpty) &&
-        _viewCols >= kMinTerminalCols &&
-        _viewRows >= kMinTerminalRows &&
-        (terminal.viewWidth != _viewCols || terminal.viewHeight != _viewRows)) {
-      terminal.resize(_viewCols, _viewRows);
+    const batchTerminalWrites = !kIsWeb;
+    if (batchTerminalWrites) {
+      if (_viewCols >= kMinTerminalCols &&
+          _viewRows >= kMinTerminalRows &&
+          (terminal.viewWidth != _viewCols ||
+              terminal.viewHeight != _viewRows)) {
+        terminal.resize(_viewCols, _viewRows);
+      }
+      _replayingHistoryOnTerminal = true;
+      beginTerminalWriteBatch();
     }
-    store.dispatch(
-      HistoryBytes(
-        pending.rawOutput,
-        cols: _viewCols,
-        rows: _viewRows,
-        throughOutputSeq: pending.throughOutputSeq,
-        rawOutputStart: pending.rawOutputStart,
-        windowBytes: pending.windowBytes,
-        rawOutputPrefix: pending.rawOutputPrefix,
-        rawOutputViewport: pending.rawOutputViewport,
-      ),
-    );
+    try {
+      store.dispatch(
+        HistoryBytes(
+          pending.rawOutput,
+          cols: _viewCols,
+          rows: _viewRows,
+          throughOutputSeq: pending.throughOutputSeq,
+          rawOutputStart: pending.rawOutputStart,
+          windowBytes: pending.windowBytes,
+          rawOutputPrefix: pending.rawOutputPrefix,
+          rawOutputViewport: pending.rawOutputViewport,
+        ),
+      );
+    } finally {
+      _finishTerminalHistoryBatch();
+    }
     if (isExited) {
       markExited();
     }
@@ -938,18 +1000,35 @@ class SessionVm {
 
   /// Apply a live raw output chunk (remote PTY bytes) through the write path.
   void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
-    if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
-      noteViewFit(lastFittedCols!, lastFittedRows!);
+    beginTerminalWriteBatch();
+    try {
+      if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
+        noteViewFit(lastFittedCols!, lastFittedRows!);
+      }
+      store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
+    } finally {
+      endTerminalWriteBatch();
     }
-    store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
   }
 
   /// Echo locally produced bytes for local/demo sessions (no remote PTY).
   void echoLocalBytes(List<int> bytes) {
-    store.dispatch(LiveBytes(bytes));
+    beginTerminalWriteBatch();
+    try {
+      store.dispatch(LiveBytes(bytes));
+    } finally {
+      endTerminalWriteBatch();
+    }
   }
 
-  void markExited() => store.dispatch(const Exited());
+  void markExited() {
+    beginTerminalWriteBatch();
+    try {
+      store.dispatch(const Exited());
+    } finally {
+      endTerminalWriteBatch();
+    }
+  }
 
   void focusCursorOnNextDisplay() {
     focusCursorRevision += 1;
@@ -958,14 +1037,17 @@ class SessionVm {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _replayingHistoryOnTerminal = false;
+    _terminalBatchDepth = 0;
     store.dispose();
     terminalController.dispose();
+    _terminal?.dispose();
   }
 }
 
 /// Staged attach/resync history awaiting the view's first fit.
 class _PendingHistory {
-  const _PendingHistory(
+  _PendingHistory(
     this.rawOutput,
     this.throughOutputSeq, {
     this.rawOutputStart,
@@ -981,7 +1063,12 @@ class _PendingHistory {
   final List<int> rawOutputPrefix;
   final List<int> rawOutputViewport;
 
+  bool _computedEffectiveStart = false;
+  int? _cachedEffectiveStart;
+
   int? get effectiveStart {
+    if (_computedEffectiveStart) return _cachedEffectiveStart;
+    _computedEffectiveStart = true;
     final start = rawOutputStart;
     if (start == null) return null;
     final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
@@ -991,7 +1078,7 @@ class _PendingHistory {
       maxLines: budgets.maxLines,
       maxBytes: budgets.maxBytes,
     );
-    return start + trimmed.droppedRawBytes;
+    return _cachedEffectiveStart = start + trimmed.droppedRawBytes;
   }
 }
 
@@ -4096,7 +4183,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       status: loading ? 'loading' : 'idle',
       statusColor: loading ? const Color(0xffffc857) : const Color(0xff7f8b8d),
       icon: Icons.terminal,
-      rows: loading ? [_plainRow('Loading session $sessionId...')] : const [],
+      rows: (loading && runningUnderFlutterTest())
+          ? [_plainRow('Loading session $sessionId...')]
+          : const [],
       isRemote: true,
     );
   }
@@ -4299,9 +4388,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (existingIndex == -1) return;
         _sessions[existingIndex].status = 'load failed';
         _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
-        _sessions[existingIndex].rows
-          ..clear()
-          ..add(_plainRow('Failed to load session $sid'));
+        if (runningUnderFlutterTest()) {
+          _sessions[existingIndex].rows
+            ..clear()
+            ..add(_plainRow('Failed to load session $sid'));
+        }
       });
       // With the stack: this catch spans the whole load — attach, the swap
       // setState, regroup, drain, resize — so the message alone does not say
@@ -4468,9 +4559,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         status: exited ? 'exited' : 'attached',
         statusColor: exited ? const Color(0xff7f8b8d) : const Color(0xff7fd1c7),
         icon: Icons.terminal,
-        rows: plainRows.isEmpty
-            ? [_plainRow('Attached to session $sid')]
-            : plainRows,
+        rows: plainRows.isNotEmpty
+            ? plainRows
+            : (runningUnderFlutterTest()
+                  ? [_plainRow('Attached to session $sid')]
+                  : const []),
         isRemote: true,
         isExited: exited,
       );
@@ -4498,13 +4591,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // Replay the raw output-history tail through the single write path. Live
       // chunks already covered by this snapshot are dropped by output_seq.
       final rawOutputStart = snapshot?['raw_output_start'] as int?;
+      final snapMap = snapshot ?? const <String, dynamic>{};
+      final rawOutput = _rawOutputFromSnapshot(snapMap);
+      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapMap);
+      final rawOutputViewport = _rawOutputViewportFromSnapshot(
+        snapMap,
+        decodedPrefix: rawOutputPrefix,
+        decodedRawOutput: rawOutput,
+      );
       session.applyHistory(
-        _rawOutputFromSnapshot(snapshot ?? const {}),
+        rawOutput,
         throughOutputSeq: outputSeq,
         rawOutputStart: rawOutputStart,
         windowBytes: kHistoryFirstWindowBytes,
-        rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
-        rawOutputViewport: _rawOutputViewportFromSnapshot(snapshot ?? const {}),
+        rawOutputPrefix: rawOutputPrefix,
+        rawOutputViewport: rawOutputViewport,
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -4617,14 +4718,35 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<void> _processWebsocketEventQueue() async {
     if (_websocketProcessingEvent || _websocketEventQueue.isEmpty) return;
     _websocketProcessingEvent = true;
+    final batchedSessions = <SessionVm>{};
+    void flushBatchedSessions() {
+      if (batchedSessions.isEmpty) return;
+      for (final s in batchedSessions) {
+        s.endTerminalWriteBatch();
+      }
+      batchedSessions.clear();
+    }
+
+    final sliceWatch = Stopwatch()..start();
     try {
       while (_websocketEventQueue.isNotEmpty && !_disposed) {
         final message = _websocketEventQueue.removeFirst();
         try {
-          await _processWebSocketEvent(message);
+          await _processWebSocketEvent(
+            message,
+            batchedSessions: batchedSessions,
+          );
         } catch (_) {}
+        if (!runningUnderFlutterTest() &&
+            _websocketEventQueue.isNotEmpty &&
+            sliceWatch.elapsedMilliseconds >= 8) {
+          flushBatchedSessions();
+          await Future<void>.delayed(Duration.zero);
+          sliceWatch.reset();
+        }
       }
     } finally {
+      flushBatchedSessions();
       _websocketProcessingEvent = false;
     }
   }
@@ -4751,7 +4873,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _processWebSocketEvent(Map<String, dynamic> message) async {
+  Future<void> _processWebSocketEvent(
+    Map<String, dynamic> message, {
+    Set<SessionVm>? batchedSessions,
+  }) async {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
       _onWebSocketClosed(_connectGeneration);
@@ -4981,7 +5106,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final pending = _pendingEvents.remove(sessionId);
       if (pending != null && pending.isNotEmpty) {
         for (final msg in pending) {
-          _processWebSocketEvent(msg);
+          await _processWebSocketEvent(msg, batchedSessions: batchedSessions);
         }
       }
 
@@ -4990,11 +5115,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final outputSeq = output['output_seq'] as int?;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
 
+        if (batchedSessions != null &&
+            !kIsWeb &&
+            batchedSessions.add(session)) {
+          session.beginTerminalWriteBatch();
+        }
         // Single write path: raw bytes flow through the store, which owns UTF-8
         // carry, CRLF normalization, buffering, and all output_seq
         // de-duplication (against both the history high-water and re-deliveries).
         session.applyLiveBytes(bytes, outputSeq: outputSeq);
       } else if (event.containsKey('Exited')) {
+        if (batchedSessions != null && batchedSessions.remove(session)) {
+          session.endTerminalWriteBatch();
+        }
         _pendingInput.forget(sessionId);
         session.hasInputLease = false;
         session.markExited();
@@ -5023,6 +5156,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hostSizeRows = rows;
         }
       } else if (event.containsKey('ResyncRequired')) {
+        if (batchedSessions != null && batchedSessions.remove(session)) {
+          session.endTerminalWriteBatch();
+        }
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
@@ -5187,7 +5323,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (replayHistory || !session.loaded) {
       final rawOutput = _rawOutputFromSnapshot(snapshot);
       final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      final rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
+      final rawOutputViewport = _rawOutputViewportFromSnapshot(
+        snapshot,
+        decodedPrefix: rawOutputPrefix,
+        decodedRawOutput: rawOutput,
+      );
       session.applyHistory(
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
@@ -5316,14 +5456,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
       rawOutputPrefixFromSnapshot(snapshot);
 
-  Uint8List _rawOutputViewportFromSnapshot(Map<String, dynamic> snapshot) =>
-      rawOutputViewportFromSnapshot(snapshot);
+  Uint8List _rawOutputViewportFromSnapshot(
+    Map<String, dynamic> snapshot, {
+    Uint8List? decodedPrefix,
+    Uint8List? decodedRawOutput,
+  }) => rawOutputViewportFromSnapshot(
+    snapshot,
+    decodedPrefix: decodedPrefix,
+    decodedRawOutput: decodedRawOutput,
+  );
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.
   /// Prefers visible_rows, falling back to the flattened text of styled_rows.
   List<StyledRow> _plainRowsFromSnapshot(Map<String, dynamic>? snapshot) {
-    if (snapshot == null) return const <StyledRow>[];
+    if (snapshot == null || !runningUnderFlutterTest()) {
+      return const <StyledRow>[];
+    }
     final visible = snapshot['visible_rows'] as List<dynamic>?;
     if (visible != null && visible.isNotEmpty) {
       return visible.map((row) => _plainRow(row?.toString() ?? '')).toList();
@@ -5650,7 +5799,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected || !session.isRemote || !session.loaded) {
       return null;
     }
-    if (session.pagingHistory || session.terminal.isUsingAltBuffer) {
+    if (session.pagingHistory || session.isUsingAltBuffer) {
       return null;
     }
     final start = session.historyStart;
@@ -5738,10 +5887,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (currentStart == null || currentStart <= 0) {
         return;
       }
-      if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
+      if (snapshot == null) return;
       var rawOutput = _rawOutputFromSnapshot(snapshot);
       var rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      var rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
+      if (rawOutput.isEmpty && rawOutputPrefix.isEmpty) return;
+      var rawOutputViewport = _rawOutputViewportFromSnapshot(
+        snapshot,
+        decodedPrefix: rawOutputPrefix,
+        decodedRawOutput: rawOutput,
+      );
       if (rawOutputViewport.isEmpty &&
           session.store.retainedRawViewport.isNotEmpty) {
         rawOutputViewport = session.store.retainedRawViewport;
@@ -5770,13 +5924,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               !session.store.isPagingHistory) {
             return;
           }
-          if (!snapshotCarriesHistory(fallback)) return;
+          final fallbackRawOutput = _rawOutputFromSnapshot(fallback);
+          final fallbackRawOutputPrefix = _rawOutputPrefixFromSnapshot(
+            fallback,
+          );
+          if (fallbackRawOutput.isEmpty && fallbackRawOutputPrefix.isEmpty) {
+            return;
+          }
           final fallbackStart = fallback['raw_output_start'] as int?;
           if (fallbackStart == null) return;
           snapshot = fallback;
-          rawOutput = _rawOutputFromSnapshot(fallback);
-          rawOutputPrefix = _rawOutputPrefixFromSnapshot(fallback);
-          rawOutputViewport = _rawOutputViewportFromSnapshot(fallback);
+          rawOutput = fallbackRawOutput;
+          rawOutputPrefix = fallbackRawOutputPrefix;
+          rawOutputViewport = _rawOutputViewportFromSnapshot(
+            fallback,
+            decodedPrefix: rawOutputPrefix,
+            decodedRawOutput: rawOutput,
+          );
           if (rawOutputViewport.isEmpty &&
               session.store.retainedRawViewport.isNotEmpty) {
             rawOutputViewport = session.store.retainedRawViewport;

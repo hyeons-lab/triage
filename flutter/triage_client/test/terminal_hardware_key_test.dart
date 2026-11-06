@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
-import 'package:xterm/xterm.dart' hide TerminalController, TerminalStyle;
+import 'package:xterm2/xterm.dart' hide TerminalController, TerminalStyle;
 
 void main() {
   group('TerminalPane hardware Tab and Shift+Tab key handling', () {

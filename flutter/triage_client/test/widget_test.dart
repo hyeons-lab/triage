@@ -32,7 +32,7 @@ import 'package:triage_client/terminal/terminal_store.dart'
         kHistoryLeaseProbeBytes,
         kHistoryReplayMaxBytes;
 import 'package:triage_client/widgets/terminal_pane.dart';
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 
 /// One history window a test serves for a session: the raw tail bytes, the
 /// absolute log offset they start at, and the output sequence they run
