@@ -224,6 +224,7 @@ impl TriageTermEngine {
         self.config
             .physical_rows
             .store(physical_rows, Ordering::Relaxed);
+        self.prevent_trailing_wrapped_line_drop_on_resize();
         self.terminal.resize(TerminalSize {
             rows: physical_rows,
             cols: physical_cols,
@@ -234,8 +235,55 @@ impl TriageTermEngine {
         self.resized_since_sync = true;
     }
 
+    /// Before `Screen::resize` runs `rewrap_lines`, it pops trailing whitespace
+    /// lines after the cursor. If the last surviving line still has
+    /// `last_cell_was_wrapped() == true`, `rewrap_lines` holds it in
+    /// `logical_line` waiting for a continuation line and drops it at loop end.
+    fn prevent_trailing_wrapped_line_drop_on_resize(&mut self) {
+        if self.terminal.is_alt_screen_active() {
+            return;
+        }
+        let seqno = self.terminal.current_seqno();
+        let cursor_y = self.terminal.cursor_pos().y;
+        let screen = self.terminal.screen_mut();
+        let total = screen.scrollback_rows();
+        if total == 0 {
+            return;
+        }
+        let cursor_phys = screen.phys_row(cursor_y);
+        let mut last_surviving = total - 1;
+        while last_surviving > cursor_phys {
+            if screen.line_mut(last_surviving).is_whitespace() {
+                last_surviving -= 1;
+            } else {
+                break;
+            }
+        }
+        let last_line = screen.line_mut(last_surviving);
+        if last_line.last_cell_was_wrapped() {
+            last_line.set_last_cell_was_wrapped(false, seqno);
+        }
+    }
+
     pub fn clear(&mut self) {
+        self.write_bytes(
+            b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\
+              \x1b[?2004l\x1b[?1l\x1b[?6l\x1b[?7h\x1b[?25h\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J",
+        );
         self.terminal.erase_scrollback_and_viewport();
+        let screen = self.terminal.screen();
+        let physical_rows = screen.physical_rows.max(1);
+        let physical_cols = screen.physical_cols.max(1);
+        let reset_baseline = ScreenSyncBaseline {
+            synced_seqno: 0,
+            stable_offset: 0,
+            total_lines: physical_rows,
+            physical_rows,
+            physical_cols,
+        };
+        self.primary_baseline = reset_baseline;
+        self.alt_baseline = reset_baseline;
+        self.last_alt_screen = false;
         self.saw_erase_scrollback = true;
         self.saw_erase_display = true;
     }
@@ -427,9 +475,15 @@ impl TriageTermEngine {
         let screen = self.terminal.screen();
         let physical_rows = screen.physical_rows.max(1);
         let physical_cols = screen.physical_cols.max(1);
-        let total_lines = screen.scrollback_rows().max(physical_rows);
-        let current_stable = screen.phys_to_stable_row_index(0).max(0) as usize;
-        let max_allowed = self.max_lines.max(physical_rows);
+        let raw_total_lines = screen.scrollback_rows().max(physical_rows);
+        let max_allowed = if is_alt {
+            physical_rows
+        } else {
+            self.max_lines.max(physical_rows)
+        };
+        let phys_offset = raw_total_lines.saturating_sub(max_allowed);
+        let total_lines = raw_total_lines - phys_offset;
+        let current_stable = screen.phys_to_stable_row_index(phys_offset).max(0) as usize;
 
         let baseline = if is_alt {
             &mut self.alt_baseline
@@ -438,9 +492,11 @@ impl TriageTermEngine {
         };
 
         let force_all_dirty = alt_switched
-            || self.resized_since_sync
             || baseline.synced_seqno == 0
-            || physical_cols != baseline.physical_cols;
+            || physical_cols != baseline.physical_cols
+            || (self.resized_since_sync && (is_alt || current_stable != baseline.stable_offset))
+            || self.saw_erase_scrollback
+            || self.saw_erase_display;
 
         let (explicit_trimmed_top, pushed_bottom) =
             if is_alt || self.resized_since_sync || baseline.synced_seqno == 0 {
@@ -474,22 +530,36 @@ impl TriageTermEngine {
         self.combining_meta.clear();
 
         if force_all_dirty
+            || self.resized_since_sync
             || current_seqno > last_seqno
             || self.saw_erase_scrollback
             || self.saw_erase_display
         {
-            let lines = screen.lines_in_phys_range(0..total_lines);
-            let actual_len = lines.len();
             let mut dirty_idx = 0usize;
-            for phys_idx in 0..actual_len {
-                let line = &lines[phys_idx];
-                let is_dirty = force_all_dirty
-                    || phys_idx >= dirty_tail_start
-                    || line.changed_since(last_seqno);
-                if !is_dirty {
-                    continue;
+            let mut prev_line_wrapped = false;
+            let mut prev_line_changed = false;
+            screen.for_each_phys_line(|phys_idx, line| {
+                let line_wrapped = line.last_cell_was_wrapped();
+                let line_changed = line.changed_since(last_seqno);
+                if phys_idx < phys_offset {
+                    prev_line_wrapped = line_wrapped;
+                    prev_line_changed = line_changed;
+                    return;
                 }
-                let is_wrapped = phys_idx > 0 && lines[phys_idx - 1].last_cell_was_wrapped();
+                let rel_idx = phys_idx - phys_offset;
+                if rel_idx >= total_lines {
+                    return;
+                }
+                let is_wrapped = rel_idx > 0 && prev_line_wrapped;
+                let is_dirty = force_all_dirty
+                    || rel_idx >= dirty_tail_start
+                    || line_changed
+                    || prev_line_changed;
+                prev_line_wrapped = line_wrapped;
+                prev_line_changed = line_changed;
+                if !is_dirty {
+                    return;
+                }
                 let has_combining = pack_line_cells(
                     line,
                     physical_cols,
@@ -504,10 +574,10 @@ impl TriageTermEngine {
                 if has_combining {
                     line_flags |= 2;
                 }
-                self.dirty_line_meta.push(phys_idx as u32);
+                self.dirty_line_meta.push(rel_idx as u32);
                 self.dirty_line_meta.push(line_flags);
                 dirty_idx += 1;
-            }
+            });
         }
 
         baseline.synced_seqno = current_seqno;
@@ -941,5 +1011,82 @@ mod tests {
         engine.write_bytes(b"\r\x1b[999999I");
         let h2 = *engine.sync();
         assert_eq!(h2.cursor_x, 39);
+    }
+
+    #[test]
+    fn narrow_resize_at_scrollback_capacity_clamps_total_lines() {
+        let mut engine = TriageTermEngine::new(40, 5, 20);
+        for i in 0..25 {
+            engine.write_bytes(format!("row-{i:02}-01234567890123456789012345\r\n").as_bytes());
+        }
+        let h1 = *engine.sync();
+        assert_eq!(h1.total_lines, 20);
+
+        // Narrowing from 40 to 10 cols wraps each 33-char line into 4 physical rows,
+        // expanding `Screen::lines` past `max_lines` (20). `sync()` must clamp
+        // `total_lines` to `max_lines` so the Dart circular buffer never overflows.
+        engine.resize(10, 5, 0, 0);
+        let h2 = *engine.sync();
+        assert_eq!(h2.total_lines, 20);
+        assert_eq!(h2.dirty_line_count, 20);
+
+        // Subsequent scrolling continues to report accurate `pushed_bottom`.
+        engine.write_bytes(b"tail\r\n");
+        let h3 = *engine.sync();
+        assert_eq!(h3.total_lines, 20);
+        assert_eq!(h3.pushed_bottom, 1);
+    }
+
+    #[test]
+    fn clear_exits_alt_screen_and_resets_modes() {
+        let mut engine = TriageTermEngine::new(20, 5, 50);
+        engine.write_bytes(b"\x1b[?1049h\x1b[?1002h\x1b[?1006hAlt text");
+        let h1 = *engine.sync();
+        assert_ne!(h1.mode_flags & MODE_ALT_SCREEN, 0);
+        assert_eq!(h1.mouse_mode, 3);
+        assert_eq!(h1.mouse_report_mode, 2);
+
+        engine.clear();
+        let h2 = *engine.sync();
+        assert_eq!(h2.mode_flags & MODE_ALT_SCREEN, 0);
+        assert_eq!(h2.mouse_mode, 0);
+        assert_eq!(h2.total_lines, 5);
+    }
+
+    #[test]
+    fn alt_screen_height_shrink_clamps_total_lines_to_physical_rows() {
+        let mut engine = TriageTermEngine::new(80, 24, 1000);
+        engine.write_bytes(b"\x1b[?1049h\x1b[1;1HHeader\x1b[24;1HStatusBar\x1b[1;1H");
+        let h1 = *engine.sync();
+        assert_ne!(h1.mode_flags & MODE_ALT_SCREEN, 0);
+        assert_eq!(h1.total_lines, 24);
+
+        // Shrinking the alternate screen height when row 24 is non-whitespace
+        // must still report `total_lines == physical_rows` (15), never 24.
+        engine.resize(44, 15, 0, 0);
+        let h2 = *engine.sync();
+        assert_eq!(h2.physical_rows, 15);
+        assert_eq!(h2.total_lines, 15);
+        assert_eq!(h2.dirty_line_count, 15);
+    }
+
+    #[test]
+    fn height_only_resize_on_primary_screen_syncs_only_viewport_tail() {
+        let mut engine = TriageTermEngine::new(44, 30, 1000);
+        for i in 0..1000 {
+            engine.write_bytes(format!("line-{i:04}\r\n").as_bytes());
+        }
+        let h1 = *engine.sync();
+        assert_eq!(h1.total_lines, 1000);
+
+        // Height-only resize (such as an Android IME keyboard frame) should only
+        // sync the viewport tail rather than repacking all 1,000 scrollback lines.
+        engine.resize(44, 15, 0, 0);
+        let h2 = *engine.sync();
+        assert!(
+            h2.dirty_line_count <= 30,
+            "dirty_line_count={}",
+            h2.dirty_line_count
+        );
     }
 }

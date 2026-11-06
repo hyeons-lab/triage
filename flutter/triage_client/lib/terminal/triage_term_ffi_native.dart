@@ -353,7 +353,16 @@ class TriageRustTerminal extends xt.Terminal {
   int _rustViewHeight = 24;
   int _rustCellPixelWidth = 0;
   int _rustCellPixelHeight = 0;
+  bool _batchingUpdates = false;
+  bool _needsRustSync = false;
   bool _disposed = false;
+
+  void _flushPendingRustSync() {
+    if (_needsRustSync && !_disposed && _engine != ffi.nullptr) {
+      _needsRustSync = false;
+      _syncFromRust(notify: false);
+    }
+  }
 
   @override
   int get viewWidth => _rustViewWidth;
@@ -362,9 +371,46 @@ class TriageRustTerminal extends xt.Terminal {
   int get viewHeight => _rustViewHeight;
 
   @override
+  xt.Buffer get buffer {
+    _flushPendingRustSync();
+    return super.buffer;
+  }
+
+  @override
+  xt.Buffer get mainBuffer {
+    _flushPendingRustSync();
+    return super.mainBuffer;
+  }
+
+  @override
+  xt.Buffer get altBuffer {
+    _flushPendingRustSync();
+    return super.altBuffer;
+  }
+
+  @override
+  bool get isUsingAltBuffer {
+    _flushPendingRustSync();
+    return super.isUsingAltBuffer;
+  }
+
+  @override
+  void setSynchronizedUpdateMode(bool enabled) {
+    _batchingUpdates = enabled;
+    if (!enabled && _needsRustSync && !_disposed && _engine != ffi.nullptr) {
+      _needsRustSync = false;
+      _syncFromRust(notify: true);
+    }
+  }
+
+  @override
   void write(String data) {
     if (_disposed || data.isEmpty || _engine == ffi.nullptr) return;
     _bindings.writeString(_engine, data);
+    if (_batchingUpdates) {
+      _needsRustSync = true;
+      return;
+    }
     _syncFromRust(notify: true);
   }
 
@@ -403,17 +449,17 @@ class TriageRustTerminal extends xt.Terminal {
     _rustViewWidth = newWidth;
     _rustViewHeight = newHeight;
 
-    if (newHeight > mainBuffer.lines.maxLength) {
-      mainBuffer.lines.maxLength = newHeight;
+    if (newHeight > super.mainBuffer.lines.maxLength) {
+      super.mainBuffer.lines.maxLength = newHeight;
     }
-    if (newHeight > altBuffer.lines.maxLength) {
-      altBuffer.lines.maxLength = newHeight;
+    if (newHeight > super.altBuffer.lines.maxLength) {
+      super.altBuffer.lines.maxLength = newHeight;
     }
 
-    mainBuffer.resetVerticalMargins();
-    mainBuffer.resetHorizontalMargins();
-    altBuffer.resetVerticalMargins();
-    altBuffer.resetHorizontalMargins();
+    super.mainBuffer.resetVerticalMargins();
+    super.mainBuffer.resetHorizontalMargins();
+    super.altBuffer.resetVerticalMargins();
+    super.altBuffer.resetHorizontalMargins();
 
     _bindings.termResize(
       _engine,
@@ -422,21 +468,27 @@ class TriageRustTerminal extends xt.Terminal {
       _rustCellPixelWidth,
       _rustCellPixelHeight,
     );
+    _needsRustSync = false;
     _syncFromRust(notify: false);
   }
 
   @override
   void clear() {
     if (_disposed || _engine == ffi.nullptr) return;
+    _needsRustSync = false;
     _bindings.termClear(_engine);
-    buffer.clear();
-    _syncFromRust(notify: true);
+    useMainBuffer();
+    super.mainBuffer.clear();
+    super.altBuffer.clear();
+    _syncFromRust(notify: !_batchingUpdates);
   }
 
   @override
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _batchingUpdates = false;
+    _needsRustSync = false;
     if (_engine != ffi.nullptr) {
       _bindings.termFree(_engine);
       _engine = ffi.nullptr;
@@ -451,7 +503,7 @@ class TriageRustTerminal extends xt.Terminal {
     final h = headerPtr.ref;
 
     final isAlt = (h.modeFlags & _kModeAltScreen) != 0;
-    if (isAlt != isUsingAltBuffer) {
+    if (isAlt != super.isUsingAltBuffer) {
       if (isAlt) {
         useAltBuffer();
       } else {
@@ -487,30 +539,41 @@ class TriageRustTerminal extends xt.Terminal {
       setOriginMode(nextOrigin);
     }
 
-    final buf = isAlt ? altBuffer : mainBuffer;
+    final buf = isAlt ? super.altBuffer : super.mainBuffer;
     final totalLines = h.totalLines;
     final physicalCols = h.physicalCols;
     final sawEraseScrollback = (h.modeFlags & _kModeSawEraseScrollback) != 0;
     final sawEraseDisplay = (h.modeFlags & _kModeSawEraseDisplay) != 0;
 
+    final minCap = max(totalLines, buf.viewHeight);
+    if (minCap > buf.lines.maxLength) {
+      buf.lines.maxLength = minCap;
+    }
+
     if (!isAlt) {
       final explicitTrim = h.explicitTrimmedTop;
       if (explicitTrim > 0) {
         if (sawEraseScrollback &&
-            h.pushedBottom == 0 &&
             buf.height > buf.viewHeight &&
-            explicitTrim == buf.scrollBack) {
+            explicitTrim >= buf.scrollBack) {
+          final oldScrollBack = buf.scrollBack;
           buf.clearScrollback();
+          if (explicitTrim > oldScrollBack) {
+            buf.lines.trimStart(explicitTrim - oldScrollBack);
+          }
         } else {
           buf.lines.trimStart(explicitTrim);
         }
       }
+      if (sawEraseDisplay) {
+        while (buf.lines.length < buf.viewHeight) {
+          buf.lines.push(xt.BufferLine(physicalCols));
+        }
+        buf.eraseDisplay();
+      }
       final pushed = h.pushedBottom;
       for (var i = 0; i < pushed; i++) {
         buf.lines.push(xt.BufferLine(physicalCols));
-      }
-      if (sawEraseDisplay) {
-        buf.eraseDisplay();
       }
     }
 
@@ -566,6 +629,14 @@ class TriageRustTerminal extends xt.Terminal {
 
     buf.setCursorX(h.cursorX);
     buf.setCursorY(h.cursorY);
+    final absCursorY = buf.absoluteCursorY;
+    if (absCursorY >= 0 && absCursorY < buf.lines.length) {
+      final cursorLine = buf.lines[absCursorY];
+      if (cursorLine.length < physicalCols ||
+          cursorLine.data.length < physicalCols * 4) {
+        cursorLine.resize(physicalCols);
+      }
+    }
 
     if ((h.modeFlags & _kModeBellRang) != 0) {
       onBell?.call();
