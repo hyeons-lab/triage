@@ -32,6 +32,7 @@ import 'package:triage_client/terminal/size_drift.dart';
 import 'package:triage_client/terminal/terminal_intent.dart';
 import 'package:triage_client/terminal/terminal_store.dart';
 import 'package:triage_client/terminal/terminal_controller_sink.dart';
+import 'package:triage_client/terminal/triage_term_ffi.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
 // the web client — which has no `dart:io` — compiles against web stubs.
 import 'package:triage_client/platform_env_io.dart'
@@ -818,7 +819,7 @@ class SessionVm {
   bool get isUsingAltBuffer => _terminal?.isUsingAltBuffer ?? false;
 
   xt.Terminal _createTerminal() {
-    final created = xt.Terminal(
+    final created = createTriageTerminal(
       maxLines: 50000,
       // Re-wrap the whole buffer on resize, like a real terminal; otherwise
       // scrollback keeps its old wrap points and a full-screen TUI's in-place
