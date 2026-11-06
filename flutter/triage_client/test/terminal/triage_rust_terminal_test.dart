@@ -1,6 +1,8 @@
 import 'dart:io';
 
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/main.dart' show SessionVm;
 import 'package:triage_client/terminal/triage_term_ffi.dart';
 import 'package:xterm2/xterm.dart' as xt;
 
@@ -123,4 +125,136 @@ void main() {
     expect(sw.elapsedMilliseconds, lessThan(100));
     expect(terminal.buffer.lines[0].getText().trimRight(), endsWith('B'));
   });
+
+  test(
+    'TriageRustTerminal narrowing resize at scrollback capacity does not spin',
+    () {
+      final terminal = createTriageTerminal(maxLines: 50, reflowEnabled: true);
+      addTearDown(terminal.dispose);
+      terminal.resize(80, 10);
+
+      for (var i = 0; i < 60; i++) {
+        terminal.write('line-${i.toString().padLeft(2, '0')}-${'X' * 65}\r\n');
+      }
+      expect(terminal.buffer.lines.length, 50);
+
+      final sw = Stopwatch()..start();
+      terminal.resize(20, 10);
+      sw.stop();
+
+      expect(sw.elapsedMilliseconds, lessThan(50));
+      expect(terminal.buffer.lines.length, 50);
+    },
+  );
+
+  test(
+    'TriageRustTerminal setSynchronizedUpdateMode batches writes into one notification',
+    () {
+      final terminal = createTriageTerminal(
+        maxLines: 1000,
+        reflowEnabled: true,
+      );
+      addTearDown(terminal.dispose);
+      terminal.resize(44, 30);
+
+      var notifications = 0;
+      terminal.addListener(() {
+        notifications++;
+      });
+
+      terminal.setSynchronizedUpdateMode(true);
+      for (var i = 0; i < 200; i++) {
+        terminal.write('batch-line-$i\r\n');
+      }
+      expect(notifications, 0);
+
+      terminal.setSynchronizedUpdateMode(false);
+      expect(notifications, 1);
+      expect(terminal.buffer.getText(), contains('batch-line-199'));
+    },
+  );
+
+  test(
+    'SessionVm replays history and resizes to mobile dimensions without freezing',
+    () {
+      final vm = SessionVm(
+        title: 'mobile-replay',
+        status: 'Running',
+        statusColor: Colors.green,
+        icon: Icons.terminal,
+        rows: const [],
+        sessionId: 'session-mobile-test',
+        isRemote: true,
+      );
+      addTearDown(vm.dispose);
+
+      // Start at mobile viewport 44x30 and replay 300 synchronized output frames.
+      vm.noteViewFit(44, 30);
+      final payload = StringBuffer();
+      for (var i = 0; i < 300; i++) {
+        payload.write(
+          '\x1b[?2026h\r\x1b[2KFrame $i: ${'A' * 70}\r\n\x1b[?2026l',
+        );
+      }
+      final sw = Stopwatch()..start();
+      vm.applyHistory(
+        payload.toString().codeUnits,
+        throughOutputSeq: 1,
+        rawOutputStart: 0,
+        windowBytes: 256 * 1024,
+      );
+      vm.terminal.resize(80, 24);
+      vm.terminal.resize(44, 30);
+      sw.stop();
+
+      expect(sw.elapsedMilliseconds, lessThan(250));
+      expect(vm.terminal.buffer.getText(), contains('Frame 299'));
+    },
+  );
+
+  test(
+    'alternate screen height shrink with non-whitespace bottom row does not spin',
+    () {
+      final terminal = createTriageTerminal(maxLines: 1000);
+      addTearDown(terminal.dispose);
+
+      terminal.write('\x1b[?1049h\x1b[1;1HHeader\x1b[24;1HStatusBar\x1b[1;1H');
+      expect(terminal.isUsingAltBuffer, isTrue);
+      expect(terminal.buffer.height, 24);
+
+      terminal.resize(44, 15);
+      expect(terminal.viewWidth, 44);
+      expect(terminal.viewHeight, 15);
+      expect(terminal.buffer.height, 15);
+    },
+  );
+
+  test(
+    '30-frame IME keyboard height animation on full scrollback completes quickly',
+    () {
+      final terminal = createTriageTerminal(maxLines: 1000);
+      addTearDown(terminal.dispose);
+
+      terminal.resize(44, 30);
+      final sb = StringBuffer();
+      for (var i = 0; i < 1000; i++) {
+        sb.write('scrollback-line-$i-content\r\n');
+      }
+      terminal.write(sb.toString());
+      expect(terminal.buffer.height, 1000);
+
+      final sw = Stopwatch()..start();
+      for (var rows = 29; rows >= 15; rows--) {
+        terminal.resize(44, rows);
+      }
+      for (var rows = 16; rows <= 30; rows++) {
+        terminal.resize(44, rows);
+      }
+      sw.stop();
+
+      expect(sw.elapsedMilliseconds, lessThan(50));
+      expect(terminal.viewHeight, 30);
+      expect(terminal.buffer.getText(), contains('scrollback-line-999'));
+    },
+  );
 }
