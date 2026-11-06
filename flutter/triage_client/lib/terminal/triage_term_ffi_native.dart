@@ -468,6 +468,10 @@ class TriageRustTerminal extends xt.Terminal {
       _rustCellPixelWidth,
       _rustCellPixelHeight,
     );
+    if (_batchingUpdates) {
+      _needsRustSync = true;
+      return;
+    }
     _needsRustSync = false;
     _syncFromRust(notify: false);
   }
@@ -475,12 +479,16 @@ class TriageRustTerminal extends xt.Terminal {
   @override
   void clear() {
     if (_disposed || _engine == ffi.nullptr) return;
-    _needsRustSync = false;
     _bindings.termClear(_engine);
     useMainBuffer();
     super.mainBuffer.clear();
     super.altBuffer.clear();
-    _syncFromRust(notify: !_batchingUpdates);
+    if (_batchingUpdates) {
+      _needsRustSync = true;
+      return;
+    }
+    _needsRustSync = false;
+    _syncFromRust(notify: true);
   }
 
   @override

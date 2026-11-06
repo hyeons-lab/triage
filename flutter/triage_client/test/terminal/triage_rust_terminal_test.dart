@@ -257,4 +257,60 @@ void main() {
       expect(terminal.buffer.getText(), contains('scrollback-line-999'));
     },
   );
+
+  test(
+    '500 incremental live writes over 10,000 scrollback lines complete quickly',
+    () {
+      final vm = SessionVm(
+        title: 'scrollback-live-burst',
+        status: 'Running',
+        statusColor: Colors.green,
+        icon: Icons.terminal,
+        rows: const [],
+        sessionId: 'session-burst-test',
+        isRemote: true,
+      );
+      addTearDown(vm.dispose);
+
+      vm.noteViewFit(80, 24);
+      vm.applyHistory(
+        const <int>[],
+        throughOutputSeq: 0,
+        rawOutputStart: 0,
+        windowBytes: 64 * 1024,
+      );
+      final initial = StringBuffer();
+      for (var i = 0; i < 10000; i++) {
+        initial.write('history-row-$i-${'x' * 50}\r\n');
+      }
+      vm.terminal.setSynchronizedUpdateMode(true);
+      vm.terminal.write(initial.toString());
+      vm.terminal.setSynchronizedUpdateMode(false);
+      expect(vm.terminal.buffer.height, greaterThanOrEqualTo(10000));
+
+      var notifications = 0;
+      vm.terminal.addListener(() {
+        notifications++;
+      });
+
+      final sw = Stopwatch()..start();
+      // 250 unbatched incremental writes (each syncing against a 10k-line scrollback).
+      for (var i = 0; i < 250; i++) {
+        vm.applyLiveBytes('live-unbatched-$i\r\n'.codeUnits, outputSeq: i + 1);
+      }
+      expect(notifications, 250);
+
+      // 250 batched live writes (as in _processWebsocketEventQueue).
+      vm.beginTerminalWriteBatch();
+      for (var i = 250; i < 500; i++) {
+        vm.applyLiveBytes('live-batched-$i\r\n'.codeUnits, outputSeq: i + 1);
+      }
+      vm.endTerminalWriteBatch();
+      sw.stop();
+
+      expect(notifications, 251);
+      expect(sw.elapsedMilliseconds, lessThan(150));
+      expect(vm.terminal.buffer.getText(), contains('live-batched-499'));
+    },
+  );
 }

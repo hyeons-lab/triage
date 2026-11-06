@@ -539,10 +539,16 @@ impl TriageTermEngine {
             let mut prev_line_wrapped = false;
             let mut prev_line_changed = false;
             screen.for_each_phys_line(|phys_idx, line| {
-                let line_wrapped = line.last_cell_was_wrapped();
                 let line_changed = line.changed_since(last_seqno);
                 if phys_idx < phys_offset {
-                    prev_line_wrapped = line_wrapped;
+                    prev_line_wrapped = if phys_idx + 1 == phys_offset
+                        && total_lines > 0
+                        && (force_all_dirty || dirty_tail_start == 0 || line_changed)
+                    {
+                        line.last_cell_was_wrapped()
+                    } else {
+                        false
+                    };
                     prev_line_changed = line_changed;
                     return;
                 }
@@ -555,18 +561,22 @@ impl TriageTermEngine {
                     || rel_idx >= dirty_tail_start
                     || line_changed
                     || prev_line_changed;
-                prev_line_wrapped = line_wrapped;
                 prev_line_changed = line_changed;
                 if !is_dirty {
+                    let next_rel_idx = rel_idx + 1;
+                    prev_line_wrapped = next_rel_idx < total_lines
+                        && next_rel_idx >= dirty_tail_start
+                        && line.last_cell_was_wrapped();
                     return;
                 }
-                let has_combining = pack_line_cells(
+                let (has_combining, line_wrapped) = pack_line_cells(
                     line,
                     physical_cols,
                     dirty_idx,
                     &mut self.cell_words,
                     &mut self.combining_meta,
                 );
+                prev_line_wrapped = line_wrapped;
                 let mut line_flags = 0u32;
                 if is_wrapped {
                     line_flags |= 1;
@@ -757,37 +767,40 @@ fn pack_line_cells(
     dirty_line_idx: usize,
     cell_words: &mut Vec<u32>,
     combining_meta: &mut Vec<u32>,
-) -> bool {
+) -> (bool, bool) {
     let base_offset = cell_words.len();
     let row_words = physical_cols * CELL_WORDS;
     cell_words.resize(base_offset + row_words, 0);
 
-    // When `fill_range` erases an entire VecStorage row to default blanks,
-    // `prune_trailing_blanks` in `wezterm-surface` leaves `line.len() == physical_cols`
-    // if every cell is blank. Keep all words zeroed in that case so `getText()`
-    // treats the erased row as empty rather than `physical_cols` spaces.
-    let blank_attrs = CellAttributes::blank();
-    if line.len() >= physical_cols && !line.last_cell_was_wrapped() {
-        let all_default_blank = line
-            .visible_cells()
-            .all(|c| c.str() == " " && c.attrs() == &blank_attrs);
-        if all_default_blank {
-            return false;
-        }
+    let line_len = line.len();
+    if line_len == 0 {
+        return (false, false);
     }
 
+    // When `fill_range` erases an entire VecStorage row to default blanks,
+    // `prune_trailing_blanks` in `wezterm-surface` leaves `line.len() == physical_cols`
+    // if every cell is blank. Track whether the row consists solely of unwrapped
+    // default blanks during the single cell pass and zero it out if so, so
+    // `getText()` treats an erased row as empty rather than `physical_cols` spaces.
+    let blank_attrs = CellAttributes::blank();
+    let mut all_default_blank = line_len >= physical_cols;
+    let mut last_wrapped = false;
     let mut has_combining = false;
     for cell in line.visible_cells() {
-        let col = cell.cell_index();
-        if col >= physical_cols {
-            break;
-        }
         let attrs = cell.attrs();
+        last_wrapped = attrs.wrapped();
+        let col = cell.cell_index();
+        let text = cell.str();
+        if all_default_blank && (text != " " || attrs != &blank_attrs) {
+            all_default_blank = false;
+        }
+        if col >= physical_cols {
+            continue;
+        }
         let fg = encode_color(attrs.foreground());
         let bg = encode_color(attrs.background());
         let attr_flags = encode_attrs(attrs);
         let width = cell.width().clamp(1, 2) as u32;
-        let text = cell.str();
         let mut chars = text.chars();
         let first_char = chars.next().unwrap_or(' ');
         let cp = (first_char as u32) & CONTENT_CODEPOINT_MASK;
@@ -814,7 +827,11 @@ fn pack_line_cells(
             combining_meta.push(extra as u32);
         }
     }
-    has_combining
+    if all_default_blank && !last_wrapped {
+        cell_words[base_offset..base_offset + row_words].fill(0);
+        return (false, false);
+    }
+    (has_combining, last_wrapped)
 }
 
 #[unsafe(no_mangle)]
@@ -1088,5 +1105,27 @@ mod tests {
             "dirty_line_count={}",
             h2.dirty_line_count
         );
+    }
+
+    #[test]
+    fn incremental_sync_preserves_wrapped_flag_at_dirty_tail_boundary() {
+        let mut engine = TriageTermEngine::new(10, 4, 1000);
+        for i in 0..20 {
+            engine.write_bytes(format!("W{i:02}-0123456789ABCDEF\r\n").as_bytes());
+        }
+        let h1 = *engine.sync();
+        let total1 = h1.total_lines as usize;
+        assert!(total1 > 10);
+
+        // Write on the bottom line without scrolling: `dirty_tail_start` lands right
+        // on the first visible viewport row, which is a wrapped continuation of the
+        // last scrollback row above it.
+        engine.write_bytes(b"tail");
+        let h2 = *engine.sync();
+        assert_eq!(h2.dirty_line_count, 4);
+        assert_eq!(engine.dirty_line_meta[0], (total1 - 4) as u32);
+        // `total1 - 4` is the second half of the wrapped 20-char line (`total1 - 5`),
+        // so its `is_wrapped` flag (`line_flags & 1`) must be 1.
+        assert_eq!(engine.dirty_line_meta[1] & 1, 1);
     }
 }

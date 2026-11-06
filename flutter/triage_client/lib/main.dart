@@ -377,16 +377,20 @@ class SessionVm {
       terminalController.addClearListener(() {
         final t = _terminal;
         if (t == null) return;
+        beginTerminalWriteBatch();
         try {
+          t.clear();
           t.useMainBuffer();
           t.mainBuffer.clear();
           t.altBuffer.clear();
-          t.clear();
           t.write(
             '\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
             '\x1b[?2004l\x1b[?1l\x1b[?7h\x1b[?25h\x1b[H\x1b[2J\x1b[3J',
           );
-        } catch (_) {}
+        } catch (_) {
+        } finally {
+          endTerminalWriteBatch();
+        }
       });
       terminalController.addResizeListener((cols, rows) {
         terminal.resize(cols, rows);
@@ -846,7 +850,24 @@ class SessionVm {
   // whole view model, and ChangeNotifier.dispose asserts on reuse.
   bool _disposed = false;
   bool _replayingHistoryOnTerminal = false;
+  int _terminalBatchDepth = 0;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
+
+  void beginTerminalWriteBatch() {
+    if (kIsWeb || _disposed) return;
+    _terminalBatchDepth += 1;
+    if (_terminalBatchDepth == 1) {
+      terminal.setSynchronizedUpdateMode(true);
+    }
+  }
+
+  void endTerminalWriteBatch() {
+    if (kIsWeb || _terminalBatchDepth <= 0) return;
+    _terminalBatchDepth -= 1;
+    if (_terminalBatchDepth == 0 && !_disposed) {
+      _terminal?.setSynchronizedUpdateMode(false);
+    }
+  }
 
   // Deferred history: replay must wait until the view is laid out and fitted, so
   // it re-emulates at the real terminal size. Writing before the first fit
@@ -934,16 +955,18 @@ class SessionVm {
   void _finishTerminalHistoryBatch() {
     if (!_replayingHistoryOnTerminal) return;
     _replayingHistoryOnTerminal = false;
-    _terminal?.setSynchronizedUpdateMode(false);
+    endTerminalWriteBatch();
+    if (_terminalBatchDepth > 0 && !_disposed) {
+      _terminal?.setSynchronizedUpdateMode(false);
+      _terminal?.setSynchronizedUpdateMode(true);
+    }
   }
 
   void _flushPendingHistory() {
     final pending = _pendingHistory;
     if (pending == null) return;
     _pendingHistory = null;
-    final batchTerminalWrites =
-        !kIsWeb &&
-        (pending.rawOutput.isNotEmpty || pending.rawOutputPrefix.isNotEmpty);
+    const batchTerminalWrites = !kIsWeb;
     if (batchTerminalWrites) {
       if (_viewCols >= kMinTerminalCols &&
           _viewRows >= kMinTerminalRows &&
@@ -952,7 +975,7 @@ class SessionVm {
         terminal.resize(_viewCols, _viewRows);
       }
       _replayingHistoryOnTerminal = true;
-      terminal.setSynchronizedUpdateMode(true);
+      beginTerminalWriteBatch();
     }
     try {
       store.dispatch(
@@ -977,18 +1000,35 @@ class SessionVm {
 
   /// Apply a live raw output chunk (remote PTY bytes) through the write path.
   void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
-    if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
-      noteViewFit(lastFittedCols!, lastFittedRows!);
+    beginTerminalWriteBatch();
+    try {
+      if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
+        noteViewFit(lastFittedCols!, lastFittedRows!);
+      }
+      store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
+    } finally {
+      endTerminalWriteBatch();
     }
-    store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
   }
 
   /// Echo locally produced bytes for local/demo sessions (no remote PTY).
   void echoLocalBytes(List<int> bytes) {
-    store.dispatch(LiveBytes(bytes));
+    beginTerminalWriteBatch();
+    try {
+      store.dispatch(LiveBytes(bytes));
+    } finally {
+      endTerminalWriteBatch();
+    }
   }
 
-  void markExited() => store.dispatch(const Exited());
+  void markExited() {
+    beginTerminalWriteBatch();
+    try {
+      store.dispatch(const Exited());
+    } finally {
+      endTerminalWriteBatch();
+    }
+  }
 
   void focusCursorOnNextDisplay() {
     focusCursorRevision += 1;
@@ -997,7 +1037,8 @@ class SessionVm {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
-    _finishTerminalHistoryBatch();
+    _replayingHistoryOnTerminal = false;
+    _terminalBatchDepth = 0;
     store.dispose();
     terminalController.dispose();
     _terminal?.dispose();
@@ -4677,14 +4718,35 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<void> _processWebsocketEventQueue() async {
     if (_websocketProcessingEvent || _websocketEventQueue.isEmpty) return;
     _websocketProcessingEvent = true;
+    final batchedSessions = <SessionVm>{};
+    void flushBatchedSessions() {
+      if (batchedSessions.isEmpty) return;
+      for (final s in batchedSessions) {
+        s.endTerminalWriteBatch();
+      }
+      batchedSessions.clear();
+    }
+
+    final sliceWatch = Stopwatch()..start();
     try {
       while (_websocketEventQueue.isNotEmpty && !_disposed) {
         final message = _websocketEventQueue.removeFirst();
         try {
-          await _processWebSocketEvent(message);
+          await _processWebSocketEvent(
+            message,
+            batchedSessions: batchedSessions,
+          );
         } catch (_) {}
+        if (!runningUnderFlutterTest() &&
+            _websocketEventQueue.isNotEmpty &&
+            sliceWatch.elapsedMilliseconds >= 8) {
+          flushBatchedSessions();
+          await Future<void>.delayed(Duration.zero);
+          sliceWatch.reset();
+        }
       }
     } finally {
+      flushBatchedSessions();
       _websocketProcessingEvent = false;
     }
   }
@@ -4811,7 +4873,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _processWebSocketEvent(Map<String, dynamic> message) async {
+  Future<void> _processWebSocketEvent(
+    Map<String, dynamic> message, {
+    Set<SessionVm>? batchedSessions,
+  }) async {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
       _onWebSocketClosed(_connectGeneration);
@@ -5041,7 +5106,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final pending = _pendingEvents.remove(sessionId);
       if (pending != null && pending.isNotEmpty) {
         for (final msg in pending) {
-          _processWebSocketEvent(msg);
+          await _processWebSocketEvent(msg, batchedSessions: batchedSessions);
         }
       }
 
@@ -5050,11 +5115,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final outputSeq = output['output_seq'] as int?;
         final bytes = (output['bytes'] as List<dynamic>).cast<int>();
 
+        if (batchedSessions != null &&
+            !kIsWeb &&
+            batchedSessions.add(session)) {
+          session.beginTerminalWriteBatch();
+        }
         // Single write path: raw bytes flow through the store, which owns UTF-8
         // carry, CRLF normalization, buffering, and all output_seq
         // de-duplication (against both the history high-water and re-deliveries).
         session.applyLiveBytes(bytes, outputSeq: outputSeq);
       } else if (event.containsKey('Exited')) {
+        if (batchedSessions != null && batchedSessions.remove(session)) {
+          session.endTerminalWriteBatch();
+        }
         _pendingInput.forget(sessionId);
         session.hasInputLease = false;
         session.markExited();
@@ -5083,6 +5156,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hostSizeRows = rows;
         }
       } else if (event.containsKey('ResyncRequired')) {
+        if (batchedSessions != null && batchedSessions.remove(session)) {
+          session.endTerminalWriteBatch();
+        }
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
