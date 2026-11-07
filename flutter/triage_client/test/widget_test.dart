@@ -2048,15 +2048,12 @@ void main() {
 
       // The reclaim refits and jiggles the host one row short and back, so the
       // program repaints over the live stream. What it asserts is that a
-      // reclaim happened and took the shape of a jiggle, not which size it
-      // reclaimed to: the refit reads `session.terminal`, and neither
-      // `onViewFit` nor `sendResizeOut` resizes the Dart-side terminal, so it
-      // stays at its 80x24 default throughout. That size is the harness, not
-      // the arbitration, and it will need updating if the fake's attach
-      // snapshot ever reports something else.
+      // reclaim happened and took the shape of a jiggle: the refit reads
+      // `session.terminal`, which `SessionVm._flushPendingHistory` resized to
+      // the fitted 95x34 viewport when replaying the snapshot above.
       expect(client.resizeSessionCalls.skip(beforeReclaim.length), [
-        'flutter-spike:80:23',
-        'flutter-spike:80:24',
+        'flutter-spike:95:33',
+        'flutter-spike:95:34',
       ]);
     },
   );

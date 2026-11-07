@@ -128,6 +128,22 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: nightly-2026-07-10
+
+      - name: Cache Rust build artifacts
+        # Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          cache-bin: false
+
+      - name: Build triage-term FFI library
+        working-directory: .
+        run: cargo build --release -p triage-term --locked
+
       - name: Install flatc
         # Version comes from the action's own default, which the drift check
         # below reads too — the checked-in bindings are only byte-comparable
@@ -216,6 +232,19 @@ jobs:
 
       - name: Install dependencies
         run: flutter pub get
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: nightly-2026-07-10
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - name: Cache Rust build artifacts
+        # Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          cache-bin: false
 
       # A release build, but signed with the debug keystore (see the release
       # signingConfig in android/app/build.gradle.kts), so the artifact installs

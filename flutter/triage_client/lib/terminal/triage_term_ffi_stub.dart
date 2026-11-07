@@ -17,7 +17,7 @@ xt.Terminal createTriageTerminal({
   bool reflowWithHiddenCursor = true,
   Set<int>? wordSeparators,
 }) {
-  return xt.Terminal(
+  return _TriageFallbackTerminal(
     maxLines: maxLines,
     onBell: onBell,
     onTitleChange: onTitleChange,
@@ -29,4 +29,40 @@ xt.Terminal createTriageTerminal({
     reflowWithHiddenCursor: reflowWithHiddenCursor,
     wordSeparators: wordSeparators,
   );
+}
+
+class _TriageFallbackTerminal extends xt.Terminal {
+  _TriageFallbackTerminal({
+    super.maxLines = 1000,
+    super.onBell,
+    super.onTitleChange,
+    super.onIconChange,
+    super.onOutput,
+    super.onResize,
+    super.platform = xt.TerminalTargetPlatform.unknown,
+    super.reflowEnabled = true,
+    super.reflowWithHiddenCursor = true,
+    super.wordSeparators,
+  });
+
+  bool _batchingUpdates = false;
+  bool _pendingNotify = false;
+
+  @override
+  void setSynchronizedUpdateMode(bool enabled) {
+    _batchingUpdates = enabled;
+    if (!enabled && _pendingNotify) {
+      _pendingNotify = false;
+      super.notifyListeners();
+    }
+  }
+
+  @override
+  void notifyListeners() {
+    if (_batchingUpdates) {
+      _pendingNotify = true;
+      return;
+    }
+    super.notifyListeners();
+  }
 }
