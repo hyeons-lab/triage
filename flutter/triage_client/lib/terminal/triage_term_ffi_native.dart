@@ -237,12 +237,18 @@ _TriageTermBindings? _loadBindings() {
   final candidates = <String>[];
   if (Platform.isAndroid || Platform.isLinux) {
     candidates.add('libtriage_term.so');
+    if (Platform.isLinux) {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      candidates.add('$exeDir/lib/libtriage_term.so');
+    }
     final cwd = Directory.current.path;
     candidates.add('$cwd/../../target/release/libtriage_term.so');
     candidates.add('$cwd/../../target/debug/libtriage_term.so');
     candidates.add('$cwd/target/release/libtriage_term.so');
     candidates.add('$cwd/target/debug/libtriage_term.so');
   } else if (Platform.isMacOS) {
+    final exeDir = File(Platform.resolvedExecutable).parent.parent.path;
+    candidates.add('$exeDir/Frameworks/libtriage_term.dylib');
     final cwd = Directory.current.path;
     candidates.add('$cwd/macos/Frameworks/libtriage_term.dylib');
     candidates.add('$cwd/../../target/release/libtriage_term.dylib');
@@ -251,6 +257,8 @@ _TriageTermBindings? _loadBindings() {
     candidates.add('$cwd/target/debug/libtriage_term.dylib');
     candidates.add('libtriage_term.dylib');
   } else if (Platform.isWindows) {
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    candidates.add('$exeDir/triage_term.dll');
     final cwd = Directory.current.path;
     candidates.add('$cwd/../../target/release/triage_term.dll');
     candidates.add('$cwd/../../target/debug/triage_term.dll');
@@ -311,7 +319,7 @@ xt.Terminal createTriageTerminal({
       wordSeparators: wordSeparators,
     );
   }
-  return xt.Terminal(
+  return _TriageFallbackTerminal(
     maxLines: maxLines,
     onBell: onBell,
     onTitleChange: onTitleChange,
@@ -323,6 +331,42 @@ xt.Terminal createTriageTerminal({
     reflowWithHiddenCursor: reflowWithHiddenCursor,
     wordSeparators: wordSeparators,
   );
+}
+
+class _TriageFallbackTerminal extends xt.Terminal {
+  _TriageFallbackTerminal({
+    super.maxLines = 1000,
+    super.onBell,
+    super.onTitleChange,
+    super.onIconChange,
+    super.onOutput,
+    super.onResize,
+    super.platform = xt.TerminalTargetPlatform.unknown,
+    super.reflowEnabled = true,
+    super.reflowWithHiddenCursor = true,
+    super.wordSeparators,
+  });
+
+  bool _batchingUpdates = false;
+  bool _pendingNotify = false;
+
+  @override
+  void setSynchronizedUpdateMode(bool enabled) {
+    _batchingUpdates = enabled;
+    if (!enabled && _pendingNotify) {
+      _pendingNotify = false;
+      super.notifyListeners();
+    }
+  }
+
+  @override
+  void notifyListeners() {
+    if (_batchingUpdates) {
+      _pendingNotify = true;
+      return;
+    }
+    super.notifyListeners();
+  }
 }
 
 /// A [xt.Terminal] whose VT parser, escape sequence state machine, scrollback,

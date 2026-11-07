@@ -65,9 +65,6 @@ val buildTriageTermRust by tasks.registering {
     val x86_64Lib = file("src/main/jniLibs/x86_64/libtriage_term.so")
     val workspaceRoot = file("../../../..")
     doLast {
-        if (arm64Lib.exists() && x86_64Lib.exists()) {
-            return@doLast
-        }
         val ndkDir = android.ndkDirectory
         val hostTag = when {
             org.gradle.internal.os.OperatingSystem.current().isMacOsX -> "darwin-x86_64"
@@ -101,18 +98,22 @@ val buildTriageTermRust by tasks.registering {
                 }
                 .inheritIO()
                 .start()
-            if (proc.waitFor() == 0) {
-                arm64Lib.parentFile.mkdirs()
-                x86_64Lib.parentFile.mkdirs()
-                File(workspaceRoot, "target/aarch64-linux-android/release/libtriage_term.so")
-                    .takeIf { it.exists() }
-                    ?.copyTo(arm64Lib, overwrite = true)
-                File(workspaceRoot, "target/x86_64-linux-android/release/libtriage_term.so")
-                    .takeIf { it.exists() }
-                    ?.copyTo(x86_64Lib, overwrite = true)
+            val exitCode = proc.waitFor()
+            if (exitCode != 0) {
+                throw GradleException("cargo build -p triage-term failed with exit code $exitCode")
             }
-        } catch (e: Exception) {
-            println("Skipping Rust triage-term Android build: ${e.message}")
+            arm64Lib.parentFile.mkdirs()
+            x86_64Lib.parentFile.mkdirs()
+            File(workspaceRoot, "target/aarch64-linux-android/release/libtriage_term.so")
+                .takeIf { it.exists() }
+                ?.copyTo(arm64Lib, overwrite = true)
+            File(workspaceRoot, "target/x86_64-linux-android/release/libtriage_term.so")
+                .takeIf { it.exists() }
+                ?.copyTo(x86_64Lib, overwrite = true)
+        } catch (e: java.io.IOException) {
+            if (!arm64Lib.exists() || !x86_64Lib.exists()) {
+                println("Skipping Rust triage-term Android build: ${e.message}")
+            }
         }
     }
 }
