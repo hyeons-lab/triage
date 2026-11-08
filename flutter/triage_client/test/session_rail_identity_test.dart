@@ -1,3 +1,4 @@
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -453,6 +454,187 @@ void main() {
       expect(find.text('feat/two'), findsOneWidget);
       // The shared repo appears as context on each row, never as the lead.
       expect(find.text('triage'), findsNWidgets(2));
+    });
+
+    testWidgets('agent badge shows kind and short conversation id', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'claude', 'conversation_id': 'abc12345ef'},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('claude abc12345'), findsOneWidget);
+    });
+
+    testWidgets('kind-only agent badge marks most-recent fallback', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'muse'},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('muse (recent)'), findsOneWidget);
+    });
+
+    testWidgets('agent badge shows codex kind and short conversation id', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'codex', 'conversation_id': 'abc12345ef'},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('codex abc12345'), findsOneWidget);
+    });
+
+    testWidgets('agent badge shortens antigravity to the TUI name', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {
+              'kind': 'antigravity',
+              'conversation_id': 'abc12345ef',
+            },
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('agy abc12345'), findsOneWidget);
+    });
+
+    testWidgets('agent badge shows grok kind and short conversation id', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'grok', 'conversation_id': 'abc12345ef'},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('grok abc12345'), findsOneWidget);
+    });
+
+    testWidgets(
+      'hover glance card shows agent badge and transcript path when present',
+      (tester) async {
+        await tester.pumpWidget(
+          host(
+            SessionListTile(
+              title: 'session',
+              subtitle: 'attached',
+              statusColor: const Color(0xff7fd1c7),
+              icon: Icons.terminal,
+              agent: const {
+                'kind': 'grok',
+                'conversation_id': 'abc12345ef',
+                'transcript_path': '/tmp/grok/transcript.jsonl',
+              },
+              onTap: () {},
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(find.text('/tmp/grok/transcript.jsonl'), findsNothing);
+
+        final gesture = await tester.createGesture(
+          kind: PointerDeviceKind.mouse,
+        );
+        addTearDown(gesture.removePointer);
+        await gesture.addPointer(location: Offset.zero);
+        await gesture.moveTo(tester.getCenter(find.byType(SessionListTile)));
+        await tester.pump();
+
+        expect(find.text('grok abc12345'), findsNWidgets(2));
+        expect(find.text('/tmp/grok/transcript.jsonl'), findsOneWidget);
+      },
+    );
+
+    testWidgets('empty conversation id reads as most-recent fallback', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'claude', 'conversation_id': ''},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('claude (recent)'), findsOneWidget);
+    });
+
+    testWidgets('agent badge truncates by character, not UTF-16 unit', (
+      tester,
+    ) async {
+      // Ten astral-plane chars: rune truncation keeps eight, while a
+      // UTF-16 substring(0, 8) would keep only four.
+      const id = '😀😀😀😀😀😀😀😀😀😀';
+      await tester.pumpWidget(
+        host(
+          SessionListTile(
+            title: 'session',
+            subtitle: 'attached',
+            statusColor: const Color(0xff7fd1c7),
+            icon: Icons.terminal,
+            agent: const {'kind': 'claude', 'conversation_id': id},
+            onTap: () {},
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('claude 😀😀😀😀😀😀😀😀'), findsOneWidget);
     });
 
     testWidgets('the meta line never repeats the title', (tester) async {
