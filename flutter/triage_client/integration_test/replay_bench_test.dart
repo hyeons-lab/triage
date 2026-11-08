@@ -1,13 +1,10 @@
-// Phase −1 widget bench: 256 KiB one-shot replay frame times for a visible
-// TerminalView, xterm 4.0 fork vs xterm2. ABBA order: each arm runs twice so
-// first-paint warmup (fonts, shaders) can't bias the comparison. Run
-// profile-mode via flutter drive:
+// Widget bench: 256 KiB one-shot replay frame times for a visible
+// TerminalView (xterm2). Run profile-mode via flutter drive:
 //   flutter drive --driver=test_driver/replay_bench_driver.dart \
 //     --target=integration_test/replay_bench_test.dart --profile -d <device>
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
-import 'package:xterm/xterm.dart' as xterm4;
 import 'package:xterm2/xterm.dart' as xterm2;
 
 import '../tool/bench_payload.dart';
@@ -50,28 +47,16 @@ void main() {
 
   testWidgets('warmup', (tester) async {
     // Unmeasured: pay font/shader/first-frame costs once, outside the traces.
-    final terminal = xterm4.Terminal(maxLines: kMaxLines);
+    final terminal = xterm2.Terminal(maxLines: kMaxLines);
     await tester.pumpWidget(
       MaterialApp(
-        home: Scaffold(body: _sizedView(xterm4.TerminalView(terminal))),
+        home: Scaffold(body: _sizedView(xterm2.TerminalView(terminal))),
       ),
     );
     terminal.write(warmupPayload);
     await tester.pumpAndSettle();
     await tester.pumpWidget(const MaterialApp(home: Scaffold()));
     await tester.pumpAndSettle();
-  });
-
-  testWidgets('replay frames: xterm4 (a)', (tester) async {
-    final terminal = xterm4.Terminal(maxLines: kMaxLines);
-    await _benchArm(
-      tester,
-      binding,
-      'xterm4_replay_256k_a',
-      () => _sizedView(xterm4.TerminalView(terminal)),
-      () => terminal.write(payload),
-    );
-    expect(terminal.mainBuffer.lines.length, greaterThan(100));
   });
 
   testWidgets('replay frames: xterm2 (a)', (tester) async {
@@ -93,18 +78,6 @@ void main() {
       binding,
       'xterm2_replay_256k_b',
       () => _sizedView(xterm2.TerminalView(terminal)),
-      () => terminal.write(payload),
-    );
-    expect(terminal.mainBuffer.lines.length, greaterThan(100));
-  });
-
-  testWidgets('replay frames: xterm4 (b)', (tester) async {
-    final terminal = xterm4.Terminal(maxLines: kMaxLines);
-    await _benchArm(
-      tester,
-      binding,
-      'xterm4_replay_256k_b',
-      () => _sizedView(xterm4.TerminalView(terminal)),
       () => terminal.write(payload),
     );
     expect(terminal.mainBuffer.lines.length, greaterThan(100));

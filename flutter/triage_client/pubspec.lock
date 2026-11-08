@@ -748,23 +748,22 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "7.0.1"
-  xterm:
+  xterm2:
     dependency: "direct main"
     description:
-      path: "."
-      ref: "7e867fe15be8e76cca5651f3def8876d801df9a7"
-      resolved-ref: "7e867fe15be8e76cca5651f3def8876d801df9a7"
-      url: "https://github.com/hyeons-lab/xterm.dart.git"
-    source: git
-    version: "4.0.0"
-  xterm2:
-    dependency: "direct dev"
-    description:
       name: xterm2
-      sha256: "0b62e7510b414329dfb6ce7dbcffcfe97cc5109033573cf0f4abca568dac8149"
+      sha256: da8f15c6ecd0a0e06ca11f8d9fe55d6f1e686823ff084ad82fccf9a5fd1f8c00
       url: "https://pub.dev"
     source: hosted
-    version: "5.2.0"
+    version: "5.4.0"
+  xterm2_core:
+    dependency: transitive
+    description:
+      name: xterm2_core
+      sha256: "500ac551e448d8fa9766671aba26303dd5979d9d1af93df77af80afae16c75de"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.0"
   yaml:
     dependency: transitive
     description:

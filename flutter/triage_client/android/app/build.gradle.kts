@@ -59,3 +59,65 @@ android {
 flutter {
     source = "../.."
 }
+
+val buildTriageTermRust by tasks.registering {
+    val arm64Lib = file("src/main/jniLibs/arm64-v8a/libtriage_term.so")
+    val x86_64Lib = file("src/main/jniLibs/x86_64/libtriage_term.so")
+    val workspaceRoot = file("../../../..")
+    doLast {
+        val ndkDir = android.ndkDirectory
+        val hostTag = when {
+            org.gradle.internal.os.OperatingSystem.current().isMacOsX -> "darwin-x86_64"
+            org.gradle.internal.os.OperatingSystem.current().isLinux -> "linux-x86_64"
+            else -> return@doLast
+        }
+        val llvmBin = File(ndkDir, "toolchains/llvm/prebuilt/$hostTag/bin")
+        val aarch64Clang = File(llvmBin, "aarch64-linux-android24-clang")
+        val x86_64Clang = File(llvmBin, "x86_64-linux-android24-clang")
+        if (!aarch64Clang.exists() || !x86_64Clang.exists()) {
+            return@doLast
+        }
+        try {
+            val proc = ProcessBuilder(
+                "cargo",
+                "build",
+                "--release",
+                "-p",
+                "triage-term",
+                "--target",
+                "aarch64-linux-android",
+                "--target",
+                "x86_64-linux-android",
+            )
+                .directory(workspaceRoot)
+                .apply {
+                    environment()["CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"] =
+                        aarch64Clang.absolutePath
+                    environment()["CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER"] =
+                        x86_64Clang.absolutePath
+                }
+                .inheritIO()
+                .start()
+            val exitCode = proc.waitFor()
+            if (exitCode != 0) {
+                throw GradleException("cargo build -p triage-term failed with exit code $exitCode")
+            }
+            arm64Lib.parentFile.mkdirs()
+            x86_64Lib.parentFile.mkdirs()
+            File(workspaceRoot, "target/aarch64-linux-android/release/libtriage_term.so")
+                .takeIf { it.exists() }
+                ?.copyTo(arm64Lib, overwrite = true)
+            File(workspaceRoot, "target/x86_64-linux-android/release/libtriage_term.so")
+                .takeIf { it.exists() }
+                ?.copyTo(x86_64Lib, overwrite = true)
+        } catch (e: java.io.IOException) {
+            if (!arm64Lib.exists() || !x86_64Lib.exists()) {
+                println("Skipping Rust triage-term Android build: ${e.message}")
+            }
+        }
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(buildTriageTermRust)
+}

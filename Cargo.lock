@@ -3974,6 +3974,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "triage-term"
+version = "0.3.0"
+dependencies = [
+ "tattoy-wezterm-surface",
+ "tattoy-wezterm-term",
+]
+
+[[package]]
 name = "triage-test-support"
 version = "0.3.0"
 dependencies = [

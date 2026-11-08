@@ -20,6 +20,7 @@ all = "warn"
 
 [workspace.dependencies]
 triage-core = { version = "0.3.0", path = "crates/triage-core" }
+triage-term = { version = "0.3.0", path = "crates/triage-term" }
 triage-transport-ws = { version = "0.3.0", path = "crates/triage-transport-ws" }
 triaged = { version = "0.3.0", path = "crates/triaged" }
 anyhow = "1"

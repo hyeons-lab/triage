@@ -25,7 +25,7 @@ import 'package:flutter/services.dart'
         KeyEvent,
         KeyRepeatEvent,
         LogicalKeyboardKey;
-import 'package:xterm/xterm.dart' as xt;
+import 'package:xterm2/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
@@ -1301,30 +1301,11 @@ class _TerminalPaneState extends State<TerminalPane>
 
   void _sendWheelStep(bool up, xt.CellOffset cell) {
     if (_terminal.mouseMode.reportScroll) {
-      // xterm.dart's TerminalMouseButton.wheelUp/wheelDown encode 68/69
-      // (64 + 4/5, which sets the Shift modifier bit in XTerm mouse reporting)
-      // instead of 64/65. Emit the standard unshifted wheel IDs directly so
-      // TUIs (Claude Code, tmux, nvim, less) recognize wheel scroll events.
-      final buttonId = up ? 64 : 65;
-      final x = cell.x + 1;
-      final y = cell.y + 1;
-      final String report;
-      switch (_terminal.mouseReportMode) {
-        case xt.MouseReportMode.sgr:
-          report = '\x1b[<$buttonId;$x;${y}M';
-        case xt.MouseReportMode.urxvt:
-          report = '\x1b[${32 + buttonId};$x;${y}M';
-        case xt.MouseReportMode.normal:
-        case xt.MouseReportMode.utf:
-          final maxCoord =
-              _terminal.mouseReportMode == xt.MouseReportMode.normal
-              ? 223
-              : 2015;
-          final col = x <= maxCoord ? String.fromCharCode(32 + x) : '\x00';
-          final row = y <= maxCoord ? String.fromCharCode(32 + y) : '\x00';
-          report = '\x1b[M${String.fromCharCode(32 + buttonId)}$col$row';
-      }
-      widget.controller.sendInput(report);
+      _terminal.mouseInput(
+        up ? xt.TerminalMouseButton.wheelUp : xt.TerminalMouseButton.wheelDown,
+        xt.TerminalMouseButtonState.down,
+        cell,
+      );
       return;
     }
     _terminal.keyInput(up ? xt.TerminalKey.arrowUp : xt.TerminalKey.arrowDown);
@@ -1459,12 +1440,7 @@ class _TerminalPaneState extends State<TerminalPane>
     // TUIs) are pointer interactions, not keyboard typing: forward them without
     // clearing saved scroll or snapping the scroll view to the bottom.
     if (isTerminalMouseReport(data)) {
-      final normalized = data
-          .replaceAll('\x1b[<68;', '\x1b[<64;')
-          .replaceAll('\x1b[<69;', '\x1b[<65;')
-          .replaceAll('\x1b[<70;', '\x1b[<66;')
-          .replaceAll('\x1b[<71;', '\x1b[<67;');
-      widget.controller.sendInput(normalized);
+      widget.controller.sendInput(data);
       return;
     }
 
