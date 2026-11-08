@@ -2107,6 +2107,9 @@ impl SessionManager {
                 raw_output_prefix,
                 raw_output,
                 size: coords.size.clone(),
+                styled_rows: coords.styled_rows.clone(),
+                styled_rows_start: coords.styled_rows_start,
+                cursor: coords.cursor.clone(),
                 exited: coords.exited,
                 bracketed_paste_enabled: coords.bracketed_paste_enabled,
                 current_working_directory: coords.current_working_directory.clone(),
@@ -2174,7 +2177,8 @@ impl SessionManager {
             let full_older_cap = history_cap.saturating_sub(already_held);
             if let Some(journal) = coords.journal.as_ref() {
                 let probe_budget = (history_cap / 2).min(usize::MAX as u64) as usize;
-                let probe = journal.read_prefix_at_or_older_than(before_byte, probe_budget);
+                let probe =
+                    journal.read_prefix_at_or_older_than(coords.logged_tail_bytes, probe_budget);
                 if probe.is_empty() {
                     if let Some((start, raw)) = read_valid_before(full_older_cap) {
                         return Ok(build_response(
@@ -2190,30 +2194,14 @@ impl SessionManager {
                     let total_raw_cap = history_cap.saturating_sub(probe.len() as u64);
                     let older_raw_cap = total_raw_cap.saturating_sub(already_held);
                     if let Some((seam, raw)) = read_valid_before(older_raw_cap) {
-                        let raw_len = raw.len() as u64;
-                        let prefix = journal.read_prefix_at_or_older_than(seam, probe.len());
-                        if prefix.is_empty() && raw_len == older_raw_cap {
-                            if let Some((full_start, full_raw)) = read_valid_before(full_older_cap)
-                            {
-                                return Ok(build_response(
-                                    coords.logged_output_seq,
-                                    full_start,
-                                    before_byte,
-                                    true,
-                                    Vec::new(),
-                                    full_raw,
-                                ));
-                            }
-                        } else {
-                            return Ok(build_response(
-                                coords.logged_output_seq,
-                                seam,
-                                before_byte,
-                                true,
-                                prefix,
-                                raw,
-                            ));
-                        }
+                        return Ok(build_response(
+                            coords.logged_output_seq,
+                            seam,
+                            before_byte,
+                            true,
+                            probe,
+                            raw,
+                        ));
                     }
                 }
             } else if let Some((start, raw)) = read_valid_before(full_older_cap) {
@@ -2233,14 +2221,10 @@ impl SessionManager {
             output_seq: coords.logged_output_seq,
             bytes_logged: coords.bytes_logged,
             size: coords.size.clone(),
-            styled_rows: Vec::new(),
-            styled_rows_start: 0,
+            styled_rows: coords.styled_rows.clone(),
+            styled_rows_start: coords.styled_rows_start,
             visible_rows: Vec::new(),
-            cursor: TerminalCursor {
-                row: 0,
-                col: 0,
-                visible: true,
-            },
+            cursor: coords.cursor.clone(),
             current_working_directory: coords.current_working_directory.clone(),
             context: coords.context.clone(),
             bracketed_paste_enabled: coords.bracketed_paste_enabled,
@@ -2260,6 +2244,16 @@ impl SessionManager {
             history_cap,
             coords.journal.as_ref(),
         );
+        if let Some(journal) = coords.journal.as_ref()
+            && !overlaid.raw_output.is_empty()
+        {
+            let probe_budget = (history_cap / 2).min(usize::MAX as u64) as usize;
+            let full_prefix =
+                journal.read_prefix_at_or_older_than(coords.logged_tail_bytes, probe_budget);
+            if !full_prefix.is_empty() {
+                overlaid.raw_output_prefix = full_prefix;
+            }
+        }
         inject_active_terminal_modes(
             &mut overlaid,
             coords.is_alt_screen_active,
@@ -6593,12 +6587,19 @@ impl HistoricalSession {
     fn history_coordinates(&self) -> SessionHistoryCoordinates {
         let is_alt_screen_active = self.output.terminal.is_alt_screen_active();
         let is_mouse_grabbed = self.output.terminal.is_mouse_grabbed();
+        let total_rows = self.output.terminal.screen().scrollback_rows();
+        let styled_rows_start = total_rows.saturating_sub(self.size.rows);
+        let styled_rows =
+            styled_visible_rows_for_range(&self.output.terminal, styled_rows_start, total_rows);
         SessionHistoryCoordinates {
             log_path: self.persisted.log_path.clone(),
             logged_tail_bytes: self.output.logged_tail_bytes,
             logged_output_seq: self.output.logged_output_seq,
             bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
+            styled_rows,
+            styled_rows_start,
+            cursor: terminal_cursor(&self.output.terminal),
             exited: true,
             bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
             is_alt_screen_active,
@@ -7845,7 +7846,7 @@ impl ActorState {
         // the primary screen (`Screen::rewrap_lines`) and resizes the alternate
         // screen in memory without reading or re-emulating the 16 MiB session log.
         self.output.terminal.resize(terminal_size(&size));
-        if size.cols != self.size.cols {
+        if size.cols != self.size.cols || size.rows != self.size.rows {
             self.output.scroll_seq_baseline = None;
         }
         self.size = size;
@@ -7882,12 +7883,19 @@ impl ActorState {
     fn history_coordinates(&self) -> SessionHistoryCoordinates {
         let is_alt_screen_active = self.output.terminal.is_alt_screen_active();
         let is_mouse_grabbed = self.output.terminal.is_mouse_grabbed();
+        let total_rows = self.output.terminal.screen().scrollback_rows();
+        let styled_rows_start = total_rows.saturating_sub(self.size.rows);
+        let styled_rows =
+            styled_visible_rows_for_range(&self.output.terminal, styled_rows_start, total_rows);
         SessionHistoryCoordinates {
             log_path: self.output.log_path.clone(),
             logged_tail_bytes: self.output.logged_tail_bytes,
             logged_output_seq: self.output.logged_output_seq,
             bytes_logged: self.output.bytes_logged,
             size: self.size.clone(),
+            styled_rows,
+            styled_rows_start,
+            cursor: terminal_cursor(&self.output.terminal),
             exited: self.exited,
             bracketed_paste_enabled: self.output.terminal.bracketed_paste_enabled(),
             is_alt_screen_active,
@@ -9574,6 +9582,9 @@ pub struct SessionHistoryResponse {
     pub raw_output_prefix: Vec<u8>,
     pub raw_output: Vec<u8>,
     pub size: SessionSize,
+    pub styled_rows: Vec<StyledRow>,
+    pub styled_rows_start: usize,
+    pub cursor: TerminalCursor,
     pub exited: bool,
     pub bracketed_paste_enabled: bool,
     pub current_working_directory: Option<PathBuf>,
@@ -9588,6 +9599,9 @@ struct SessionHistoryCoordinates {
     logged_output_seq: u64,
     bytes_logged: u64,
     size: SessionSize,
+    styled_rows: Vec<StyledRow>,
+    styled_rows_start: usize,
+    cursor: TerminalCursor,
     exited: bool,
     bracketed_paste_enabled: bool,
     is_alt_screen_active: bool,

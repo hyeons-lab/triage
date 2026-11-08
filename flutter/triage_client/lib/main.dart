@@ -388,7 +388,10 @@ class SessionVm {
           terminal.useMainBuffer();
           terminal.mainBuffer.clear();
           terminal.altBuffer.clear();
-          terminal.write('\x1b[H\x1b[2J\x1b[3J');
+          terminal.write(
+            '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
+            '\x1b[?2004l\x1b[?1l\x1b[?7h\x1b[?25h\x1b[H\x1b[2J\x1b[3J',
+          );
         } catch (_) {}
       });
       terminalController.addResizeListener((cols, rows) {
@@ -5075,9 +5078,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<Map<String, dynamic>> _fetchAndMergeSessionHistory(
     SessionVm session,
     String sessionId,
-    Map<String, dynamic> snapshot,
-  ) async {
+    Map<String, dynamic> snapshot, {
+    bool forceFullWindow = false,
+  }) async {
     final canUseDelta =
+        !forceFullWindow &&
         session.loaded &&
         !session.isExited &&
         !session.store.state.exited &&
@@ -5114,6 +5119,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, dynamic> snapshot, {
     (int, int)? renderSize,
     bool replayHistory = true,
+    bool forceFullReplay = false,
     // True when the snapshot was served unwindowed at the full history
     // cap (server-pushed ResyncRequired): the replay must keep the
     // platform budgets instead of the session's narrower held window,
@@ -5190,6 +5196,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutputPrefix: rawOutputPrefix,
         rawOutputViewport: rawOutputViewport,
         isExited: exited,
+        preservePendingLive: forceFullReplay,
       );
       session.loaded = true;
     } else if (exited != session.isExited) {
@@ -5898,6 +5905,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // exactly the evidence the refocus reclaim looks for. Left null in that
         // case so the snapshot's own size is used instead.
         (int, int)? drivenSize;
+        var resizedHost = false;
         if (snapshot['exited'] == true) {
           // Drop any keystrokes buffered for the dead incarnation before
           // reviving the session id with a fresh shell.
@@ -5986,12 +5994,30 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // reclaim on refocus covers the size this skips, which is why
           // `drivenSize` is set only once the resize has actually landed.
           try {
-            await _client.resizeSession(
-              sessionId: sessionId,
-              rows: replayTargetSize.$1,
-              cols: replayTargetSize.$2,
+            final resizedSnapshot = _snapshotFromResponse(
+              await _client.resizeSession(
+                sessionId: sessionId,
+                rows: replayTargetSize.$1,
+                cols: replayTargetSize.$2,
+              ),
             );
             drivenSize = replayTargetSize;
+            resizedHost = true;
+            if (resizedSnapshot != null) {
+              finalSnapshot = <String, dynamic>{
+                ...finalSnapshot,
+                if (resizedSnapshot['size'] != null)
+                  'size': resizedSnapshot['size'],
+                if (resizedSnapshot['styled_rows'] != null)
+                  'styled_rows': resizedSnapshot['styled_rows'],
+                if (resizedSnapshot['styled_rows_start'] != null)
+                  'styled_rows_start': resizedSnapshot['styled_rows_start'],
+                if (resizedSnapshot['visible_rows'] != null)
+                  'visible_rows': resizedSnapshot['visible_rows'],
+                if (resizedSnapshot['cursor'] != null)
+                  'cursor': resizedSnapshot['cursor'],
+              };
+            }
           } on TriageAuthException {
             rethrow;
           } catch (_) {}
@@ -6005,14 +6031,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final revivedNeedsReplay =
             (session.isExited || session.store.state.exited) &&
             finalSnapshot['exited'] != true;
+        final postResizeHttpReplay =
+            resizedHost && useHttpHistory && !session.terminal.isUsingAltBuffer;
         final shouldReplayHistory =
-            includeHistory || !session.loaded || revivedNeedsReplay;
+            includeHistory ||
+            !session.loaded ||
+            revivedNeedsReplay ||
+            postResizeHttpReplay;
         if (useHttpHistory && shouldReplayHistory) {
           if (_isStale(owningGeneration)) return;
           final mergedSnapshot = await _fetchAndMergeSessionHistory(
             session,
             sessionId,
             finalSnapshot,
+            forceFullWindow: resizedHost,
           );
           if (_isStale(owningGeneration)) return;
           finalSnapshot = mergedSnapshot;
@@ -6029,7 +6061,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           replayHistory:
               includeHistory ||
               (!session.loaded && snapshot['exited'] == true) ||
-              revivedNeedsReplay,
+              revivedNeedsReplay ||
+              postResizeHttpReplay,
+          forceFullReplay: resizedHost,
           // finalSnapshot comes from attach/resume responses, whose agent
           // field is manager-overlaid and authoritative.
           agentAuthoritative: true,

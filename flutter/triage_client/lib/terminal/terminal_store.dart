@@ -158,12 +158,12 @@ List<int> _collectGenuineNewlineIndices(List<int> bytes, int start, int end) {
       if (p < end && bytes[p] >= 0x40 && bytes[p] <= 0x7e) {
         final finalByte = bytes[p];
         if (privateMarker == 0) {
-          if (finalByte == 0x41) {
+          if (finalByte == 0x41 || finalByte == 0x46) {
             final step = (!hasFirstParam || firstParam <= 0) ? 1 : firstParam;
             cursorUpDebt = min(500, cursorUpDebt + min(500, step));
           } else if (finalByte == 0x48 ||
               finalByte == 0x66 ||
-              finalByte == 0x4a) {
+              (finalByte == 0x4a && hasFirstParam && firstParam >= 2)) {
             cursorUpDebt = 0;
           }
         }
@@ -1149,13 +1149,7 @@ class TerminalStore extends ChangeNotifier {
           : Uint8List.fromList(rawOutputViewport);
     }
     final useViewportForRaw =
-        rawOutputPrefix.isNotEmpty &&
-        effectiveViewport.isNotEmpty &&
-        _collectGenuineNewlineIndices(
-          trimmed.rawBytes,
-          0,
-          trimmed.rawBytes.length,
-        ).isEmpty;
+        rawOutputPrefix.isNotEmpty && effectiveViewport.isNotEmpty;
     if (useViewportForRaw) {
       final trimmedPrefix = trimHistoryTailWithOffset(
         rawOutputPrefix,
