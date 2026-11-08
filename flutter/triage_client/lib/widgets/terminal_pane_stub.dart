@@ -1124,13 +1124,13 @@ class _TerminalPaneState extends State<TerminalPane>
             final saved = _sessionSavedScrollOffsets[widget.terminalId];
             target ??= (dist != null && dist > 0.0)
                 ? (p.maxScrollExtent - dist).clamp(0.0, p.maxScrollExtent)
-                : (frac != null && frac > 0.0)
+                : (frac != null && frac >= 0.0)
                 ? (p.maxScrollExtent * frac).clamp(0.0, p.maxScrollExtent)
-                : (saved != null && saved > 0.0)
+                : (saved != null && saved >= 0.0)
                 ? saved.clamp(0.0, p.maxScrollExtent)
                 : null;
             if (target != null &&
-                target > 0.0 &&
+                target >= 0.0 &&
                 (p.pixels - target).abs() > 0.5) {
               final wasSuppressed = _suppressAnchorCapture;
               _suppressAnchorCapture = true;
@@ -1247,17 +1247,18 @@ class _TerminalPaneState extends State<TerminalPane>
     if (!position.hasContentDimensions || position.maxScrollExtent <= 0) return;
     final id = terminalId ?? widget.terminalId;
     final isAtBottom = position.pixels >= position.maxScrollExtent - 0.5;
-    if (!isAtBottom && position.pixels > 0.0) {
-      _sessionSavedScrollOffsets[id] = position.pixels;
+    if (!isAtBottom) {
+      final clampedPixels = position.pixels.clamp(0.0, position.maxScrollExtent);
+      _sessionSavedScrollOffsets[id] = clampedPixels;
       if (_scrollAnchor.hasAnchor) {
         _sessionSavedScrollAnchors[id] = _scrollAnchor.clone();
       } else {
         _sessionSavedScrollAnchors.remove(id);
       }
       _sessionSavedDistanceFromBottom[id] =
-          position.maxScrollExtent - position.pixels;
+          position.maxScrollExtent - clampedPixels;
       _sessionSavedScrollFractions[id] = position.maxScrollExtent > 0
-          ? (position.pixels / position.maxScrollExtent).clamp(0.0, 1.0)
+          ? (clampedPixels / position.maxScrollExtent).clamp(0.0, 1.0)
           : 0.0;
     } else {
       _clearSavedSessionScroll(id);
@@ -1422,7 +1423,7 @@ class _TerminalPaneState extends State<TerminalPane>
       maxScrollExtent: position.maxScrollExtent,
       lineHeight: lineHeight,
     );
-    if (desired == null || desired <= 0.0) return;
+    if (desired == null || desired < 0.0) return;
     if ((desired - position.pixels).abs() < 0.5) return;
     final wasSuppressed = _suppressAnchorCapture;
     _suppressAnchorCapture = true;
@@ -1476,19 +1477,19 @@ class _TerminalPaneState extends State<TerminalPane>
               lineHeight: lineHeight,
             );
           }
-          if (desired != null && desired > 0.0) {
+          if (desired != null && desired >= 0.0) {
             target = desired;
           } else if (savedDistance != null && savedDistance > 0.0) {
             target = (position.maxScrollExtent - savedDistance).clamp(
               0.0,
               position.maxScrollExtent,
             );
-          } else if (savedFraction != null && savedFraction > 0.0) {
+          } else if (savedFraction != null && savedFraction >= 0.0) {
             target = (position.maxScrollExtent * savedFraction).clamp(
               0.0,
               position.maxScrollExtent,
             );
-          } else if (saved != null && saved > 0.0) {
+          } else if (saved != null && saved >= 0.0) {
             target = saved.clamp(0.0, position.maxScrollExtent);
           } else {
             final isNearBottom =
@@ -1496,9 +1497,6 @@ class _TerminalPaneState extends State<TerminalPane>
             target = isNearBottom
                 ? position.maxScrollExtent
                 : position.pixels.clamp(0.0, position.maxScrollExtent);
-          }
-          if (target <= 0.0 && position.maxScrollExtent > 0) {
-            target = position.maxScrollExtent;
           }
         }
 
