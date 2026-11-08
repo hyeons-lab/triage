@@ -37,6 +37,7 @@ class TerminalPane extends StatefulWidget {
     this.isExited = false,
     this.isLoading = false,
     this.isObscured = false,
+    this.interactionEnabled = true,
     this.softKeyboardEnabled = true,
   });
 
@@ -68,6 +69,10 @@ class TerminalPane extends StatefulWidget {
   /// the workspace, so pointer/touch gestures on the overlay cannot leak into
   /// or scroll the xterm.js DOM element underneath.
   final bool isObscured;
+
+  /// False while the session rail overlay covers the workspace or a rail drag
+  /// is in flight, so gestures on the rail never scroll or focus the terminal.
+  final bool interactionEnabled;
 
   /// Mobile soft-keyboard kill switch. While false the pane never focuses
   /// xterm's hidden textarea, so the keyboard stays down and its insets stop
@@ -630,9 +635,9 @@ class _TerminalPaneState extends State<TerminalPane>
         cachedFitAddon != null &&
         cachedContainer.children.isNotEmpty) {
       _container = cachedContainer as html.DivElement;
-      _terminalWrapper = _container.children.firstWhere(
-        (el) => el is html.DivElement,
-      ) as html.DivElement;
+      _terminalWrapper =
+          _container.children.firstWhere((el) => el is html.DivElement)
+              as html.DivElement;
       _unmaskTerminalAfterReplay();
       _term = cachedTerm;
       _fitAddon = cachedFitAddon;
@@ -748,7 +753,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
     _windowKeyDownListener = (html.Event event) {
       if (event is html.KeyboardEvent) {
-        final isCurrent = _isRouteCurrentAndUnobscured;
+        final isCurrent = _isInteractive;
         if (isCurrent && _eventTargetsTerminal(event, allowExited: true)) {
           // Allow IME composition to proceed natively.
           if (event.isComposing == true || event.key == 'Process') {
@@ -927,14 +932,31 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   bool get _isRouteCurrentAndUnobscured =>
-      (_currentRoute?.isCurrent ?? true) && !widget.isObscured;
+      (_currentRoute?.isCurrent ?? true) &&
+      !widget.isObscured &&
+      widget.interactionEnabled;
+
+  bool get _isInteractive => _isRouteCurrentAndUnobscured && !widget.isLoading;
 
   void _syncPointerEvents() {
-    final isInteractive = _isRouteCurrentAndUnobscured && !widget.isLoading;
-    final target = isInteractive ? 'auto' : 'none';
+    final interactive = _isInteractive;
+    final target = interactive ? 'auto' : 'none';
+    final touchAction = interactive ? '' : 'none';
     if (_initialized || _sessionContainers.containsKey(_sanitizedId)) {
       if (_container.style.pointerEvents != target) {
         _container.style.pointerEvents = target;
+      }
+      if (_container.style.touchAction != touchAction) {
+        _container.style.touchAction = touchAction;
+      }
+      final viewport = _container.querySelector('.xterm-viewport');
+      if (viewport != null) {
+        if (viewport.style.pointerEvents != target) {
+          viewport.style.pointerEvents = target;
+        }
+        if (viewport.style.touchAction != touchAction) {
+          viewport.style.touchAction = touchAction;
+        }
       }
     }
   }
@@ -959,7 +981,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // handler.
   void _sendMobileInput(String text) {
     if (!mounted || widget.isExited || text.isEmpty) return;
-    if (!_isRouteCurrentAndUnobscured) return;
+    if (!_isInteractive) return;
 
     if (_ctrlArmed) {
       _setCtrlArmed(false);
@@ -1060,7 +1082,8 @@ class _TerminalPaneState extends State<TerminalPane>
   /// Whether this pane may take keyboard focus right now. On mobile with the
   /// soft keyboard suppressed, focusing xterm's textarea would raise the
   /// keyboard, so [_activateTerminal] skips that step. Desktop always passes.
-  bool get _mayTakeFocus => !_isMobile || widget.softKeyboardEnabled;
+  bool get _mayTakeFocus =>
+      widget.interactionEnabled && (!_isMobile || widget.softKeyboardEnabled);
 
   static html.Element? _deepActiveElement() {
     try {
@@ -1162,7 +1185,7 @@ class _TerminalPaneState extends State<TerminalPane>
       late final Timer timer;
       timer = Timer(Duration(milliseconds: delayMs), () {
         _focusRetryTimers.remove(timer);
-        if (!mounted || !_initialized || !_isRouteCurrentAndUnobscured) {
+        if (!mounted || !_initialized || !_isInteractive) {
           return;
         }
         if (_isActiveElementInTerminal()) {
@@ -1176,8 +1199,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _activateTerminal({bool force = false}) {
-    if (!mounted || !_initialized || widget.isExited) return;
-    if (!_isRouteCurrentAndUnobscured) return;
+    if (!mounted || !_initialized || widget.isExited || !_isInteractive) return;
 
     if (!force) {
       final active = _deepActiveElement();
@@ -1282,6 +1304,7 @@ class _TerminalPaneState extends State<TerminalPane>
       js_util.setProperty(html.window, 'activeTerm', _term);
 
       js_util.callMethod(_term, 'open', [_terminalWrapper]);
+      _syncPointerEvents();
 
       final fitAddonModule = js_util.getProperty(html.window, 'FitAddon');
       final fitAddonConstructor = js_util.getProperty(
@@ -1383,11 +1406,16 @@ class _TerminalPaneState extends State<TerminalPane>
     if (onDataSubscription == null) {
       final sessionId = _sanitizedId;
       final onDataCallback = js_util.allowInterop((String data, [dynamic _]) {
-        // Filter terminal query responses (such as CPR \x1b[...R or DA \x1b[?...c)
-        // emitted by the terminal emulator itself in reply to application queries.
-        // Send directly to the PTY without resetting scroll positions, disarming
-        // sticky Ctrl, or formatting as paste.
+        // Drop terminal query responses (such as CPR \x1b[...R or DA \x1b[?...c)
+        // emitted by the client terminal emulator in reply to application queries.
+        // The daemon's own terminal emulator answers PTY queries on the host side;
+        // forwarding client replies injects duplicate escape sequences into stdin.
         if (isEmulatorQueryResponse(data)) {
+          return;
+        }
+        // Forward mouse report sequences directly without resetting the scroll
+        // viewport, disarming sticky Ctrl, or running mobile auto-space logic.
+        if (isTerminalMouseReport(data)) {
           _sessionInputRouter.sendInput(sessionId, data);
           return;
         }
@@ -2282,6 +2310,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerEventOwners[_sanitizedId]?._unbindContainerEvents();
     _containerEventOwners[_sanitizedId] = this;
     _containerMouseDownSubscription = _container.onMouseDown.listen((event) {
+      if (!_isInteractive) return;
       if (_initialized) {
         try {
           _activateTerminal(force: true);
@@ -2291,6 +2320,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerClickSubscription = _container.onClick.listen((event) {
+      if (!_isInteractive) return;
       if (_initialized) {
         try {
           _activateTerminal(force: true);
@@ -2300,7 +2330,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerTouchStartSubscription = _container.onTouchStart.listen((event) {
-      if (widget.isObscured) return;
+      if (!_isInteractive) return;
       _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activeTouchCount = event.touches?.length ?? (_activeTouchCount + 1);
       if (event.touches != null && event.touches!.isNotEmpty) {
@@ -2309,7 +2339,10 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerTouchMoveSubscription = _container.onTouchMove.listen((event) {
-      if (widget.isObscured) return;
+      if (!_isInteractive) {
+        _touchStartY = null;
+        return;
+      }
       _touchScrollTakeover.onTouchMove(DateTime.now().millisecondsSinceEpoch);
       if (_touchStartY != null &&
           event.touches != null &&
@@ -2324,6 +2357,20 @@ class _TerminalPaneState extends State<TerminalPane>
               if (term != null) {
                 final buffer = js_util.getProperty(term, 'buffer');
                 final active = js_util.getProperty(buffer, 'active');
+                final activeType =
+                    js_util.getProperty(active, 'type') as String?;
+                String? mouseMode;
+                try {
+                  final modes = js_util.getProperty(term, 'modes');
+                  mouseMode =
+                      js_util.getProperty(modes, 'mouseTrackingMode')
+                          as String?;
+                } catch (_) {}
+                if (activeType == 'alternate' ||
+                    (mouseMode != null && mouseMode != 'none')) {
+                  _touchStartY = null;
+                  return;
+                }
                 final viewportY =
                     (js_util.getProperty(active, 'viewportY') as num?)
                         ?.toInt() ??
@@ -2352,7 +2399,7 @@ class _TerminalPaneState extends State<TerminalPane>
       _activeTouchCount =
           event.touches?.length ?? math.max(0, _activeTouchCount - 1);
       _handleUserGestureEnded();
-      if (_initialized) {
+      if (_initialized && _isInteractive) {
         try {
           _activateTerminal(force: true);
           _scheduleFocusRetries(force: true);
@@ -2372,7 +2419,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerPointerDownSubscription = _container.on['pointerdown'].listen((
       event,
     ) {
-      if (widget.isObscured) return;
+      if (!_isInteractive) return;
       _touchScrollTakeover.onPointerDown(DateTime.now().millisecondsSinceEpoch);
       _activePointerCount++;
     });
@@ -2411,7 +2458,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _containerPointerMoveSubscription = _container.on['pointermove'].listen((
       event,
     ) {
-      if (!_initialized || widget.isObscured) return;
+      if (!_initialized || !_isInteractive) return;
       final term = _sessionTerms[_sanitizedId];
       if (term == null) return;
       final int buttons;
@@ -2435,9 +2482,11 @@ class _TerminalPaneState extends State<TerminalPane>
         return;
       }
       if (pointerType == 'mouse') return;
-      final canDrive = pointerType == 'pen'
-          ? _activeTouchCount == 0
-          : _activeTouchCount == 1;
+      final canDrive =
+          _activePointerCount > 0 &&
+          (pointerType == 'pen'
+              ? _activeTouchCount == 0
+              : _activeTouchCount == 1);
       double rowPx = 0;
       try {
         final rows = (js_util.getProperty(term, 'rows') as num).toDouble();
@@ -2451,11 +2500,17 @@ class _TerminalPaneState extends State<TerminalPane>
       // touch stream must not veto the fallback (else swipes scroll nothing
       // on quiet sessions). `modes` needs the proposed API, already enabled.
       var forceDrive = false;
+      String? mouseMode;
+      String? activeType;
       try {
         final modes = js_util.getProperty(term, 'modes');
-        final mouseMode =
-            js_util.getProperty(modes, 'mouseTrackingMode') as String?;
-        forceDrive = mouseMode != null && mouseMode != 'none';
+        mouseMode = js_util.getProperty(modes, 'mouseTrackingMode') as String?;
+        final buffer = js_util.getProperty(term, 'buffer');
+        final active = js_util.getProperty(buffer, 'active');
+        activeType = js_util.getProperty(active, 'type') as String?;
+        forceDrive =
+            (mouseMode != null && mouseMode != 'none') ||
+            activeType == 'alternate';
       } catch (_) {}
       final rowsToScroll = _touchScrollTakeover.onPointerMove(
         nowMs: DateTime.now().millisecondsSinceEpoch,
@@ -2468,11 +2523,33 @@ class _TerminalPaneState extends State<TerminalPane>
       try {
         final buffer = js_util.getProperty(term, 'buffer');
         final active = js_util.getProperty(buffer, 'active');
+        activeType ??= js_util.getProperty(active, 'type') as String?;
         final viewportY = (js_util.getProperty(active, 'viewportY') as num)
             .toInt();
         final baseY = (js_util.getProperty(active, 'baseY') as num).toInt();
+        if (forceDrive && (baseY <= 0 || activeType == 'alternate')) {
+          final count = rowsToScroll.abs().clamp(1, 10);
+          if (mouseMode != null && mouseMode != 'none') {
+            final btn = rowsToScroll < 0 ? 64 : 65;
+            final cols =
+                (js_util.getProperty(term, 'cols') as num?)?.toInt() ?? 80;
+            final rows =
+                (js_util.getProperty(term, 'rows') as num?)?.toInt() ?? 24;
+            final col = (cols ~/ 2).clamp(1, cols > 0 ? cols : 1);
+            final row = (rows ~/ 2).clamp(1, rows > 0 ? rows : 1);
+            final seq = '\x1b[<$btn;$col;${row}M' * count;
+            _containerEventOwners[_sanitizedId]?._sendInput(seq);
+          } else if (activeType == 'alternate') {
+            final key = rowsToScroll < 0 ? '\x1b[A' : '\x1b[B';
+            _containerEventOwners[_sanitizedId]?._sendInput(key * count);
+          }
+          return;
+        }
         final target = (viewportY + rowsToScroll).clamp(0, baseY);
-        if (rowsToScroll < 0 && target <= 0) {
+        if (rowsToScroll < 0 &&
+            target <= 0 &&
+            activeType != 'alternate' &&
+            !forceDrive) {
           _containerEventOwners[_sanitizedId]?.widget.onNearTop?.call();
         }
         if (target == viewportY) return;
@@ -2481,7 +2558,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
 
     _containerWheelSubscription = _container.onWheel.listen((event) {
-      if (!_isRouteCurrentAndUnobscured) {
+      if (!_isInteractive) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -2491,9 +2568,7 @@ class _TerminalPaneState extends State<TerminalPane>
       if (event is html.ClipboardEvent) {
         event.preventDefault();
         event.stopPropagation();
-        if (!_isRouteCurrentAndUnobscured ||
-            _isPasteDialogShowing ||
-            widget.isExited) {
+        if (!_isInteractive || _isPasteDialogShowing || widget.isExited) {
           return;
         }
         final clipboardData = event.clipboardData;
@@ -2560,7 +2635,7 @@ class _TerminalPaneState extends State<TerminalPane>
     _unbindTextareaEvents();
 
     void beforeInputListener(html.Event event) {
-      if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
+      if (!mounted || widget.isExited || !_isInteractive) {
         return;
       }
       final inputType = js_util.getProperty(event, 'inputType') as String?;
@@ -2632,7 +2707,7 @@ class _TerminalPaneState extends State<TerminalPane>
     }
 
     void inputListener(html.Event event) {
-      if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
+      if (!mounted || widget.isExited || !_isInteractive) {
         return;
       }
       final inputType = js_util.getProperty(event, 'inputType') as String?;
@@ -2664,7 +2739,7 @@ class _TerminalPaneState extends State<TerminalPane>
     }
 
     void compositionEndListener(html.Event event) {
-      if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
+      if (!mounted || widget.isExited || !_isInteractive) {
         return;
       }
       final data = js_util.getProperty(event, 'data') as String?;
@@ -3114,9 +3189,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   bool _eventTargetsTerminal(html.Event event, {bool allowExited = false}) {
-    if (!mounted ||
-        (!allowExited && widget.isExited) ||
-        !_isRouteCurrentAndUnobscured) {
+    if (!mounted || (!allowExited && widget.isExited) || !_isInteractive) {
       return false;
     }
 
@@ -3538,9 +3611,17 @@ class _TerminalPaneState extends State<TerminalPane>
         _focusNode.unfocus();
       }
     }
-    if (oldWidget.isLoading != widget.isLoading) {
+    if (oldWidget.isLoading != widget.isLoading ||
+        oldWidget.interactionEnabled != widget.interactionEnabled) {
+      if (!widget.interactionEnabled) {
+        _activeTouchCount = 0;
+        _activePointerCount = 0;
+        _touchStartY = null;
+      }
       _syncPointerEvents();
-      if (!widget.isLoading && _replayMaskTimer == null) {
+      if (oldWidget.isLoading != widget.isLoading &&
+          !widget.isLoading &&
+          _replayMaskTimer == null) {
         _restoreScrollPosition(requestFocus: false);
       }
     }
@@ -3709,7 +3790,10 @@ class _TerminalPaneState extends State<TerminalPane>
             child: Stack(
               children: [
                 IgnorePointer(
-                  ignoring: widget.isLoading || widget.isObscured,
+                  ignoring:
+                      widget.isLoading ||
+                      widget.isObscured ||
+                      !widget.interactionEnabled,
                   child: AnimatedOpacity(
                     opacity: widget.isLoading ? 0.7 : 1.0,
                     duration: const Duration(milliseconds: 150),

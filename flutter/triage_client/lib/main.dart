@@ -300,16 +300,20 @@ bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
   return platform == TargetPlatform.windows;
 }
 
+@visibleForTesting
+bool debugForceMobileLayoutForTest = false;
+
 /// True on touch platforms — where the terminal takes IME input, so requesting
 /// focus raises the soft keyboard and insets the viewport.
 ///
 /// False under the widget tests: their default platform is android, but they
 /// assert the desktop side-by-side layout.
 bool isMobilePlatform() =>
-    !runningUnderFlutterTest() &&
-    (defaultTargetPlatform == TargetPlatform.iOS ||
-        defaultTargetPlatform == TargetPlatform.android ||
-        isWebMobileBrowser());
+    debugForceMobileLayoutForTest ||
+    (!runningUnderFlutterTest() &&
+        (defaultTargetPlatform == TargetPlatform.iOS ||
+            defaultTargetPlatform == TargetPlatform.android ||
+            isWebMobileBrowser()));
 
 /// Whether a client in [state] should be asserting its terminal size on the
 /// shared PTY.
@@ -377,7 +381,7 @@ class SessionVm {
     );
     if (!kIsWeb) {
       terminalController.addWriteListener((data) {
-        terminal.write(data);
+        writeToXterm(terminal, data);
       });
       terminalController.addClearListener(() {
         try {
@@ -803,6 +807,7 @@ class SessionVm {
   // Set once the view first reports its real fitted size after a fresh attach.
   // Gates the one-shot host re-sync to that size (see `_onSessionViewFit`).
   bool hasFitted = false;
+  bool refitInFlight = false;
   int? inFlightCols;
   int? inFlightRows;
   int resizeRequestSeq = 0;
@@ -846,6 +851,7 @@ class SessionVm {
     int? rawOutputStart,
     int? windowBytes,
     List<int> rawOutputPrefix = const [],
+    List<int> rawOutputViewport = const [],
     bool isExited = false,
     bool preservePendingLive = false,
   }) {
@@ -864,6 +870,7 @@ class SessionVm {
       rawOutputStart: rawOutputStart,
       windowBytes: windowBytes,
       rawOutputPrefix: rawOutputPrefix,
+      rawOutputViewport: rawOutputViewport,
     );
     tdbg(
       'vm.applyHistory',
@@ -902,6 +909,13 @@ class SessionVm {
     final pending = _pendingHistory;
     if (pending == null) return;
     _pendingHistory = null;
+    if (!kIsWeb &&
+        (pending.rawOutput.isNotEmpty || pending.rawOutputPrefix.isNotEmpty) &&
+        _viewCols >= kMinTerminalCols &&
+        _viewRows >= kMinTerminalRows &&
+        (terminal.viewWidth != _viewCols || terminal.viewHeight != _viewRows)) {
+      terminal.resize(_viewCols, _viewRows);
+    }
     store.dispatch(
       HistoryBytes(
         pending.rawOutput,
@@ -911,6 +925,7 @@ class SessionVm {
         rawOutputStart: pending.rawOutputStart,
         windowBytes: pending.windowBytes,
         rawOutputPrefix: pending.rawOutputPrefix,
+        rawOutputViewport: pending.rawOutputViewport,
       ),
     );
     if (isExited) {
@@ -953,6 +968,7 @@ class _PendingHistory {
     this.rawOutputStart,
     this.windowBytes,
     this.rawOutputPrefix = const [],
+    this.rawOutputViewport = const [],
   });
 
   final List<int> rawOutput;
@@ -960,6 +976,7 @@ class _PendingHistory {
   final int? rawOutputStart;
   final int? windowBytes;
   final List<int> rawOutputPrefix;
+  final List<int> rawOutputViewport;
 
   int? get effectiveStart {
     final start = rawOutputStart;
@@ -1387,6 +1404,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // changing repository) would leave it set over a drag the list had already
   // killed, dimming a group until the next one.
   String? _draggingRailGroup;
+  bool _railDragging = false;
   // Set when the daemon could not supply session contexts, which leaves every
   // session in one repo-less group. On its own that is not enough to reject a
   // drag: see [_railGroupingIsCollapsed], which pairs it with what the rail is
@@ -1980,14 +1998,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _refitAndFocusActiveSession();
   }
 
-  /// Web-only companion to [SessionVm.hostSizeDriftedFromOwnFit]: true when
-  /// the selected session's live xterm.js grid disagrees with the host size.
+  /// Companion to [SessionVm.hostSizeDriftedFromOwnFit]: true when the
+  /// selected session's live terminal grid disagrees with the host size.
   /// A fit that applied locally but never reached the host reads as healthy
   /// to the last-sent comparison (term 46, PTY 80, sent 80) while rendering
-  /// narrow; this catches it so the foreground reclaim heals it. Native
-  /// `TerminalView` auto-fit owns its grid, so there is no equivalent gap.
+  /// narrow; this catches it so the foreground reclaim heals it.
   bool _selectedSessionGridDriftedFromHost() {
-    if (!kIsWeb) return false;
     final session = _selectedSession;
     final grid = TerminalPane.getCachedTerminalSize(session.title);
     return cachedGridDriftedFromHost(
@@ -2048,15 +2064,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
 
+    final generation = _connectGeneration;
     // The pane owns the re-fit. On web this is the whole operation; running the
     // native jiggle below afterward would nudge the host straight back to the
     // stale shadow width.
     session.terminalController.refit();
     if (kIsWeb) return;
+    if (session.refitInFlight) return;
 
     final cols = session.terminal.viewWidth;
     final rows = session.terminal.viewHeight;
     if (cols < 2 || rows < 2) return;
+    session.hostSizeCols = cols;
+    session.hostSizeRows = rows;
+    session.refitInFlight = true;
     unawaited(() async {
       try {
         await _client.resizeSession(
@@ -2064,15 +2085,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           cols: cols,
           rows: rows - 1,
         );
-        if (_disposed) return;
+        if (_disposed || _isStale(generation)) return;
         await Future<void>.delayed(const Duration(milliseconds: 60));
-        if (_disposed) return;
+        if (_disposed || _isStale(generation)) return;
         await _client.resizeSession(
           sessionId: sessionId,
           cols: cols,
           rows: rows,
         );
-      } catch (_) {}
+        session.hostSizeCols = cols;
+        session.hostSizeRows = rows;
+      } catch (_) {
+      } finally {
+        session.refitInFlight = false;
+      }
     }());
   }
 
@@ -2317,7 +2343,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           sessionId != null &&
           !session.isExited &&
           session.status != 'exited') {
-        ++session.resizeRequestSeq;
+        final reqSeq = ++session.resizeRequestSeq;
+        final generation = _connectGeneration;
         // Tell the host its new PTY size; the program repaints and the live
         // byte stream self-heals the view. No history replay on resize.
         unawaited(() async {
@@ -2327,6 +2354,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               cols: cols,
               rows: rows,
             );
+            if (!_isStale(generation) && reqSeq == session.resizeRequestSeq) {
+              session.hostSizeCols = cols;
+              session.hostSizeRows = rows;
+            }
           } catch (_) {}
         }());
       }
@@ -2442,6 +2473,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     String sessionId,
     List<int> bytes,
   ) {
+    final isMouseReport =
+        bytes.length >= 6 &&
+        bytes[0] == 0x1b &&
+        bytes[1] == 0x5b &&
+        (bytes[2] == 0x3c || bytes[2] == 0x4d);
+    if (!isMouseReport &&
+        !session.refitInFlight &&
+        _clientForeground &&
+        _selectedIndex >= 0 &&
+        _selectedIndex < _sessions.length &&
+        identical(session, _selectedSession) &&
+        (session.hostSizeDriftedFromOwnFit ||
+            _selectedSessionGridDriftedFromHost())) {
+      _refitActiveSession();
+    }
     if (!session.hasInputLease ||
         !_client.isConnected ||
         _pendingInput.hasPending(sessionId)) {
@@ -3831,6 +3877,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // this state: `cancelReorder` raises neither `onReorderEnd` nor
     // `onReorderItem`, so the drag it just ended would otherwise never clear.
     _draggingRailGroup = null;
+    _railDragging = false;
     _applyPins(_pins, persist: false, syncToDaemon: false);
   }
 
@@ -3843,8 +3890,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (index < 0 || index >= items.length) return;
     final item = items[index];
     final group = item.isHeader ? item.groupKey : null;
-    if (_draggingRailGroup == group) return;
-    setState(() => _draggingRailGroup = group);
+    if (_draggingRailGroup == group && _railDragging) return;
+    setState(() {
+      _draggingRailGroup = group;
+      _railDragging = true;
+    });
   }
 
   /// Clears the header-drag treatment. Safe to call when nothing is set, which
@@ -3867,8 +3917,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // most: this is the one callback documented above as arriving after its
     // widget has gone.
     if (_disposed || !mounted) return;
-    if (_draggingRailGroup == null) return;
-    setState(() => _draggingRailGroup = null);
+    if (_draggingRailGroup == null && !_railDragging) return;
+    setState(() {
+      _draggingRailGroup = null;
+      _railDragging = false;
+    });
   }
 
   /// Whether the rail has collapsed into a single contextless group, which it
@@ -4129,6 +4182,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // supposed to surface exactly what is being used.
         session.lastInteractionMs = oldSession.lastInteractionMs;
         session.lastOutputMs = oldSession.lastOutputMs;
+        session.focusCursorRevision = oldSession.focusCursorRevision;
         // Same reasoning for the repository, which is what decides the session's
         // *group*: the replacement takes its context from the attach snapshot,
         // and a snapshot that omits one (an older daemon, or a session outside
@@ -4447,6 +4501,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutputStart: rawOutputStart,
         windowBytes: kHistoryFirstWindowBytes,
         rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
+        rawOutputViewport: _rawOutputViewportFromSnapshot(snapshot ?? const {}),
         isExited: exited,
       );
       _setupSessionInputListener(session);
@@ -4955,7 +5010,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final size = snapshot?['size'] as Map<String, dynamic>?;
         final cols = size?['cols'] as int?;
         final rows = size?['rows'] as int?;
-        if (cols != null && rows != null) {
+        if (cols != null && rows != null && !session.refitInFlight) {
           session.lastFittedCols = cols;
           session.lastFittedRows = rows;
           // The host's own account of the PTY's settled size. Recorded
@@ -5126,12 +5181,14 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (replayHistory || !session.loaded) {
       final rawOutput = _rawOutputFromSnapshot(snapshot);
       final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
+      final rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
       session.applyHistory(
         rawOutput,
         throughOutputSeq: snapshotOutputSeq,
         rawOutputStart: snapshotRawOutputStart,
         windowBytes: unwindowed ? null : session.historyWindowBytes,
         rawOutputPrefix: rawOutputPrefix,
+        rawOutputViewport: rawOutputViewport,
         isExited: exited,
       );
       session.loaded = true;
@@ -5251,6 +5308,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
       rawOutputPrefixFromSnapshot(snapshot);
+
+  Uint8List _rawOutputViewportFromSnapshot(Map<String, dynamic> snapshot) =>
+      rawOutputViewportFromSnapshot(snapshot);
 
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
   /// fallback view; production rendering is driven by the store from raw bytes.
@@ -5583,7 +5643,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected || !session.isRemote || !session.loaded) {
       return null;
     }
-    if (session.pagingHistory) return null;
+    if (session.pagingHistory || session.terminal.isUsingAltBuffer) {
+      return null;
+    }
     final start = session.historyStart;
     if (start == null || start <= 0) return null;
     final maxWindow = kIsWeb
@@ -5672,6 +5734,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
       var rawOutput = _rawOutputFromSnapshot(snapshot);
       var rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
+      var rawOutputViewport = _rawOutputViewportFromSnapshot(snapshot);
+      if (rawOutputViewport.isEmpty &&
+          session.store.retainedRawViewport.isNotEmpty) {
+        rawOutputViewport = session.store.retainedRawViewport;
+      }
       var rawOutputStart = snapshot['raw_output_start'] as int?;
       if (rawOutputStart == null) return;
       var throughOutputSeq = snapshot['output_seq'] as int?;
@@ -5702,6 +5769,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           snapshot = fallback;
           rawOutput = _rawOutputFromSnapshot(fallback);
           rawOutputPrefix = _rawOutputPrefixFromSnapshot(fallback);
+          rawOutputViewport = _rawOutputViewportFromSnapshot(fallback);
+          if (rawOutputViewport.isEmpty &&
+              session.store.retainedRawViewport.isNotEmpty) {
+            rawOutputViewport = session.store.retainedRawViewport;
+          }
           rawOutputStart = fallbackStart;
           throughOutputSeq = fallback['output_seq'] as int?;
         } else {
@@ -5718,9 +5790,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
       final retainedPrefixBytes = trimmed.retainedPrefixBytes;
       final effectiveStart = rawOutputStart + trimmed.droppedRawBytes;
+      final isSplitHistory =
+          rawOutputPrefix.isNotEmpty && rawOutputViewport.isNotEmpty;
       if ((rawOutput.isEmpty && rawOutputPrefix.isEmpty) ||
-          (effectiveStart >= currentStart &&
-              retainedPrefixBytes <= session.historyPrefixBytes)) {
+          (isSplitHistory
+              ? retainedPrefixBytes <= session.historyPrefixBytes
+              : (effectiveStart >= currentStart &&
+                    retainedPrefixBytes <= session.historyPrefixBytes))) {
         session.historyWindowBytes = max(
           session.historyWindowBytes,
           nextWindow,
@@ -5743,6 +5819,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         rawOutputStart: rawOutputStart,
         windowBytes: nextWindow,
         rawOutputPrefix: rawOutputPrefix,
+        rawOutputViewport: rawOutputViewport,
         isExited:
             (snapshot['exited'] == true) ||
             session.isExited ||
@@ -6215,6 +6292,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             rawOutputStart: rawOutputStart,
             windowBytes: kHistoryFirstWindowBytes,
             rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
+            rawOutputViewport: _rawOutputViewportFromSnapshot(
+              snapshot ?? const {},
+            ),
             isExited: exited,
           );
 
@@ -6715,7 +6795,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
     } else {
       final isNarrow =
-          !runningUnderFlutterTest() && MediaQuery.of(context).size.width < 768;
+          !runningUnderFlutterTest() && MediaQuery.sizeOf(context).width < 768;
       final isMobile = isMobilePlatform() || isNarrow;
       final hasSelectedSession =
           _selectedIndex >= 0 && _selectedIndex < _sessions.length;
@@ -6726,7 +6806,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       }
 
       void collapseRail() {
-        if (!_sidebarCollapsed) setState(() => _sidebarCollapsed = true);
+        if (!_sidebarCollapsed || _railDragging || _draggingRailGroup != null) {
+          setState(() {
+            _sidebarCollapsed = true;
+            _draggingRailGroup = null;
+            _railDragging = false;
+          });
+        }
       }
 
       void openRail() {
@@ -6801,6 +6887,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             : () {
                 setState(() {
                   _sidebarCollapsed = !_sidebarCollapsed;
+                  if (_sidebarCollapsed) {
+                    _draggingRailGroup = null;
+                    _railDragging = false;
+                  }
                 });
               },
       );
@@ -6828,6 +6918,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         ),
       );
 
+      final workspaceInteractive =
+          (!isMobile || _sidebarCollapsed) && !_railDragging;
       final currentSession = _sessions.isEmpty ? null : _selectedSession;
       final isWorkspaceObscured = isMobile && !_sidebarCollapsed;
       final workspace = currentSession == null
@@ -6835,6 +6927,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           : SessionWorkspace(
               session: currentSession,
               connected: _client.isConnected,
+              interactionEnabled: workspaceInteractive,
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
@@ -6857,7 +6950,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             );
 
       if (isMobile) {
-        final screenWidth = MediaQuery.of(context).size.width;
+        final screenWidth = MediaQuery.sizeOf(context).width;
         final overlayWidth = screenWidth < _sessionRailExpandedWidth
             ? screenWidth
             : _sessionRailExpandedWidth;
@@ -6867,7 +6960,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               children: [
                 Positioned.fill(
                   child: IgnorePointer(
-                    ignoring: isWorkspaceObscured,
+                    ignoring: isWorkspaceObscured || !workspaceInteractive,
                     child: workspace,
                   ),
                 ),
@@ -6925,7 +7018,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                   thickness: 1,
                   color: Color(0xff263033),
                 ),
-                Expanded(child: workspace),
+                Expanded(
+                  child: IgnorePointer(
+                    ignoring: !workspaceInteractive,
+                    child: workspace,
+                  ),
+                ),
               ],
             ),
           ),
@@ -7091,6 +7189,8 @@ class SessionRail extends StatefulWidget {
 class _SessionRailState extends State<SessionRail> {
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
+  final ScrollController _expandedScrollController = ScrollController();
+  final ScrollController _collapsedScrollController = ScrollController();
   String _searchQuery = '';
   bool _searchOpen = false;
   Offset _lastTapDownPosition = Offset.zero;
@@ -7120,10 +7220,15 @@ class _SessionRailState extends State<SessionRail> {
   void dispose() {
     _searchController.dispose();
     _searchFocusNode.dispose();
+    _expandedScrollController.dispose();
+    _collapsedScrollController.dispose();
     super.dispose();
   }
 
   void _onSearchChanged(String value) {
+    if (value.trim().isNotEmpty) {
+      widget.onRailDragEnd();
+    }
     setState(() {
       _searchQuery = value;
     });
@@ -7238,6 +7343,8 @@ class _SessionRailState extends State<SessionRail> {
         const SizedBox(height: 8),
         Expanded(
           child: SingleChildScrollView(
+            controller: _collapsedScrollController,
+            primary: false,
             padding: const EdgeInsets.symmetric(horizontal: 8),
             child: Column(
               children: [
@@ -7557,12 +7664,12 @@ class _SessionRailState extends State<SessionRail> {
                   ),
                 )
               : Listener(
-                  onPointerUp: (_) =>
-                      isSearching ? null : widget.onRailDragEnd(),
-                  onPointerCancel: (_) =>
-                      isSearching ? null : widget.onRailDragEnd(),
+                  onPointerUp: (_) => widget.onRailDragEnd(),
+                  onPointerCancel: (_) => widget.onRailDragEnd(),
                   child: ReorderableList(
                     key: widget.railListKey,
+                    controller: _expandedScrollController,
+                    primary: false,
                     padding: const EdgeInsets.fromLTRB(12, 0, 12, 16),
                     proxyDecorator: _railDragProxyDecorator,
                     onReorderItem: (oldIndex, newIndex) => isSearching
@@ -7571,8 +7678,7 @@ class _SessionRailState extends State<SessionRail> {
                     onReorderStart: (index) => isSearching
                         ? null
                         : widget.onRailDragStart(items, index),
-                    onReorderEnd: (_) =>
-                        isSearching ? null : widget.onRailDragEnd(),
+                    onReorderEnd: (_) => widget.onRailDragEnd(),
                     itemCount: items.length,
                     itemBuilder: (context, index) {
                       final item = items[index];
@@ -11457,6 +11563,7 @@ class SessionWorkspace extends StatelessWidget {
     super.key,
     required this.session,
     required this.connected,
+    this.interactionEnabled = true,
     this.onCloseSession,
     this.onViewFit,
     this.onNearTop,
@@ -11470,6 +11577,7 @@ class SessionWorkspace extends StatelessWidget {
 
   final SessionVm session;
   final bool connected;
+  final bool interactionEnabled;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
   // The terminal scrolled near the top of its scrollback: page older
@@ -11524,6 +11632,7 @@ class SessionWorkspace extends StatelessWidget {
             isExited: session.status == 'exited',
             isLoading: session.status == 'loading' || !session.loaded,
             isObscured: isObscured,
+            interactionEnabled: interactionEnabled,
             softKeyboardEnabled: softKeyboardEnabled,
           ),
         ),
