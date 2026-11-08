@@ -142,6 +142,17 @@ class TerminalPane extends StatefulWidget {
   static (int, int)? getLastFittedWorkspaceSize() =>
       _TerminalPaneState._lastWorkspaceFittedSize;
 
+  /// Clears the cached last-sent resize dimensions for [terminalId] so the
+  /// next fit or resize-out forwards its size to the host even if the local
+  /// grid dimensions did not change since the previous send.
+  static void invalidateCachedResizeOut(String terminalId) {
+    final sanitizedId = terminalId.replaceAll(RegExp(r'[^a-zA-Z0-9-]'), '_');
+    _TerminalPaneState._sessionLastResizeOutCols.remove(sanitizedId);
+    _TerminalPaneState._sessionLastResizeOutRows.remove(sanitizedId);
+    _TerminalPaneState._sessionLastResizeOutCols.remove(terminalId);
+    _TerminalPaneState._sessionLastResizeOutRows.remove(terminalId);
+  }
+
   /// When true in widget tests, renders the real `xt.TerminalView`
   /// (`RenderTerminal`) instead of the `SingleChildScrollView` test fallback.
   @visibleForTesting
@@ -385,6 +396,9 @@ class _TerminalPaneState extends State<TerminalPane>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _suppressAnchorCapture = false;
+      if (!_metricsResizeSettling) {
+        _syncTerminalSizeToRender(sendResizeOut: !widget.isLoading);
+      }
       if (_scrollController.hasClients &&
           _scrollController.position.hasContentDimensions) {
         _lastScrollPixels = _scrollController.position.pixels;
@@ -563,6 +577,13 @@ class _TerminalPaneState extends State<TerminalPane>
     final sessionSwapped =
         !identical(oldWidget.terminal, widget.terminal) ||
         oldWidget.terminalId != widget.terminalId;
+    if (sessionSwapped || (oldWidget.isLoading && !widget.isLoading)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_metricsResizeSettling) {
+          _syncTerminalSizeToRender(sendResizeOut: !widget.isLoading);
+        }
+      });
+    }
     if (!sessionSwapped &&
         oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       final hasSavedScroll =
@@ -639,14 +660,14 @@ class _TerminalPaneState extends State<TerminalPane>
       _scrollAnchor.clear();
       _clearSavedSessionScroll(widget.terminalId);
     }
+    _syncTerminalSizeToRender(sendResizeOut: !widget.isLoading);
     setState(() {});
     _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
   }
 
   void _onRefit() {
     if (!mounted) return;
-    _sessionLastResizeOutCols.remove(widget.terminalId);
-    _sessionLastResizeOutRows.remove(widget.terminalId);
+    TerminalPane.invalidateCachedResizeOut(widget.terminalId);
     final hasSavedScroll =
         _scrollAnchor.hasAnchor ||
         _sessionSavedScrollOffsets.containsKey(widget.terminalId);
@@ -664,6 +685,10 @@ class _TerminalPaneState extends State<TerminalPane>
       _scrollAnchor.clear();
       _clearSavedSessionScroll(widget.terminalId);
     }
+    _syncTerminalSizeToRender(sendResizeOut: false);
+    _resizeOutDebounceTimer?.cancel();
+    _pendingResizeOutCols = null;
+    _pendingResizeOutRows = null;
     setState(() {});
     _scrollToCursor(requestFocus: false, forceBottom: isAtBottom);
   }
@@ -684,6 +709,14 @@ class _TerminalPaneState extends State<TerminalPane>
     try {
       _terminalViewKey.currentState?.renderTerminal.terminal = _terminal;
     } catch (_) {}
+    if (!_metricsResizeSettling) {
+      _syncTerminalSizeToRender(sendResizeOut: false);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_metricsResizeSettling) {
+        _syncTerminalSizeToRender(sendResizeOut: false);
+      }
+    });
     // A scroll-up page replayed a wider window: re-seat the viewport on
     // the same content (old pixels plus the added rows) instead of the
     // normal bottom snap. Re-applied on the post-frame callback once
@@ -1616,6 +1649,9 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _scheduleResizeOut(int cols, int rows) {
+    if (widget.isLoading) {
+      return;
+    }
     if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
         _sessionLastResizeOutRows[widget.terminalId] == rows) {
       _resizeOutDebounceTimer?.cancel();
@@ -1647,6 +1683,10 @@ class _TerminalPaneState extends State<TerminalPane>
     );
     _sessionLastGridSize[sanitizedId] = (rows, cols);
     _sessionLastGridSize[widget.terminalId] = (rows, cols);
+    _lastWorkspaceFittedSize = (rows, cols);
+    if (widget.isLoading) {
+      return;
+    }
     if (_sessionLastResizeOutCols[widget.terminalId] == cols &&
         _sessionLastResizeOutRows[widget.terminalId] == rows) {
       return;
@@ -1747,7 +1787,7 @@ class _TerminalPaneState extends State<TerminalPane>
     });
   }
 
-  void _syncTerminalSizeToRender() {
+  void _syncTerminalSizeToRender({bool sendResizeOut = true}) {
     try {
       final render = _terminalViewKey.currentState?.renderTerminal;
       if (render != null && render.hasSize) {
@@ -1759,6 +1799,14 @@ class _TerminalPaneState extends State<TerminalPane>
           final cols = render.size.width ~/ cell.width;
           final rows = render.size.height ~/ cell.height;
           if (cols > 0 && rows > 0) {
+            final sanitizedId = widget.terminalId.replaceAll(
+              RegExp(r'[^a-zA-Z0-9-]'),
+              '_',
+            );
+            final prevGrid = _sessionLastGridSize[widget.terminalId];
+            _sessionLastGridSize[sanitizedId] = (rows, cols);
+            _sessionLastGridSize[widget.terminalId] = (rows, cols);
+            _lastWorkspaceFittedSize = (rows, cols);
             if (cols != _terminal.viewWidth || rows != _terminal.viewHeight) {
               _terminal.resize(
                 cols,
@@ -1766,9 +1814,18 @@ class _TerminalPaneState extends State<TerminalPane>
                 cell.width.round(),
                 cell.height.round(),
               );
+            } else if (prevGrid != (rows, cols)) {
+              scheduleMicrotask(() {
+                if (mounted) {
+                  widget.onViewFit?.call(cols, rows);
+                }
+              });
             }
-            _sendResizeOutNow(cols, rows);
+            if (sendResizeOut) {
+              _sendResizeOutNow(cols, rows);
+            }
             render.markNeedsLayout();
+            render.markNeedsPaint();
           }
         }
       }

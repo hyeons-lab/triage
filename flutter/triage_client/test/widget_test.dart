@@ -6823,11 +6823,7 @@ void main() {
 
         final client = FakeTriageWebSocketClient();
         client.attachHistoryWindows['flutter-spike'] = {
-          kHistoryFirstWindowBytes: (
-            bytes: historyBytes,
-            start: 0,
-            seq: 5,
-          ),
+          kHistoryFirstWindowBytes: (bytes: historyBytes, start: 0, seq: 5),
         };
 
         await tester.pumpWidget(TriageClientApp(client: client));
@@ -6838,14 +6834,8 @@ void main() {
         // at column 80 into two lines ('S' * 80 and 'S' * 20).
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
-        expect(
-          pane.terminal.buffer.lines[0].toString().trimRight(),
-          'S' * 80,
-        );
-        expect(
-          pane.terminal.buffer.lines[1].toString().trimRight(),
-          'S' * 20,
-        );
+        expect(pane.terminal.buffer.lines[0].toString().trimRight(), 'S' * 80);
+        expect(pane.terminal.buffer.lines[1].toString().trimRight(), 'S' * 20);
 
         // Now widen the terminal to 120x24 and press Refit in the workspace header.
         pane.terminal.resize(120, 24);
@@ -6860,6 +6850,61 @@ void main() {
           pane.terminal.buffer.lines[1].toString().trimRight(),
           'visible-or-scrolled-0',
         );
+      },
+    );
+
+    testWidgets(
+      'metadata refresh on re-select resizes host without clobbering live SIGWINCH output via HTTP history replay',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
+        client.attachHistoryWindows['flutter-spike'] = {
+          kHistoryFirstWindowBytes: (
+            bytes: utf8.encode('initial prompt\r\n'),
+            start: 0,
+            seq: 1,
+          ),
+        };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(120, 40);
+        await tester.pumpAndSettle();
+
+        // Simulate a live SIGWINCH redraw or agent output arriving at seq 2,
+        // while the server's HTTP history snapshot still only carries seq 1.
+        client.emitOutput(
+          'flutter-spike',
+          'live-redraw-after-sigwinch\r\n',
+          outputSeq: 2,
+        );
+        await tester.pumpAndSettle();
+
+        // Another device resizes the PTY to 47x19; switching away and back
+        // triggers a metadata refresh (`includeHistory: false`) that resizes
+        // the host back to 120x40. It must not run a full HTTP history replay
+        // that wipes out seq 2.
+        client.emitSnapshot('flutter-spike', ['narrow'], size: (19, 47));
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('triage / main'));
+        await tester.pumpAndSettle();
+        final historyCallsBefore = client.fetchSessionHistoryCalls.length;
+
+        await tester.tap(find.text('experiment/flutter-spike').first);
+        await tester.pumpAndSettle();
+
+        expect(client.fetchSessionHistoryCalls.length, historyCallsBefore);
+        final reselectedPane = tester.widget<TerminalPane>(
+          find.byType(TerminalPane),
+        );
+        final bufferText = List.generate(
+          reselectedPane.terminal.buffer.lines.length,
+          (i) => reselectedPane.terminal.buffer.lines[i].toString(),
+        ).join('\n');
+        expect(bufferText, contains('live-redraw-after-sigwinch'));
       },
     );
   });

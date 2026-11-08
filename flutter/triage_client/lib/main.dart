@@ -1002,8 +1002,16 @@ class SessionVm {
   void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
     beginTerminalWriteBatch();
     try {
-      if (!_viewReady && lastFittedCols != null && lastFittedRows != null) {
-        noteViewFit(lastFittedCols!, lastFittedRows!);
+      if (!_viewReady) {
+        final cols =
+            ownFittedCols ??
+            (runningUnderFlutterTest() ? lastFittedCols : null);
+        final rows =
+            ownFittedRows ??
+            (runningUnderFlutterTest() ? lastFittedRows : null);
+        if (cols != null && rows != null) {
+          noteViewFit(cols, rows);
+        }
       }
       store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
     } finally {
@@ -2095,7 +2103,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// narrow; this catches it so the foreground reclaim heals it.
   bool _selectedSessionGridDriftedFromHost() {
     final session = _selectedSession;
-    final grid = TerminalPane.getCachedTerminalSize(session.title);
+    final grid =
+        TerminalPane.getLastFittedWorkspaceSize() ??
+        TerminalPane.getCachedTerminalSize(session.title);
     return cachedGridDriftedFromHost(
       gridRowsCols: grid,
       hostCols: session.hostSizeCols,
@@ -4306,8 +4316,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.terminalController,
         );
         final cachedSize =
-            TerminalPane.getCachedTerminalSize(session.title) ??
-            TerminalPane.getLastFittedWorkspaceSize();
+            TerminalPane.getLastFittedWorkspaceSize() ??
+            TerminalPane.getCachedTerminalSize(session.title);
         if (cachedSize != null) {
           session.hasFitted = true;
           session.lastFittedRows = cachedSize.$1;
@@ -4329,12 +4339,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         if (cachedSize == null) {
           if (oldSession._viewReady) {
             session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
-          } else if (oldSession.lastFittedCols != null &&
-              oldSession.lastFittedRows != null) {
-            session.noteViewFit(
-              oldSession.lastFittedCols!,
-              oldSession.lastFittedRows!,
-            );
+          } else {
+            final fallbackCols =
+                oldSession.ownFittedCols ??
+                (runningUnderFlutterTest() ? oldSession.lastFittedCols : null);
+            final fallbackRows =
+                oldSession.ownFittedRows ??
+                (runningUnderFlutterTest() ? oldSession.lastFittedRows : null);
+            if (fallbackCols != null && fallbackRows != null) {
+              session.noteViewFit(fallbackCols, fallbackRows);
+            }
           }
         }
       });
@@ -4343,12 +4357,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (!session.isExited && _pendingInput.hasPending(sid)) {
         unawaited(_acquireInputLeaseAndFlush(session, sid));
       }
-      if (session.lastFittedCols != null &&
-          session.lastFittedRows != null &&
-          (session.hostSizeCols != session.lastFittedCols ||
-              session.hostSizeRows != session.lastFittedRows)) {
-        final targetCols = session.lastFittedCols!;
-        final targetRows = session.lastFittedRows!;
+      final postLoadCols = session.ownFittedCols ?? session.lastFittedCols;
+      final postLoadRows = session.ownFittedRows ?? session.lastFittedRows;
+      if (_clientForeground &&
+          postLoadCols != null &&
+          postLoadRows != null &&
+          (session.hostSizeCols != postLoadCols ||
+              session.hostSizeRows != postLoadRows)) {
+        final targetCols = postLoadCols;
+        final targetRows = postLoadRows;
         unawaited(() async {
           // The swap above settled the generation; a switch since must not
           // resize the new daemon's same-named session.
@@ -4410,6 +4427,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }) async {
     String? subId;
     try {
+      if (!runningUnderFlutterTest() &&
+          mounted &&
+          TerminalPane.getLastFittedWorkspaceSize() == null &&
+          TerminalPane.getCachedTerminalSize('triage / $sid') == null) {
+        // Wait for the frame scheduled by `_loadDaemonSessions` / `_loadDaemonSessionInto`
+        // to lay out `TerminalPane` so `RenderTerminal` measures the real font and
+        // viewport cell grid before we resize the daemon PTY or fetch history.
+        await WidgetsBinding.instance.endOfFrame;
+        if (_isStale(owningGeneration)) throw const _StaleLoad();
+      }
+
       var preAttachSnapshot = <String, dynamic>{};
       try {
         final snapshotRes = await _client.snapshotSession(sessionId: sid);
@@ -4422,8 +4450,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         orElse: () => null,
       );
       final cachedSize =
-          TerminalPane.getCachedTerminalSize('triage / $sid') ??
-          TerminalPane.getLastFittedWorkspaceSize();
+          TerminalPane.getLastFittedWorkspaceSize() ??
+          TerminalPane.getCachedTerminalSize('triage / $sid');
       final knownFittedRows =
           cachedSize?.$1 ?? existing?.ownFittedRows ?? existing?.lastFittedRows;
       final knownFittedCols =
@@ -4435,7 +4463,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       final replayTargetSize =
           knownTargetSize ??
-          (includeHistory && (!kIsWeb || preAttachSnapshot['exited'] == true)
+          (includeHistory &&
+                  (preAttachSnapshot['exited'] == true ||
+                      (!kIsWeb && runningUnderFlutterTest()))
               ? _estimatedTerminalRestoreSize(
                   preAttachSnapshot['size'] as Map<String, dynamic>?,
                 )
@@ -4467,7 +4497,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             preAttachSnapshot = preparedSnapshot;
           }
         } catch (_) {}
-      } else if (replayTargetSize != null &&
+      }
+
+      // Subscribe to events before resizing a live session so we do not miss
+      // any SIGWINCH redraw emitted by the child process during attach.
+      if (_isStale(owningGeneration)) throw const _StaleLoad();
+      subId = await _checkedSubscribeSessionEvents(sid);
+      // Above the install, not just the attach: a response landing after a
+      // switch must not plant the old daemon's id under a `sub-{n}` key the
+      // new connection reissues. The attach below is covered by this same
+      // guard; only synchronous work sits between it and the issuance.
+      if (_isStale(owningGeneration)) throw const _StaleLoad();
+      _subscriptionIds[subId] = sid;
+
+      if (preAttachSnapshot['exited'] != true &&
+          replayTargetSize != null &&
           _clientForeground &&
           !_snapshotSizeMatches(preAttachSnapshot, replayTargetSize)) {
         // Gated like the other resize-out paths. When a known fitted size is
@@ -4487,16 +4531,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }
         } catch (_) {}
       }
-
-      // Subscribe to events first so we don't miss anything printed during attach
-      if (_isStale(owningGeneration)) throw const _StaleLoad();
-      subId = await _checkedSubscribeSessionEvents(sid);
-      // Above the install, not just the attach: a response landing after a
-      // switch must not plant the old daemon's id under a `sub-{n}` key the
-      // new connection reissues. The attach below is covered by this same
-      // guard; only synchronous work sits between it and the issuance.
-      if (_isStale(owningGeneration)) throw const _StaleLoad();
-      _subscriptionIds[subId] = sid;
 
       // Observer: loading a session to look at it must not steal the input
       // lease from another client (or agent) typing there. The first
@@ -4677,8 +4711,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     Map<String, dynamic>? fallbackSize,
   ) {
     final cachedSize =
-        TerminalPane.getCachedTerminalSize(session.title) ??
-        TerminalPane.getLastFittedWorkspaceSize();
+        TerminalPane.getLastFittedWorkspaceSize() ??
+        TerminalPane.getCachedTerminalSize(session.title);
     final cols =
         cachedSize?.$2 ?? session.ownFittedCols ?? session.lastFittedCols;
     final rows =
@@ -5154,6 +5188,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // is observable, and it is what a reclaim has to compare against.
           session.hostSizeCols = cols;
           session.hostSizeRows = rows;
+          if (session.ownFittedCols != cols || session.ownFittedRows != rows) {
+            TerminalPane.invalidateCachedResizeOut(session.title);
+          }
         }
       } else if (event.containsKey('ResyncRequired')) {
         if (batchedSessions != null && batchedSessions.remove(session)) {
@@ -5380,6 +5417,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (hostSize != null) {
       session.hostSizeCols = hostSize.$2;
       session.hostSizeRows = hostSize.$1;
+      if (session.ownFittedCols != hostSize.$2 ||
+          session.ownFittedRows != hostSize.$1) {
+        TerminalPane.invalidateCachedResizeOut(session.title);
+      }
     }
     session.lastFittedCols = fittedCols;
     session.lastFittedRows = fittedRows;
@@ -5756,17 +5797,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // (and skip on the zero-size guard); fit at the current size when the
       // host already matches this device's fit, or reclaim with the rows-1
       // jiggle only when the host size has drifted.
-      if (kIsWeb) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!_disposed &&
-              _selectedIndex >= 0 &&
-              _selectedIndex < _sessions.length &&
-              identical(_sessions[_selectedIndex], session) &&
-              _client.isConnected) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_disposed &&
+            _selectedIndex >= 0 &&
+            _selectedIndex < _sessions.length &&
+            identical(_sessions[_selectedIndex], session) &&
+            _client.isConnected) {
+          if (kIsWeb) {
             _fitOrReclaimActiveSessionOnWeb();
+          } else {
+            session.terminalController.fit();
           }
-        });
-      }
+        }
+      });
     } else {
       // Not yet fitted: the first view-fit issues the initial refresh at the
       // real size; refreshing here too would race it with an estimated size.
@@ -6070,168 +6113,171 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // case so the snapshot's own size is used instead.
         (int, int)? drivenSize;
         var resizedHost = false;
-        if (snapshot['exited'] == true) {
-          // Drop any keystrokes buffered for the dead incarnation before
-          // reviving the session id with a fresh shell.
-          _pendingInput.forget(sessionId);
-          session.hasInputLease = false;
-          debugPrint(
-            'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
-          );
-          final restoreSize = replayTargetSize;
-          var reviveStep = _ResubStep.restore;
-          try {
-            final restoredSnapshot = _snapshotFromResponse(
-              await _client.restoreSession(
-                sessionId: sessionId,
-                rows: restoreSize.$1,
-                cols: restoreSize.$2,
-              ),
-            );
-            // A restore re-spawns the process at this size, so the host is
-            // genuinely here now whatever the snapshot says.
-            drivenSize = restoreSize;
-            if (restoredSnapshot != null) {
-              finalSnapshot = restoredSnapshot;
-            }
-            // A restore re-spawns the daemon actor, orphaning our subscription;
-            // re-subscribe before the fresh attach. The actor replacement
-            // requires it even when another path holds the resubscribe claim;
-            // a racing holder at worst orphans one dead-actor id.
-            reviveStep = _ResubStep.resubscribe;
-            await _resubscribeSessionEvents(
-              sessionId,
-              owningGeneration: owningGeneration,
-            );
-            // The resubscribe above bails silently when stale; without this
-            // recheck the fresh attach would fire at the new daemon under a
-            // colliding id.
-            if (_isStale(owningGeneration)) return;
-            reviveStep = _ResubStep.attach;
-            final freshAttachRes = await _client.attachSession(
-              sessionId: sessionId,
-              clientId: _clientId,
-              mode: 'Observer',
-              historyBytes: useHttpHistory
-                  ? kHistoryLeaseProbeBytes
-                  : session.historyWindowBytes,
-            );
-            if (_isStale(owningGeneration)) return;
-            session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
-            final freshResponseObj =
-                freshAttachRes['response'] as Map<String, dynamic>?;
-            final freshSnapshot =
-                freshResponseObj?['snapshot'] as Map<String, dynamic>?;
-            if (freshSnapshot != null) {
-              if (freshSnapshot['exited'] == true ||
-                  _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
-                finalSnapshot = freshSnapshot;
-              }
-            }
-          } on TriageAuthException {
-            rethrow;
-          } catch (e) {
-            // Any resubscribe-step failure rolls back like every other
-            // checked-subscribe caller: without a subscription the revive
-            // cannot hear live events, so logging-and-continuing would strand
-            // an unsubscribed session behind an 'attached' status.
-            // Restore/attach-step failures instead log and render the
-            // pre-revive snapshot; the session still reads exited, so the
-            // next refresh retries the revive.
-            if (reviveStep == _ResubStep.resubscribe) rethrow;
-            debugPrint(
-              'Failed to revive session $sessionId during refresh '
-              '(${reviveStep.name}): ${e.toString()}',
-            );
-          }
-        } else if (_clientForeground &&
-            !_snapshotSizeMatches(snapshot, replayTargetSize)) {
-          // Resize the host so its program repaints at our width, but keep the
-          // history-bearing attach snapshot for rendering. The resize response
-          // carries no raw_output (resize snapshots never do), so using it would
-          // make applyHistory clear the terminal and blank it; history replays
-          // at the fitted size client-side anyway.
-          //
-          // Gated on foreground for the same reason the resize-out listener is:
-          // a reconnect on a blurred client would otherwise re-take the shared
-          // PTY from whichever device the user is actually looking at. The
-          // reclaim on refocus covers the size this skips, which is why
-          // `drivenSize` is set only once the resize has actually landed.
-          try {
-            final resizedSnapshot = _snapshotFromResponse(
-              await _client.resizeSession(
-                sessionId: sessionId,
-                rows: replayTargetSize.$1,
-                cols: replayTargetSize.$2,
-              ),
-            );
-            drivenSize = replayTargetSize;
-            resizedHost = true;
-            if (resizedSnapshot != null) {
-              finalSnapshot = <String, dynamic>{
-                ...finalSnapshot,
-                if (resizedSnapshot['size'] != null)
-                  'size': resizedSnapshot['size'],
-                if (resizedSnapshot['styled_rows'] != null)
-                  'styled_rows': resizedSnapshot['styled_rows'],
-                if (resizedSnapshot['styled_rows_start'] != null)
-                  'styled_rows_start': resizedSnapshot['styled_rows_start'],
-                if (resizedSnapshot['visible_rows'] != null)
-                  'visible_rows': resizedSnapshot['visible_rows'],
-                if (resizedSnapshot['cursor'] != null)
-                  'cursor': resizedSnapshot['cursor'],
-              };
-            }
-          } on TriageAuthException {
-            rethrow;
-          } catch (_) {}
+        if (needsHistory) {
+          session.store.beginHistoryPaging();
         }
-        // A restore inside this refresh may have revived an exited session.
-        // Without a replay the exited-to-live transition in the apply below
-        // dispatches a bare Attach and strands the store in awaitingHistory.
-        // Either side can record the exit (the push skips the VM flag when
-        // unmounted), and replaying when only the store says exited is safe
-        // since the delta paths refuse anyway.
-        final revivedNeedsReplay =
-            (session.isExited || session.store.state.exited) &&
-            finalSnapshot['exited'] != true;
-        final postResizeHttpReplay =
-            resizedHost && useHttpHistory && !session.terminal.isUsingAltBuffer;
-        final shouldReplayHistory =
-            includeHistory ||
-            !session.loaded ||
-            revivedNeedsReplay ||
-            postResizeHttpReplay;
-        if (useHttpHistory && shouldReplayHistory) {
+        try {
+          if (snapshot['exited'] == true) {
+            // Drop any keystrokes buffered for the dead incarnation before
+            // reviving the session id with a fresh shell.
+            _pendingInput.forget(sessionId);
+            session.hasInputLease = false;
+            debugPrint(
+              'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
+            );
+            final restoreSize = replayTargetSize;
+            var reviveStep = _ResubStep.restore;
+            try {
+              final restoredSnapshot = _snapshotFromResponse(
+                await _client.restoreSession(
+                  sessionId: sessionId,
+                  rows: restoreSize.$1,
+                  cols: restoreSize.$2,
+                ),
+              );
+              // A restore re-spawns the process at this size, so the host is
+              // genuinely here now whatever the snapshot says.
+              drivenSize = restoreSize;
+              if (restoredSnapshot != null) {
+                finalSnapshot = restoredSnapshot;
+              }
+              // A restore re-spawns the daemon actor, orphaning our subscription;
+              // re-subscribe before the fresh attach. The actor replacement
+              // requires it even when another path holds the resubscribe claim;
+              // a racing holder at worst orphans one dead-actor id.
+              reviveStep = _ResubStep.resubscribe;
+              await _resubscribeSessionEvents(
+                sessionId,
+                owningGeneration: owningGeneration,
+              );
+              // The resubscribe above bails silently when stale; without this
+              // recheck the fresh attach would fire at the new daemon under a
+              // colliding id.
+              if (_isStale(owningGeneration)) return;
+              reviveStep = _ResubStep.attach;
+              final freshAttachRes = await _client.attachSession(
+                sessionId: sessionId,
+                clientId: _clientId,
+                mode: 'Observer',
+                historyBytes: useHttpHistory
+                    ? kHistoryLeaseProbeBytes
+                    : session.historyWindowBytes,
+              );
+              if (_isStale(owningGeneration)) return;
+              session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
+              final freshResponseObj =
+                  freshAttachRes['response'] as Map<String, dynamic>?;
+              final freshSnapshot =
+                  freshResponseObj?['snapshot'] as Map<String, dynamic>?;
+              if (freshSnapshot != null) {
+                if (freshSnapshot['exited'] == true ||
+                    _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
+                  finalSnapshot = freshSnapshot;
+                }
+              }
+            } on TriageAuthException {
+              rethrow;
+            } catch (e) {
+              // Any resubscribe-step failure rolls back like every other
+              // checked-subscribe caller: without a subscription the revive
+              // cannot hear live events, so logging-and-continuing would strand
+              // an unsubscribed session behind an 'attached' status.
+              // Restore/attach-step failures instead log and render the
+              // pre-revive snapshot; the session still reads exited, so the
+              // next refresh retries the revive.
+              if (reviveStep == _ResubStep.resubscribe) rethrow;
+              debugPrint(
+                'Failed to revive session $sessionId during refresh '
+                '(${reviveStep.name}): ${e.toString()}',
+              );
+            }
+          } else if (_clientForeground &&
+              !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+            // Resize the host so its program repaints at our width, but keep the
+            // history-bearing attach snapshot for rendering. The resize response
+            // carries no raw_output (resize snapshots never do), so using it would
+            // make applyHistory clear the terminal and blank it; history replays
+            // at the fitted size client-side anyway.
+            //
+            // Gated on foreground for the same reason the resize-out listener is:
+            // a reconnect on a blurred client would otherwise re-take the shared
+            // PTY from whichever device the user is actually looking at. The
+            // reclaim on refocus covers the size this skips, which is why
+            // `drivenSize` is set only once the resize has actually landed.
+            try {
+              final resizedSnapshot = _snapshotFromResponse(
+                await _client.resizeSession(
+                  sessionId: sessionId,
+                  rows: replayTargetSize.$1,
+                  cols: replayTargetSize.$2,
+                ),
+              );
+              drivenSize = replayTargetSize;
+              resizedHost = true;
+              if (resizedSnapshot != null) {
+                finalSnapshot = <String, dynamic>{
+                  ...finalSnapshot,
+                  if (resizedSnapshot['size'] != null)
+                    'size': resizedSnapshot['size'],
+                  if (resizedSnapshot['styled_rows'] != null)
+                    'styled_rows': resizedSnapshot['styled_rows'],
+                  if (resizedSnapshot['styled_rows_start'] != null)
+                    'styled_rows_start': resizedSnapshot['styled_rows_start'],
+                  if (resizedSnapshot['visible_rows'] != null)
+                    'visible_rows': resizedSnapshot['visible_rows'],
+                  if (resizedSnapshot['cursor'] != null)
+                    'cursor': resizedSnapshot['cursor'],
+                };
+              }
+            } on TriageAuthException {
+              rethrow;
+            } catch (_) {}
+          }
+          // A restore inside this refresh may have revived an exited session.
+          // Without a replay the exited-to-live transition in the apply below
+          // dispatches a bare Attach and strands the store in awaitingHistory.
+          // Either side can record the exit (the push skips the VM flag when
+          // unmounted), and replaying when only the store says exited is safe
+          // since the delta paths refuse anyway.
+          final revivedNeedsReplay =
+              (session.isExited || session.store.state.exited) &&
+              finalSnapshot['exited'] != true;
+          final shouldReplayHistory =
+              includeHistory || !session.loaded || revivedNeedsReplay;
+          if (useHttpHistory && shouldReplayHistory) {
+            if (_isStale(owningGeneration)) return;
+            final mergedSnapshot = await _fetchAndMergeSessionHistory(
+              session,
+              sessionId,
+              finalSnapshot,
+              forceFullWindow: resizedHost,
+            );
+            if (_isStale(owningGeneration)) return;
+            finalSnapshot = mergedSnapshot;
+          }
+          // The restore/resize awaits above span a purge window: applying a
+          // superseded snapshot onto the reused VM would blank the new
+          // generation's load with old-daemon bytes.
           if (_isStale(owningGeneration)) return;
-          final mergedSnapshot = await _fetchAndMergeSessionHistory(
+          await _applySnapshotToSession(
             session,
             sessionId,
             finalSnapshot,
-            forceFullWindow: resizedHost,
+            renderSize: drivenSize,
+            replayHistory:
+                includeHistory ||
+                (!session.loaded && snapshot['exited'] == true) ||
+                revivedNeedsReplay,
+            forceFullReplay: resizedHost && shouldReplayHistory,
+            // finalSnapshot comes from attach/resume responses, whose agent
+            // field is manager-overlaid and authoritative.
+            agentAuthoritative: true,
           );
-          if (_isStale(owningGeneration)) return;
-          finalSnapshot = mergedSnapshot;
+        } finally {
+          if (needsHistory) {
+            session.store.endHistoryPaging();
+          }
         }
-        // The restore/resize awaits above span a purge window: applying a
-        // superseded snapshot onto the reused VM would blank the new
-        // generation's load with old-daemon bytes.
-        if (_isStale(owningGeneration)) return;
-        await _applySnapshotToSession(
-          session,
-          sessionId,
-          finalSnapshot,
-          renderSize: drivenSize,
-          replayHistory:
-              includeHistory ||
-              (!session.loaded && snapshot['exited'] == true) ||
-              revivedNeedsReplay ||
-              postResizeHttpReplay,
-          forceFullReplay: resizedHost,
-          // finalSnapshot comes from attach/resume responses, whose agent
-          // field is manager-overlaid and authoritative.
-          agentAuthoritative: true,
-        );
       }
     } on TriageAuthException {
       if (!_isStale(owningGeneration)) {

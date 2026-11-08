@@ -1426,5 +1426,158 @@ void main() {
         }
       },
     );
+
+    testWidgets(
+      'fit, refit, and history replay reconcile terminal size with RenderTerminal when terminal was resized to a stale grid',
+      (WidgetTester tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        TerminalPane.debugForceNativeTerminalView = true;
+        try {
+          final term = Terminal(maxLines: 500);
+          final ctrl = TerminalController();
+          final resizeOuts = <(int, int)>[];
+          ctrl.addResizeOutListener(
+            (cols, rows) => resizeOuts.add((cols, rows)),
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 800,
+                  height: 500,
+                  child: TerminalPane(
+                    terminalId: 'reconcile-stale-grid',
+                    terminal: term,
+                    controller: ctrl,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 1,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 150));
+
+          final fittedCols = term.viewWidth;
+          final fittedRows = term.viewHeight;
+          expect(fittedCols, greaterThan(47));
+          expect(fittedRows, greaterThan(19));
+
+          // Simulate a stale history or snapshot resize shrinking `term` while
+          // the outer 800x500 SizedBox (and RenderTerminal._viewportSize) does
+          // not change.
+          term.resize(47, 19);
+          expect(term.viewWidth, 47);
+          expect(term.viewHeight, 19);
+
+          // `ctrl.fit()` must reconcile `term` back to RenderTerminal's cell grid.
+          ctrl.fit();
+          await tester.pump();
+          expect(term.viewWidth, fittedCols);
+          expect(term.viewHeight, fittedRows);
+
+          // Shrink again and verify `notifyHistoryReplayed()` also restores the
+          // live RenderTerminal dimensions.
+          term.resize(47, 19);
+          ctrl.notifyHistoryReplayed();
+          await tester.pump();
+          expect(term.viewWidth, fittedCols);
+          expect(term.viewHeight, fittedRows);
+
+          // Invalidating cached resizeOut causes the next fit() to re-emit
+          // resizeOut even though the local grid dimensions did not change.
+          resizeOuts.clear();
+          TerminalPane.invalidateCachedResizeOut('reconcile-stale-grid');
+          ctrl.fit();
+          await tester.pump();
+          expect(resizeOuts, [(fittedCols, fittedRows)]);
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('reconcile-stale-grid');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'isLoading placeholder pane records workspace size without poisoning resizeOut cache for the loaded session',
+      (WidgetTester tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+        TerminalPane.debugForceNativeTerminalView = true;
+        try {
+          final placeholderTerm = Terminal(maxLines: 500);
+          final placeholderCtrl = TerminalController();
+          final loadedTerm = Terminal(maxLines: 500);
+          final loadedCtrl = TerminalController();
+          final loadedResizeOuts = <(int, int)>[];
+          loadedCtrl.addResizeOutListener(
+            (cols, rows) => loadedResizeOuts.add((cols, rows)),
+          );
+
+          Widget buildPane({
+            required Terminal terminal,
+            required TerminalController controller,
+            required bool isLoading,
+          }) {
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 800,
+                  height: 500,
+                  child: TerminalPane(
+                    terminalId: 'loading-swap-resize',
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (cb) {
+                      terminal.onResize = cb;
+                    },
+                    focusCursorRevision: 1,
+                    isLoading: isLoading,
+                  ),
+                ),
+              ),
+            );
+          }
+
+          await tester.pumpWidget(
+            buildPane(
+              terminal: placeholderTerm,
+              controller: placeholderCtrl,
+              isLoading: true,
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 150));
+
+          final fittedCols = placeholderTerm.viewWidth;
+          final fittedRows = placeholderTerm.viewHeight;
+          expect(TerminalPane.getLastFittedWorkspaceSize(), (
+            fittedRows,
+            fittedCols,
+          ));
+
+          // Swap in the loaded session under the same terminalId with
+          // isLoading: false; its resizeOut must fire with the fitted size.
+          await tester.pumpWidget(
+            buildPane(
+              terminal: loadedTerm,
+              controller: loadedCtrl,
+              isLoading: false,
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 150));
+
+          expect(loadedTerm.viewWidth, fittedCols);
+          expect(loadedTerm.viewHeight, fittedRows);
+          expect(loadedResizeOuts, contains((fittedCols, fittedRows)));
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('loading-swap-resize');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
   });
 }
