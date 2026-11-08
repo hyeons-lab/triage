@@ -24,10 +24,11 @@ use serde::{Deserialize, Serialize};
 use triage_core::judge::{JudgeRequest, JudgeVerdict, SessionJudgePolicy};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest, ServerUpdateInfo,
-    SessionApi, SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage,
-    SessionSnapshot, StartSessionRequest, StyledRowsRequest, StyledRowsResponse,
-    SubscribeSessionEventsRequest, WriteInputRequest,
+    LeaseChange, RailLayout, ResizeSessionRequest, RestoreSessionRequest,
+    SendSessionMessageRequest, SendSessionMessageResponse, ServerUpdateInfo, SessionApi,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionSnapshot,
+    StartSessionRequest, StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest,
+    WaitForSessionMessagesRequest, WriteInputRequest,
 };
 
 #[cfg(unix)]
@@ -103,7 +104,7 @@ mod transport {
     #[cfg(windows)]
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-    const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+    pub const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
     const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[cfg(unix)]
@@ -112,6 +113,22 @@ mod transport {
         let _ = stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT));
         let _ = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
         Ok(stream)
+    }
+
+    #[cfg(unix)]
+    pub fn set_read_timeout(
+        stream: &ClientStream,
+        timeout: Option<Duration>,
+    ) -> std::io::Result<()> {
+        stream.set_read_timeout(timeout)
+    }
+
+    #[cfg(windows)]
+    pub fn set_read_timeout(
+        _stream: &ClientStream,
+        _timeout: Option<Duration>,
+    ) -> std::io::Result<()> {
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -436,8 +453,22 @@ impl IpcClient {
     }
 
     fn round_trip(&self, request: WireRequest) -> Result<WireSuccess> {
+        self.round_trip_with_extra_read_timeout(request, Duration::ZERO)
+    }
+
+    fn round_trip_with_extra_read_timeout(
+        &self,
+        request: WireRequest,
+        extra_read_timeout: Duration,
+    ) -> Result<WireSuccess> {
         let mut stream = transport::connect(&self.socket_path)
             .with_context(|| format!("connecting to {}", display_endpoint(&self.socket_path)))?;
+        if !extra_read_timeout.is_zero() {
+            let _ = transport::set_read_timeout(
+                &stream,
+                Some(transport::CLIENT_READ_TIMEOUT.saturating_add(extra_read_timeout)),
+            );
+        }
         write_json_line(&mut stream, &request).context("writing IPC request")?;
         transport::finish_write(&stream).context("finishing IPC request")?;
 
@@ -594,10 +625,34 @@ impl SessionApi for IpcClient {
         }
     }
 
+    fn send_session_message_with_options(
+        &self,
+        request: SendSessionMessageRequest,
+    ) -> Result<SendSessionMessageResponse> {
+        match self.round_trip(WireRequest::SendSessionMessageWithOptions(request))? {
+            WireSuccess::SendSessionMessageResponse(response) => Ok(response),
+            other => bail!("unexpected send_session_message_with_options response: {other:?}"),
+        }
+    }
+
     fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
         match self.round_trip(WireRequest::ReceiveSessionMessages { session_id })? {
             WireSuccess::SessionMessages(messages) => Ok(messages),
             other => bail!("unexpected receive_session_messages response: {other:?}"),
+        }
+    }
+
+    fn wait_for_session_messages(
+        &self,
+        request: WaitForSessionMessagesRequest,
+    ) -> Result<Vec<SessionMessage>> {
+        let extra = Duration::from_millis(request.timeout_ms);
+        match self.round_trip_with_extra_read_timeout(
+            WireRequest::WaitForSessionMessages(request),
+            extra,
+        )? {
+            WireSuccess::SessionMessages(messages) => Ok(messages),
+            other => bail!("unexpected wait_for_session_messages response: {other:?}"),
         }
     }
 
@@ -688,9 +743,11 @@ enum WireRequest {
         to: SessionId,
         body: String,
     },
+    SendSessionMessageWithOptions(SendSessionMessageRequest),
     ReceiveSessionMessages {
         session_id: SessionId,
     },
+    WaitForSessionMessages(WaitForSessionMessagesRequest),
     AckSessionMessages {
         session_id: SessionId,
         message_ids: Vec<u64>,
@@ -766,6 +823,7 @@ enum WireSuccess {
     SessionSnapshot(SessionSnapshot),
     StyledRows(StyledRowsResponse),
     SessionMessageId(u64),
+    SendSessionMessageResponse(SendSessionMessageResponse),
     SessionMessages(Vec<SessionMessage>),
     CompletedSession(CompletedSession),
     Subscribed,
@@ -1881,8 +1939,14 @@ fn handle_request(
         WireRequest::SendSessionMessage { from, to, body } => manager
             .send_session_message(from, to, body)
             .map(WireSuccess::SessionMessageId),
+        WireRequest::SendSessionMessageWithOptions(request) => manager
+            .send_session_message_with_options(request)
+            .map(WireSuccess::SendSessionMessageResponse),
         WireRequest::ReceiveSessionMessages { session_id } => manager
             .receive_session_messages(session_id)
+            .map(WireSuccess::SessionMessages),
+        WireRequest::WaitForSessionMessages(request) => manager
+            .wait_for_session_messages(request)
             .map(WireSuccess::SessionMessages),
         WireRequest::AckSessionMessages {
             session_id,
@@ -2344,6 +2408,32 @@ mod tests {
             .receive_session_messages(to.clone())
             .expect("receive after ack");
         assert!(mail.is_empty());
+
+        let wait_client = IpcClient::new(socket_path.clone());
+        let wait_target = to.clone();
+        let waiter = thread::spawn(move || {
+            wait_client
+                .wait_for_session_messages(WaitForSessionMessagesRequest::new(wait_target, 5_000))
+                .expect("wait for session messages over socket")
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let send_res = client
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(
+                    from.clone(),
+                    to.clone(),
+                    "wake waiter over ipc".to_string(),
+                )
+                .with_wake(true),
+            )
+            .expect("send with options over socket");
+        assert!(send_res.message_id > id);
+
+        let waited = waiter.join().expect("join ipc waiter");
+        assert_eq!(waited.len(), 1);
+        assert_eq!(waited[0].id, send_res.message_id);
+        assert_eq!(waited[0].body, "wake waiter over ipc");
 
         let _ = fs::remove_file(socket_path);
         let _ = fs::remove_dir_all(log_dir);

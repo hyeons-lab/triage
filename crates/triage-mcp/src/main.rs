@@ -5,7 +5,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use triage_core::session::{SessionApi, SessionId, StyledRowsRequest};
+use triage_core::session::{
+    SESSION_MESSAGE_DEFAULT_WAIT_TIMEOUT_MS, SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
+    SendSessionMessageRequest, SessionApi, SessionId, StyledRowsRequest,
+    WaitForSessionMessagesRequest,
+};
 #[cfg(any(unix, windows))]
 use triaged::ipc::{IpcClient, default_socket_path};
 
@@ -197,6 +201,9 @@ impl<A: SessionApi> McpServer<A> {
             "receive_session_messages" => {
                 tool_result(receive_session_messages(&self.api, arguments)?)
             }
+            "wait_for_session_message" => {
+                tool_result(wait_for_session_message(&self.api, arguments)?)
+            }
             "ack_session_messages" => tool_result(ack_session_messages(&self.api, arguments)?),
             other => {
                 Err(JsonRpcError::invalid_params(format!("unknown Triage tool {other}")).into())
@@ -309,7 +316,7 @@ fn tool_definitions() -> Value {
         {
             "name": "send_session_message",
             "title": "Send Session Message",
-            "description": "Queue a direct coordination message in another session's inbox. Mail is poll-based: the target reads it with receive_session_messages, which keeps returning it until ack_session_messages confirms it.",
+            "description": "Queue a direct coordination message in another session's inbox. Mail is poll-based: the target reads it with receive_session_messages or wait_for_session_message, which keeps returning it until ack_session_messages confirms it. Pass wake: true to nudge the target session if it is currently idle or waiting for input.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -324,6 +331,10 @@ fn tool_definitions() -> Value {
                     "body": {
                         "type": "string",
                         "description": "Message body (required, non-blank after trimming, at most 65536 bytes; blank or oversize bodies are rejected)."
+                    },
+                    "wake": {
+                        "type": "boolean",
+                        "description": "Optional. When true, nudges the target session to check its Triage inbox if it is currently idle or waiting for input."
                     }
                 },
                 "required": ["from_session_id", "to_session_id", "body"]
@@ -345,6 +356,33 @@ fn tool_definitions() -> Value {
                     "session_id": {
                         "type": "string",
                         "description": "Triage session id."
+                    }
+                },
+                "required": ["session_id"]
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "wait_for_session_message",
+            "title": "Wait For Session Message",
+            "description": "Block until at least one unacked message is present in the session's inbox or timeout_ms elapses. Returns immediately if unacked mail is already waiting, or an empty messages list on timeout.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Triage session id."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
+                        "description": "Maximum milliseconds to wait before returning an empty messages list (default 30000, max 300000)."
                     }
                 },
                 "required": ["session_id"]
@@ -465,12 +503,21 @@ fn send_session_message(
     let from = named_session_id_arg(arguments, "from_session_id")?;
     let to = named_session_id_arg(arguments, "to_session_id")?;
     let body = required_argument_string(arguments, "body")?.to_string();
+    let wake = optional_bool(arguments, "wake")?.unwrap_or(false);
 
-    let id = api
-        .send_session_message(from.clone(), to.clone(), body)
+    let response = api
+        .send_session_message_with_options(SendSessionMessageRequest {
+            from: from.clone(),
+            to: to.clone(),
+            body,
+            wake,
+        })
         .with_context(|| format!("sending message from session {from} to session {to}"))?;
 
-    Ok(json!({ "message_id": id }))
+    Ok(json!({
+        "message_id": response.message_id,
+        "woke": response.woke,
+    }))
 }
 
 fn receive_session_messages(
@@ -483,7 +530,39 @@ fn receive_session_messages(
         .receive_session_messages(session_id.clone())
         .with_context(|| format!("reading messages for session {session_id}"))?;
 
-    Ok(json!({
+    Ok(format_session_messages_result(session_id, &messages))
+}
+
+fn wait_for_session_message(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    let arguments = arguments_object(&arguments)?;
+    let session_id = session_id_arg(arguments)?;
+    let timeout_ms =
+        optional_u64(arguments, "timeout_ms")?.unwrap_or(SESSION_MESSAGE_DEFAULT_WAIT_TIMEOUT_MS);
+    if timeout_ms > SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS {
+        return Err(JsonRpcError::invalid_params(format!(
+            "timeout_ms must be at most {SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS}"
+        ))
+        .into());
+    }
+
+    let messages = api
+        .wait_for_session_messages(WaitForSessionMessagesRequest {
+            session_id: session_id.clone(),
+            timeout_ms,
+        })
+        .with_context(|| format!("waiting for messages for session {session_id}"))?;
+
+    Ok(format_session_messages_result(session_id, &messages))
+}
+
+fn format_session_messages_result(
+    session_id: SessionId,
+    messages: &[triage_core::session::SessionMessage],
+) -> Value {
+    json!({
         "session_id": session_id,
         "messages": messages
             .iter()
@@ -494,7 +573,7 @@ fn receive_session_messages(
                 "sent_at_ms": message.sent_at_ms,
             }))
             .collect::<Vec<_>>(),
-    }))
+    })
 }
 
 fn ack_session_messages(
@@ -615,6 +694,29 @@ fn required_usize(
     usize::try_from(value)
         .with_context(|| format!("{field} must fit in usize"))
         .map_err(ToolCallError::Tool)
+}
+
+fn optional_bool(
+    values: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<bool>, ToolCallError> {
+    match values.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(JsonRpcError::invalid_params(format!("{field} must be a boolean")).into()),
+    }
+}
+
+fn optional_u64(
+    values: &serde_json::Map<String, Value>,
+    field: &str,
+) -> std::result::Result<Option<u64>, ToolCallError> {
+    match values.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("{field} must be a non-negative integer")).into()
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -872,7 +974,25 @@ mod tests {
             Ok(id)
         }
 
+        fn send_session_message_with_options(
+            &self,
+            request: SendSessionMessageRequest,
+        ) -> Result<triage_core::session::SendSessionMessageResponse> {
+            let message_id = self.send_session_message(request.from, request.to, request.body)?;
+            Ok(triage_core::session::SendSessionMessageResponse {
+                message_id,
+                woke: request.wake,
+            })
+        }
+
         fn receive_session_messages(&self, _session_id: SessionId) -> Result<Vec<SessionMessage>> {
+            Ok(self.inbox.borrow().clone())
+        }
+
+        fn wait_for_session_messages(
+            &self,
+            _request: WaitForSessionMessagesRequest,
+        ) -> Result<Vec<SessionMessage>> {
             Ok(self.inbox.borrow().clone())
         }
 
@@ -919,7 +1039,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         assert_eq!(tools[0]["name"], "list_sessions");
         let names = tools
             .iter()
@@ -933,6 +1053,7 @@ mod tests {
                 "styled_rows",
                 "send_session_message",
                 "receive_session_messages",
+                "wait_for_session_message",
                 "ack_session_messages",
             ]
         );
@@ -1066,11 +1187,26 @@ mod tests {
             json!({
                 "from_session_id": "session-1",
                 "to_session_id": "session-2",
-                "body": "handoff: build is green"
+                "body": "handoff: build is green",
+                "wake": true
             }),
         );
         assert_eq!(sent["isError"], false);
         assert_eq!(sent["structuredContent"]["message_id"], 1);
+        assert_eq!(sent["structuredContent"]["woke"], true);
+
+        let waited = call_tool(
+            &server,
+            "wait_for_session_message",
+            json!({ "session_id": "session-2", "timeout_ms": 1000 }),
+        );
+        assert_eq!(
+            waited["structuredContent"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Peek: unacked mail redelivers.
         for _ in 0..2 {
@@ -1182,6 +1318,44 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, -32602);
         assert!(error.message.contains("session_id"));
+
+        // Invalid wake type on send.
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(5)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "send_session_message",
+                    "arguments": {
+                        "from_session_id": "session-1",
+                        "to_session_id": "session-2",
+                        "body": "hello",
+                        "wake": "yes"
+                    }
+                })),
+            })
+            .expect("response");
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("wake"));
+
+        // Oversize timeout_ms on wait_for_session_message.
+        let response = server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!(6)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "wait_for_session_message",
+                    "arguments": {
+                        "session_id": "session-2",
+                        "timeout_ms": SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS + 1
+                    }
+                })),
+            })
+            .expect("response");
+        let error = response.error.expect("error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("timeout_ms"));
     }
 
     #[test]

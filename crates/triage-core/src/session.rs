@@ -699,6 +699,10 @@ pub struct ServerUpdateInfo {
 pub const SESSION_MESSAGE_MAX_BODY_LEN: usize = 64 * 1024;
 /// Maximum queued messages per session inbox; past this the send is rejected.
 pub const SESSION_INBOX_CAPACITY: usize = 256;
+/// Default timeout (in milliseconds) for `wait_for_session_messages`.
+pub const SESSION_MESSAGE_DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+/// Maximum timeout (in milliseconds) for `wait_for_session_messages`.
+pub const SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS: u64 = 300_000;
 
 /// One direct message between sessions, queued in the target's side inbox.
 /// Agents coordinate through these over MCP; delivery is poll-based
@@ -714,6 +718,53 @@ pub struct SessionMessage {
     pub body: String,
     /// Unix millis when the daemon queued the message.
     pub sent_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendSessionMessageRequest {
+    pub from: SessionId,
+    pub to: SessionId,
+    pub body: String,
+    #[serde(default)]
+    pub wake: bool,
+}
+
+impl SendSessionMessageRequest {
+    pub fn new(from: SessionId, to: SessionId, body: String) -> Self {
+        Self {
+            from,
+            to,
+            body,
+            wake: false,
+        }
+    }
+
+    pub fn with_wake(mut self, wake: bool) -> Self {
+        self.wake = wake;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendSessionMessageResponse {
+    pub message_id: u64,
+    #[serde(default)]
+    pub woke: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitForSessionMessagesRequest {
+    pub session_id: SessionId,
+    pub timeout_ms: u64,
+}
+
+impl WaitForSessionMessagesRequest {
+    pub fn new(session_id: SessionId, timeout_ms: u64) -> Self {
+        Self {
+            session_id,
+            timeout_ms,
+        }
+    }
 }
 
 pub trait SessionApi {
@@ -750,10 +801,31 @@ pub trait SessionApi {
     fn send_session_message(&self, _from: SessionId, _to: SessionId, _body: String) -> Result<u64> {
         anyhow::bail!("session messaging is not supported by this session API")
     }
+    /// Queue a direct message in another session's side inbox and optionally
+    /// nudge the target session if it is currently idle or waiting for input.
+    fn send_session_message_with_options(
+        &self,
+        request: SendSessionMessageRequest,
+    ) -> Result<SendSessionMessageResponse> {
+        let message_id = self.send_session_message(request.from, request.to, request.body)?;
+        Ok(SendSessionMessageResponse {
+            message_id,
+            woke: false,
+        })
+    }
     /// Peek a session's unacked inbox mail (oldest first) without clearing
     /// it. Unknown sessions error; no unacked mail returns an empty vec.
     /// Default: unsupported.
     fn receive_session_messages(&self, _session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        anyhow::bail!("session messaging is not supported by this session API")
+    }
+    /// Wait up to `request.timeout_ms` for at least one unacked message in the
+    /// session's inbox, returning all unacked messages (oldest first) or an
+    /// empty vec on timeout.
+    fn wait_for_session_messages(
+        &self,
+        _request: WaitForSessionMessagesRequest,
+    ) -> Result<Vec<SessionMessage>> {
         anyhow::bail!("session messaging is not supported by this session API")
     }
     /// Confirm receipt, removing the ids from the session's inbox. Unknown
@@ -938,8 +1010,20 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
         (**self).send_session_message(from, to, body)
     }
+    fn send_session_message_with_options(
+        &self,
+        request: SendSessionMessageRequest,
+    ) -> Result<SendSessionMessageResponse> {
+        (**self).send_session_message_with_options(request)
+    }
     fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
         (**self).receive_session_messages(session_id)
+    }
+    fn wait_for_session_messages(
+        &self,
+        request: WaitForSessionMessagesRequest,
+    ) -> Result<Vec<SessionMessage>> {
+        (**self).wait_for_session_messages(request)
     }
     fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
         (**self).ack_session_messages(session_id, message_ids)
