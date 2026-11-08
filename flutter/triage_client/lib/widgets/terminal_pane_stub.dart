@@ -984,6 +984,9 @@ class _TerminalPaneState extends State<TerminalPane>
       widget.controller.sendInput(data);
       return;
     }
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) {
+      return;
+    }
 
     _clearSavedSessionScroll(widget.terminalId);
     _scrollAnchor.clear();
@@ -1039,12 +1042,14 @@ class _TerminalPaneState extends State<TerminalPane>
   // of sending anything. Does not request focus so tapping shortcuts does not
   // pop open the soft keyboard.
   void _sendAccessory(String bytes) {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
     widget.controller.sendInput(bytes);
     _disarmCtrl();
     _mobileAutoSpace.reset();
   }
 
   void _toggleCtrl() {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
     if (_ctrlArmed) {
       _disarmCtrl();
     } else {
@@ -1057,12 +1062,19 @@ class _TerminalPaneState extends State<TerminalPane>
     _requestTerminalFocus();
   }
 
+  bool get _isRouteCurrentAndUnobscured {
+    if (!mounted || widget.isObscured) return false;
+    return ModalRoute.of(context)?.isCurrent != false;
+  }
+
   /// Whether this pane may take keyboard focus right now. On mobile with the
   /// soft keyboard suppressed, focusing would raise the keyboard (or, with the
   /// IME path closed, focus a terminal the user cannot type into), so every
   /// focus request funnels through here. Desktop always passes: focusing
   /// never raises a keyboard there.
-  bool get _mayTakeFocus => !_isMobile || widget.softKeyboardEnabled;
+  bool get _mayTakeFocus =>
+      (!_isMobile || widget.softKeyboardEnabled) &&
+      _isRouteCurrentAndUnobscured;
 
   void _requestTerminalFocus() {
     if (_mayTakeFocus) _focusNode.requestFocus();
@@ -1552,10 +1564,13 @@ class _TerminalPaneState extends State<TerminalPane>
   // with the gap spaces restored. Returning `ignored` for everything else
   // leaves xterm's normal key handling, including Ctrl+C -> SIGINT, untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
-    if (widget.isObscured || ModalRoute.of(context)?.isCurrent == false) {
-      return KeyEventResult.ignored;
+    if (!_isRouteCurrentAndUnobscured) {
+      return KeyEventResult.handled;
     }
     if (event.logicalKey == LogicalKeyboardKey.tab) {
+      if (widget.isExited) {
+        return KeyEventResult.ignored;
+      }
       if (event is KeyDownEvent || event is KeyRepeatEvent) {
         widget.controller.notifyInteraction();
         final shiftKey = HardwareKeyboard.instance.isShiftPressed;
@@ -1564,10 +1579,11 @@ class _TerminalPaneState extends State<TerminalPane>
       return KeyEventResult.handled;
     }
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
-      return KeyEventResult.ignored;
+      return widget.isExited ? KeyEventResult.handled : KeyEventResult.ignored;
     }
-    if (event.logicalKey == LogicalKeyboardKey.enter ||
-        event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+    if ((event.logicalKey == LogicalKeyboardKey.enter ||
+            event.logicalKey == LogicalKeyboardKey.numpadEnter) &&
+        !widget.isExited) {
       // Shift+Enter inserts a newline (LF) instead of submitting (CR);
       // anything else falls through to xterm's default handling below.
       final keys = HardwareKeyboard.instance;
@@ -1587,6 +1603,9 @@ class _TerminalPaneState extends State<TerminalPane>
     if (event.logicalKey == LogicalKeyboardKey.keyC && _isCopyChord()) {
       // Nothing selected (or nothing in it) leaves xterm's own handling in place.
       if (_copySelectionToClipboard()) return KeyEventResult.handled;
+    }
+    if (widget.isExited) {
+      return KeyEventResult.handled;
     }
     if (_isPasteChord(event)) {
       unawaited(_pasteFromClipboard());
@@ -1819,7 +1838,12 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   Future<void> _handlePaste(String text) async {
-    if (!mounted || text.isEmpty || widget.isExited) return;
+    if (!mounted ||
+        text.isEmpty ||
+        widget.isExited ||
+        !_isRouteCurrentAndUnobscured) {
+      return;
+    }
     final isBracketed = _isBracketedPasteEnabled();
     if (isBracketed || !isMultiLine(text)) {
       final formatted = formatPasteInput(text, isBracketed);
@@ -1832,7 +1856,10 @@ class _TerminalPaneState extends State<TerminalPane>
     _isPasteDialogShowing = true;
     try {
       final chosenText = await showMultiLinePasteDialog(context, text);
-      if (chosenText != null && mounted && !widget.isExited) {
+      if (chosenText != null &&
+          mounted &&
+          !widget.isExited &&
+          _isRouteCurrentAndUnobscured) {
         final formatted = formatPasteInput(chosenText, false);
         widget.controller.sendInput(formatted);
         _xtermController.clearSelection();
@@ -1848,6 +1875,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   Future<void> _pasteFromClipboard() async {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
     if (_isPasting) return;
     _isPasting = true;
     try {
@@ -2081,6 +2109,14 @@ class _TerminalPaneState extends State<TerminalPane>
                                         softKeyboardEnabled:
                                             widget.softKeyboardEnabled,
                                       ),
+                                  readOnly:
+                                      !terminalHardwareKeyboardOnly(
+                                        isMobile: _isMobile,
+                                        softKeyboardEnabled:
+                                            widget.softKeyboardEnabled,
+                                      ) &&
+                                      (widget.isExited ||
+                                          !_isRouteCurrentAndUnobscured),
                                 ),
                               ),
                             ),

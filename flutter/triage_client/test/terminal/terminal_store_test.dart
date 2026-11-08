@@ -329,6 +329,16 @@ void main() {
         ),
       );
       expect(store.isPagingHistory, isFalse);
+      final splicedAfterIntervening = store.spliceBackwardHistoryPage(
+        b('pre-350\n'),
+        rawOutputStart: 342,
+        rawOutputEnd: 350,
+      );
+      expect(splicedAfterIntervening, isNotNull);
+      expect(
+        utf8.decode(splicedAfterIntervening!.bytes),
+        'pre-350\neven-older\nlive-15\n',
+      );
     },
   );
 
@@ -2765,6 +2775,196 @@ void main() {
       );
       expect(store.retainedRawStart, 88);
       expect(store.appliedLogBytes, 123 + 'in-flight-live\n'.length);
+    },
+  );
+
+  test(
+    'trimmed history does not leak synthetic reset prefix into retained raw byte coordinates',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const Resize(80, 24));
+      final oversized = List<int>.filled(
+        kHistoryReplayMaxBytes + 100,
+        'x'.codeUnitAt(0),
+      );
+      store.dispatch(
+        HistoryBytes(
+          oversized,
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 5,
+          rawOutputStart: 1000,
+        ),
+      );
+      expect(store.retainedRawStart, 1100);
+      expect(store.appliedLogBytes, 1000 + oversized.length);
+
+      final spliced = store.spliceBackwardHistoryPage(
+        b('prev-page\n'),
+        rawOutputStart: 1090,
+        rawOutputEnd: 1100,
+      );
+      expect(spliced, isNotNull);
+      expect(spliced!.bytes.length, 10 + kHistoryReplayMaxBytes);
+    },
+  );
+
+  test(
+    'intervening full-replay HistoryBytes during beginHistoryPaging preserves post-snapshot live chunks',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const Resize(80, 24));
+      store.dispatch(
+        HistoryBytes(
+          b('initial\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 10,
+          rawOutputStart: 100,
+        ),
+      );
+      store.beginHistoryPaging();
+      store.dispatch(LiveBytes(b('in-snapshot-11\n'), outputSeq: 11));
+      store.dispatch(LiveBytes(b('post-snapshot-12\n'), outputSeq: 12));
+
+      // An intervening resync snapshot arrives without Attach (hasLogByteGap
+      // triggers full replay) captured at throughOutputSeq 11.
+      sink.written.clear();
+      store.dispatch(
+        HistoryBytes(
+          b('rebased-11\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 11,
+          rawOutputStart: 200,
+        ),
+      );
+
+      expect(store.isPagingHistory, isFalse);
+      expect(sink.written.toString(), 'rebased-11\r\npost-snapshot-12\r\n');
+      expect(store.appliedLiveSeq, 12);
+      expect(
+        store.appliedLogBytes,
+        200 + 'rebased-11\n'.length + 'post-snapshot-12\n'.length,
+      );
+      final spliced = store.spliceBackwardHistoryPage(
+        b('before-200\n'),
+        rawOutputStart: 189,
+        rawOutputEnd: 200,
+      );
+      expect(spliced, isNotNull);
+      expect(
+        utf8.decode(spliced!.bytes),
+        'before-200\nrebased-11\npost-snapshot-12\n',
+      );
+      expect(spliced.throughOutputSeq, 12);
+    },
+  );
+
+  test(
+    'pending-live cap eviction during beginHistoryPaging folds evicted chunks into retained raw tail',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const Resize(80, 24));
+      store.dispatch(
+        HistoryBytes(
+          b('head\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 1,
+          rawOutputStart: 100,
+        ),
+      );
+      store.beginHistoryPaging();
+      final chunkA = List<int>.filled(100 * 1024, 'A'.codeUnitAt(0));
+      final chunkB = List<int>.filled(950 * 1024, 'B'.codeUnitAt(0));
+      store.dispatch(LiveBytes(chunkA, outputSeq: 2));
+      store.dispatch(LiveBytes(chunkB, outputSeq: 3));
+
+      // While paging is still in flight, chunkA was evicted from _pendingLive
+      // into _retainedRawBytes (total 5 + 100 KiB <= 256 KiB cap), so
+      // retainedRawStart is still 100 and throughOutputSeq is 2.
+      final inFlightSplice = store.spliceBackwardHistoryPage(
+        b('pre\n'),
+        rawOutputStart: 96,
+        rawOutputEnd: 100,
+      );
+      expect(inFlightSplice, isNotNull);
+      expect(inFlightSplice!.bytes.length, 4 + 5 + chunkA.length);
+      expect(inFlightSplice.throughOutputSeq, 2);
+
+      // When the page bails out, endHistoryPaging folds chunkB onto chunkA and
+      // trims to kHistoryReplayMaxBytes, advancing retainedRawStart contiguously.
+      store.endHistoryPaging();
+      final expectedStart =
+          100 + 5 + chunkA.length + chunkB.length - kHistoryReplayMaxBytes;
+      expect(store.retainedRawStart, expectedStart);
+      expect(store.appliedHistoryStart, expectedStart);
+
+      final postBailSplice = store.spliceBackwardHistoryPage(
+        b('pre\n'),
+        rawOutputStart: expectedStart - 4,
+        rawOutputEnd: expectedStart,
+      );
+      expect(postBailSplice, isNotNull);
+      expect(postBailSplice!.bytes.length, 4 + kHistoryReplayMaxBytes);
+      expect(postBailSplice.throughOutputSeq, 3);
+    },
+  );
+
+  test(
+    'live seq epoch reset clears retainedRawSeq and spliceBackwardHistoryPage does not fall back to in-flight appliedLiveSeq',
+    () {
+      store.dispatch(const Attach());
+      store.dispatch(const Resize(80, 24));
+      store.dispatch(
+        HistoryBytes(
+          b('pre-restart\n'),
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: 500,
+          rawOutputStart: 100,
+        ),
+      );
+      store.beginHistoryPaging();
+      store.dispatch(LiveBytes(b('old-epoch-501\n'), outputSeq: 501));
+      // Daemon restarts output_seq at 1 while paging is active.
+      store.dispatch(LiveBytes(b('new-epoch-1\n'), outputSeq: 1));
+
+      final spliced = store.spliceBackwardHistoryPage(
+        b('older-slice\n'),
+        rawOutputStart: 88,
+        rawOutputEnd: 100,
+      );
+      expect(spliced, isNotNull);
+      expect(spliced!.throughOutputSeq, isNull);
+
+      sink.ops.clear();
+      sink.written.clear();
+      store.dispatch(const Attach(preservePendingLive: true));
+      store.dispatch(
+        HistoryBytes(
+          spliced.bytes,
+          cols: 80,
+          rows: 24,
+          throughOutputSeq: spliced.throughOutputSeq,
+          rawOutputStart: 88,
+        ),
+      );
+      store.endHistoryPaging();
+
+      expect(
+        sink.written.toString(),
+        'older-slice\r\npre-restart\r\nold-epoch-501\r\nnew-epoch-1\r\n',
+      );
+      expect(store.state.historyHighWaterSeq, isNull);
+
+      // Next chunk in the new epoch (seq 2) must not be dropped as a duplicate.
+      store.dispatch(LiveBytes(b('new-epoch-2\n'), outputSeq: 2));
+      expect(
+        sink.written.toString(),
+        'older-slice\r\npre-restart\r\nold-epoch-501\r\nnew-epoch-1\r\nnew-epoch-2\r\n',
+      );
     },
   );
 }

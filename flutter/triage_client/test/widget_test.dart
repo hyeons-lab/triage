@@ -6565,6 +6565,7 @@ void main() {
               .first,
         );
         final beforePixels = scrollable.position.pixels;
+        expect(beforePixels, greaterThan(0));
 
         await tester.drag(
           find.byType(TerminalPane),

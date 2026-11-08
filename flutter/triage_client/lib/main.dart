@@ -4901,30 +4901,17 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           final snapshotHasHistory = snapshotCarriesHistory(snapshot);
           if (!snapshotHasHistory && _client.hasHttpHistoryTransport) {
             try {
-              final canUseDelta =
-                  session.loaded &&
-                  !session.isExited &&
-                  !session.store.state.exited &&
-                  snapshot['exited'] != true;
-              final historySnapshot = await _client.fetchSessionHistory(
-                sessionId: sessionId,
-                clientId: _clientId,
-                windowBytes: session.historyWindowBytes,
-                afterByte: canUseDelta ? session.store.appliedLogBytes : null,
-                afterSeq: canUseDelta
-                    ? (session.store.appliedLiveSeq ??
-                          session.store.state.historyHighWaterSeq)
-                    : null,
+              final mergedSnapshot = await _fetchAndMergeSessionHistory(
+                session,
+                sessionId,
+                snapshot,
               );
               if (_isStale(generation) ||
                   _disposed ||
                   !_sessions.contains(session)) {
                 return;
               }
-              effectiveSnapshot = _mergeHistoryIntoSnapshot(
-                snapshot,
-                historySnapshot,
-              );
+              effectiveSnapshot = mergedSnapshot;
             } on TriageAuthException {
               _routeStaleAuthFailure(generation);
               return;
@@ -4956,6 +4943,29 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       }
     }
+  }
+
+  Future<Map<String, dynamic>> _fetchAndMergeSessionHistory(
+    SessionVm session,
+    String sessionId,
+    Map<String, dynamic> snapshot,
+  ) async {
+    final canUseDelta =
+        session.loaded &&
+        !session.isExited &&
+        !session.store.state.exited &&
+        snapshot['exited'] != true;
+    final historySnapshot = await _client.fetchSessionHistory(
+      sessionId: sessionId,
+      clientId: _clientId,
+      windowBytes: session.historyWindowBytes,
+      afterByte: canUseDelta ? session.store.appliedLogBytes : null,
+      afterSeq: canUseDelta
+          ? (session.store.appliedLiveSeq ??
+                session.store.state.historyHighWaterSeq)
+          : null,
+    );
+    return _mergeHistoryIntoSnapshot(snapshot, historySnapshot);
   }
 
   Map<String, dynamic> _mergeHistoryIntoSnapshot(
@@ -5090,7 +5100,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.inFlightRows = null;
 
     final nextRows = _plainRowsFromSnapshot(snapshot);
-    final rowsChanged = !_styledRowsEqual(session.rows, nextRows);
+    final rowsChanged =
+        nextRows.isNotEmpty && !_styledRowsEqual(session.rows, nextRows);
     final nextStatus = exited ? 'exited' : 'attached';
     final nextStatusColor = exited
         ? const Color(0xff7f8b8d)
@@ -5837,27 +5848,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             includeHistory || !session.loaded || revivedNeedsReplay;
         if (useHttpHistory && shouldReplayHistory) {
           if (_isStale(owningGeneration)) return;
-          final canUseDelta =
-              session.loaded &&
-              !revivedNeedsReplay &&
-              !session.isExited &&
-              !session.store.state.exited &&
-              finalSnapshot['exited'] != true;
-          final historySnapshot = await _client.fetchSessionHistory(
-            sessionId: sessionId,
-            clientId: _clientId,
-            windowBytes: session.historyWindowBytes,
-            afterByte: canUseDelta ? session.store.appliedLogBytes : null,
-            afterSeq: canUseDelta
-                ? (session.store.appliedLiveSeq ??
-                      session.store.state.historyHighWaterSeq)
-                : null,
+          final mergedSnapshot = await _fetchAndMergeSessionHistory(
+            session,
+            sessionId,
+            finalSnapshot,
           );
           if (_isStale(owningGeneration)) return;
-          finalSnapshot = _mergeHistoryIntoSnapshot(
-            finalSnapshot,
-            historySnapshot,
-          );
+          finalSnapshot = mergedSnapshot;
         }
         // The restore/resize awaits above span a purge window: applying a
         // superseded snapshot onto the reused VM would blank the new

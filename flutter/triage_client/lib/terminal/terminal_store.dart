@@ -541,11 +541,7 @@ class TerminalStore extends ChangeNotifier {
     final combined = Uint8List(olderBytes.length + retained.length);
     combined.setRange(0, olderBytes.length, olderBytes);
     combined.setRange(olderBytes.length, combined.length, retained);
-    return (
-      bytes: combined,
-      throughOutputSeq:
-          _retainedRawSeq ?? _appliedLiveSeq ?? _state.historyHighWaterSeq,
-    );
+    return (bytes: combined, throughOutputSeq: _retainedRawSeq);
   }
 
   // True while we are programmatically resizing the sink, so its onResize echo
@@ -599,7 +595,8 @@ class TerminalStore extends ChangeNotifier {
   }
 
   /// Disarms shadow-buffering once the backward history page RPC finishes and
-  /// drops any shadow-queued chunks if the page bailed out without replaying.
+  /// folds any shadow-queued chunks into [_retainedRawBytes] before clearing
+  /// [_pendingLive] when the page bails out while live.
   void endHistoryPaging() {
     final wasPaging = _pagingHistory;
     _pagingHistory = false;
@@ -659,7 +656,7 @@ class TerminalStore extends ChangeNotifier {
         );
 
       case Detach():
-        _pagingHistory = false;
+        endHistoryPaging();
         _closeFrameOnWire();
         return s.copyWith(phase: AttachPhase.detached);
 
@@ -761,7 +758,6 @@ class TerminalStore extends ChangeNotifier {
     int? windowBytes,
     List<int> rawOutputPrefix = const [],
   }) {
-    _pagingHistory = false;
     // Replay at the client's target grid size ([cols] x [rows], the current
     // emulator/view size chosen by the caller, not the host capture size). A
     // later viewport [Resize] reflows and the live repaint self-heals.
@@ -786,6 +782,7 @@ class TerminalStore extends ChangeNotifier {
         rawOutputPrefix.isEmpty &&
         s.scrollbackReady &&
         !s.exited) {
+      endHistoryPaging();
       if (next.sized) {
         _flushPendingLive(next.historyHighWaterSeq);
       }
@@ -866,6 +863,7 @@ class TerminalStore extends ChangeNotifier {
           currentLogBytes != null &&
           snapshotEndBytes != null) {
         if (currentLogBytes >= snapshotEndBytes) {
+          endHistoryPaging();
           final resolvedSeq = throughSeq != null
               ? max(next.historyHighWaterSeq ?? 0, throughSeq)
               : next.historyHighWaterSeq;
@@ -873,11 +871,9 @@ class TerminalStore extends ChangeNotifier {
             _appliedLiveSeq = _appliedLiveSeq == null
                 ? throughSeq
                 : max(_appliedLiveSeq!, throughSeq);
-            if (!_pagingHistory) {
-              _retainedRawSeq = _retainedRawSeq == null
-                  ? throughSeq
-                  : max(_retainedRawSeq!, throughSeq);
-            }
+            _retainedRawSeq = _retainedRawSeq == null
+                ? throughSeq
+                : max(_retainedRawSeq!, throughSeq);
           }
           if (next.sized) {
             _flushPendingLive(resolvedSeq);
@@ -893,6 +889,7 @@ class TerminalStore extends ChangeNotifier {
         if (currentLogBytes >= rawStart) {
           final deltaOffset = currentLogBytes - rawStart;
           if (deltaOffset >= 0 && deltaOffset < bytes.length) {
+            endHistoryPaging();
             final deltaBytes = bytes is Uint8List
                 ? Uint8List.sublistView(bytes, deltaOffset)
                 : bytes.sublist(deltaOffset);
@@ -922,15 +919,14 @@ class TerminalStore extends ChangeNotifier {
       } else if (throughSeq != null &&
           currentSeq != null &&
           currentSeq >= throughSeq) {
+        endHistoryPaging();
         final resolvedSeq = max(next.historyHighWaterSeq ?? 0, throughSeq);
         _appliedLiveSeq = _appliedLiveSeq == null
             ? throughSeq
             : max(_appliedLiveSeq!, throughSeq);
-        if (!_pagingHistory) {
-          _retainedRawSeq = _retainedRawSeq == null
-              ? throughSeq
-              : max(_retainedRawSeq!, throughSeq);
-        }
+        _retainedRawSeq = _retainedRawSeq == null
+            ? throughSeq
+            : max(_retainedRawSeq!, throughSeq);
         if (next.sized) {
           _flushPendingLive(resolvedSeq);
         }
@@ -941,6 +937,13 @@ class TerminalStore extends ChangeNotifier {
           exited: false,
         );
       }
+    }
+
+    final wasPagingInLive =
+        _pagingHistory && s.phase == AttachPhase.live && s.sized;
+    _pagingHistory = false;
+    if (isSnapshotSeqRegressed || (wasPagingInLive && throughSeq == null)) {
+      _clearPendingLive();
     }
 
     tdbg(
@@ -1011,8 +1014,8 @@ class TerminalStore extends ChangeNotifier {
     _retainedRawBytes.clear();
     _retainedRawStart = _appliedHistoryStart;
     _retainedRawSeq = throughSeq;
-    if (_retainedRawStart != null && trimmed.rawBytes.isNotEmpty) {
-      _retainedRawBytes.add(trimmed.rawBytes);
+    if (_retainedRawStart != null && bytes.length > trimmed.droppedRawBytes) {
+      _retainedRawBytes.add(bytes.sublist(trimmed.droppedRawBytes));
     }
 
     next = next.copyWith(
@@ -1047,6 +1050,13 @@ class TerminalStore extends ChangeNotifier {
       // because log byte offsets (unlike `output_seq`) survive a restart
       // and still anchor the next history delta-merge.
       _appliedLiveSeq = null;
+      _retainedRawSeq = null;
+      for (var i = 0; i < _pendingLive.length; i++) {
+        final q = _pendingLive[i];
+        if (q.outputSeq != null) {
+          _pendingLive[i] = _QueuedLive(q.bytes, null);
+        }
+      }
       next = s.copyWith(resetHistoryHighWaterSeq: true);
     }
     if (_isDuplicate(seq, next.historyHighWaterSeq)) {
@@ -1107,6 +1117,9 @@ class TerminalStore extends ChangeNotifier {
       final old = _pendingLive.removeAt(0);
       _pendingLiveBytes -= old.bytes.length;
       dropped += old.bytes.length;
+      if (_pagingHistory && _state.phase == AttachPhase.live && _state.sized) {
+        _appendRetainedRaw(old.bytes, old.outputSeq);
+      }
     }
     if (dropped > 0) {
       debugPrint(
@@ -1153,12 +1166,19 @@ class TerminalStore extends ChangeNotifier {
   void _appendRetainedRaw(List<int> bytes, int? outputSeq) {
     if (_retainedRawStart != null && bytes.isNotEmpty) {
       _retainedRawBytes.add(bytes);
+      final maxRetainedBytes = kIsWeb
+          ? kHistoryReplayWebMaxBytes
+          : kHistoryReplayMaxBytes;
       final total = _retainedRawBytes.length;
-      if (total > kHistoryReplayMaxBytes) {
-        final drop = total - kHistoryReplayMaxBytes;
+      if (total > maxRetainedBytes) {
+        final drop = total - maxRetainedBytes;
         final current = _retainedRawBytes.takeBytes();
         _retainedRawBytes.add(Uint8List.sublistView(current, drop));
         _retainedRawStart = _retainedRawStart! + drop;
+        if (_appliedHistoryStart != null &&
+            _retainedRawStart! > _appliedHistoryStart!) {
+          _appliedHistoryStart = _retainedRawStart;
+        }
       }
     }
     if (outputSeq != null) {

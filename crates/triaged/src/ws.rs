@@ -94,11 +94,12 @@ where
     tracing::debug!(?format, "Upgraded WebSocket client connected");
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let global_rx = manager.register_global_receiver();
     let mut conn =
         WebSocketSessionConnection::with_authenticator(Arc::clone(&manager), Arc::clone(&manager))
-            .with_format(format)
-            .with_global_receiver(global_rx);
+            .with_format(format);
+    if conn.is_authenticated() {
+        conn.set_global_receiver(manager.register_global_receiver());
+    }
     if let Some(peer_addr) = peer_addr {
         conn = conn.with_peer_addr(peer_addr);
     }
@@ -114,6 +115,9 @@ where
                             Message::Text(text) => {
                                 if format == triage_transport_ws::ProtocolFormat::Json {
                                     let response = conn.handle_text_message(&text);
+                                    if conn.is_authenticated() && !conn.has_global_receiver() {
+                                        conn.set_global_receiver(manager.register_global_receiver());
+                                    }
                                     if ws_sender.send(Message::Text(response)).await.is_err() {
                                         break;
                                     }
@@ -130,6 +134,9 @@ where
                             Message::Binary(bytes) => {
                                 if format == triage_transport_ws::ProtocolFormat::Flatbuffers {
                                     let response = conn.handle_binary_message(&bytes);
+                                    if conn.is_authenticated() && !conn.has_global_receiver() {
+                                        conn.set_global_receiver(manager.register_global_receiver());
+                                    }
                                     if ws_sender.send(Message::Binary(response)).await.is_err() {
                                         break;
                                     }
