@@ -18,6 +18,113 @@ bool terminalSelectionIsLive(xt.Buffer buffer, xt.BufferRange range) {
   return normalized.begin.y >= 0 && normalized.end.y < buffer.lines.length;
 }
 
+/// Computes the `(base, extent)` cell offsets to pass to
+/// `TerminalController.setSelection` for a selection anchored at [anchorCell]
+/// and extended to [targetCell].
+///
+/// `BufferRangeLine` treats its normalized `[begin, end)` range as half-open on
+/// the end column. When [targetCell] is at or after [anchorCell] in `(row, col)`
+/// order, `extent.x` is incremented by 1 so [targetCell] is included. When
+/// [targetCell] is before [anchorCell] (a backward drag or Shift-click),
+/// `BufferRangeLine.normalized` swaps `base` and `extent`, making `base` the
+/// exclusive upper bound; `base.x` is therefore incremented by 1 so
+/// [anchorCell] itself stays included.
+(xt.CellOffset base, xt.CellOffset extent)? resolveSelectionEndpoints({
+  required xt.CellOffset anchorCell,
+  required xt.CellOffset targetCell,
+  required int viewWidth,
+  required int lineCount,
+}) {
+  final lastRow = lineCount - 1;
+  if (lastRow < 0 || viewWidth <= 0) return null;
+  final maxCol = viewWidth - 1;
+  final safeAnchor = xt.CellOffset(
+    anchorCell.x.clamp(0, maxCol),
+    anchorCell.y.clamp(0, lastRow),
+  );
+  final safeTarget = xt.CellOffset(
+    targetCell.x.clamp(0, maxCol),
+    targetCell.y.clamp(0, lastRow),
+  );
+  final forward =
+      safeTarget.y > safeAnchor.y ||
+      (safeTarget.y == safeAnchor.y && safeTarget.x >= safeAnchor.x);
+  final base = xt.CellOffset(
+    forward ? safeAnchor.x : safeAnchor.x + 1,
+    safeAnchor.y,
+  );
+  final extent = xt.CellOffset(
+    forward ? safeTarget.x + 1 : safeTarget.x,
+    safeTarget.y,
+  );
+  return (base, extent);
+}
+
+/// Shifts [offset] down by [addedLines] after a scrollback page prepends older
+/// rows at the top of the buffer, clamping into `[0, lineCount - 1]`.
+xt.CellOffset? shiftCellOffsetForHistoryPage({
+  required xt.CellOffset offset,
+  required int addedLines,
+  required int lineCount,
+}) {
+  final lastRow = lineCount - 1;
+  if (lastRow < 0) return null;
+  return xt.CellOffset(offset.x, (offset.y + addedLines).clamp(0, lastRow));
+}
+
+/// Whether a web keyboard event matches the terminal select-all shortcut:
+/// Cmd+A (without Ctrl/Alt/Shift) or Ctrl+Shift+A (without Meta/Alt) so plain
+/// Ctrl+A (0x01 / start-of-line) still reaches the PTY.
+bool isWebSelectAllShortcut({
+  required String? key,
+  required bool ctrlKey,
+  required bool metaKey,
+  required bool shiftKey,
+  required bool altKey,
+}) {
+  if (key != 'a' && key != 'A') return false;
+  return (metaKey && !ctrlKey && !altKey && !shiftKey) ||
+      (ctrlKey && shiftKey && !metaKey && !altKey);
+}
+
+/// Snapshot of xterm.js `getSelectionPosition()` buffer coordinates (`start`
+/// inclusive, `end` exclusive) captured before a scrollback history page.
+class WebSelectionRange {
+  const WebSelectionRange({
+    required this.startX,
+    required this.startY,
+    required this.endX,
+    required this.endY,
+  });
+
+  final int startX;
+  final int startY;
+  final int endX;
+  final int endY;
+}
+
+/// Computes the `(column, row, length)` arguments for xterm.js
+/// `term.select(column, row, length)` after a scrollback page adds [addedLines]
+/// older rows at the top of a buffer with [lineCount] total lines and [cols]
+/// columns. Returns `null` when the grid is empty or the resulting selection
+/// has non-positive length.
+({int column, int row, int length})? shiftWebSelectionForHistoryPage({
+  required WebSelectionRange selection,
+  required int addedLines,
+  required int lineCount,
+  required int cols,
+}) {
+  if (lineCount <= 0 || cols <= 0) return null;
+  final shift = addedLines > 0 ? addedLines : 0;
+  final newStartY = (selection.startY + shift).clamp(0, lineCount - 1);
+  final newEndY = (selection.endY + shift).clamp(0, lineCount - 1);
+  final startX = selection.startX.clamp(0, cols);
+  final endX = selection.endX.clamp(0, cols);
+  final length = (newEndY - newStartY) * cols - startX + endX;
+  if (length <= 0) return null;
+  return (column: startX, row: newStartY, length: length);
+}
+
 /// Rebuilds the plain text for a terminal selection [range], preserving the
 /// spaces that xterm.dart's own `Buffer.getText` drops.
 ///
