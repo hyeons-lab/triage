@@ -47,6 +47,7 @@ class TerminalPane extends StatefulWidget {
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
+    this.isObscured = false,
     this.softKeyboardEnabled = true,
   });
 
@@ -72,6 +73,11 @@ class TerminalPane extends StatefulWidget {
   final int focusCursorRevision;
   final bool isExited;
   final bool isLoading;
+
+  /// True when an in-route overlay (such as the mobile session rail) covers
+  /// the workspace, so pointer/touch gestures on the overlay cannot leak into
+  /// or scroll the terminal underneath.
+  final bool isObscured;
 
   /// Mobile soft-keyboard kill switch. While false the pane neither takes
   /// focus nor opens the IME path, so the keyboard stays down and its
@@ -444,6 +450,10 @@ class _TerminalPaneState extends State<TerminalPane>
         _scrollToCursor(requestFocus: false, forceBottom: true);
       }
     }
+    if (oldWidget.isObscured != widget.isObscured && widget.isObscured) {
+      _activePointers.clear();
+      _endDrag();
+    }
     if (oldWidget.focusCursorRevision != widget.focusCursorRevision) {
       final pos = _scrollController.hasClients
           ? _scrollController.position
@@ -742,6 +752,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // here; our anchor is preserved because _recordSelectionAnchor ignores the
   // resulting null.
   void _handlePointerDown(PointerDownEvent event) {
+    if (widget.isObscured) return;
     _mobileAutoSpace.reset();
     _activePointers.add(event.pointer);
     // Desktop only: focus on pointer-down so a mouse click focuses the terminal
@@ -757,7 +768,11 @@ class _TerminalPaneState extends State<TerminalPane>
     // Touch: let the terminal's own gestures handle scrolling (a swipe) and
     // selection (long-press). The pointer-driven drag-select below is for a
     // mouse — on touch it would hijack a swipe-to-scroll into a text selection.
-    if (_isMobile || ModalRoute.of(context)?.isCurrent == false) return;
+    if (_isMobile ||
+        widget.isObscured ||
+        ModalRoute.of(context)?.isCurrent == false) {
+      return;
+    }
     if (HardwareKeyboard.instance.isShiftPressed) {
       // Shift+primary: a click extends the existing selection on pointer-up.
       _shiftClickPointer = event.pointer;
@@ -1248,7 +1263,10 @@ class _TerminalPaneState extends State<TerminalPane>
     final id = terminalId ?? widget.terminalId;
     final isAtBottom = position.pixels >= position.maxScrollExtent - 0.5;
     if (!isAtBottom) {
-      final clampedPixels = position.pixels.clamp(0.0, position.maxScrollExtent);
+      final clampedPixels = position.pixels.clamp(
+        0.0,
+        position.maxScrollExtent,
+      );
       _sessionSavedScrollOffsets[id] = clampedPixels;
       if (_scrollAnchor.hasAnchor) {
         _sessionSavedScrollAnchors[id] = _scrollAnchor.clone();
@@ -1534,7 +1552,7 @@ class _TerminalPaneState extends State<TerminalPane>
   // with the gap spaces restored. Returning `ignored` for everything else
   // leaves xterm's normal key handling, including Ctrl+C -> SIGINT, untouched.
   KeyEventResult _handleTerminalKeyEvent(FocusNode node, KeyEvent event) {
-    if (ModalRoute.of(context)?.isCurrent == false) {
+    if (widget.isObscured || ModalRoute.of(context)?.isCurrent == false) {
       return KeyEventResult.ignored;
     }
     if (event.logicalKey == LogicalKeyboardKey.tab) {
@@ -1883,7 +1901,7 @@ class _TerminalPaneState extends State<TerminalPane>
             fit: StackFit.expand,
             children: [
               IgnorePointer(
-                ignoring: widget.isLoading,
+                ignoring: widget.isLoading || widget.isObscured,
                 child: AnimatedOpacity(
                   opacity: widget.isLoading ? 0.7 : 1.0,
                   duration: const Duration(milliseconds: 150),
@@ -2001,7 +2019,7 @@ class _TerminalPaneState extends State<TerminalPane>
                   fit: StackFit.expand,
                   children: [
                     IgnorePointer(
-                      ignoring: widget.isLoading,
+                      ignoring: widget.isLoading || widget.isObscured,
                       child: AnimatedOpacity(
                         opacity: widget.isLoading ? 0.7 : 1.0,
                         duration: const Duration(milliseconds: 150),

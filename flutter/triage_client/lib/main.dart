@@ -4284,22 +4284,34 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // keystroke acquires it through the buffer-and-flush path instead.
       // First-page window: first paint waits on the viewport, and
       // scrolling near the top re-attaches with a doubling window.
+      final useHttpHistory = _client.hasHttpHistoryTransport;
       final attachRes = await _client.attachSession(
         sessionId: sid,
         clientId: _clientId,
         mode: 'Observer',
-        historyBytes: kHistoryFirstWindowBytes,
+        historyBytes: useHttpHistory
+            ? kHistoryLeaseProbeBytes
+            : kHistoryFirstWindowBytes,
       );
+      if (_isStale(owningGeneration)) throw const _StaleLoad();
       final responseObj = attachRes['response'] as Map<String, dynamic>?;
       var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-      // Fall back to the prepared snapshot only when it carries history: the
-      // restore path's snapshot does, but a resize snapshot never does, and
-      // replaying its empty history would clear the terminal to a blank screen.
-      if (replayTargetSize != null &&
+      if (useHttpHistory) {
+        final historySnapshot = await _client.fetchSessionHistory(
+          sessionId: sid,
+          clientId: _clientId,
+          windowBytes: kHistoryFirstWindowBytes,
+        );
+        if (_isStale(owningGeneration)) throw const _StaleLoad();
+        snapshot = _mergeHistoryIntoSnapshot(snapshot, historySnapshot);
+      } else if (replayTargetSize != null &&
           preparedSnapshot != null &&
           snapshotCarriesHistory(preparedSnapshot) &&
           snapshot?['exited'] != true &&
           !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+        // Fall back to the prepared snapshot only when it carries history: the
+        // restore path's snapshot does, but a resize snapshot never does, and
+        // replaying its empty history would clear the terminal to a blank screen.
         snapshot = preparedSnapshot;
       }
 
@@ -4884,14 +4896,54 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final snapshot =
             event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
         if (snapshot != null) {
-          // Pushed snapshots are served unwindowed at the full history
-          // cap: replay them at the platform budgets, not the held
-          // window, or the trim over-shrinks them.
+          final generation = _connectGeneration;
+          var effectiveSnapshot = snapshot;
+          final snapshotHasHistory = snapshotCarriesHistory(snapshot);
+          if (!snapshotHasHistory && _client.hasHttpHistoryTransport) {
+            try {
+              final canUseDelta =
+                  session.loaded &&
+                  !session.isExited &&
+                  !session.store.state.exited &&
+                  snapshot['exited'] != true;
+              final historySnapshot = await _client.fetchSessionHistory(
+                sessionId: sessionId,
+                clientId: _clientId,
+                windowBytes: session.historyWindowBytes,
+                afterByte: canUseDelta ? session.store.appliedLogBytes : null,
+                afterSeq: canUseDelta
+                    ? (session.store.appliedLiveSeq ??
+                          session.store.state.historyHighWaterSeq)
+                    : null,
+              );
+              if (_isStale(generation) ||
+                  _disposed ||
+                  !_sessions.contains(session)) {
+                return;
+              }
+              effectiveSnapshot = _mergeHistoryIntoSnapshot(
+                snapshot,
+                historySnapshot,
+              );
+            } on TriageAuthException {
+              _routeStaleAuthFailure(generation);
+              return;
+            } catch (e) {
+              tdbg(
+                'history.resync',
+                'HTTP resync fetch failed for $sessionId: $e',
+              );
+              return;
+            }
+          }
+          // Pushed snapshots carrying inline history are served unwindowed at
+          // the full history cap: replay them at the platform budgets, not the
+          // held window, or the trim over-shrinks them.
           await _applySnapshotToSession(
             session,
             sessionId,
-            snapshot,
-            unwindowed: true,
+            effectiveSnapshot,
+            unwindowed: snapshotHasHistory,
           );
         }
       } else if (event.containsKey('LeaseChanged')) {
@@ -4904,6 +4956,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }
       }
     }
+  }
+
+  Map<String, dynamic> _mergeHistoryIntoSnapshot(
+    Map<String, dynamic>? base,
+    Map<String, dynamic> history,
+  ) {
+    final merged = <String, dynamic>{...?base};
+    for (final entry in history.entries) {
+      if (entry.value != null) {
+        merged[entry.key] = entry.value;
+      }
+    }
+    return merged;
   }
 
   Future<void> _applySnapshotToSession(
@@ -5451,10 +5516,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   /// scrollback on `false`).
   bool _canPageHistory(SessionVm session) => _nextHistoryPage(session) != null;
 
-  /// Page older scrollback after a near-top scroll: re-attach with a
-  /// doubling history window (up to the platform replay budget) and replay
-  /// the wider tail. Stops at the log start (`historyStart == 0`) and
-  /// coalesces triggers behind one in-flight page.
+  /// Page older scrollback after a near-top scroll: fetch the older byte
+  /// slice (or re-attach with a doubling history window on transports without
+  /// HTTP) and replay the wider tail. Stops at the log start (`historyStart == 0`)
+  /// and coalesces triggers behind one in-flight page.
   Future<void> _pageHistoryUp(SessionVm session) async {
     final target = _nextHistoryPage(session);
     if (target == null) return;
@@ -5463,34 +5528,92 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.pagingHistory = true;
     session.store.beginHistoryPaging();
     try {
-      // Observer: paging must not steal the lease from whoever is typing.
-      final attachRes = await _client.attachSession(
-        sessionId: sessionId,
-        clientId: _clientId,
-        mode: 'Observer',
-        historyBytes: nextWindow,
-      );
+      final useHttpHistory = _client.hasHttpHistoryTransport;
+      final requestBeforeByte =
+          session.store.retainedRawStart ?? session.historyStart;
+      Map<String, dynamic>? snapshot;
+      if (useHttpHistory) {
+        snapshot = await _client.fetchSessionHistory(
+          sessionId: sessionId,
+          clientId: _clientId,
+          windowBytes: nextWindow,
+          beforeByte: requestBeforeByte,
+          afterByte: session.store.appliedLogBytes,
+          afterSeq:
+              session.store.appliedLiveSeq ??
+              session.store.state.historyHighWaterSeq,
+        );
+      } else {
+        // Observer: paging must not steal the lease from whoever is typing.
+        final attachRes = await _client.attachSession(
+          sessionId: sessionId,
+          clientId: _clientId,
+          mode: 'Observer',
+          historyBytes: nextWindow,
+        );
+        if (_isStale(generation) ||
+            _disposed ||
+            !_sessions.contains(session) ||
+            !session.store.isPagingHistory) {
+          return;
+        }
+        session.hasInputLease =
+            !session.isExited &&
+            !session.store.state.exited &&
+            _attachGrantsInputLease(attachRes);
+        final responseObj = attachRes['response'] as Map<String, dynamic>?;
+        snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+      }
       if (_isStale(generation) ||
           _disposed ||
           !_sessions.contains(session) ||
           !session.store.isPagingHistory) {
         return;
       }
-      session.hasInputLease =
-          !session.isExited &&
-          !session.store.state.exited &&
-          _attachGrantsInputLease(attachRes);
       final currentStart = session.historyStart;
       if (currentStart == null || currentStart <= 0) {
         return;
       }
-      final responseObj = attachRes['response'] as Map<String, dynamic>?;
-      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
       if (snapshot == null || !snapshotCarriesHistory(snapshot)) return;
-      final rawOutput = _rawOutputFromSnapshot(snapshot);
-      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      final rawOutputStart = snapshot['raw_output_start'] as int?;
+      var rawOutput = _rawOutputFromSnapshot(snapshot);
+      var rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
+      var rawOutputStart = snapshot['raw_output_start'] as int?;
       if (rawOutputStart == null) return;
+      var throughOutputSeq = snapshot['output_seq'] as int?;
+      if (snapshot['raw_output_truncated'] == true) {
+        final rawOutputEnd =
+            (snapshot['raw_output_end'] as int?) ??
+            (rawOutputStart + rawOutput.length);
+        final spliced = session.store.spliceBackwardHistoryPage(
+          rawOutput,
+          rawOutputStart: rawOutputStart,
+          rawOutputEnd: rawOutputEnd,
+        );
+        if (spliced == null) {
+          final fallback = await _client.fetchSessionHistory(
+            sessionId: sessionId,
+            clientId: _clientId,
+            windowBytes: nextWindow,
+          );
+          if (_isStale(generation) ||
+              _disposed ||
+              !_sessions.contains(session) ||
+              !session.store.isPagingHistory) {
+            return;
+          }
+          if (!snapshotCarriesHistory(fallback)) return;
+          final fallbackStart = fallback['raw_output_start'] as int?;
+          if (fallbackStart == null) return;
+          snapshot = fallback;
+          rawOutput = _rawOutputFromSnapshot(fallback);
+          rawOutputPrefix = _rawOutputPrefixFromSnapshot(fallback);
+          rawOutputStart = fallbackStart;
+          throughOutputSeq = fallback['output_seq'] as int?;
+        } else {
+          rawOutput = spliced.bytes;
+          throughOutputSeq = spliced.throughOutputSeq;
+        }
+      }
       final budgets = historyTrimBudgetsForWindow(nextWindow, web: kIsWeb);
       final trimmed = trimHistoryReplay(
         rawOutputPrefix: rawOutputPrefix,
@@ -5521,7 +5644,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.historyWindowBytes = max(session.historyWindowBytes, nextWindow);
       session.applyHistory(
         rawOutput,
-        throughOutputSeq: snapshot['output_seq'] as int?,
+        throughOutputSeq: throughOutputSeq,
         rawOutputStart: rawOutputStart,
         windowBytes: nextWindow,
         rawOutputPrefix: rawOutputPrefix,
@@ -5575,11 +5698,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           !session.loaded ||
           session.isExited ||
           session.store.state.exited;
+      final useHttpHistory = _client.hasHttpHistoryTransport;
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'Observer',
-        historyBytes: needsHistory
+        historyBytes: (needsHistory && !useHttpHistory)
             ? session.historyWindowBytes
             : kHistoryLeaseProbeBytes,
       );
@@ -5644,7 +5768,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               sessionId: sessionId,
               clientId: _clientId,
               mode: 'Observer',
-              historyBytes: session.historyWindowBytes,
+              historyBytes: useHttpHistory
+                  ? kHistoryLeaseProbeBytes
+                  : session.historyWindowBytes,
             );
             if (_isStale(owningGeneration)) return;
             session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
@@ -5707,6 +5833,32 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         final revivedNeedsReplay =
             (session.isExited || session.store.state.exited) &&
             finalSnapshot['exited'] != true;
+        final shouldReplayHistory =
+            includeHistory || !session.loaded || revivedNeedsReplay;
+        if (useHttpHistory && shouldReplayHistory) {
+          if (_isStale(owningGeneration)) return;
+          final canUseDelta =
+              session.loaded &&
+              !revivedNeedsReplay &&
+              !session.isExited &&
+              !session.store.state.exited &&
+              finalSnapshot['exited'] != true;
+          final historySnapshot = await _client.fetchSessionHistory(
+            sessionId: sessionId,
+            clientId: _clientId,
+            windowBytes: session.historyWindowBytes,
+            afterByte: canUseDelta ? session.store.appliedLogBytes : null,
+            afterSeq: canUseDelta
+                ? (session.store.appliedLiveSeq ??
+                      session.store.state.historyHighWaterSeq)
+                : null,
+          );
+          if (_isStale(owningGeneration)) return;
+          finalSnapshot = _mergeHistoryIntoSnapshot(
+            finalSnapshot,
+            historySnapshot,
+          );
+        }
         // The restore/resize awaits above span a purge window: applying a
         // superseded snapshot onto the reused VM would blank the new
         // generation's load with old-daemon bytes.
@@ -6592,6 +6744,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
 
       final currentSession = _sessions.isEmpty ? null : _selectedSession;
+      final isWorkspaceObscured = isMobile && !_sidebarCollapsed;
       final workspace = currentSession == null
           ? emptyWorkspace
           : SessionWorkspace(
@@ -6609,6 +6762,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
+              isObscured: isWorkspaceObscured,
               softKeyboardEnabled: _softKeyboardEnabled,
               // The header toggle only exists where a soft keyboard can
               // raise and shift the layout (native mobile + mobile web).
@@ -6626,7 +6780,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           body: SafeArea(
             child: Stack(
               children: [
-                Positioned.fill(child: workspace),
+                Positioned.fill(
+                  child: IgnorePointer(
+                    ignoring: isWorkspaceObscured,
+                    child: workspace,
+                  ),
+                ),
                 if (_sidebarCollapsed && _sessions.isEmpty)
                   Positioned(
                     top: 4,
@@ -6646,6 +6805,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTap: collapseRail,
+                        onVerticalDragUpdate: (_) {},
+                        onHorizontalDragUpdate: (_) {},
                         child: const ColoredBox(color: Color(0x99000000)),
                       ),
                     ),
@@ -11149,6 +11310,7 @@ class SessionWorkspace extends StatelessWidget {
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
+    this.isObscured = false,
     this.softKeyboardEnabled = true,
     this.onToggleSoftKeyboard,
   });
@@ -11167,6 +11329,9 @@ class SessionWorkspace extends StatelessWidget {
   // Re-asserts this device's terminal size on the shared PTY.
   final VoidCallback? onRefit;
   final VoidCallback? onToggleJudge;
+  // True when an overlay (such as the mobile session rail) covers the
+  // workspace so gestures on the overlay cannot leak into the terminal.
+  final bool isObscured;
   // Mobile soft-keyboard kill switch: the state drives the terminal pane,
   // the toggle lives in the workspace header.
   final bool softKeyboardEnabled;
@@ -11205,6 +11370,7 @@ class SessionWorkspace extends StatelessWidget {
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',
             isLoading: session.status == 'loading' || !session.loaded,
+            isObscured: isObscured,
             softKeyboardEnabled: softKeyboardEnabled,
           ),
         ),

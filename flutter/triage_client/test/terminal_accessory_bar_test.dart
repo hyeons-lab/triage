@@ -52,6 +52,7 @@ void main() {
     await tapKey(tester, '◀');
     await tapKey(tester, '▶');
     await tapKey(tester, '^C');
+    await tapKey(tester, '^O');
     await tapKey(tester, '^K');
     await tapKey(tester, '/');
     await tapKey(tester, '|');
@@ -68,6 +69,7 @@ void main() {
       '\x1b[D',
       '\x1b[C',
       '\x03',
+      '\x0f',
       '\x0b',
       '/',
       '|',
@@ -117,9 +119,7 @@ void main() {
     expect(bar.ctrlToggles(), 0);
   });
 
-  testWidgets('no keyboard toggle lives in the accessory row', (
-    tester,
-  ) async {
+  testWidgets('no keyboard toggle lives in the accessory row', (tester) async {
     // The soft-keyboard switch moved to the workspace header; the bottom
     // bar keeps input keys only.
     await pumpBar(tester);

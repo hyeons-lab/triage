@@ -1355,7 +1355,10 @@ void main() {
       final raw = Uint8List.fromList([1, 2, 3]);
       final prefix = Uint8List.fromList([4, 5]);
       expect(
-        snapshotCarriesHistory({'raw_output': raw, 'raw_output_prefix': prefix}),
+        snapshotCarriesHistory({
+          'raw_output': raw,
+          'raw_output_prefix': prefix,
+        }),
         isTrue,
       );
       expect(snapshotCarriesHistory({'raw_output': raw}), isTrue);
@@ -1366,22 +1369,25 @@ void main() {
       expect(snapshotCarriesHistory({}), isFalse);
     });
 
-    test('prefix extractor reads raw_output_prefix with the same encodings', () {
-      final original = utf8.encode('journaled old line\n');
-      final encoded = base64Encode(GZipEncoder().encode(original));
-      expect(
-        rawOutputPrefixFromSnapshot({'raw_output_prefix': encoded}),
-        equals(Uint8List.fromList(original)),
-      );
-      expect(rawOutputPrefixFromSnapshot({}), isEmpty);
-      expect(rawOutputPrefixFromSnapshot({'raw_output_prefix': null}), isEmpty);
-      // The raw tail key must not leak into the prefix: a wrong key
-      // string fails silent as an empty prefix at every attach site.
-      expect(
-        rawOutputPrefixFromSnapshot({'raw_output': encoded}),
-        isEmpty,
-      );
-    });
+    test(
+      'prefix extractor reads raw_output_prefix with the same encodings',
+      () {
+        final original = utf8.encode('journaled old line\n');
+        final encoded = base64Encode(GZipEncoder().encode(original));
+        expect(
+          rawOutputPrefixFromSnapshot({'raw_output_prefix': encoded}),
+          equals(Uint8List.fromList(original)),
+        );
+        expect(rawOutputPrefixFromSnapshot({}), isEmpty);
+        expect(
+          rawOutputPrefixFromSnapshot({'raw_output_prefix': null}),
+          isEmpty,
+        );
+        // The raw tail key must not leak into the prefix: a wrong key
+        // string fails silent as an empty prefix at every attach site.
+        expect(rawOutputPrefixFromSnapshot({'raw_output': encoded}), isEmpty);
+      },
+    );
 
     test('rejects corrupted gzip stream and returns empty Uint8List', () {
       final corrupt = [0x1f, 0x8b, 0x08, 0x00, 0xff, 0xff, 0xff];
@@ -1527,67 +1533,260 @@ void main() {
       expect(stats.batteryState, 'unknown');
     });
 
-    test('mergeDaemonStats retains previous legs when incoming legs are unknown', () {
-      const previous = (
-        diskFreeBytes: 40,
-        diskTotalBytes: 100,
-        cpuPercent: 18,
-        batteryPercent: 75,
-        batteryState: 'discharging',
-      );
-      final afterZeroDiskAndNullHost = mergeDaemonStats(previous, (
-        diskFreeBytes: 0,
-        diskTotalBytes: 0,
-        cpuPercent: null,
-        batteryPercent: null,
-        batteryState: 'unknown',
-      ));
-      expect(afterZeroDiskAndNullHost, equals(previous));
+    test(
+      'mergeDaemonStats retains previous legs when incoming legs are unknown',
+      () {
+        const previous = (
+          diskFreeBytes: 40,
+          diskTotalBytes: 100,
+          cpuPercent: 18,
+          batteryPercent: 75,
+          batteryState: 'discharging',
+        );
+        final afterZeroDiskAndNullHost = mergeDaemonStats(previous, (
+          diskFreeBytes: 0,
+          diskTotalBytes: 0,
+          cpuPercent: null,
+          batteryPercent: null,
+          batteryState: 'unknown',
+        ));
+        expect(afterZeroDiskAndNullHost, equals(previous));
 
-      final afterPartialUpdate = mergeDaemonStats(previous, (
-        diskFreeBytes: 35,
-        diskTotalBytes: 100,
-        cpuPercent: null,
-        batteryPercent: 80,
-        batteryState: 'charging',
-      ));
-      expect(afterPartialUpdate.diskFreeBytes, 35);
-      expect(afterPartialUpdate.diskTotalBytes, 100);
-      expect(afterPartialUpdate.cpuPercent, 18);
-      expect(afterPartialUpdate.batteryPercent, 80);
-      expect(afterPartialUpdate.batteryState, 'charging');
-    });
+        final afterPartialUpdate = mergeDaemonStats(previous, (
+          diskFreeBytes: 35,
+          diskTotalBytes: 100,
+          cpuPercent: null,
+          batteryPercent: 80,
+          batteryState: 'charging',
+        ));
+        expect(afterPartialUpdate.diskFreeBytes, 35);
+        expect(afterPartialUpdate.diskTotalBytes, 100);
+        expect(afterPartialUpdate.cpuPercent, 18);
+        expect(afterPartialUpdate.batteryPercent, 80);
+        expect(afterPartialUpdate.batteryState, 'charging');
+      },
+    );
   });
 
   group('millisSinceLastInbound', () {
-    test('is zero before connect, grows with silence, resets on traffic',
-        () async {
-      final sink = RecordingWebSocketSink();
-      final channel = FakeWebSocketChannel(
-        sink: sink,
-        protocol: 'triage-json',
+    test(
+      'is zero before connect, grows with silence, resets on traffic',
+      () async {
+        final sink = RecordingWebSocketSink();
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-json',
+        );
+        final client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        expect(client.millisSinceLastInbound, 0);
+
+        await client.connect();
+        final fresh = client.millisSinceLastInbound;
+        expect(fresh, lessThan(60000));
+
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+        final silent = client.millisSinceLastInbound;
+        expect(silent, greaterThan(fresh));
+
+        channel.addIncoming(jsonEncode({'type': 'session_started'}));
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        expect(client.millisSinceLastInbound, lessThan(silent));
+
+        await client.disconnect();
+        expect(client.millisSinceLastInbound, 0);
+      },
+    );
+  });
+
+  group('HTTP session history', () {
+    Uint8List buildThs1Frame({
+      String sessionId = 's1',
+      bool exited = false,
+      bool bracketedPaste = false,
+      bool rawOutputTruncated = false,
+      int rows = 24,
+      int cols = 80,
+      int outputSeq = 42,
+      int bytesLogged = 2000,
+      int rawOutputStart = 1000,
+      int rawOutputEnd = 2000,
+      List<int> prefix = const <int>[],
+      List<int> raw = const <int>[],
+    }) {
+      final metaBytes = utf8.encode(
+        jsonEncode({
+          'session_id': sessionId,
+          'size': {'rows': rows, 'cols': cols},
+          'exited': exited,
+          'output_seq': outputSeq,
+          'bracketed_paste_enabled': bracketedPaste,
+          'bytes_logged': bytesLogged,
+          'raw_output_start': rawOutputStart,
+          'raw_output_end': rawOutputEnd,
+          'raw_output_truncated': rawOutputTruncated,
+        }),
       );
-      final client = TriageWebSocketClient(
-        Uri.parse('ws://localhost/ws'),
-        channelFactory: (_) => channel,
+      final out = BytesBuilder(copy: false);
+      out.add(const <int>[0x54, 0x48, 0x53, 0x31]); // THS1
+      final header = ByteData(12);
+      header.setUint32(0, metaBytes.length, Endian.little);
+      header.setUint32(4, prefix.length, Endian.little);
+      header.setUint32(8, raw.length, Endian.little);
+      out.add(header.buffer.asUint8List());
+      out.add(metaBytes);
+      out.add(prefix);
+      out.add(raw);
+      return out.toBytes();
+    }
+
+    test(
+      'buildHistoryUri maps ws:// to cleartext http:// and wss:// to https://',
+      () {
+        final cleartextClient = TriageWebSocketClient(
+          Uri.parse('ws://100.64.0.1:7777/ws'),
+        );
+        final cleartextUri = cleartextClient.buildHistoryUri(
+          'feat/my session',
+          windowBytes: 65536,
+          afterByte: 1024,
+          afterSeq: 7,
+          beforeByte: 4096,
+        );
+        expect(cleartextUri.scheme, 'http');
+        expect(cleartextUri.host, '100.64.0.1');
+        expect(cleartextUri.port, 7777);
+        expect(cleartextUri.path, '/api/sessions/feat%2Fmy%20session/history');
+        expect(cleartextUri.queryParameters, {
+          'window_bytes': '65536',
+          'after_byte': '1024',
+          'after_seq': '7',
+          'before_byte': '4096',
+        });
+
+        final tlsClient = TriageWebSocketClient(
+          Uri.parse('wss://triage.example.com:8443/ws'),
+        );
+        final tlsUri = tlsClient.buildHistoryUri('main', windowBytes: 131072);
+        expect(tlsUri.scheme, 'https');
+        expect(tlsUri.host, 'triage.example.com');
+        expect(tlsUri.port, 8443);
+        expect(tlsUri.path, '/api/sessions/main/history');
+        expect(tlsUri.queryParameters, {'window_bytes': '131072'});
+      },
+    );
+
+    test('decodeHistoryFrame decodes THS1 metadata and binary slices', () {
+      final rawBytes = utf8.encode('hello world\n');
+      final prefixBytes = utf8.encode('older prefix\n');
+
+      final frame = buildThs1Frame(
+        sessionId: 's1',
+        exited: true,
+        bracketedPaste: true,
+        rawOutputTruncated: true,
+        rows: 40,
+        cols: 120,
+        outputSeq: 99,
+        bytesLogged: 5000,
+        rawOutputStart: 1200,
+        rawOutputEnd: 2400,
+        prefix: prefixBytes,
+        raw: rawBytes,
       );
-      expect(client.millisSinceLastInbound, 0);
-
-      await client.connect();
-      final fresh = client.millisSinceLastInbound;
-      expect(fresh, lessThan(60000));
-
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      final silent = client.millisSinceLastInbound;
-      expect(silent, greaterThan(fresh));
-
-      channel.addIncoming(jsonEncode({'type': 'session_started'}));
-      await Future<void>.delayed(Duration.zero);
-      await Future<void>.delayed(Duration.zero);
-      expect(client.millisSinceLastInbound, lessThan(silent));
-
-      await client.disconnect();
-      expect(client.millisSinceLastInbound, 0);
+      final decoded = decodeHistoryFrame(frame);
+      expect(decoded['session_id'], 's1');
+      expect(decoded['exited'], isTrue);
+      expect(decoded['bracketed_paste_enabled'], isTrue);
+      expect(decoded['raw_output_truncated'], isTrue);
+      expect(decoded['size'], {'rows': 40, 'cols': 120});
+      expect(decoded['output_seq'], 99);
+      expect(decoded['bytes_logged'], 5000);
+      expect(decoded['raw_output_start'], 1200);
+      expect(decoded['raw_output_end'], 2400);
+      expect(utf8.decode(decoded['raw_output'] as Uint8List), 'hello world\n');
+      expect(
+        utf8.decode(decoded['raw_output_prefix'] as Uint8List),
+        'older prefix\n',
+      );
     });
+
+    test(
+      'fetchSessionHistory sends auth headers and maps 401 to TriageAuthException',
+      () async {
+        Uri? capturedUri;
+        Map<String, String>? capturedHeaders;
+        var statusToReturn = 200;
+
+        final sink = RecordingWebSocketSink();
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-json',
+        );
+        final client = TriageWebSocketClient(
+          Uri.parse('ws://127.0.0.1:7777/ws'),
+          channelFactory: (_) => channel,
+          httpFetcher: (uri, {required headers}) async {
+            capturedUri = uri;
+            capturedHeaders = headers;
+            return (
+              statusCode: statusToReturn,
+              body: buildThs1Frame(
+                outputSeq: 12,
+                bytesLogged: 100,
+                rawOutputStart: 0,
+                rawOutputEnd: 100,
+                raw: utf8.encode('ok\n'),
+              ),
+              contentType: 'application/octet-stream',
+            );
+          },
+        );
+        await client.connect();
+        final helloFuture = client.hello(
+          clientId: 'client-1',
+          token: 'tok-secret',
+        );
+        await Future<void>.delayed(Duration.zero);
+        final helloReq =
+            jsonDecode(sink.sent.single as String) as Map<String, dynamic>;
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'response',
+            'id': helloReq['id'],
+            'response': {'type': 'hello', 'accepted': true},
+          }),
+        );
+        await helloFuture;
+
+        final res = await client.fetchSessionHistory(
+          sessionId: 'main',
+          clientId: 'client-1',
+          windowBytes: 65536,
+          afterByte: 50,
+          afterSeq: 10,
+        );
+        expect(
+          capturedUri.toString(),
+          'http://127.0.0.1:7777/api/sessions/main/history?window_bytes=65536&after_byte=50&after_seq=10',
+        );
+        expect(capturedHeaders?['Authorization'], 'Bearer tok-secret');
+        expect(capturedHeaders?['X-Triage-Client-Id'], 'client-1');
+        expect(utf8.decode(res['raw_output'] as Uint8List), 'ok\n');
+
+        statusToReturn = 401;
+        await expectLater(
+          client.fetchSessionHistory(
+            sessionId: 'main',
+            clientId: 'client-1',
+            windowBytes: 65536,
+          ),
+          throwsA(isA<TriageAuthException>()),
+        );
+      },
+    );
   });
 }

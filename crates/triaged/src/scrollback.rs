@@ -391,6 +391,26 @@ impl ScrollbackJournal {
         self.broken
     }
 
+    /// Returns a lightweight read-only handle referencing the same journal
+    /// directory so callers can serve history prefixes off the actor thread
+    /// without cloning or locking the active writer.
+    pub fn reader_clone(&self) -> Self {
+        Self {
+            dir: self.dir.clone(),
+            active_index: 0,
+            active_lines: 0,
+            writer: None,
+            since_flush: 0,
+            pending_seals: Vec::new(),
+            broken: self.broken,
+            warned: self.warned,
+            #[cfg(test)]
+            attempts_used: 0,
+            #[cfg(test)]
+            test_on_staged: None,
+        }
+    }
+
     /// Append one scrolled line. Soft-fails into disabled mode.
     pub fn append(&mut self, log_offset: u64, bytes: &[u8]) {
         if self.broken {
