@@ -6907,5 +6907,45 @@ void main() {
         expect(bufferText, contains('live-redraw-after-sigwinch'));
       },
     );
+
+    test(
+      'SessionVm.applyHistory preserves pending live chunks when store isPagingHistory is active even if preservePendingLive is false',
+      () {
+        final vm = SessionVm(
+          title: 'triage / paging-live-preserve',
+          sessionId: 'paging-live-preserve',
+          status: 'attached',
+          statusColor: const Color(0xff7fd1c7),
+          icon: Icons.terminal,
+          rows: const [],
+          isRemote: true,
+          loaded: false,
+        );
+        vm.noteViewFit(80, 24);
+        vm.store.beginHistoryPaging();
+        try {
+          vm.applyLiveBytes(
+            utf8.encode('in-flight-live-line\r\n'),
+            outputSeq: 2,
+          );
+          vm.applyHistory(
+            utf8.encode('history-line\r\n'),
+            throughOutputSeq: 1,
+            rawOutputStart: 0,
+            windowBytes: kHistoryFirstWindowBytes,
+            preservePendingLive: false,
+          );
+        } finally {
+          vm.store.endHistoryPaging();
+        }
+        final bufferText = List.generate(
+          vm.terminal.buffer.lines.length,
+          (i) => vm.terminal.buffer.lines[i].toString(),
+        ).join('\n');
+        expect(bufferText, contains('history-line'));
+        expect(bufferText, contains('in-flight-live-line'));
+        vm.dispose();
+      },
+    );
   });
 }

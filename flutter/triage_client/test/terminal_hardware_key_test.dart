@@ -1479,12 +1479,17 @@ void main() {
           expect(term.viewHeight, fittedRows);
 
           // Shrink again and verify `notifyHistoryReplayed()` also restores the
-          // live RenderTerminal dimensions.
+          // live RenderTerminal dimensions without leaking a 100ms debounce
+          // timer that emits a delayed resizeOut.
+          TerminalPane.invalidateCachedResizeOut('reconcile-stale-grid');
           term.resize(47, 19);
+          resizeOuts.clear();
           ctrl.notifyHistoryReplayed();
           await tester.pump();
           expect(term.viewWidth, fittedCols);
           expect(term.viewHeight, fittedRows);
+          await tester.pump(const Duration(milliseconds: 150));
+          expect(resizeOuts, isEmpty);
 
           // Invalidating cached resizeOut causes the next fit() to re-emit
           // resizeOut even though the local grid dimensions did not change.

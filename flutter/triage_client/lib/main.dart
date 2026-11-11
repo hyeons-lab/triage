@@ -928,7 +928,11 @@ class SessionVm {
     if (preservePendingLive ||
         !store.state.scrollbackReady ||
         store.appliedLogBytes == null) {
-      store.dispatch(Attach(preservePendingLive: preservePendingLive));
+      store.dispatch(
+        Attach(
+          preservePendingLive: preservePendingLive || store.isPagingHistory,
+        ),
+      );
     }
     this.isExited = isExited;
     if (_viewReady) {
@@ -4327,16 +4331,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.hostSizeCols ??= oldSession.hostSizeCols;
           session.hostSizeRows ??= oldSession.hostSizeRows;
           session.noteViewFit(cachedSize.$2, cachedSize.$1);
-        } else if (oldSession.hasFitted) {
-          session.hasFitted = true;
-          session.lastFittedCols = oldSession.lastFittedCols;
-          session.lastFittedRows = oldSession.lastFittedRows;
-          session.ownFittedCols = oldSession.ownFittedCols;
-          session.ownFittedRows = oldSession.ownFittedRows;
-          session.hostSizeCols ??= oldSession.hostSizeCols;
-          session.hostSizeRows ??= oldSession.hostSizeRows;
-        }
-        if (cachedSize == null) {
+        } else {
+          if (oldSession.hasFitted) {
+            session.hasFitted = true;
+            session.lastFittedCols = oldSession.lastFittedCols;
+            session.lastFittedRows = oldSession.lastFittedRows;
+            session.ownFittedCols = oldSession.ownFittedCols;
+            session.ownFittedRows = oldSession.ownFittedRows;
+            session.hostSizeCols ??= oldSession.hostSizeCols;
+            session.hostSizeRows ??= oldSession.hostSizeRows;
+          }
           if (oldSession._viewReady) {
             session.noteViewFit(oldSession._viewCols, oldSession._viewRows);
           } else {
@@ -4427,14 +4431,24 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }) async {
     String? subId;
     try {
+      final existing = _sessions.cast<SessionVm?>().firstWhere(
+        (s) => s?.remoteSessionId == sid,
+        orElse: () => null,
+      );
+      final sessionTitle = existing?.title ?? 'triage / $sid';
       if (!runningUnderFlutterTest() &&
           mounted &&
           TerminalPane.getLastFittedWorkspaceSize() == null &&
-          TerminalPane.getCachedTerminalSize('triage / $sid') == null) {
+          TerminalPane.getCachedTerminalSize(sessionTitle) == null) {
         // Wait for the frame scheduled by `_loadDaemonSessions` / `_loadDaemonSessionInto`
         // to lay out `TerminalPane` so `RenderTerminal` measures the real font and
         // viewport cell grid before we resize the daemon PTY or fetch history.
-        await WidgetsBinding.instance.endOfFrame;
+        // Bound the wait so a minimized or occluded window (where the OS
+        // compositor suspends vsync callbacks) cannot block session attach.
+        await WidgetsBinding.instance.endOfFrame.timeout(
+          const Duration(milliseconds: 500),
+          onTimeout: () {},
+        );
         if (_isStale(owningGeneration)) throw const _StaleLoad();
       }
 
@@ -4445,13 +4459,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             snapshotRes['snapshot'] as Map<String, dynamic>? ?? {};
       } catch (_) {}
 
-      final existing = _sessions.cast<SessionVm?>().firstWhere(
-        (s) => s?.remoteSessionId == sid,
-        orElse: () => null,
-      );
       final cachedSize =
           TerminalPane.getLastFittedWorkspaceSize() ??
-          TerminalPane.getCachedTerminalSize('triage / $sid');
+          TerminalPane.getCachedTerminalSize(sessionTitle);
       final knownFittedRows =
           cachedSize?.$1 ?? existing?.ownFittedRows ?? existing?.lastFittedRows;
       final knownFittedCols =
@@ -5791,12 +5801,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           owningGeneration: _connectGeneration,
         ),
       );
-      // Web only: the native pane re-fits its terminal synchronously inside
-      // performLayout on the selection-driven remount. The xterm.js canvas
-      // also fits on remount, but that fit can land before layout settles
-      // (and skip on the zero-size guard); fit at the current size when the
-      // host already matches this device's fit, or reclaim with the rows-1
-      // jiggle only when the host size has drifted.
+      // Reconcile the terminal grid after the selection-driven remount. On web,
+      // the xterm.js canvas fit on remount can land before layout settles (and
+      // skip on the zero-size guard), so fit at the current size when the host
+      // already matches this device's fit or reclaim with the rows-1 jiggle
+      // when the host size has drifted. On native platforms, call fit() so
+      // RenderTerminal and session.terminal stay synchronized across session
+      // switches even when the viewport pixel dimensions did not change.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!_disposed &&
             _selectedIndex >= 0 &&
@@ -6268,7 +6279,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
                 includeHistory ||
                 (!session.loaded && snapshot['exited'] == true) ||
                 revivedNeedsReplay,
-            forceFullReplay: resizedHost && shouldReplayHistory,
+            forceFullReplay:
+                (resizedHost || revivedNeedsReplay) && shouldReplayHistory,
             // finalSnapshot comes from attach/resume responses, whose agent
             // field is manager-overlaid and authoritative.
             agentAuthoritative: true,

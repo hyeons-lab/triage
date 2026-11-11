@@ -1823,6 +1823,10 @@ class _TerminalPaneState extends State<TerminalPane>
             }
             if (sendResizeOut) {
               _sendResizeOutNow(cols, rows);
+            } else {
+              _resizeOutDebounceTimer?.cancel();
+              _pendingResizeOutCols = null;
+              _pendingResizeOutRows = null;
             }
             render.markNeedsLayout();
             render.markNeedsPaint();

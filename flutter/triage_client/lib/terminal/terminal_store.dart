@@ -1175,7 +1175,7 @@ class TerminalStore extends ChangeNotifier {
   }
 
   TerminalState _reduceLive(TerminalState s, List<int> bytes, int? outputSeq) {
-    if (s.phase == AttachPhase.detached) {
+    if (s.phase == AttachPhase.detached && !_pagingHistory) {
       return s;
     }
     // As in _reduceHistory: a negative is corrupt, so null keeps it off
@@ -1200,7 +1200,7 @@ class TerminalStore extends ChangeNotifier {
     if (_isDuplicate(seq, next.historyHighWaterSeq)) {
       return next;
     }
-    if (!next.sized || next.phase == AttachPhase.awaitingHistory) {
+    if (!next.sized || next.phase != AttachPhase.live) {
       tdbg(
         'store.live',
         'QUEUED seq=$seq ${bytes.length}B '
