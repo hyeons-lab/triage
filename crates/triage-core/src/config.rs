@@ -426,6 +426,18 @@ pub struct JudgeConfig {
     /// Extra always-safe commands, matched as a leading token sequence (e.g.
     /// `"npm test"`). Additive to the built-in allowlist.
     pub allow_commands: Vec<String>,
+    /// Liquid `d1` decision model repository (`"LiquidAI/d1-2B-GGUF"`), direct
+    /// Hugging Face `.gguf` URL, or local `.gguf` file path used by Layer 3.
+    pub model: String,
+    /// Quantization tag when `model` names a Hugging Face repository (e.g.
+    /// `"Q4_K_M"` or `"Q8_0"`).
+    pub quant: String,
+    /// Minimum calibrated `allow` probability percentage (`1..=100`) required for
+    /// Layer 3 to auto-approve a command. Below this threshold (or whenever `ask`
+    /// wins), the judge returns `ask`.
+    pub min_allow_confidence_pct: u8,
+    /// Optional model cache directory override. `None` uses `~/.cache/triage/models`.
+    pub cache_dir: Option<String>,
 }
 
 impl JudgeConfig {
@@ -445,6 +457,15 @@ impl JudgeConfig {
             self.timeout_ms > 0,
             "judge.timeout_ms must be greater than zero"
         );
+        ensure_non_empty("judge.model", &self.model)?;
+        ensure_non_empty("judge.quant", &self.quant)?;
+        ensure!(
+            (1..=100).contains(&self.min_allow_confidence_pct),
+            "judge.min_allow_confidence_pct must be between 1 and 100"
+        );
+        if let Some(ref dir) = self.cache_dir {
+            ensure_non_empty("judge.cache_dir", dir)?;
+        }
         Ok(())
     }
 }
@@ -457,6 +478,10 @@ impl Default for JudgeConfig {
             timeout_ms: 8_000,
             deny_substrings: Vec::new(),
             allow_commands: Vec::new(),
+            model: "LiquidAI/d1-2B-GGUF".to_string(),
+            quant: "Q4_K_M".to_string(),
+            min_allow_confidence_pct: 65,
+            cache_dir: None,
         }
     }
 }
@@ -503,7 +528,7 @@ impl Default for KeybindingsConfig {
 pub struct SummarizerConfig {
     /// Master switch. When false, no model is loaded and no snippets are produced.
     pub enabled: bool,
-    /// LeapBundles bundle id, e.g. `LFM2-2.6B-GGUF`.
+    /// LeapBundles bundle id, e.g. `LFM2.5-1.2B-Instruct-GGUF`.
     pub bundle_id: String,
     /// Quantization tag, e.g. `Q4_0`.
     pub quant: String,
@@ -552,20 +577,11 @@ impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // LFM2-2.6B rather than LFM2.5-1.2B, and specifically at Q4_K_M.
-            // The judge's model layer is only worth its place if the model can
-            // actually read the criteria it is given, and on a 20-command
-            // labeled set this is the smallest local model that does: 19/20 with
-            // no false allows, against 10/20 for the 1.2B, which answered `ask`
-            // to all twenty including `true`. It costs 0.20s per decision
-            // against 0.10s, and 1.46 GB resident against 664 MB.
-            //
-            // The quantization is part of the choice, not an afterthought: the
-            // same model at Q4_0 scores 15/20. Note this is LFM2, not LFM2.5;
-            // the LFM2.5 2.6B is a forced reasoning model whose template opens a
-            // `<think>` block, which a one-token grammar cannot work with.
-            bundle_id: "LFM2-2.6B-GGUF".to_string(),
-            quant: "Q4_K_M".to_string(),
+            // Tool-call judging runs on its own dedicated `d1` decision model
+            // (`JudgeConfig`), so session summarization uses the compact
+            // 1.2B instruct bundle (664 MB at Q4_0).
+            bundle_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+            quant: "Q4_0".to_string(),
             context_size: 1024,
             max_tokens: 24,
             detail_max_tokens: 180,
@@ -650,6 +666,10 @@ default_enabled_per_session = true
 timeout_ms = 5000
 deny_substrings = ["terraform apply"]
 allow_commands = ["npm test"]
+model = "LiquidAI/d1-2B-GGUF"
+quant = "Q8_0"
+min_allow_confidence_pct = 75
+cache_dir = "~/.cache/triage/judge-models"
 
 [keybindings]
 overview = "ctrl+o"
@@ -683,9 +703,14 @@ pause_all = "ctrl+p"
         assert_eq!(config.mcp.tcp_bind, "127.0.0.1:7778");
         assert!(!config.grpc.enabled);
         assert_eq!(config.keybindings.next_attention, "g w");
+        assert!(config.judge.enabled);
+        assert_eq!(config.judge.model, "LiquidAI/d1-2B-GGUF");
+        assert_eq!(config.judge.quant, "Q4_K_M");
+        assert_eq!(config.judge.min_allow_confidence_pct, 65);
+        assert_eq!(config.judge.cache_dir, None);
         assert!(config.summarizer.enabled);
-        assert_eq!(config.summarizer.bundle_id, "LFM2-2.6B-GGUF");
-        assert_eq!(config.summarizer.quant, "Q4_K_M");
+        assert_eq!(config.summarizer.bundle_id, "LFM2.5-1.2B-Instruct-GGUF");
+        assert_eq!(config.summarizer.quant, "Q4_0");
         assert_eq!(config.summarizer.context_size, 1024);
     }
 
@@ -738,6 +763,13 @@ notify_sound = false
         assert_eq!(config.judge.timeout_ms, 5_000);
         assert_eq!(config.judge.deny_substrings, ["terraform apply"]);
         assert_eq!(config.judge.allow_commands, ["npm test"]);
+        assert_eq!(config.judge.model, "LiquidAI/d1-2B-GGUF");
+        assert_eq!(config.judge.quant, "Q8_0");
+        assert_eq!(config.judge.min_allow_confidence_pct, 75);
+        assert_eq!(
+            config.judge.cache_dir.as_deref(),
+            Some("~/.cache/triage/judge-models")
+        );
         assert_eq!(config.keybindings.overview, "ctrl+o");
     }
 
@@ -1002,5 +1034,35 @@ allow_commands = ["git status; rm -rf /"]
                 .contains("cannot contain shell control characters"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn judge_config_validates_model_and_confidence_bounds() {
+        for (toml_body, expected_substr) in [
+            (
+                "[judge]\nmodel = \"   \"\n",
+                "judge.model must not be empty",
+            ),
+            ("[judge]\nquant = \"\"\n", "judge.quant must not be empty"),
+            (
+                "[judge]\nmin_allow_confidence_pct = 0\n",
+                "judge.min_allow_confidence_pct must be between 1 and 100",
+            ),
+            (
+                "[judge]\nmin_allow_confidence_pct = 101\n",
+                "judge.min_allow_confidence_pct must be between 1 and 100",
+            ),
+            (
+                "[judge]\ncache_dir = \"  \"\n",
+                "judge.cache_dir must not be empty",
+            ),
+        ] {
+            let error = Config::from_toml_str(toml_body)
+                .expect_err("invalid judge model config should fail");
+            assert!(
+                error.to_string().contains(expected_substr),
+                "expected {expected_substr:?} in {error}"
+            );
+        }
     }
 }

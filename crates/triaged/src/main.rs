@@ -460,12 +460,12 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
         triage_core::config::Config::default()
     };
 
-    // Start the local-LLM session summarizer (on by default; model loads lazily
-    // on first activity, so this never blocks startup). No-op when disabled.
-    manager.start_summarizer(config.summarizer.clone());
+    // Start the shared local inference worker for session summarization and
+    // Layer 3 `d1` approval judging (both models load lazily on first use, so
+    // this never blocks startup).
+    manager.start_inference(config.summarizer.clone(), config.judge.clone());
 
-    // Install the tool-call approval judge. It shares the summarizer's resident
-    // model, so this only builds the rule tables and never loads anything.
+    // Install the tool-call approval judge rule tables and policy state.
     manager.start_judge(config.judge.clone());
     triaged::service::install_global_agent_hooks();
 

@@ -52,6 +52,9 @@ enabled = false
 enabled = true
 default_enabled_per_session = true
 timeout_ms = 8000
+model = "LiquidAI/d1-2B-GGUF"
+quant = "Q4_K_M"
+min_allow_confidence_pct = 65
 deny_substrings = ["terraform apply", "drop table"]
 allow_commands = ["npm test", "pnpm lint", "cargo check"]
 
@@ -65,8 +68,8 @@ pause_all = "ctrl+shift+p"
 
 [summarizer]
 enabled = true
-bundle_id = "LFM2-2.6B-GGUF"
-quant = "Q4_K_M"
+bundle_id = "LFM2.5-1.2B-Instruct-GGUF"
+quant = "Q4_0"
 context_size = 1024
 max_tokens = 24
 detail_max_tokens = 180
@@ -114,6 +117,10 @@ Settings for the resident tool-call approval judge. See [Approval Judge Document
 | `enabled` | boolean | `true` | Master switch for tool-call judging across the daemon. When `false`, all queries fall back to `ask`. |
 | `default_enabled_per_session` | boolean | `true` | Default auto-approval policy for newly spawned sessions. Per-session overrides can be toggled interactively with **`F5`** in the TUI (then `y`/`n`/`r`) or the Auto-Approve switch in Flutter. |
 | `timeout_ms` | integer | `8000` | Maximum time (in milliseconds) the daemon may spend evaluating a single decision before safely falling back to `ask`. |
+| `model` | string | `"LiquidAI/d1-2B-GGUF"` | Liquid `d1` decision model (Hugging Face repo, direct `.gguf` URL, or local `.gguf` path) used by Layer 3. |
+| `quant` | string | `"Q4_K_M"` | Quantization level when `model` names a Hugging Face repository (e.g., `Q4_K_M`, `Q8_0`). |
+| `min_allow_confidence_pct` | integer | `65` | Minimum calibrated `allow` probability percentage (`1` to `100`) required for Layer 3 auto-approval. |
+| `cache_dir` | string (optional) | `None` | Custom directory for caching `d1` model weights. Defaults to `~/.cache/triage/models`. |
 | `deny_substrings` | array of strings | `[]` | Extra substrings that trigger an instant deterministic denial. Additive to built-in security deny rules. |
 | `allow_commands` | array of strings | `[]` | Extra command prefixes that are auto-approved without invoking the model (e.g. `"npm test"`). Must not contain shell metacharacters (`;&|$\`><()`). |
 
@@ -125,9 +132,9 @@ Local LLM inference settings for automated session activity summaries and status
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | Master switch for local LLM inference. When `false`, background summaries and Layer 3 model judging are disabled. |
-| `bundle_id` | string | `"LFM2-2.6B-GGUF"` | HuggingFace / LeapBundles GGUF model repository. |
-| `quant` | string | `"Q4_K_M"` | Quantization level (e.g., `Q4_K_M`, `Q4_0`). |
+| `enabled` | boolean | `true` | Master switch for background session summaries. Layer 3 `d1` judging is controlled independently by `[judge].enabled`. |
+| `bundle_id` | string | `"LFM2.5-1.2B-Instruct-GGUF"` | HuggingFace / LeapBundles GGUF model repository. |
+| `quant` | string | `"Q4_0"` | Quantization level (e.g., `Q4_0`, `Q4_K_M`). |
 | `context_size` | integer | `1024` | Maximum context tokens for inference window. |
 | `max_tokens` | integer | `24` | Maximum tokens to generate for one-line rail summaries. |
 | `detail_max_tokens` | integer | `180` | Maximum tokens for detailed multi-sentence popover summaries. |

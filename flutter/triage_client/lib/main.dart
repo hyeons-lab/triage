@@ -8792,7 +8792,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                         ),
                       ),
                       child: const Text(
-                        'Local AI · LFM2-2.6B',
+                        'Local AI · Liquid d1-2B',
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,

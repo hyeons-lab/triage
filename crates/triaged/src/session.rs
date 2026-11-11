@@ -1482,9 +1482,9 @@ impl SessionManager {
             .remove(session_id.as_str());
     }
 
-    /// Installs the tool-call approval judge. Cheap: the rule tables are pure
-    /// data and the model is the summarizer's, already resident. No-op when
-    /// `judge.enabled` is false, which leaves every query answering `ask`.
+    /// Installs the tool-call approval judge rule tables and policy state.
+    /// Model loading for Layer 3 happens lazily on the shared inference worker
+    /// started by [`Self::start_inference`].
     pub fn start_judge(&self, config: triage_core::config::JudgeConfig) {
         let is_enabled = config.enabled;
         let state = JudgeState {
@@ -1901,33 +1901,67 @@ impl SessionManager {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        summarizer.judge(
+        summarizer.judge_with_confidence(
             request.clone(),
+            Some(state.config.min_allow_confidence_pct),
             Duration::from_millis(state.config.timeout_ms),
         )
     }
 
-    /// Starts the local-LLM summarizer: loads the model lazily on a worker
-    /// thread, wires session activity into a debounce loop, and pushes generated
-    /// snippets to clients. No-op when disabled. Safe to call once at startup.
+    /// Starts the local-LLM session summarizer only (without Layer 3 judging).
+    /// Kept for callers that configure summarization standalone; daemon startup
+    /// calls [`Self::start_inference`] so both subsystems share one worker.
     pub fn start_summarizer(self: &Arc<Self>, config: triage_core::config::SummarizerConfig) {
-        if !config.enabled {
+        self.start_inference(
+            config,
+            triage_core::config::JudgeConfig {
+                enabled: false,
+                ..triage_core::config::JudgeConfig::default()
+            },
+        );
+    }
+
+    /// Starts the shared local inference worker for session summarization and/or
+    /// Layer 3 `d1` approval judging. Each model slot loads lazily on its first
+    /// job, so enabling either feature never blocks startup and disabling
+    /// `[summarizer]` leaves Layer 3 judging active.
+    pub fn start_inference(
+        self: &Arc<Self>,
+        summarizer_cfg: triage_core::config::SummarizerConfig,
+        judge_cfg: triage_core::config::JudgeConfig,
+    ) {
+        if !summarizer_cfg.enabled && !judge_cfg.enabled {
             return;
         }
-        let cache_dir = config
-            .cache_dir
-            .clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(default_model_cache_dir);
-        let worker_config = crate::summarizer::SummarizerConfig {
-            bundle_id: config.bundle_id.clone(),
-            quant: config.quant.clone(),
-            context_size: config.context_size,
-            max_tokens: config.max_tokens,
-            detail_max_tokens: config.detail_max_tokens,
-            cache_dir,
-            judge_queue_depth: 8,
-        };
+        let summarizer_slot = summarizer_cfg.enabled.then(|| {
+            let cache_dir = summarizer_cfg
+                .cache_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(default_model_cache_dir);
+            crate::summarizer::SummarizerConfig {
+                bundle_id: summarizer_cfg.bundle_id.clone(),
+                quant: summarizer_cfg.quant.clone(),
+                context_size: summarizer_cfg.context_size,
+                max_tokens: summarizer_cfg.max_tokens,
+                detail_max_tokens: summarizer_cfg.detail_max_tokens,
+                cache_dir,
+                judge_queue_depth: 8,
+            }
+        });
+        let judge_slot = judge_cfg.enabled.then(|| {
+            let cache_dir = judge_cfg
+                .cache_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(default_model_cache_dir);
+            crate::summarizer::JudgeModelConfig {
+                model: judge_cfg.model.clone(),
+                quant: judge_cfg.quant.clone(),
+                min_allow_confidence_pct: judge_cfg.min_allow_confidence_pct,
+                cache_dir,
+            }
+        });
 
         let on_result = {
             let weak = Arc::downgrade(self);
@@ -1937,8 +1971,21 @@ impl SessionManager {
                 }
             }
         };
-        let summarizer = Summarizer::spawn(worker_config, on_result);
+        let summarizer = Summarizer::spawn_worker(
+            crate::summarizer::InferenceWorkerConfig {
+                summarizer: summarizer_slot,
+                judge: judge_slot,
+                judge_queue_depth: 8,
+            },
+            on_result,
+        );
         if !summarizer.is_enabled() {
+            return;
+        }
+        if let Ok(mut guard) = self.summarizer.lock() {
+            *guard = summarizer.clone();
+        }
+        if !summarizer_cfg.enabled {
             return;
         }
 
@@ -1946,13 +1993,10 @@ impl SessionManager {
         if let Ok(mut guard) = self.dirty_tx.lock() {
             *guard = Some(dirty_tx);
         }
-        if let Ok(mut guard) = self.summarizer.lock() {
-            *guard = summarizer.clone();
-        }
 
         let weak = Arc::downgrade(self);
-        let settle = Duration::from_millis(config.settle_ms);
-        let min_regen = Duration::from_millis(config.min_regen_ms);
+        let settle = Duration::from_millis(summarizer_cfg.settle_ms);
+        let min_regen = Duration::from_millis(summarizer_cfg.min_regen_ms);
         let loop_summarizer = summarizer.clone();
         if let Err(error) = thread::Builder::new()
             .name("triage-summarizer-debounce".into())
@@ -1978,7 +2022,7 @@ impl SessionManager {
             Ok(guard) => guard.clone(),
             Err(_) => return,
         };
-        if summarizer.is_enabled() {
+        if summarizer.is_summarizer_enabled() {
             self.seed_initial_summaries(&summarizer);
         }
     }
