@@ -20,19 +20,21 @@
 //!
 //! # Why the model cannot deny
 //!
-//! The model is never offered [`JudgeDecision::Deny`], and the decode grammar
-//! makes emitting it impossible rather than merely discouraged. A denial the
-//! model invented would be indistinguishable, to the user staring at the agent's
-//! output, from one a deny rule meant. Denials therefore stay a property of code
-//! that can be read and tested.
+//! Layer 3 runs a Liquid `d1` decision model (`LiquidAI/d1-2B-GGUF` by default)
+//! via [`cera::d1::D1Engine`], scoring a two-option `choice` question (`allow` vs
+//! `ask`) in a single forward pass with zero generated tokens. [`JudgeDecision::Deny`]
+//! is not one of the options and [`interpret_d1_response`] never maps any answer
+//! to `Deny`. A denial the model invented would be indistinguishable, to the user
+//! staring at the agent's output, from one a deny rule meant. Denials therefore
+//! stay a property of code that can be read and tested.
 //!
 //! # Why `ask` is the fail-safe
 //!
 //! [`JudgeDecision::Ask`] is not an error path. It is precisely what the agent
 //! does with no judge installed: prompt the user. So every way this can fail (a
-//! disabled judge, an unloaded model, a decode error, a timeout, an unparseable
-//! command) resolves to `ask`, and the worst outcome of a broken judge is the
-//! status quo.
+//! disabled judge, an unloaded model, an inference error, a timeout, an
+//! unparseable command) resolves to `ask`, and the worst outcome of a broken
+//! judge is the status quo.
 //!
 //! # What the allowlist guarantees
 //!
@@ -42,56 +44,47 @@
 //! condition is what makes prefix matching safe, so it is checked before any
 //! allow rule is consulted, and deny rules deliberately run first regardless.
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 
-use cera::tokenizer::ChatMessage;
+use anyhow::{Context, bail, ensure};
+use cera::bundle::BundleRepo;
+use cera::d1::{D1Engine, D1Request, D1Response, Json, Question, QuestionType};
 pub use triage_core::config::JudgeConfig;
 pub use triage_core::judge::*;
 
-/// Instruction given to the model. It is told the sensitive question is already
-/// settled, because it is: sensitive rules ran before this point and the grammar
-/// cannot emit `deny` anyway.
-const SYSTEM_PROMPT: &str = "You are a cautious approval gate for shell commands run by a coding \
-agent inside a developer's working repository. Obviously destructive commands have already been \
-blocked before reaching you, so your only question is whether this command is routine enough to \
-run without asking the developer first. Answer \"allow\" for commands that only read state, build, \
-test, format, lint, or make ordinary edits inside the working directory. Answer \"ask\" for \
-anything that deletes data, touches files outside the working directory, changes system or global \
-configuration, installs software, sends data over the network, or that you are unsure about. When \
-in doubt, answer \"ask\". Reply with exactly one word: allow or ask.";
+const JUDGE_QUESTION_NAME: &str = "decision";
 
-/// Constrains decode to a single decision word. This is what makes "the model
-/// cannot deny" a structural property rather than a prompt-level request.
-const DECISION_GRAMMAR: &str = r#"root ::= "allow" | "ask""#;
+/// Question posed to the `d1` decision model. Sensitive/destructive rules have
+/// already run before Layer 3, so the question only decides whether a grey-zone
+/// shell command is routine enough to run without prompting the user.
+const JUDGE_INSTRUCTIONS: &str = "A coding agent wants to run this shell command inside the \
+developer's repository. Should it run automatically (`allow`) or prompt the developer for \
+confirmation first (`ask`)?";
 
-/// The compiled decision grammar, parsed once. `None` if the grammar failed to
-/// compile, which disables the model layer rather than letting it decode
-/// unconstrained: an unconstrained model could emit `deny`, and that is exactly
-/// the guarantee this module exists to keep.
-fn decision_grammar() -> Option<&'static Arc<cera::grammar::Grammar>> {
-    static GRAMMAR: OnceLock<Option<Arc<cera::grammar::Grammar>>> = OnceLock::new();
-    GRAMMAR
-        .get_or_init(|| match cera::grammar::Grammar::parse(DECISION_GRAMMAR) {
-            Ok(grammar) => Some(Arc::new(grammar)),
-            Err(error) => {
-                tracing::error!(%error, "judge decision grammar failed to compile; model layer disabled");
-                None
-            }
-        })
-        .as_ref()
-}
+const ALLOW_CRITERIA: &str = "Routine local development command that only inspects files or git \
+history, searches text, formats, lints, type-checks, builds, or runs local unit tests inside the \
+working directory without network uploads, package installations, file deletions, destructive git \
+resets/cleans, process kills, or global/system changes.";
 
-/// Asks the model to decide an ambiguous command. Returns `Allow` or `Ask` only;
-/// anything unexpected in the decode is reported as an error so the caller can
-/// fall back to `ask`.
-pub fn judge_with_model(
-    engine: &cera::CeraEngine,
+const ASK_CRITERIA: &str = "Command that installs or publishes packages/software, pushes or sends \
+data over the network, opens network listeners, deletes files, runs destructive git resets or \
+cleans, kills processes, modifies files or databases outside the working directory, changes \
+system services or containers, deploys or merges remotely, or carries any side-effect ambiguity.";
+
+/// Asks the Liquid `d1` decision model to classify an ambiguous command.
+///
+/// Runs one forward pass with zero output tokens (`D1Engine::decide`) and
+/// requires both `choice == "allow"` and calibrated `P(allow)` at or above
+/// `min_allow_confidence_pct` (`1..=100`). Returns `Allow` or `Ask` only; any
+/// malformed model answer is returned as `Err` so the caller falls back to `ask`.
+pub fn judge_with_d1(
+    engine: &D1Engine,
     request: &JudgeRequest,
+    min_allow_confidence_pct: u8,
 ) -> anyhow::Result<JudgeVerdict> {
     // Second line of defence on the length cap. `evaluate` rejects an over-long
-    // command before this is reached, but this function is `pub` and the prompt
-    // must never be crowded out by its own input. See [`MAX_COMMAND_CHARS`].
+    // command before this is reached, but this function is `pub` and the state
+    // must never be unbounded. See [`MAX_COMMAND_CHARS`].
     let command_len = request
         .command_line
         .as_deref()
@@ -101,73 +94,227 @@ pub fn judge_with_model(
         return Ok(JudgeVerdict::fallback("command is too long to judge"));
     }
 
-    let grammar = decision_grammar()
-        .ok_or_else(|| anyhow::anyhow!("decision grammar unavailable"))?
-        .clone();
+    let d1_request = build_d1_request(request);
+    let response = engine.decide(&d1_request)?;
+    interpret_d1_response(&response, min_allow_confidence_pct)
+}
 
-    let mut session = engine.new_session(cera::SessionConfig::default())?;
-    let messages = [
-        ChatMessage {
-            role: "system".to_string(),
-            content: SYSTEM_PROMPT.to_string(),
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: build_user_prompt(request),
-        },
-    ];
-    let rendered = cera::tokenizer::apply_chat_template(engine.tokenizer(), &messages, true)?;
-    session.append_text(&rendered)?;
+/// Builds the structured `d1` request for one tool-call judge query.
+///
+/// `cera::d1` escapes `<|name|>` tokens inside `state` to `<¦name¦>` before
+/// tokenizing, so shell arguments containing delimiter-like text cannot forge
+/// prompt boundaries.
+pub fn build_d1_request(request: &JudgeRequest) -> D1Request {
+    let command = request.command_line.as_deref().unwrap_or("");
+    let mut state_fields = Vec::with_capacity(2);
+    if let Some(cwd) = request.cwd.as_deref().filter(|s| !s.is_empty()) {
+        state_fields.push(("working_directory".to_string(), Json::Str(cwd.to_string())));
+    }
+    state_fields.push(("command".to_string(), Json::Str(command.to_string())));
 
-    let mut sink = crate::summarizer::TextSink::new(engine.tokenizer());
-    let opts = cera::GenerateOpts {
-        // "allow" and "ask" are each a token or two; the grammar stops decode as
-        // soon as one completes, so this is only a backstop.
-        max_tokens: 4,
-        // Greedy, and deliberately *not* the bundle manifest's sampling params,
-        // which every other decode in this daemon honors. Sampling exists to help
-        // a model choose better prose; this decode is a security verdict, the
-        // grammar above already fixes the output shape, and the property that
-        // matters is that an identical command gets an identical answer. Sampling
-        // therefore has no upside here and one downside: measured against a
-        // bundle manifest it flipped an install command to `allow` on one run in
-        // six. The run-by-run numbers are in
-        // `devlog/000126-feat-approval-judge.md`.
-        temperature: 0.0,
-        grammar: Some(grammar),
-        ..Default::default()
+    D1Request {
+        state: Json::Object(state_fields),
+        questions: vec![(
+            JUDGE_QUESTION_NAME.to_string(),
+            Question {
+                kind: QuestionType::Choice,
+                instructions: JUDGE_INSTRUCTIONS.to_string(),
+                criteria: vec![
+                    ("allow".to_string(), Json::Str(ALLOW_CRITERIA.to_string())),
+                    ("ask".to_string(), Json::Str(ASK_CRITERIA.to_string())),
+                ],
+            },
+        )],
+        images: Vec::new(),
+        audio: None,
+    }
+}
+
+/// Maps a [`D1Response`] and confidence floor (`1..=100`) to a [`JudgeVerdict`].
+///
+/// Structural invariants:
+/// - Only `"allow"` and `"ask"` are accepted as valid choices; `"deny"` or any
+///   other token returns `Err` so the caller degrades to fallback `ask`.
+/// - `Allow` requires both `choice == "allow"` and finite `P(allow)` in `[0, 1]`
+///   meeting `min_allow_confidence_pct`.
+pub fn interpret_d1_response(
+    response: &D1Response,
+    min_allow_confidence_pct: u8,
+) -> anyhow::Result<JudgeVerdict> {
+    let (_, answer) = response
+        .answers
+        .iter()
+        .find(|(name, _)| name == JUDGE_QUESTION_NAME)
+        .ok_or_else(|| anyhow::anyhow!("d1 response missing `{JUDGE_QUESTION_NAME}` answer"))?;
+
+    let choice = answer
+        .get("choice")
+        .and_then(Json::as_str)
+        .ok_or_else(|| anyhow::anyhow!("d1 answer missing string `choice` field"))?;
+    if choice != "allow" && choice != "ask" {
+        bail!("d1 answer produced unexpected choice {choice:?}");
+    }
+
+    let p_allow = match answer
+        .get("probabilities")
+        .and_then(|probs| probs.get("allow"))
+    {
+        Some(Json::Float(p)) if p.is_finite() && (0.0..=1.0).contains(p) => *p,
+        other => bail!("d1 answer missing valid `allow` probability: {other:?}"),
     };
-    session.generate(&opts, &mut sink)?;
 
-    let decision = parse_decision(&sink.text)
-        .ok_or_else(|| anyhow::anyhow!("model produced no usable decision: {:?}", sink.text))?;
+    let threshold = f64::from(min_allow_confidence_pct.clamp(1, 100)) / 100.0;
+    let decision = if choice == "allow" && p_allow >= threshold {
+        JudgeDecision::Allow
+    } else {
+        JudgeDecision::Ask
+    };
+
     Ok(JudgeVerdict {
         decision,
         source: JudgeSource::Model,
-        reason: "decided by the local model".to_string(),
+        reason: format!("decided by d1 model (p_allow={p_allow:.2})"),
     })
 }
 
-/// Renders the request for the model. Callers reject an over-long command
-/// before reaching here, so this never truncates; see [`MAX_COMMAND_CHARS`].
-fn build_user_prompt(request: &JudgeRequest) -> String {
-    let command = request.command_line.as_deref().unwrap_or("");
-    match request.cwd.as_deref() {
-        Some(cwd) => format!("Working directory: {cwd}\nCommand: {command}"),
-        None => format!("Command: {command}"),
+/// Expands a leading `~/` or `~\` against `$HOME` / `$USERPROFILE`.
+fn expand_home_prefix(raw: &str) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"))
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(raw)
+}
+
+/// Whether `spec` looks like an explicit filesystem path rather than a remote
+/// URL or Hugging Face repository identifier (`owner/repo`).
+fn looks_like_local_path(spec: &str, expanded: &Path) -> bool {
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        return false;
+    }
+    if expanded.is_file() {
+        return true;
+    }
+    if spec.starts_with('/')
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.starts_with("~/")
+        || spec.starts_with("~\\")
+        || spec.contains('\\')
+    {
+        return true;
+    }
+    // Windows drive prefix (`C:/...`)
+    if spec.len() >= 3
+        && spec.as_bytes()[0].is_ascii_alphabetic()
+        && spec.as_bytes()[1] == b':'
+        && (spec.as_bytes()[2] == b'/' || spec.as_bytes()[2] == b'\\')
+    {
+        return true;
+    }
+    // Bare `foo.gguf` with no repo slash.
+    spec.ends_with(".gguf") && !spec.contains('/')
+}
+
+/// Derives the canonical Hugging Face `.gguf` resolve URL for a `d1` model
+/// specification when `model` is an HTTP(S) URL, `owner/repo`, `owner/repo/file.gguf`,
+/// or bare LiquidAI repo name (e.g. `"d1-2B-GGUF"`). Returns `None` for local paths.
+pub fn d1_model_download_url(model: &str, quant: &str) -> Option<String> {
+    let trimmed = model.trim();
+    let quant = quant.trim();
+    if trimmed.is_empty() || quant.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Some(trimmed.to_string());
+    }
+    let expanded = expand_home_prefix(trimmed);
+    if looks_like_local_path(trimmed, &expanded) {
+        return None;
+    }
+
+    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        [repo] => {
+            let stem = repo
+                .strip_suffix("-GGUF")
+                .or_else(|| repo.strip_suffix("-gguf"))
+                .unwrap_or(repo);
+            Some(format!(
+                "https://huggingface.co/LiquidAI/{repo}/resolve/main/{stem}-{quant}.gguf"
+            ))
+        }
+        [owner, repo] => {
+            let stem = repo
+                .strip_suffix("-GGUF")
+                .or_else(|| repo.strip_suffix("-gguf"))
+                .unwrap_or(repo);
+            Some(format!(
+                "https://huggingface.co/{owner}/{repo}/resolve/main/{stem}-{quant}.gguf"
+            ))
+        }
+        [owner, repo, filename] if filename.ends_with(".gguf") => Some(format!(
+            "https://huggingface.co/{owner}/{repo}/resolve/main/{filename}"
+        )),
+        _ => None,
     }
 }
 
-/// Maps decoded text back to a decision. The grammar means only `allow` or `ask`
-/// can be produced, but this stays defensive: an unrecognized decode returns
-/// `None` and the caller falls back to `ask`. `deny` is not accepted here even
-/// if it somehow appeared.
-fn parse_decision(raw: &str) -> Option<JudgeDecision> {
-    match raw.trim().to_lowercase().as_str() {
-        "allow" => Some(JudgeDecision::Allow),
-        "ask" => Some(JudgeDecision::Ask),
-        _ => None,
+/// Resolves `JudgeConfig.model` + `quant` to an on-disk `.gguf` file path,
+/// downloading into `cache_dir` on a cache miss when `model` names a remote URL
+/// or Hugging Face repository.
+pub fn resolve_d1_model_path(
+    model: &str,
+    quant: &str,
+    cache_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let trimmed = model.trim();
+    ensure!(!trimmed.is_empty(), "judge.model must not be empty");
+    let expanded = expand_home_prefix(trimmed);
+    if looks_like_local_path(trimmed, &expanded) {
+        ensure!(
+            expanded.is_file(),
+            "judge model file does not exist: {}",
+            expanded.display()
+        );
+        return Ok(expanded);
     }
+
+    let store = BundleRepo::new(cache_dir);
+    if let Some(url) = d1_model_download_url(trimmed, quant) {
+        match store.resolve_url(&url, None) {
+            Ok(path) => return Ok(path),
+            Err(primary_err) => {
+                // If `trimmed` is already a direct URL, do not try HF repo discovery.
+                if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+                    return Err(primary_err).with_context(|| format!("resolving {url}"));
+                }
+                tracing::debug!(
+                    %url,
+                    error = %primary_err,
+                    "canonical d1 GGUF URL failed; falling back to Hugging Face repo inspection"
+                );
+            }
+        }
+    }
+
+    let hf_repo = if trimmed.contains('/') {
+        trimmed.to_string()
+    } else {
+        format!("LiquidAI/{trimmed}")
+    };
+    let manifest = cera::bundle::inspect_and_resolve_manifest(
+        &hf_repo,
+        Some(quant.trim()),
+        None,
+        Some(cache_dir),
+        None,
+    )
+    .with_context(|| format!("inspecting Hugging Face repo `{hf_repo}` for quant `{quant}`"))?;
+    store
+        .resolve_url(&manifest.files.model, None)
+        .with_context(|| format!("downloading `{}`", manifest.files.model))
 }
 
 /// Inspects the status of the `.agents/hooks.json`, `.claude/settings.json`, or Muse `settings.json` file in the workspace or home directory.
@@ -1334,31 +1481,134 @@ mod tests {
     }
 
     #[test]
-    fn model_decisions_never_parse_as_deny() {
-        assert_eq!(parse_decision("allow"), Some(JudgeDecision::Allow));
-        assert_eq!(parse_decision(" ASK\n"), Some(JudgeDecision::Ask));
-        assert_eq!(parse_decision("deny"), None);
-        assert_eq!(parse_decision(""), None);
-        assert_eq!(parse_decision("I think you should allow this"), None);
+    fn d1_response_interpretation_enforces_threshold_and_never_denies() {
+        let make_resp = |choice: &str, p_allow: f64| D1Response {
+            answers: vec![(
+                "decision".to_string(),
+                Json::Object(vec![
+                    ("type".to_string(), Json::Str("choice".to_string())),
+                    ("choice".to_string(), Json::Str(choice.to_string())),
+                    (
+                        "confidence".to_string(),
+                        Json::Float(if choice == "allow" {
+                            p_allow
+                        } else {
+                            1.0 - p_allow
+                        }),
+                    ),
+                    (
+                        "probabilities".to_string(),
+                        Json::Object(vec![
+                            ("allow".to_string(), Json::Float(p_allow)),
+                            ("ask".to_string(), Json::Float(1.0 - p_allow)),
+                        ]),
+                    ),
+                ]),
+            )],
+            input_tokens: 42,
+        };
+
+        // High-confidence allow passes threshold.
+        let allowed = interpret_d1_response(&make_resp("allow", 0.91), 65).expect("valid allow");
+        assert_eq!(allowed.decision, JudgeDecision::Allow);
+        assert_eq!(allowed.source, JudgeSource::Model);
+        assert_eq!(allowed.reason, "decided by d1 model (p_allow=0.91)");
+
+        // Marginal allow below `min_allow_confidence_pct` conservatively becomes Ask.
+        let marginal =
+            interpret_d1_response(&make_resp("allow", 0.58), 65).expect("marginal allow -> ask");
+        assert_eq!(marginal.decision, JudgeDecision::Ask);
+        assert_eq!(marginal.source, JudgeSource::Model);
+        assert_eq!(marginal.reason, "decided by d1 model (p_allow=0.58)");
+
+        // Model choosing `ask` stays Ask even if threshold is set below 50%.
+        let explicit_ask =
+            interpret_d1_response(&make_resp("ask", 0.40), 30).expect("ask stays ask");
+        assert_eq!(explicit_ask.decision, JudgeDecision::Ask);
+
+        // `deny` or unknown choices are rejected as errors so caller falls back to Ask.
+        assert!(interpret_d1_response(&make_resp("deny", 0.0), 65).is_err());
+        assert!(interpret_d1_response(&make_resp("other", 0.9), 65).is_err());
+
+        // Non-finite or out-of-range probabilities are rejected.
+        assert!(interpret_d1_response(&make_resp("allow", f64::NAN), 65).is_err());
+        assert!(interpret_d1_response(&make_resp("allow", 1.5), 65).is_err());
+        assert!(interpret_d1_response(&make_resp("allow", -0.1), 65).is_err());
     }
 
     #[test]
-    fn decision_grammar_compiles() {
-        assert!(decision_grammar().is_some());
+    fn d1_request_carries_structured_command_and_optional_cwd() {
+        let mut with_cwd = request("cargo clippy --all-targets 2>&1 | tail -n 20");
+        with_cwd.cwd = Some("/work/repo".to_string());
+        let d1_with_cwd = build_d1_request(&with_cwd);
+        assert_eq!(
+            d1_with_cwd.state.get("working_directory"),
+            Some(&Json::Str("/work/repo".to_string()))
+        );
+        assert_eq!(
+            d1_with_cwd.state.get("command"),
+            Some(&Json::Str(
+                "cargo clippy --all-targets 2>&1 | tail -n 20".to_string()
+            ))
+        );
+        assert_eq!(d1_with_cwd.questions.len(), 1);
+        assert_eq!(d1_with_cwd.questions[0].0, "decision");
+        assert_eq!(d1_with_cwd.questions[0].1.kind, QuestionType::Choice);
+        let option_keys: Vec<&str> = d1_with_cwd.questions[0]
+            .1
+            .criteria
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(option_keys, vec!["allow", "ask"]);
+
+        let d1_no_cwd = build_d1_request(&request("cargo build"));
+        assert_eq!(d1_no_cwd.state.get("working_directory"), None);
+        assert_eq!(
+            d1_no_cwd.state.get("command"),
+            Some(&Json::Str("cargo build".to_string()))
+        );
     }
 
     #[test]
-    fn user_prompt_carries_the_command_and_cwd() {
-        let mut with_cwd = request("cargo build");
-        with_cwd.cwd = Some("/work".to_string());
+    fn d1_model_url_and_local_path_resolution() {
         assert_eq!(
-            build_user_prompt(&with_cwd),
-            "Working directory: /work\nCommand: cargo build"
+            d1_model_download_url("LiquidAI/d1-2B-GGUF", "Q4_K_M").as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf")
         );
         assert_eq!(
-            build_user_prompt(&request("cargo build")),
-            "Command: cargo build"
+            d1_model_download_url("LiquidAI/d1-omni-600M-GGUF", "Q8_0").as_deref(),
+            Some(
+                "https://huggingface.co/LiquidAI/d1-omni-600M-GGUF/resolve/main/d1-omni-600M-Q8_0.gguf"
+            )
         );
+        assert_eq!(
+            d1_model_download_url("d1-3B-GGUF", "Q4_K_M").as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-3B-GGUF/resolve/main/d1-3B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            d1_model_download_url("https://example.com/models/custom-d1.gguf", "Q4_K_M").as_deref(),
+            Some("https://example.com/models/custom-d1.gguf")
+        );
+        assert_eq!(
+            d1_model_download_url("/tmp/nonexistent-local-d1.gguf", "Q4_K_M"),
+            None
+        );
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("triage-d1-path-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let existing_gguf = temp_dir.join("local.gguf");
+        std::fs::write(&existing_gguf, b"GGUF").expect("write dummy gguf");
+        let resolved = resolve_d1_model_path(existing_gguf.to_str().unwrap(), "Q4_K_M", &temp_dir)
+            .expect("existing local gguf resolves without network");
+        assert_eq!(resolved, existing_gguf);
+
+        let missing = temp_dir.join("missing.gguf");
+        let err = resolve_d1_model_path(missing.to_str().unwrap(), "Q4_K_M", &temp_dir)
+            .expect_err("missing local gguf must fail closed without hitting network");
+        assert!(err.to_string().contains("judge model file does not exist"));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -1550,6 +1800,7 @@ mod tests {
             timeout_ms: 8_000,
             deny_substrings: vec!["  deploy --prod  ".to_string()],
             allow_commands: vec!["git lfs pull".to_string(), "custom-tool verify".to_string()],
+            ..JudgeConfig::default()
         };
         let rules = JudgeRules::new(&config);
         let req = |cmd: &str| JudgeRequest {
