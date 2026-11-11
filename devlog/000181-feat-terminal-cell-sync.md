@@ -2,6 +2,7 @@
 
 - **Agent:** Antigravity @ triage branch feat/terminal-cell-sync
 - **Agent:** Antigravity (model switch at 2026-11-11T01:19-0800) @ triage branch feat/terminal-cell-sync
+- **Agent:** Antigravity (Gemini 4 Carbon High, model switch at 2026-11-11T08:01-0800) @ triage branch feat/terminal-cell-sync
 - **Intent:** Replace client-side terminal emulation (`xterm2`, `xterm.js`, and client `triage-term` FFI) and top-to-bottom raw history byte replay with Mosh-style server-side terminal cell-grid state synchronization, random-access virtualized scrollback pages, client-acked slow-link frame coalescing, and a single unified Flutter GPU cell-grid renderer across Web, iOS, Android, macOS, Linux, and Windows.
 
 ## What Changed
@@ -28,6 +29,7 @@
 - 2026-11-11T02:20-0800 `TerminalPane._snapToBottom` captured a pre-layout scroll anchor before `RenderTerminalGrid.performLayout` updated `maxScrollExtent`, leaving `TerminalGridView` unpinned after output bursts: cleared `_scrollAnchor` on snap-to-bottom so `stickToBottom` pins synchronously during layout.
 - 2026-11-11T02:48-0800 `SessionVm(isExited: true)` called `markExited()` before lazy `_terminal` creation, leaving `terminal.cursorVisible` true on cold exited-session view models: propagated `!isExited` cursor visibility inside `_createTerminal()`.
 - 2026-11-11T03:05-0800 `_selectSession` scheduled a redundant post-frame delta `_refreshSessionSnapshot` even when `!subscribed` had already launched `_resubscribeAndRefreshHistory`: gated the post-frame fallback refresh on `sid == null || subscribed`.
+- 2026-11-11T08:01-0800 `libc::openpty` in `handover_terminal_modes_round_trip` passed `&mut ws`, triggering `clippy::unnecessary_mut_passed` on Linux (`*const winsize` on glibc vs `*mut winsize` on Darwin): cast `&ws as *const libc::winsize as *mut libc::winsize` matching the adjacent handover test.
 
 ## Progress
 
@@ -42,4 +44,5 @@
 
 ## Commits
 
-- `HEAD`: feat: replace client terminal emulation with server cell sync and GPU grid renderer
+- `373d917`: feat: replace client terminal emulation with server cell sync and GPU grid renderer
+- `HEAD`: fix(triaged): avoid clippy unnecessary_mut_passed on Linux openpty test
