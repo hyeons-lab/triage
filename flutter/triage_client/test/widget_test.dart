@@ -136,6 +136,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   })?
   httpHistoryBuilder;
 
+  Future<Map<String, dynamic>> Function({
+    required String sessionId,
+    int? windowBytes,
+    int? afterByte,
+    int? afterSeq,
+    int? beforeByte,
+  })?
+  asyncHttpHistoryBuilder;
+
   @override
   Future<Map<String, dynamic>> fetchSessionHistory({
     required String sessionId,
@@ -152,6 +161,16 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       afterSeq: afterSeq,
       beforeByte: beforeByte,
     ));
+    final asyncBuilder = asyncHttpHistoryBuilder;
+    if (asyncBuilder != null) {
+      return asyncBuilder(
+        sessionId: sessionId,
+        windowBytes: windowBytes,
+        afterByte: afterByte,
+        afterSeq: afterSeq,
+        beforeByte: beforeByte,
+      );
+    }
     final builder = httpHistoryBuilder;
     if (builder != null) {
       return builder(
@@ -6823,11 +6842,7 @@ void main() {
 
         final client = FakeTriageWebSocketClient();
         client.attachHistoryWindows['flutter-spike'] = {
-          kHistoryFirstWindowBytes: (
-            bytes: historyBytes,
-            start: 0,
-            seq: 5,
-          ),
+          kHistoryFirstWindowBytes: (bytes: historyBytes, start: 0, seq: 5),
         };
 
         await tester.pumpWidget(TriageClientApp(client: client));
@@ -6838,14 +6853,8 @@ void main() {
         // at column 80 into two lines ('S' * 80 and 'S' * 20).
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
-        expect(
-          pane.terminal.buffer.lines[0].toString().trimRight(),
-          'S' * 80,
-        );
-        expect(
-          pane.terminal.buffer.lines[1].toString().trimRight(),
-          'S' * 20,
-        );
+        expect(pane.terminal.buffer.lines[0].toString().trimRight(), 'S' * 80);
+        expect(pane.terminal.buffer.lines[1].toString().trimRight(), 'S' * 20);
 
         // Now widen the terminal to 120x24 and press Refit in the workspace header.
         pane.terminal.resize(120, 24);
@@ -6860,6 +6869,219 @@ void main() {
           pane.terminal.buffer.lines[1].toString().trimRight(),
           'visible-or-scrolled-0',
         );
+      },
+    );
+
+    testWidgets(
+      'metadata refresh on re-select resizes host without clobbering live SIGWINCH output via HTTP history replay',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
+        client.attachHistoryWindows['flutter-spike'] = {
+          kHistoryFirstWindowBytes: (
+            bytes: utf8.encode('initial prompt\r\n'),
+            start: 0,
+            seq: 1,
+          ),
+        };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(120, 40);
+        await tester.pumpAndSettle();
+
+        // Simulate a live SIGWINCH redraw or agent output arriving at seq 2,
+        // while the server's HTTP history snapshot still only carries seq 1.
+        client.emitOutput(
+          'flutter-spike',
+          'live-redraw-after-sigwinch\r\n',
+          outputSeq: 2,
+        );
+        await tester.pumpAndSettle();
+
+        // Another device resizes the PTY to 47x19; switching away and back
+        // triggers a metadata refresh (`includeHistory: false`) that resizes
+        // the host back to 120x40. It must not run a full HTTP history replay
+        // that wipes out seq 2.
+        client.emitSnapshot('flutter-spike', ['narrow'], size: (19, 47));
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('triage / main'));
+        await tester.pumpAndSettle();
+        final historyCallsBefore = client.fetchSessionHistoryCalls.length;
+
+        await tester.tap(find.text('experiment/flutter-spike').first);
+        await tester.pumpAndSettle();
+
+        expect(client.fetchSessionHistoryCalls.length, historyCallsBefore);
+        final reselectedPane = tester.widget<TerminalPane>(
+          find.byType(TerminalPane),
+        );
+        final bufferText = List.generate(
+          reselectedPane.terminal.buffer.lines.length,
+          (i) => reselectedPane.terminal.buffer.lines[i].toString(),
+        ).join('\n');
+        expect(bufferText, contains('live-redraw-after-sigwinch'));
+      },
+    );
+
+    test(
+      'SessionVm.applyHistory preserves pending live chunks when store isPagingHistory is active even if preservePendingLive is false',
+      () {
+        final vm = SessionVm(
+          title: 'triage / paging-live-preserve',
+          sessionId: 'paging-live-preserve',
+          status: 'attached',
+          statusColor: const Color(0xff7fd1c7),
+          icon: Icons.terminal,
+          rows: const [],
+          isRemote: true,
+          loaded: false,
+        );
+        vm.noteViewFit(80, 24);
+        vm.store.beginHistoryPaging();
+        try {
+          vm.applyLiveBytes(
+            utf8.encode('in-flight-live-line\r\n'),
+            outputSeq: 2,
+          );
+          vm.applyHistory(
+            utf8.encode('history-line\r\n'),
+            throughOutputSeq: 1,
+            rawOutputStart: 0,
+            windowBytes: kHistoryFirstWindowBytes,
+            preservePendingLive: false,
+          );
+        } finally {
+          vm.store.endHistoryPaging();
+        }
+        final bufferText = List.generate(
+          vm.terminal.buffer.lines.length,
+          (i) => vm.terminal.buffer.lines[i].toString(),
+        ).join('\n');
+        expect(bufferText, contains('history-line'));
+        expect(bufferText, contains('in-flight-live-line'));
+        vm.dispose();
+      },
+    );
+
+    testWidgets(
+      'history refresh on reconnect defers in-flight live output until missed HTTP delta lands in order',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final initialBytes = utf8.encode('initial prompt\r\n');
+        final missedDeltaBytes = utf8.encode('missed-delta\r\n');
+        final parkedDeltaFetch = Completer<Map<String, dynamic>>();
+
+        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
+        client.asyncHttpHistoryBuilder =
+            ({
+              required sessionId,
+              windowBytes,
+              afterByte,
+              afterSeq,
+              beforeByte,
+            }) async {
+              if (afterByte != null) {
+                return parkedDeltaFetch.future;
+              }
+              return {
+                'session_id': sessionId,
+                'size': {'rows': 24, 'cols': 80},
+                'exited': false,
+                'output_seq': 1,
+                'bytes_logged': initialBytes.length,
+                'raw_output_start': 0,
+                'raw_output_end': initialBytes.length,
+                'raw_output_truncated': false,
+                'raw_output': initialBytes,
+                'raw_output_prefix': const <int>[],
+              };
+            };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Simulate a socket drop and reconnect so the already-loaded session
+        // runs `_resubscribeAndRefreshHistory` (`includeHistory: true`) at the
+        // matching 80x24 host size (`canUseDelta: true`).
+        await client.emitSocketClosed();
+        await tester.pump(const Duration(seconds: 2));
+        await tester.pump();
+        expect(
+          client.fetchSessionHistoryCalls.last.afterByte,
+          initialBytes.length,
+        );
+
+        // Emit a new live WebSocket Output chunk (`seq = 3`) while the HTTP
+        // delta fetch (`seq = 2`) is still in flight.
+        client.emitOutput(
+          'flutter-spike',
+          'live-during-refresh\r\n',
+          outputSeq: 3,
+        );
+        await tester.pump();
+
+        parkedDeltaFetch.complete({
+          'session_id': 'flutter-spike',
+          'size': {'rows': 24, 'cols': 80},
+          'exited': false,
+          'output_seq': 2,
+          'bytes_logged': initialBytes.length + missedDeltaBytes.length,
+          'raw_output_start': initialBytes.length,
+          'raw_output_end': initialBytes.length + missedDeltaBytes.length,
+          'raw_output_truncated': false,
+          'raw_output': missedDeltaBytes,
+          'raw_output_prefix': const <int>[],
+        });
+        await tester.pumpAndSettle();
+
+        final refreshedPane = tester.widget<TerminalPane>(
+          find.byType(TerminalPane),
+        );
+        final nonEmptyLines = List.generate(
+          refreshedPane.terminal.buffer.lines.length,
+          (i) => refreshedPane.terminal.buffer.lines[i].toString().trimRight(),
+        ).where((line) => line.isNotEmpty).toList();
+        expect(nonEmptyLines, [
+          'initial prompt',
+          'missed-delta',
+          'live-during-refresh',
+        ]);
+      },
+    );
+
+    testWidgets(
+      'initial session attach bounds endOfFrame wait when compositor never draws a frame',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        TerminalPane.resetCachedLayoutSizesForTest();
+        final neverCompletingFrame = Completer<void>();
+        debugInitialAttachFrameFutureForTest = neverCompletingFrame.future;
+        addTearDown(() {
+          debugInitialAttachFrameFutureForTest = null;
+          TerminalPane.resetCachedLayoutSizesForTest();
+        });
+
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pump(const Duration(milliseconds: 100));
+        expect(
+          client.attachSessionCalls,
+          isEmpty,
+          reason: 'attach waits up to 500ms for initial layout frame',
+        );
+
+        await tester.pump(const Duration(milliseconds: 500));
+        await tester.pumpAndSettle();
+
+        expect(client.attachSessionCalls, contains('flutter-spike'));
       },
     );
   });

@@ -692,15 +692,47 @@ class TerminalStore extends ChangeNotifier {
   /// folds any shadow-queued chunks into [_retainedRawBytes] before clearing
   /// [_pendingLive] when the page bails out while live.
   void endHistoryPaging() {
-    final wasPaging = _pagingHistory;
+    if (!_pagingHistory) return;
     _pagingHistory = false;
-    if (_state.phase == AttachPhase.live && _state.sized) {
-      if (wasPaging && _pendingLive.isNotEmpty) {
+    if (_state.phase == AttachPhase.live &&
+        _state.sized &&
+        !isRefreshingHistory) {
+      if (_pendingLive.isNotEmpty) {
         for (final q in _pendingLive) {
           _appendRetainedRaw(q.bytes, q.outputSeq);
         }
       }
       _clearPendingLive();
+    }
+  }
+
+  int _historyRefreshDepth = 0;
+
+  /// True while a forward history refresh or resync RPC is in flight and live
+  /// chunks are deferred in `_pendingLive` until the snapshot or delta lands.
+  bool get isRefreshingHistory => _historyRefreshDepth > 0;
+
+  /// Defers live-chunk application while a forward history refresh or resync
+  /// RPC is in flight so live WebSocket chunks arriving after subscription
+  /// cannot advance [_appliedLogBytes] or render ahead of a missed delta.
+  void beginHistoryRefresh() {
+    _historyRefreshDepth++;
+  }
+
+  /// Releases one history-refresh deferral scope; when the outermost scope
+  /// exits without having settled onto `awaitingHistory`, drains any buffered
+  /// live chunks onto a sized live terminal (or drops them if detached) so an
+  /// aborted refresh never strands live output.
+  void endHistoryRefresh() {
+    if (_historyRefreshDepth <= 0) return;
+    _historyRefreshDepth--;
+    if (_historyRefreshDepth > 0) return;
+    if (_state.phase == AttachPhase.detached) {
+      _clearPendingLive();
+    } else if (_state.phase == AttachPhase.live &&
+        _state.sized &&
+        !_pagingHistory) {
+      _flushPendingLive(_state.historyHighWaterSeq);
     }
   }
 
@@ -752,6 +784,9 @@ class TerminalStore extends ChangeNotifier {
 
       case Detach():
         endHistoryPaging();
+        if (!isRefreshingHistory) {
+          _clearPendingLive();
+        }
         _closeFrameOnWire();
         return s.copyWith(phase: AttachPhase.detached);
 
@@ -833,8 +868,11 @@ class TerminalStore extends ChangeNotifier {
     }
 
     // Now that we have a size, drain anything we buffered (only once live and
-    // not shadow-buffering an in-flight history page).
-    if (next.sized && next.phase == AttachPhase.live && !_pagingHistory) {
+    // not shadow-buffering an in-flight history page or deferring a refresh).
+    if (next.sized &&
+        next.phase == AttachPhase.live &&
+        !_pagingHistory &&
+        !isRefreshingHistory) {
       _flushPendingLive(next.historyHighWaterSeq);
     }
 
@@ -1039,7 +1077,9 @@ class TerminalStore extends ChangeNotifier {
     }
 
     final wasPagingInLive =
-        _pagingHistory && s.phase == AttachPhase.live && s.sized;
+        (_pagingHistory || isRefreshingHistory) &&
+        s.phase == AttachPhase.live &&
+        s.sized;
     _pagingHistory = false;
     if (isSnapshotSeqRegressed || (wasPagingInLive && throughSeq == null)) {
       _clearPendingLive();
@@ -1175,7 +1215,9 @@ class TerminalStore extends ChangeNotifier {
   }
 
   TerminalState _reduceLive(TerminalState s, List<int> bytes, int? outputSeq) {
-    if (s.phase == AttachPhase.detached) {
+    if (s.phase == AttachPhase.detached &&
+        !_pagingHistory &&
+        !isRefreshingHistory) {
       return s;
     }
     // As in _reduceHistory: a negative is corrupt, so null keeps it off
@@ -1200,11 +1242,11 @@ class TerminalStore extends ChangeNotifier {
     if (_isDuplicate(seq, next.historyHighWaterSeq)) {
       return next;
     }
-    if (!next.sized || next.phase == AttachPhase.awaitingHistory) {
+    if (!next.sized || next.phase != AttachPhase.live || isRefreshingHistory) {
       tdbg(
         'store.live',
         'QUEUED seq=$seq ${bytes.length}B '
-            '(sized=${next.sized} phase=${next.phase})',
+            '(sized=${next.sized} phase=${next.phase} refreshing=$isRefreshingHistory)',
       );
       _enqueuePendingLive(_QueuedLive(bytes, seq));
       return next;
