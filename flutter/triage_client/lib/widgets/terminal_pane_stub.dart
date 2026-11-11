@@ -142,6 +142,12 @@ class TerminalPane extends StatefulWidget {
   static (int, int)? getLastFittedWorkspaceSize() =>
       _TerminalPaneState._lastWorkspaceFittedSize;
 
+  @visibleForTesting
+  static void resetCachedLayoutSizesForTest() {
+    _TerminalPaneState._lastWorkspaceFittedSize = null;
+    _TerminalPaneState._sessionLastGridSize.clear();
+  }
+
   /// Clears the cached last-sent resize dimensions for [terminalId] so the
   /// next fit or resize-out forwards its size to the host even if the local
   /// grid dimensions did not change since the previous send.

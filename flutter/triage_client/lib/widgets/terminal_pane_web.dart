@@ -149,6 +149,12 @@ class TerminalPane extends StatefulWidget {
   static (int, int)? getLastFittedWorkspaceSize() =>
       _TerminalPaneState._lastWorkspaceFittedSize;
 
+  @visibleForTesting
+  static void resetCachedLayoutSizesForTest() {
+    _TerminalPaneState._lastWorkspaceFittedSize = null;
+    _TerminalPaneState._sessionInitialFitCompleted.clear();
+  }
+
   /// Clears any cached resize-out deduplication state for [terminalId].
   /// No-op on web where FitAddon resize events drive resize-out directly.
   static void invalidateCachedResizeOut(String terminalId) {}

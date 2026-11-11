@@ -136,6 +136,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   })?
   httpHistoryBuilder;
 
+  Future<Map<String, dynamic>> Function({
+    required String sessionId,
+    int? windowBytes,
+    int? afterByte,
+    int? afterSeq,
+    int? beforeByte,
+  })?
+  asyncHttpHistoryBuilder;
+
   @override
   Future<Map<String, dynamic>> fetchSessionHistory({
     required String sessionId,
@@ -152,6 +161,16 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       afterSeq: afterSeq,
       beforeByte: beforeByte,
     ));
+    final asyncBuilder = asyncHttpHistoryBuilder;
+    if (asyncBuilder != null) {
+      return asyncBuilder(
+        sessionId: sessionId,
+        windowBytes: windowBytes,
+        afterByte: afterByte,
+        afterSeq: afterSeq,
+        beforeByte: beforeByte,
+      );
+    }
     final builder = httpHistoryBuilder;
     if (builder != null) {
       return builder(
@@ -6945,6 +6964,124 @@ void main() {
         expect(bufferText, contains('history-line'));
         expect(bufferText, contains('in-flight-live-line'));
         vm.dispose();
+      },
+    );
+
+    testWidgets(
+      'history refresh on reconnect defers in-flight live output until missed HTTP delta lands in order',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final initialBytes = utf8.encode('initial prompt\r\n');
+        final missedDeltaBytes = utf8.encode('missed-delta\r\n');
+        final parkedDeltaFetch = Completer<Map<String, dynamic>>();
+
+        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
+        client.asyncHttpHistoryBuilder =
+            ({
+              required sessionId,
+              windowBytes,
+              afterByte,
+              afterSeq,
+              beforeByte,
+            }) async {
+              if (afterByte != null) {
+                return parkedDeltaFetch.future;
+              }
+              return {
+                'session_id': sessionId,
+                'size': {'rows': 24, 'cols': 80},
+                'exited': false,
+                'output_seq': 1,
+                'bytes_logged': initialBytes.length,
+                'raw_output_start': 0,
+                'raw_output_end': initialBytes.length,
+                'raw_output_truncated': false,
+                'raw_output': initialBytes,
+                'raw_output_prefix': const <int>[],
+              };
+            };
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Simulate a socket drop and reconnect so the already-loaded session
+        // runs `_resubscribeAndRefreshHistory` (`includeHistory: true`) at the
+        // matching 80x24 host size (`canUseDelta: true`).
+        await client.emitSocketClosed();
+        await tester.pump(const Duration(seconds: 2));
+        await tester.pump();
+        expect(
+          client.fetchSessionHistoryCalls.last.afterByte,
+          initialBytes.length,
+        );
+
+        // Emit a new live WebSocket Output chunk (`seq = 3`) while the HTTP
+        // delta fetch (`seq = 2`) is still in flight.
+        client.emitOutput(
+          'flutter-spike',
+          'live-during-refresh\r\n',
+          outputSeq: 3,
+        );
+        await tester.pump();
+
+        parkedDeltaFetch.complete({
+          'session_id': 'flutter-spike',
+          'size': {'rows': 24, 'cols': 80},
+          'exited': false,
+          'output_seq': 2,
+          'bytes_logged': initialBytes.length + missedDeltaBytes.length,
+          'raw_output_start': initialBytes.length,
+          'raw_output_end': initialBytes.length + missedDeltaBytes.length,
+          'raw_output_truncated': false,
+          'raw_output': missedDeltaBytes,
+          'raw_output_prefix': const <int>[],
+        });
+        await tester.pumpAndSettle();
+
+        final refreshedPane = tester.widget<TerminalPane>(
+          find.byType(TerminalPane),
+        );
+        final nonEmptyLines = List.generate(
+          refreshedPane.terminal.buffer.lines.length,
+          (i) => refreshedPane.terminal.buffer.lines[i].toString().trimRight(),
+        ).where((line) => line.isNotEmpty).toList();
+        expect(nonEmptyLines, [
+          'initial prompt',
+          'missed-delta',
+          'live-during-refresh',
+        ]);
+      },
+    );
+
+    testWidgets(
+      'initial session attach bounds endOfFrame wait when compositor never draws a frame',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        TerminalPane.resetCachedLayoutSizesForTest();
+        final neverCompletingFrame = Completer<void>();
+        debugInitialAttachFrameFutureForTest = neverCompletingFrame.future;
+        addTearDown(() {
+          debugInitialAttachFrameFutureForTest = null;
+          TerminalPane.resetCachedLayoutSizesForTest();
+        });
+
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pump(const Duration(milliseconds: 100));
+        expect(
+          client.attachSessionCalls,
+          isEmpty,
+          reason: 'attach waits up to 500ms for initial layout frame',
+        );
+
+        await tester.pump(const Duration(milliseconds: 500));
+        await tester.pumpAndSettle();
+
+        expect(client.attachSessionCalls, contains('flutter-spike'));
       },
     );
   });

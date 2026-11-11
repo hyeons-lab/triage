@@ -304,6 +304,9 @@ bool showNewSessionShellMenuForPlatform(TargetPlatform platform) {
 @visibleForTesting
 bool debugForceMobileLayoutForTest = false;
 
+@visibleForTesting
+Future<void>? debugInitialAttachFrameFutureForTest;
+
 /// True on touch platforms — where the terminal takes IME input, so requesting
 /// focus raises the soft keyboard and insets the viewport.
 ///
@@ -930,7 +933,10 @@ class SessionVm {
         store.appliedLogBytes == null) {
       store.dispatch(
         Attach(
-          preservePendingLive: preservePendingLive || store.isPagingHistory,
+          preservePendingLive:
+              preservePendingLive ||
+              store.isPagingHistory ||
+              store.isRefreshingHistory,
         ),
       );
     }
@@ -4436,7 +4442,12 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         orElse: () => null,
       );
       final sessionTitle = existing?.title ?? 'triage / $sid';
-      if (!runningUnderFlutterTest() &&
+      final initialAttachFrameFuture =
+          debugInitialAttachFrameFutureForTest ??
+          (!runningUnderFlutterTest()
+              ? WidgetsBinding.instance.endOfFrame
+              : null);
+      if (initialAttachFrameFuture != null &&
           mounted &&
           TerminalPane.getLastFittedWorkspaceSize() == null &&
           TerminalPane.getCachedTerminalSize(sessionTitle) == null) {
@@ -4445,7 +4456,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // viewport cell grid before we resize the daemon PTY or fetch history.
         // Bound the wait so a minimized or occluded window (where the OS
         // compositor suspends vsync callbacks) cannot block session attach.
-        await WidgetsBinding.instance.endOfFrame.timeout(
+        await initialAttachFrameFuture.timeout(
           const Duration(milliseconds: 500),
           onTimeout: () {},
         );
@@ -5212,39 +5223,44 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           final generation = _connectGeneration;
           var effectiveSnapshot = snapshot;
           final snapshotHasHistory = snapshotCarriesHistory(snapshot);
-          if (!snapshotHasHistory && _client.hasHttpHistoryTransport) {
-            try {
-              final mergedSnapshot = await _fetchAndMergeSessionHistory(
-                session,
-                sessionId,
-                snapshot,
-              );
-              if (_isStale(generation) ||
-                  _disposed ||
-                  !_sessions.contains(session)) {
+          session.store.beginHistoryRefresh();
+          try {
+            if (!snapshotHasHistory && _client.hasHttpHistoryTransport) {
+              try {
+                final mergedSnapshot = await _fetchAndMergeSessionHistory(
+                  session,
+                  sessionId,
+                  snapshot,
+                );
+                if (_isStale(generation) ||
+                    _disposed ||
+                    !_sessions.contains(session)) {
+                  return;
+                }
+                effectiveSnapshot = mergedSnapshot;
+              } on TriageAuthException {
+                _routeStaleAuthFailure(generation);
+                return;
+              } catch (e) {
+                tdbg(
+                  'history.resync',
+                  'HTTP resync fetch failed for $sessionId: $e',
+                );
                 return;
               }
-              effectiveSnapshot = mergedSnapshot;
-            } on TriageAuthException {
-              _routeStaleAuthFailure(generation);
-              return;
-            } catch (e) {
-              tdbg(
-                'history.resync',
-                'HTTP resync fetch failed for $sessionId: $e',
-              );
-              return;
             }
+            // Pushed snapshots carrying inline history are served unwindowed at
+            // the full history cap: replay them at the platform budgets, not the
+            // held window, or the trim over-shrinks them.
+            await _applySnapshotToSession(
+              session,
+              sessionId,
+              effectiveSnapshot,
+              unwindowed: snapshotHasHistory,
+            );
+          } finally {
+            session.store.endHistoryRefresh();
           }
-          // Pushed snapshots carrying inline history are served unwindowed at
-          // the full history cap: replay them at the platform budgets, not the
-          // held window, or the trim over-shrinks them.
-          await _applySnapshotToSession(
-            session,
-            sessionId,
-            effectiveSnapshot,
-            unwindowed: snapshotHasHistory,
-          );
         }
       } else if (event.containsKey('LeaseChanged')) {
         final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
@@ -6084,17 +6100,20 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       );
       return;
     }
+    final needsHistory =
+        includeHistory ||
+        !session.loaded ||
+        session.isExited ||
+        session.store.state.exited;
+    if (needsHistory) {
+      session.store.beginHistoryRefresh();
+    }
     try {
       // Observer: a refresh must not steal the lease from whoever is typing.
       // Only fetch the held history window when the snapshot will actually be
       // replayed; metadata-only refreshes (initial view-fit and rail switches
       // onto an already-loaded live session) use the 1 KiB probe so they do
       // not ship or gunzip discarded scrollback.
-      final needsHistory =
-          includeHistory ||
-          !session.loaded ||
-          session.isExited ||
-          session.store.state.exited;
       final useHttpHistory = _client.hasHttpHistoryTransport;
       final attachRes = await _client.attachSession(
         sessionId: sessionId,
@@ -6124,172 +6143,163 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // case so the snapshot's own size is used instead.
         (int, int)? drivenSize;
         var resizedHost = false;
-        if (needsHistory) {
-          session.store.beginHistoryPaging();
-        }
-        try {
-          if (snapshot['exited'] == true) {
-            // Drop any keystrokes buffered for the dead incarnation before
-            // reviving the session id with a fresh shell.
-            _pendingInput.forget(sessionId);
-            session.hasInputLease = false;
-            debugPrint(
-              'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
-            );
-            final restoreSize = replayTargetSize;
-            var reviveStep = _ResubStep.restore;
-            try {
-              final restoredSnapshot = _snapshotFromResponse(
-                await _client.restoreSession(
-                  sessionId: sessionId,
-                  rows: restoreSize.$1,
-                  cols: restoreSize.$2,
-                ),
-              );
-              // A restore re-spawns the process at this size, so the host is
-              // genuinely here now whatever the snapshot says.
-              drivenSize = restoreSize;
-              if (restoredSnapshot != null) {
-                finalSnapshot = restoredSnapshot;
-              }
-              // A restore re-spawns the daemon actor, orphaning our subscription;
-              // re-subscribe before the fresh attach. The actor replacement
-              // requires it even when another path holds the resubscribe claim;
-              // a racing holder at worst orphans one dead-actor id.
-              reviveStep = _ResubStep.resubscribe;
-              await _resubscribeSessionEvents(
-                sessionId,
-                owningGeneration: owningGeneration,
-              );
-              // The resubscribe above bails silently when stale; without this
-              // recheck the fresh attach would fire at the new daemon under a
-              // colliding id.
-              if (_isStale(owningGeneration)) return;
-              reviveStep = _ResubStep.attach;
-              final freshAttachRes = await _client.attachSession(
+        if (snapshot['exited'] == true) {
+          // Drop any keystrokes buffered for the dead incarnation before
+          // reviving the session id with a fresh shell.
+          _pendingInput.forget(sessionId);
+          session.hasInputLease = false;
+          debugPrint(
+            'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
+          );
+          final restoreSize = replayTargetSize;
+          var reviveStep = _ResubStep.restore;
+          try {
+            final restoredSnapshot = _snapshotFromResponse(
+              await _client.restoreSession(
                 sessionId: sessionId,
-                clientId: _clientId,
-                mode: 'Observer',
-                historyBytes: useHttpHistory
-                    ? kHistoryLeaseProbeBytes
-                    : session.historyWindowBytes,
-              );
-              if (_isStale(owningGeneration)) return;
-              session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
-              final freshResponseObj =
-                  freshAttachRes['response'] as Map<String, dynamic>?;
-              final freshSnapshot =
-                  freshResponseObj?['snapshot'] as Map<String, dynamic>?;
-              if (freshSnapshot != null) {
-                if (freshSnapshot['exited'] == true ||
-                    _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
-                  finalSnapshot = freshSnapshot;
-                }
-              }
-            } on TriageAuthException {
-              rethrow;
-            } catch (e) {
-              // Any resubscribe-step failure rolls back like every other
-              // checked-subscribe caller: without a subscription the revive
-              // cannot hear live events, so logging-and-continuing would strand
-              // an unsubscribed session behind an 'attached' status.
-              // Restore/attach-step failures instead log and render the
-              // pre-revive snapshot; the session still reads exited, so the
-              // next refresh retries the revive.
-              if (reviveStep == _ResubStep.resubscribe) rethrow;
-              debugPrint(
-                'Failed to revive session $sessionId during refresh '
-                '(${reviveStep.name}): ${e.toString()}',
-              );
+                rows: restoreSize.$1,
+                cols: restoreSize.$2,
+              ),
+            );
+            // A restore re-spawns the process at this size, so the host is
+            // genuinely here now whatever the snapshot says.
+            drivenSize = restoreSize;
+            if (restoredSnapshot != null) {
+              finalSnapshot = restoredSnapshot;
             }
-          } else if (_clientForeground &&
-              !_snapshotSizeMatches(snapshot, replayTargetSize)) {
-            // Resize the host so its program repaints at our width, but keep the
-            // history-bearing attach snapshot for rendering. The resize response
-            // carries no raw_output (resize snapshots never do), so using it would
-            // make applyHistory clear the terminal and blank it; history replays
-            // at the fitted size client-side anyway.
-            //
-            // Gated on foreground for the same reason the resize-out listener is:
-            // a reconnect on a blurred client would otherwise re-take the shared
-            // PTY from whichever device the user is actually looking at. The
-            // reclaim on refocus covers the size this skips, which is why
-            // `drivenSize` is set only once the resize has actually landed.
-            try {
-              final resizedSnapshot = _snapshotFromResponse(
-                await _client.resizeSession(
-                  sessionId: sessionId,
-                  rows: replayTargetSize.$1,
-                  cols: replayTargetSize.$2,
-                ),
-              );
-              drivenSize = replayTargetSize;
-              resizedHost = true;
-              if (resizedSnapshot != null) {
-                finalSnapshot = <String, dynamic>{
-                  ...finalSnapshot,
-                  if (resizedSnapshot['size'] != null)
-                    'size': resizedSnapshot['size'],
-                  if (resizedSnapshot['styled_rows'] != null)
-                    'styled_rows': resizedSnapshot['styled_rows'],
-                  if (resizedSnapshot['styled_rows_start'] != null)
-                    'styled_rows_start': resizedSnapshot['styled_rows_start'],
-                  if (resizedSnapshot['visible_rows'] != null)
-                    'visible_rows': resizedSnapshot['visible_rows'],
-                  if (resizedSnapshot['cursor'] != null)
-                    'cursor': resizedSnapshot['cursor'],
-                };
-              }
-            } on TriageAuthException {
-              rethrow;
-            } catch (_) {}
-          }
-          // A restore inside this refresh may have revived an exited session.
-          // Without a replay the exited-to-live transition in the apply below
-          // dispatches a bare Attach and strands the store in awaitingHistory.
-          // Either side can record the exit (the push skips the VM flag when
-          // unmounted), and replaying when only the store says exited is safe
-          // since the delta paths refuse anyway.
-          final revivedNeedsReplay =
-              (session.isExited || session.store.state.exited) &&
-              finalSnapshot['exited'] != true;
-          final shouldReplayHistory =
-              includeHistory || !session.loaded || revivedNeedsReplay;
-          if (useHttpHistory && shouldReplayHistory) {
-            if (_isStale(owningGeneration)) return;
-            final mergedSnapshot = await _fetchAndMergeSessionHistory(
-              session,
+            // A restore re-spawns the daemon actor, orphaning our subscription;
+            // re-subscribe before the fresh attach. The actor replacement
+            // requires it even when another path holds the resubscribe claim;
+            // a racing holder at worst orphans one dead-actor id.
+            reviveStep = _ResubStep.resubscribe;
+            await _resubscribeSessionEvents(
               sessionId,
-              finalSnapshot,
-              forceFullWindow: resizedHost,
+              owningGeneration: owningGeneration,
+            );
+            // The resubscribe above bails silently when stale; without this
+            // recheck the fresh attach would fire at the new daemon under a
+            // colliding id.
+            if (_isStale(owningGeneration)) return;
+            reviveStep = _ResubStep.attach;
+            final freshAttachRes = await _client.attachSession(
+              sessionId: sessionId,
+              clientId: _clientId,
+              mode: 'Observer',
+              historyBytes: useHttpHistory
+                  ? kHistoryLeaseProbeBytes
+                  : session.historyWindowBytes,
             );
             if (_isStale(owningGeneration)) return;
-            finalSnapshot = mergedSnapshot;
+            session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
+            final freshResponseObj =
+                freshAttachRes['response'] as Map<String, dynamic>?;
+            final freshSnapshot =
+                freshResponseObj?['snapshot'] as Map<String, dynamic>?;
+            if (freshSnapshot != null) {
+              if (freshSnapshot['exited'] == true ||
+                  _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
+                finalSnapshot = freshSnapshot;
+              }
+            }
+          } on TriageAuthException {
+            rethrow;
+          } catch (e) {
+            // Any resubscribe-step failure rolls back like every other
+            // checked-subscribe caller: without a subscription the revive
+            // cannot hear live events, so logging-and-continuing would strand
+            // an unsubscribed session behind an 'attached' status.
+            // Restore/attach-step failures instead log and render the
+            // pre-revive snapshot; the session still reads exited, so the
+            // next refresh retries the revive.
+            if (reviveStep == _ResubStep.resubscribe) rethrow;
+            debugPrint(
+              'Failed to revive session $sessionId during refresh '
+              '(${reviveStep.name}): ${e.toString()}',
+            );
           }
-          // The restore/resize awaits above span a purge window: applying a
-          // superseded snapshot onto the reused VM would blank the new
-          // generation's load with old-daemon bytes.
+        } else if (_clientForeground &&
+            !_snapshotSizeMatches(snapshot, replayTargetSize)) {
+          // Resize the host so its program repaints at our width, but keep the
+          // history-bearing attach snapshot for rendering. The resize response
+          // carries no raw_output (resize snapshots never do), so using it would
+          // make applyHistory clear the terminal and blank it; history replays
+          // at the fitted size client-side anyway.
+          //
+          // Gated on foreground for the same reason the resize-out listener is:
+          // a reconnect on a blurred client would otherwise re-take the shared
+          // PTY from whichever device the user is actually looking at. The
+          // reclaim on refocus covers the size this skips, which is why
+          // `drivenSize` is set only once the resize has actually landed.
+          try {
+            final resizedSnapshot = _snapshotFromResponse(
+              await _client.resizeSession(
+                sessionId: sessionId,
+                rows: replayTargetSize.$1,
+                cols: replayTargetSize.$2,
+              ),
+            );
+            drivenSize = replayTargetSize;
+            resizedHost = true;
+            if (resizedSnapshot != null) {
+              finalSnapshot = <String, dynamic>{
+                ...finalSnapshot,
+                if (resizedSnapshot['size'] != null)
+                  'size': resizedSnapshot['size'],
+                if (resizedSnapshot['styled_rows'] != null)
+                  'styled_rows': resizedSnapshot['styled_rows'],
+                if (resizedSnapshot['styled_rows_start'] != null)
+                  'styled_rows_start': resizedSnapshot['styled_rows_start'],
+                if (resizedSnapshot['visible_rows'] != null)
+                  'visible_rows': resizedSnapshot['visible_rows'],
+                if (resizedSnapshot['cursor'] != null)
+                  'cursor': resizedSnapshot['cursor'],
+              };
+            }
+          } on TriageAuthException {
+            rethrow;
+          } catch (_) {}
+        }
+        // A restore inside this refresh may have revived an exited session.
+        // Without a replay the exited-to-live transition in the apply below
+        // dispatches a bare Attach and strands the store in awaitingHistory.
+        // Either side can record the exit (the push skips the VM flag when
+        // unmounted), and replaying when only the store says exited is safe
+        // since the delta paths refuse anyway.
+        final revivedNeedsReplay =
+            (session.isExited || session.store.state.exited) &&
+            finalSnapshot['exited'] != true;
+        final shouldReplayHistory =
+            includeHistory || !session.loaded || revivedNeedsReplay;
+        if (useHttpHistory && shouldReplayHistory) {
           if (_isStale(owningGeneration)) return;
-          await _applySnapshotToSession(
+          final mergedSnapshot = await _fetchAndMergeSessionHistory(
             session,
             sessionId,
             finalSnapshot,
-            renderSize: drivenSize,
-            replayHistory:
-                includeHistory ||
-                (!session.loaded && snapshot['exited'] == true) ||
-                revivedNeedsReplay,
-            forceFullReplay:
-                (resizedHost || revivedNeedsReplay) && shouldReplayHistory,
-            // finalSnapshot comes from attach/resume responses, whose agent
-            // field is manager-overlaid and authoritative.
-            agentAuthoritative: true,
+            forceFullWindow: resizedHost,
           );
-        } finally {
-          if (needsHistory) {
-            session.store.endHistoryPaging();
-          }
+          if (_isStale(owningGeneration)) return;
+          finalSnapshot = mergedSnapshot;
         }
+        // The restore/resize awaits above span a purge window: applying a
+        // superseded snapshot onto the reused VM would blank the new
+        // generation's load with old-daemon bytes.
+        if (_isStale(owningGeneration)) return;
+        await _applySnapshotToSession(
+          session,
+          sessionId,
+          finalSnapshot,
+          renderSize: drivenSize,
+          replayHistory:
+              includeHistory ||
+              (!session.loaded && snapshot['exited'] == true) ||
+              revivedNeedsReplay,
+          forceFullReplay:
+              (resizedHost || revivedNeedsReplay) && shouldReplayHistory,
+          // finalSnapshot comes from attach/resume responses, whose agent
+          // field is manager-overlaid and authoritative.
+          agentAuthoritative: true,
+        );
       }
     } on TriageAuthException {
       if (!_isStale(owningGeneration)) {
@@ -6311,6 +6321,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (includeHistory) rethrow;
       debugPrint('Snapshot refresh failed for $sessionId: $e');
     } finally {
+      if (needsHistory) {
+        session.store.endHistoryRefresh();
+      }
       _refreshClaims.release(sessionId, refreshAttempt);
       _scheduleHistoryFollowUp(session, sessionId);
     }
@@ -6384,18 +6397,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     void Function(_ResubStep step)? onStep,
   }) async {
     if (_isStale(owningGeneration)) return;
-    onStep?.call(_ResubStep.resubscribe);
-    await _resubscribeSessionEvents(
-      sessionId,
-      owningGeneration: owningGeneration,
-    );
-    if (_isStale(owningGeneration)) return;
-    onStep?.call(_ResubStep.refresh);
-    await _refreshSessionSnapshot(
-      session,
-      includeHistory: true,
-      owningGeneration: owningGeneration,
-    );
+    session.store.beginHistoryRefresh();
+    try {
+      onStep?.call(_ResubStep.resubscribe);
+      await _resubscribeSessionEvents(
+        sessionId,
+        owningGeneration: owningGeneration,
+      );
+      if (_isStale(owningGeneration)) return;
+      onStep?.call(_ResubStep.refresh);
+      await _refreshSessionSnapshot(
+        session,
+        includeHistory: true,
+        owningGeneration: owningGeneration,
+      );
+    } finally {
+      session.store.endHistoryRefresh();
+    }
   }
 
   /// Subscribes to a session's events, throwing when the daemon answers
