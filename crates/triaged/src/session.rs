@@ -32,13 +32,15 @@ use tattoy_wezterm_term::{
 use triage_core::agent::{AgentAttachment, AgentKind};
 use triage_core::judge::JudgeVerdict;
 use triage_core::session::{
-    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputControllerKind,
-    InputLeaseRequest, InputLeaseState, LeaseChange, RailLayout, ResizeSessionRequest,
+    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession,
+    FetchTerminalRowsRequest, FetchTerminalRowsResponse, InputControllerKind, InputLeaseRequest,
+    InputLeaseState, LeaseChange, PollTerminalSyncOutcome, RailLayout, ResizeSessionRequest,
     RestoreSessionRequest, SendSessionMessageRequest, SendSessionMessageResponse, SessionApi,
     SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope, SessionEventReceiver,
     SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot, StartSessionRequest,
     StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest,
-    TerminalColor, TerminalCursor, TerminalStyle, WaitForSessionMessagesRequest, WriteInputRequest,
+    SyncTerminalRequest, TerminalColor, TerminalCursor, TerminalScreenCursor, TerminalStyle,
+    TerminalSyncCursor, TerminalSyncFrame, WaitForSessionMessagesRequest, WriteInputRequest,
 };
 use triage_core::session::{
     SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN, SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
@@ -162,6 +164,10 @@ struct TriageTerminalConfig;
 impl TerminalConfiguration for TriageTerminalConfig {
     fn color_palette(&self) -> ColorPalette {
         ColorPalette::default()
+    }
+
+    fn enable_kitty_keyboard(&self) -> bool {
+        true
     }
 }
 
@@ -2962,6 +2968,7 @@ impl SessionManager {
                 lease,
                 parked_input,
                 agent,
+                terminal_modes: ext.terminal_modes,
             });
         }
 
@@ -3921,6 +3928,10 @@ fn spawn_adopted_pty_runtime(
     set_private_file_permissions(&target_log_path);
 
     let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
+    let mut mode_tracker = triage_term::TerminalModeTracker::new();
+    if let Some(modes) = h_sess.terminal_modes.as_ref() {
+        mode_tracker.restore_handover_modes(modes);
+    }
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
         log_path: target_log_path,
@@ -3932,6 +3943,7 @@ fn spawn_adopted_pty_runtime(
         active_segment_bytes,
         compression_tx: None,
         terminal,
+        mode_tracker,
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: h_sess.bytes_logged,
         output_seq: h_sess.output_seq,
@@ -3947,6 +3959,9 @@ fn spawn_adopted_pty_runtime(
         pending_escape_buffer: Vec::new(),
         scrollback: Some(scrollback),
         scroll_seq_baseline: None,
+        journal_clear_floor: 0,
+        mirrored_journal_records: 0,
+        prev_top_stable: None,
     };
 
     let (replay_len, replay) = read_replay_tail(&h_sess.log_path)?;
@@ -5513,6 +5528,193 @@ impl SessionApi for SessionManager {
             server_version: status.current,
             update_available: status.update_available,
             latest_version: status.latest,
+        }
+    }
+
+    fn sync_terminal_session(
+        &self,
+        request: SyncTerminalRequest,
+        cursor: &mut TerminalSyncCursor,
+    ) -> Result<(SessionSnapshot, InputLeaseState, TerminalSyncFrame)> {
+        if let Some(ref size) = request.size {
+            size.validate()?;
+        }
+
+        let mut revived = false;
+        if request.restore_if_exited {
+            let _ = self.demote_dead_live_session(&request.session_id);
+            let maybe_restore_size = {
+                let sessions = self.sessions()?;
+                match sessions.get(&request.session_id) {
+                    Some(ManagedSession::Historical { session, .. }) => Some(
+                        request
+                            .size
+                            .clone()
+                            .unwrap_or_else(|| session.persisted.size.clone()),
+                    ),
+                    Some(_) => None,
+                    None => bail!("session {} not found", request.session_id),
+                }
+            };
+            if let Some(restore_size) = maybe_restore_size {
+                match self.restore_session(RestoreSessionRequest {
+                    session_id: request.session_id.clone(),
+                    size: restore_size,
+                }) {
+                    Ok(_) => {
+                        revived = true;
+                        cursor.reset_keep_seq();
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            session_id = %request.session_id,
+                            ?err,
+                            "restore_if_exited skipped during sync_terminal_session; serving historical state"
+                        );
+                    }
+                }
+            }
+        }
+
+        let force_full =
+            revived || request.known_frame_seq == 0 || cursor.last_alt_screen.is_none();
+        let mut sessions = self.sessions()?;
+        let session = sessions
+            .get_mut(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+
+        match session {
+            ManagedSession::Live {
+                actor,
+                lease,
+                launch,
+                ..
+            } => {
+                if let Some(kind) = request.mode.controller_kind() {
+                    self.grant_input_lease_and_flush(
+                        &request.session_id,
+                        &request.client_id,
+                        kind,
+                        lease,
+                        actor,
+                    )?;
+                }
+                let lease_out = lease.clone();
+                let cmd_tx = actor.tx.clone();
+                let resize_to = if request.resize_pty {
+                    request.size.filter(|sz| *sz != launch.size)
+                } else {
+                    None
+                };
+                drop(sessions);
+
+                let cursor_in = std::mem::take(cursor);
+                let (snapshot, updated_cursor, frame) =
+                    request_sync_terminal(&cmd_tx, resize_to.clone(), cursor_in, force_full)?;
+                *cursor = updated_cursor;
+
+                if let Some(new_size) = resize_to
+                    && let Ok(mut sessions) = self.sessions()
+                    && let Some(ManagedSession::Live { launch, .. }) =
+                        sessions.get_mut(&request.session_id)
+                {
+                    launch.size = new_size;
+                }
+
+                let snapshot = self.overlay_manager_fields(snapshot, &request.session_id);
+                Ok((snapshot, lease_out, frame))
+            }
+            ManagedSession::Historical { session, lease } => {
+                let snapshot = session.metadata_snapshot();
+                let frame = session.output.build_sync_frame(cursor, force_full);
+                let lease_out = lease.clone();
+                drop(sessions);
+                let snapshot = self.overlay_manager_fields(snapshot, &request.session_id);
+                Ok((snapshot, lease_out, frame))
+            }
+            ManagedSession::Restoring { .. } => {
+                bail!("session {} is being restored", request.session_id)
+            }
+        }
+    }
+
+    fn poll_terminal_sync(
+        &self,
+        session_id: SessionId,
+        cursor: &mut TerminalSyncCursor,
+        force_full: bool,
+    ) -> Result<PollTerminalSyncOutcome> {
+        enum PollTarget {
+            Live(Sender<ActorCommand>),
+            Ready(PollTerminalSyncOutcome),
+        }
+
+        let target = {
+            let mut sessions = self.sessions()?;
+            let session = sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            match session {
+                ManagedSession::Live { actor, .. } => PollTarget::Live(actor.tx.clone()),
+                ManagedSession::Historical { session, .. } => {
+                    PollTarget::Ready(session.output.poll_sync_frame(cursor, force_full))
+                }
+                ManagedSession::Restoring { .. } => {
+                    PollTarget::Ready(PollTerminalSyncOutcome::Idle)
+                }
+            }
+        };
+
+        match target {
+            PollTarget::Ready(outcome) => Ok(outcome),
+            PollTarget::Live(cmd_tx) => {
+                let cursor_in = std::mem::take(cursor);
+                let (updated_cursor, outcome) =
+                    request_poll_terminal_sync(&cmd_tx, cursor_in, force_full)?;
+                *cursor = updated_cursor;
+                Ok(outcome)
+            }
+        }
+    }
+
+    fn fetch_terminal_rows(
+        &self,
+        request: FetchTerminalRowsRequest,
+    ) -> Result<FetchTerminalRowsResponse> {
+        let clamped_count = request.row_count.min(512);
+        enum FetchTarget {
+            Live(Sender<ActorCommand>),
+            Ready(FetchTerminalRowsResponse),
+        }
+
+        let target = {
+            let mut sessions = self.sessions()?;
+            let session = sessions
+                .get_mut(&request.session_id)
+                .with_context(|| format!("session {} not found", request.session_id))?;
+            match session {
+                ManagedSession::Live { actor, .. } => FetchTarget::Live(actor.tx.clone()),
+                ManagedSession::Historical { session, .. } => {
+                    FetchTarget::Ready(session.output.fetch_scrollback_rows(
+                        request.session_id.clone(),
+                        request.start_row,
+                        clamped_count,
+                    ))
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {} is being restored", request.session_id)
+                }
+            }
+        };
+
+        match target {
+            FetchTarget::Ready(resp) => Ok(resp),
+            FetchTarget::Live(cmd_tx) => request_fetch_terminal_rows(
+                &cmd_tx,
+                request.session_id,
+                request.start_row,
+                clamped_count,
+            ),
         }
     }
 }
@@ -7288,6 +7490,7 @@ struct OutputState {
     active_segment_bytes: u64,
     compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
     terminal: Terminal,
+    mode_tracker: triage_term::TerminalModeTracker,
     cwd_sequence_buffer: Vec<u8>,
     bytes_logged: u64,
     output_seq: u64,
@@ -7330,6 +7533,15 @@ struct OutputState {
     /// `init_scroll_baseline` seeds it before the first live advance (and
     /// reset across reflow).
     scroll_seq_baseline: Option<StableRowIndex>,
+    /// Monotonic `ScrollbackJournal` floor set on live `CSI 3J` so client
+    /// scrollback clears cleanly while preserving raw journal segments on disk.
+    journal_clear_floor: u64,
+    /// Number of active `ScrollbackJournal` records currently mirrored inside
+    /// `terminal`'s in-memory scrollback (`0..phys_row(0)`).
+    mirrored_journal_records: u64,
+    /// Previous `screen.phys_to_stable_row_index(0)` used to count top-of-ring
+    /// scrollback evictions inside `terminal`.
+    prev_top_stable: Option<StableRowIndex>,
 }
 
 /// Visible rows + output sequence + git context + cwd, returned by the actor's
@@ -7420,6 +7632,23 @@ enum ActorCommand {
     ExtractHandoverState {
         response: Sender<ActorResult<ExtractedHandover>>,
     },
+    SyncTerminal {
+        resize: Option<SessionSize>,
+        cursor: TerminalSyncCursor,
+        force_full: bool,
+        response: Sender<ActorResult<(SessionSnapshot, TerminalSyncCursor, TerminalSyncFrame)>>,
+    },
+    PollTerminalSync {
+        cursor: TerminalSyncCursor,
+        force_full: bool,
+        response: Sender<ActorResult<(TerminalSyncCursor, PollTerminalSyncOutcome)>>,
+    },
+    FetchTerminalRows {
+        session_id: SessionId,
+        start_row: u64,
+        row_count: u32,
+        response: Sender<ActorResult<FetchTerminalRowsResponse>>,
+    },
 }
 
 #[cfg(unix)]
@@ -7444,6 +7673,7 @@ pub struct ExtractedHandover {
     pub logged_output_seq: u64,
     pub logged_tail_bytes: u64,
     pub context: Option<SessionContext>,
+    pub terminal_modes: Option<triage_term::HandoverTerminalModes>,
 }
 
 type ActorResult<T> = Result<T>;
@@ -7548,6 +7778,13 @@ impl ActorState {
             .or_else(|| self.child.process_id())
             .ok_or_else(|| anyhow!("Child process has no process ID"))?;
 
+        let current_title = self.output.terminal.get_title().to_owned();
+        let terminal_modes = Some(
+            self.output
+                .mode_tracker
+                .export_handover_modes(&current_title),
+        );
+
         Ok(ExtractedHandover {
             // Safety: `dup_cloexec` just produced this descriptor and no other owner
             // exists, so handing it to an `OwnedFd` is the only claim on it.
@@ -7561,6 +7798,7 @@ impl ActorState {
             logged_output_seq: self.output.logged_output_seq,
             logged_tail_bytes: self.output.logged_tail_bytes,
             context: self.context.clone(),
+            terminal_modes,
         })
     }
 
@@ -8031,6 +8269,58 @@ impl ActorState {
                 let _ = response.send(std::mem::take(&mut self.output.unlogged_bytes));
                 false
             }
+            ActorCommand::SyncTerminal {
+                resize,
+                mut cursor,
+                force_full,
+                response,
+            } => {
+                let result = (|| -> ActorResult<(
+                    SessionSnapshot,
+                    TerminalSyncCursor,
+                    TerminalSyncFrame,
+                )> {
+                    if let Some(size) = resize {
+                        let _ = self.resize(size)?;
+                    }
+                    let snapshot = self.metadata_snapshot();
+                    let frame = self.output.build_sync_frame(&mut cursor, force_full);
+                    Ok((snapshot, cursor, frame))
+                })();
+                let _ = response.send(result);
+                false
+            }
+            ActorCommand::PollTerminalSync {
+                mut cursor,
+                force_full,
+                response,
+            } => {
+                let outcome = if !force_full
+                    && !self.exited
+                    && self
+                        .output
+                        .mode_tracker
+                        .is_in_synchronized_update(Instant::now(), Duration::from_millis(40))
+                {
+                    PollTerminalSyncOutcome::HoldForSynchronizedUpdate
+                } else {
+                    self.output.poll_sync_frame(&mut cursor, force_full)
+                };
+                let _ = response.send(Ok((cursor, outcome)));
+                false
+            }
+            ActorCommand::FetchTerminalRows {
+                session_id,
+                start_row,
+                row_count,
+                response,
+            } => {
+                let resp = self
+                    .output
+                    .fetch_scrollback_rows(session_id, start_row, row_count);
+                let _ = response.send(Ok(resp));
+                false
+            }
         }
     }
 
@@ -8115,9 +8405,17 @@ impl ActorState {
         // `wezterm_term::Terminal::resize` rewraps soft-wrapped lines in place on
         // the primary screen (`Screen::rewrap_lines`) and resizes the alternate
         // screen in memory without reading or re-emulating the 16 MiB session log.
+        triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut self.output.terminal);
         self.output.terminal.resize(terminal_size(&size));
         if size.cols != self.size.cols || size.rows != self.size.rows {
             self.output.scroll_seq_baseline = None;
+            if !self.output.terminal.is_alt_screen_active() {
+                let screen = self.output.terminal.screen();
+                self.output.prev_top_stable = Some(screen.phys_to_stable_row_index(0));
+                if screen.phys_row(0) == 0 {
+                    self.output.mirrored_journal_records = 0;
+                }
+            }
         }
         self.size = size;
         let snapshot = self.snapshot();
@@ -8660,7 +8958,30 @@ fn trim_incomplete_replay_tail(bytes: &[u8]) -> &[u8] {
 }
 
 impl OutputState {
+    fn feed_terminal_bytes(&mut self, bytes: &[u8], live_ingest: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+        let cols = self.terminal.screen().physical_cols;
+        let prev_erase_gen = self.mode_tracker.erase_scrollback_gen();
+        let sanitized = self.mode_tracker.observe_and_sanitize(bytes, cols);
+        self.terminal.advance_bytes(sanitized);
+        if live_ingest && self.mode_tracker.erase_scrollback_gen() != prev_erase_gen {
+            let journal_next = self
+                .scrollback
+                .as_ref()
+                .map_or(0, crate::scrollback::ScrollbackJournal::next_seq);
+            self.journal_clear_floor = journal_next;
+            self.mirrored_journal_records = 0;
+            self.prev_top_stable = Some(self.terminal.screen().phys_to_stable_row_index(0));
+        }
+    }
+
     fn advance_translated_bytes(&mut self, bytes: &[u8]) {
+        self.advance_translated_bytes_inner(bytes, true);
+    }
+
+    fn advance_translated_bytes_inner(&mut self, bytes: &[u8], live_ingest: bool) {
         if bytes.is_empty() && self.pending_escape_buffer.is_empty() {
             return;
         }
@@ -8668,7 +8989,7 @@ impl OutputState {
         if self.pending_escape_buffer.is_empty() {
             if !self.pending_carriage_return && !bytes.contains(&b'\n') && !bytes.contains(&b'\x1b')
             {
-                self.terminal.advance_bytes(bytes);
+                self.feed_terminal_bytes(bytes, live_ingest);
                 self.pending_carriage_return = bytes.last() == Some(&b'\r');
                 return;
             }
@@ -8682,7 +9003,7 @@ impl OutputState {
             if !to_process.is_empty() {
                 let translated =
                     translate_newlines_with_state(to_process, self.pending_carriage_return);
-                self.terminal.advance_bytes(&translated);
+                self.feed_terminal_bytes(&translated, live_ingest);
                 self.pending_carriage_return = to_process.last() == Some(&b'\r');
             }
             return;
@@ -8698,23 +9019,31 @@ impl OutputState {
             let to_process = &self.pending_escape_buffer[..split_idx];
             let translated =
                 translate_newlines_with_state(to_process, self.pending_carriage_return);
-            self.terminal.advance_bytes(&translated);
-            self.pending_carriage_return = to_process.last() == Some(&b'\r');
+            let next_cr = to_process.last() == Some(&b'\r');
+            let translated_owned = translated.into_owned();
             self.pending_escape_buffer.drain(..split_idx);
+            self.feed_terminal_bytes(&translated_owned, live_ingest);
+            self.pending_carriage_return = next_cr;
         }
     }
 
     fn flush_replayed_pending_translated_bytes(&mut self) {
+        self.flush_pending_translated_bytes_inner(false);
+    }
+
+    fn flush_pending_translated_bytes_inner(&mut self, live_ingest: bool) {
         if self.pending_escape_buffer.is_empty() {
             return;
         }
         let translated = translate_newlines_with_state(
             &self.pending_escape_buffer,
             self.pending_carriage_return,
-        );
-        self.terminal.advance_bytes(&translated);
-        self.pending_carriage_return = self.pending_escape_buffer.last() == Some(&b'\r');
+        )
+        .into_owned();
+        let next_cr = self.pending_escape_buffer.last() == Some(&b'\r');
         self.pending_escape_buffer.clear();
+        self.feed_terminal_bytes(&translated, live_ingest);
+        self.pending_carriage_return = next_cr;
     }
 
     fn flush_pending_translated_bytes(&mut self) {
@@ -8722,7 +9051,7 @@ impl OutputState {
             return;
         }
         self.init_scroll_baseline();
-        self.flush_replayed_pending_translated_bytes();
+        self.flush_pending_translated_bytes_inner(true);
         self.journal_scrolled_lines();
         if let Some(journal) = self.scrollback.as_mut() {
             journal.flush_buffer();
@@ -9018,8 +9347,12 @@ impl OutputState {
         {
             return;
         }
-        let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
+        let screen = self.terminal.screen();
+        let first_visible = screen.visible_row_to_stable_row(0);
         self.scroll_seq_baseline = Some(first_visible);
+        if self.prev_top_stable.is_none() {
+            self.prev_top_stable = Some(screen.phys_to_stable_row_index(0));
+        }
     }
 
     /// Journal lines that scrolled into scrollback during this chunk.
@@ -9081,6 +9414,7 @@ impl OutputState {
             .terminal
             .screen()
             .lines_in_phys_range(phys_start..phys_end);
+        let appended_count = lines.len() as u64;
         let offset = self.bytes_logged;
         if let Some(journal) = self.scrollback.as_mut() {
             for mut line in lines {
@@ -9088,6 +9422,24 @@ impl OutputState {
                 journal.append(offset, &bytes);
             }
         }
+        if self
+            .scrollback
+            .as_ref()
+            .is_some_and(crate::scrollback::ScrollbackJournal::is_enabled)
+        {
+            if top > baseline {
+                self.mirrored_journal_records = appended_count;
+            } else {
+                let delta_evicted = self
+                    .prev_top_stable
+                    .map_or(0, |prev| (top - prev).max(0) as u64);
+                self.mirrored_journal_records = self
+                    .mirrored_journal_records
+                    .saturating_sub(delta_evicted)
+                    .saturating_add(appended_count);
+            }
+        }
+        self.prev_top_stable = Some(top);
         self.scroll_seq_baseline = Some(first_visible);
     }
 
@@ -9301,6 +9653,23 @@ impl OutputState {
         // fully logged by construction. (Adoption overrides both stamps
         // with the outgoing daemon's after this returns.)
         self.mark_fully_persisted();
+
+        let raw_start = total_len.saturating_sub(tail.len() as u64);
+        let in_mem = self.terminal.screen().phys_row(0) as u64;
+        self.prev_top_stable = Some(self.terminal.screen().phys_to_stable_row_index(0));
+        if let Some(journal) = self.scrollback.as_mut()
+            && journal.is_enabled()
+        {
+            if let Some(last_clear_end) = find_last_csi_3j_end(tail) {
+                let clear_offset = raw_start.saturating_add(last_clear_end as u64);
+                let after_clear = journal.count_records_after_log_offset(clear_offset);
+                self.journal_clear_floor = journal.next_seq().saturating_sub(after_clear);
+                self.mirrored_journal_records = after_clear.min(in_mem);
+            } else {
+                let tail_records = journal.count_records_after_log_offset(raw_start);
+                self.mirrored_journal_records = tail_records.min(in_mem);
+            }
+        }
         Ok(current_working_directory)
     }
 
@@ -9308,7 +9677,9 @@ impl OutputState {
     fn reflow_from_log(&mut self, size: &SessionSize, writer: SharedPtyWriter) -> Result<()> {
         let (replay_writer, replay_gate) = replay_gated_pty_writer();
         self.terminal = terminal_with_writer(size, replay_writer);
+        self.mode_tracker = triage_term::TerminalModeTracker::new();
         self.scroll_seq_baseline = None;
+        self.prev_top_stable = None;
         self.cwd_sequence_buffer.clear();
         self.pending_carriage_return = false;
         self.pending_escape_buffer.clear();
@@ -9337,8 +9708,179 @@ impl OutputState {
 
     fn advance_replayed_bytes(&mut self, bytes: &[u8]) -> Option<PathBuf> {
         let current_working_directory = self.extract_current_working_directory(bytes);
-        self.advance_translated_bytes(bytes);
+        self.advance_translated_bytes_inner(bytes, false);
         current_working_directory
+    }
+
+    fn scrollback_layout(&self) -> ScrollbackLayout {
+        if self.terminal.is_alt_screen_active() {
+            return ScrollbackLayout {
+                effective_floor: self.journal_clear_floor,
+                trimmed_top_rows: 0,
+                archived_prefix_count: 0,
+                in_mem_rows: 0,
+                total_scrollback_rows: 0,
+            };
+        }
+        let in_mem_rows = self.terminal.screen().phys_row(0) as u64;
+        let (first_retained, next_seq) = match self.scrollback.as_ref() {
+            Some(journal) if journal.is_enabled() => {
+                (journal.first_retained_seq(), journal.next_seq())
+            }
+            _ => (0, 0),
+        };
+        let effective_floor = self.journal_clear_floor.max(first_retained);
+        let trimmed_top_rows = effective_floor.saturating_sub(self.journal_clear_floor);
+        let active_journal_records = next_seq.saturating_sub(effective_floor);
+        let clamped_mirrored = self.mirrored_journal_records.min(active_journal_records);
+        let archived_prefix_count = active_journal_records.saturating_sub(clamped_mirrored);
+        let total_scrollback_rows = archived_prefix_count + in_mem_rows;
+        ScrollbackLayout {
+            effective_floor,
+            trimmed_top_rows,
+            archived_prefix_count,
+            in_mem_rows,
+            total_scrollback_rows,
+        }
+    }
+
+    fn build_sync_frame(
+        &mut self,
+        cursor: &mut TerminalSyncCursor,
+        force_full: bool,
+    ) -> TerminalSyncFrame {
+        let layout = self.scrollback_layout();
+        let mut baseline = cursor_to_baseline(cursor);
+        let maybe_patch = baseline.diff_terminal(
+            &self.terminal,
+            &mut self.mode_tracker,
+            triage_term::VirtualScrollbackMetrics {
+                total_scrollback_rows: layout.total_scrollback_rows,
+                trimmed_top_rows: layout.trimmed_top_rows,
+            },
+            force_full,
+        );
+        *cursor = baseline_to_cursor(&baseline);
+        if let Some(patch) = maybe_patch {
+            return patch_to_sync_frame(patch);
+        }
+        let screen = self.terminal.screen();
+        TerminalSyncFrame {
+            frame_seq: cursor.next_frame_seq,
+            rows: screen.physical_rows.max(1).min(u16::MAX as usize) as u16,
+            cols: screen.physical_cols.max(1).min(u16::MAX as usize) as u16,
+            total_scrollback_rows: cursor.last_total_scrollback_rows,
+            trimmed_top_rows: cursor.last_trimmed_top_rows,
+            erase_scrollback_gen: cursor.last_erase_scrollback_gen,
+            cursor_x: cursor.last_cursor_x.min(u16::MAX as u32) as u16,
+            cursor_y: cursor.last_cursor_y.min(u16::MAX as u32) as u16,
+            cursor_style: cursor.last_cursor_style as u8,
+            mode_flags: cursor.last_mode_flags,
+            mouse_mode: cursor.last_mouse_mode as u8,
+            mouse_report_mode: cursor.last_mouse_report_mode as u8,
+            kitty_keyboard_flags: cursor.last_kitty_flags,
+            title: None,
+            viewport_compression: triage_term::CELL_COMPRESSION_NONE,
+            viewport_payload: Vec::new(),
+            pushed_scrollback_start_row: cursor.last_total_scrollback_rows,
+            pushed_scrollback_row_count: 0,
+            pushed_scrollback_compression: triage_term::CELL_COMPRESSION_NONE,
+            pushed_scrollback_payload: Vec::new(),
+        }
+    }
+
+    fn poll_sync_frame(
+        &mut self,
+        cursor: &mut TerminalSyncCursor,
+        force_full: bool,
+    ) -> PollTerminalSyncOutcome {
+        let layout = self.scrollback_layout();
+        let mut baseline = cursor_to_baseline(cursor);
+        let maybe_patch = baseline.diff_terminal(
+            &self.terminal,
+            &mut self.mode_tracker,
+            triage_term::VirtualScrollbackMetrics {
+                total_scrollback_rows: layout.total_scrollback_rows,
+                trimmed_top_rows: layout.trimmed_top_rows,
+            },
+            force_full,
+        );
+        *cursor = baseline_to_cursor(&baseline);
+        match maybe_patch {
+            Some(patch) => PollTerminalSyncOutcome::Frame(Box::new(patch_to_sync_frame(patch))),
+            None => PollTerminalSyncOutcome::Idle,
+        }
+    }
+
+    fn fetch_scrollback_rows(
+        &mut self,
+        session_id: SessionId,
+        start_row: u64,
+        row_count: u32,
+    ) -> FetchTerminalRowsResponse {
+        let layout = self.scrollback_layout();
+        let erase_scrollback_gen = self.mode_tracker.erase_scrollback_gen();
+        if row_count == 0 || start_row >= layout.total_scrollback_rows {
+            return FetchTerminalRowsResponse {
+                session_id,
+                start_row: start_row.min(layout.total_scrollback_rows),
+                row_count: 0,
+                total_scrollback_rows: layout.total_scrollback_rows,
+                trimmed_top_rows: layout.trimmed_top_rows,
+                erase_scrollback_gen,
+                compression: triage_term::CELL_COMPRESSION_NONE,
+                payload: Vec::new(),
+            };
+        }
+
+        let clamped_count = u64::from(row_count)
+            .min(layout.total_scrollback_rows - start_row)
+            .min(512) as usize;
+        let end_row = start_row + clamped_count as u64;
+        let physical_cols = self.terminal.screen().physical_cols.max(1);
+        let mut builder =
+            triage_term::Tcg1BatchBuilder::with_row_capacity(clamped_count, physical_cols);
+
+        if start_row < layout.archived_prefix_count {
+            let arch_end = end_row.min(layout.archived_prefix_count);
+            let arch_count = (arch_end - start_row) as usize;
+            let start_seq = layout.effective_floor + start_row;
+            if let Some(journal) = self.scrollback.as_mut() {
+                journal.pack_record_range(
+                    start_seq,
+                    arch_count,
+                    start_seq,
+                    physical_cols,
+                    &mut builder,
+                );
+            }
+        }
+
+        if end_row > layout.archived_prefix_count {
+            let mem_virt_start = start_row.max(layout.archived_prefix_count);
+            let phys_start = (mem_virt_start - layout.archived_prefix_count) as usize;
+            let phys_end = ((end_row - layout.archived_prefix_count) as usize)
+                .min(layout.in_mem_rows as usize);
+            let rel_base = (mem_virt_start - start_row) as u32;
+            self.terminal.screen().for_each_phys_line(|phys_idx, line| {
+                if phys_idx >= phys_start && phys_idx < phys_end {
+                    let rel_row = rel_base + (phys_idx - phys_start) as u32;
+                    builder.push_wezterm_line(rel_row, line, physical_cols);
+                }
+            });
+        }
+
+        let encoded = builder.finish_encoded();
+        FetchTerminalRowsResponse {
+            session_id,
+            start_row,
+            row_count: encoded.row_count,
+            total_scrollback_rows: layout.total_scrollback_rows,
+            trimmed_top_rows: layout.trimmed_top_rows,
+            erase_scrollback_gen,
+            compression: encoded.compression,
+            payload: encoded.payload,
+        }
     }
 
     fn extract_current_working_directory(&mut self, bytes: &[u8]) -> Option<PathBuf> {
@@ -9388,6 +9930,122 @@ impl OutputState {
         }
 
         current_working_directory
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbackLayout {
+    effective_floor: u64,
+    trimmed_top_rows: u64,
+    archived_prefix_count: u64,
+    in_mem_rows: u64,
+    total_scrollback_rows: u64,
+}
+
+fn find_last_csi_3j_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let mut i = bytes.len() - 4;
+    loop {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' && bytes[i + 2] == b'3' && bytes[i + 3] == b'J'
+        {
+            return Some(i + 4);
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    None
+}
+
+fn screen_cursor_to_baseline(c: TerminalScreenCursor) -> triage_term::ScreenBaseline {
+    triage_term::ScreenBaseline {
+        initialized: c.initialized,
+        synced_seqno: c.synced_seqno,
+        first_visible_stable: c.first_visible_stable,
+        physical_rows: c.physical_rows,
+        physical_cols: c.physical_cols,
+    }
+}
+
+fn baseline_to_screen_cursor(b: triage_term::ScreenBaseline) -> TerminalScreenCursor {
+    TerminalScreenCursor {
+        initialized: b.initialized,
+        synced_seqno: b.synced_seqno,
+        first_visible_stable: b.first_visible_stable,
+        physical_rows: b.physical_rows,
+        physical_cols: b.physical_cols,
+    }
+}
+
+fn cursor_to_baseline(c: &TerminalSyncCursor) -> triage_term::ClientSyncBaseline {
+    triage_term::ClientSyncBaseline {
+        primary: screen_cursor_to_baseline(c.primary),
+        alt: screen_cursor_to_baseline(c.alt),
+        last_alt_screen: c.last_alt_screen,
+        last_erase_scrollback_gen: c.last_erase_scrollback_gen,
+        last_erase_display_gen: c.last_erase_display_gen,
+        last_bell_gen: c.last_bell_gen,
+        last_title_gen: c.last_title_gen,
+        last_mode_flags: c.last_mode_flags,
+        last_mouse_mode: c.last_mouse_mode,
+        last_mouse_report_mode: c.last_mouse_report_mode,
+        last_kitty_flags: c.last_kitty_flags,
+        last_cursor_x: c.last_cursor_x,
+        last_cursor_y: c.last_cursor_y,
+        last_cursor_style: c.last_cursor_style,
+        last_total_scrollback_rows: c.last_total_scrollback_rows,
+        last_trimmed_top_rows: c.last_trimmed_top_rows,
+        next_frame_seq: c.next_frame_seq,
+    }
+}
+
+fn baseline_to_cursor(b: &triage_term::ClientSyncBaseline) -> TerminalSyncCursor {
+    TerminalSyncCursor {
+        primary: baseline_to_screen_cursor(b.primary),
+        alt: baseline_to_screen_cursor(b.alt),
+        last_alt_screen: b.last_alt_screen,
+        last_erase_scrollback_gen: b.last_erase_scrollback_gen,
+        last_erase_display_gen: b.last_erase_display_gen,
+        last_bell_gen: b.last_bell_gen,
+        last_title_gen: b.last_title_gen,
+        last_mode_flags: b.last_mode_flags,
+        last_mouse_mode: b.last_mouse_mode,
+        last_mouse_report_mode: b.last_mouse_report_mode,
+        last_kitty_flags: b.last_kitty_flags,
+        last_cursor_x: b.last_cursor_x,
+        last_cursor_y: b.last_cursor_y,
+        last_cursor_style: b.last_cursor_style,
+        last_total_scrollback_rows: b.last_total_scrollback_rows,
+        last_trimmed_top_rows: b.last_trimmed_top_rows,
+        next_frame_seq: b.next_frame_seq,
+    }
+}
+
+fn patch_to_sync_frame(patch: triage_term::TerminalSyncPatch) -> TerminalSyncFrame {
+    TerminalSyncFrame {
+        frame_seq: patch.frame_seq,
+        rows: patch.rows,
+        cols: patch.cols,
+        total_scrollback_rows: patch.total_scrollback_rows,
+        trimmed_top_rows: patch.trimmed_top_rows,
+        erase_scrollback_gen: patch.erase_scrollback_gen,
+        cursor_x: patch.cursor_x,
+        cursor_y: patch.cursor_y,
+        cursor_style: patch.cursor_style,
+        mode_flags: patch.mode_flags,
+        mouse_mode: patch.mouse_mode,
+        mouse_report_mode: patch.mouse_report_mode,
+        kitty_keyboard_flags: patch.kitty_keyboard_flags,
+        title: patch.title,
+        viewport_compression: patch.viewport_batch.compression,
+        viewport_payload: patch.viewport_batch.payload,
+        pushed_scrollback_start_row: patch.pushed_scrollback_start_row,
+        pushed_scrollback_row_count: patch.pushed_scrollback_batch.row_count,
+        pushed_scrollback_compression: patch.pushed_scrollback_batch.compression,
+        pushed_scrollback_payload: patch.pushed_scrollback_batch.payload,
     }
 }
 
@@ -9543,6 +10201,7 @@ fn spawn_pty_runtime(
                     active_segment_bytes,
                     compression_tx: None,
                     terminal,
+                    mode_tracker: triage_term::TerminalModeTracker::new(),
                     cwd_sequence_buffer: Vec::new(),
                     bytes_logged: 0,
                     output_seq: 0,
@@ -9558,6 +10217,9 @@ fn spawn_pty_runtime(
                     pending_escape_buffer: Vec::new(),
                     scrollback: Some(scrollback),
                     scroll_seq_baseline: None,
+                    journal_clear_floor: 0,
+                    mirrored_journal_records: 0,
+                    prev_top_stable: None,
                 },
                 size: config.size,
                 current_working_directory: None,
@@ -9596,6 +10258,7 @@ fn spawn_pty_runtime(
                 active_segment_bytes,
                 compression_tx: None,
                 terminal,
+                mode_tracker: triage_term::TerminalModeTracker::new(),
                 cwd_sequence_buffer: Vec::new(),
                 bytes_logged: 0,
                 output_seq: 0,
@@ -9611,6 +10274,9 @@ fn spawn_pty_runtime(
                 pending_escape_buffer: Vec::new(),
                 scrollback: Some(scrollback),
                 scroll_seq_baseline: None,
+                journal_clear_floor: 0,
+                mirrored_journal_records: 0,
+                prev_top_stable: None,
             };
             let (replay_len, replay) = read_replay_tail(&config.log_path)?;
             let replayed_working_directory = if replay_len == 0 {
@@ -9729,6 +10395,7 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         active_segment_bytes,
         compression_tx: None,
         terminal: terminal_with_writer(&size, shared_pty_writer(Box::new(std::io::sink()))),
+        mode_tracker: triage_term::TerminalModeTracker::new(),
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: 0,
         output_seq: 0,
@@ -9744,6 +10411,9 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         pending_escape_buffer: Vec::new(),
         scrollback: Some(scrollback),
         scroll_seq_baseline: None,
+        journal_clear_floor: 0,
+        mirrored_journal_records: 0,
+        prev_top_stable: None,
     })
 }
 
@@ -10662,6 +11332,55 @@ fn request_snapshot_with_history(
     recv_actor_result(resp_rx, "reading session snapshot with history")
 }
 
+fn request_sync_terminal(
+    tx: &Sender<ActorCommand>,
+    resize: Option<SessionSize>,
+    cursor: TerminalSyncCursor,
+    force_full: bool,
+) -> Result<(SessionSnapshot, TerminalSyncCursor, TerminalSyncFrame)> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::SyncTerminal {
+        resize,
+        cursor,
+        force_full,
+        response: resp_tx,
+    })
+    .context("sending session terminal sync command")?;
+    recv_actor_result(resp_rx, "syncing session terminal")
+}
+
+fn request_poll_terminal_sync(
+    tx: &Sender<ActorCommand>,
+    cursor: TerminalSyncCursor,
+    force_full: bool,
+) -> Result<(TerminalSyncCursor, PollTerminalSyncOutcome)> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::PollTerminalSync {
+        cursor,
+        force_full,
+        response: resp_tx,
+    })
+    .context("sending session poll terminal sync command")?;
+    recv_actor_result(resp_rx, "polling session terminal sync")
+}
+
+fn request_fetch_terminal_rows(
+    tx: &Sender<ActorCommand>,
+    session_id: SessionId,
+    start_row: u64,
+    row_count: u32,
+) -> Result<FetchTerminalRowsResponse> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::FetchTerminalRows {
+        session_id,
+        start_row,
+        row_count,
+        response: resp_tx,
+    })
+    .context("sending fetch terminal rows command")?;
+    recv_actor_result(resp_rx, "fetching terminal rows")
+}
+
 fn request_actor_shutdown(tx: &Sender<ActorCommand>) -> Result<CompletedSession> {
     let (response_tx, response_rx) = mpsc::channel();
     tx.send(ActorCommand::Shutdown {
@@ -10723,6 +11442,15 @@ fn reject_command_during_shutdown(command: ActorCommand) {
         }
         #[cfg(unix)]
         ActorCommand::ExtractHandoverState { response } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::SyncTerminal { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::PollTerminalSync { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        ActorCommand::FetchTerminalRows { response, .. } => {
             let _ = response.send(Err(error));
         }
     }
@@ -12078,6 +12806,7 @@ mod tests {
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
             agent: None,
+            terminal_modes: None,
         };
 
         let mut master: libc::c_int = 0;
@@ -12237,6 +12966,7 @@ mod tests {
                         lease: InputLeaseState::default(),
                         parked_input: Vec::new(),
                         agent: None,
+                        terminal_modes: None,
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -13351,6 +14081,7 @@ mod tests {
                         lease: InputLeaseState::default(),
                         parked_input: Vec::new(),
                         agent: None,
+                        terminal_modes: None,
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -16944,6 +17675,7 @@ mod tests {
             active_segment_bytes: 0,
             compression_tx: None,
             terminal: terminal_with_writer(&SessionSize::default(), writer.clone()),
+            mode_tracker: triage_term::TerminalModeTracker::new(),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
@@ -16959,6 +17691,9 @@ mod tests {
             pending_escape_buffer: Vec::new(),
             scrollback: None,
             scroll_seq_baseline: None,
+            journal_clear_floor: 0,
+            mirrored_journal_records: 0,
+            prev_top_stable: None,
         };
 
         output
@@ -19161,6 +19896,7 @@ mod tests {
             active_segment_bytes: 0,
             compression_tx: None,
             terminal: terminal_with_writer(&size, writer),
+            mode_tracker: triage_term::TerminalModeTracker::new(),
             cwd_sequence_buffer: Vec::new(),
             bytes_logged: 0,
             output_seq: 0,
@@ -19179,6 +19915,9 @@ mod tests {
             // Journal tests open their own in a `unique_log_dir`.
             scrollback: None,
             scroll_seq_baseline: None,
+            journal_clear_floor: 0,
+            mirrored_journal_records: 0,
+            prev_top_stable: None,
         }
     }
 
@@ -19428,6 +20167,7 @@ mod tests {
                         logged_output_seq: 7,
                         logged_tail_bytes: 11,
                         context: None,
+                        terminal_modes: None,
                     }));
                 })
             })
@@ -20432,6 +21172,7 @@ mod tests {
                         lease: InputLeaseState::default(),
                         parked_input: Vec::new(),
                         agent: None,
+                        terminal_modes: None,
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -21970,6 +22711,7 @@ mod tests {
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
             agent: None,
+            terminal_modes: None,
         };
 
         let mut master: libc::c_int = 0;
@@ -22097,6 +22839,7 @@ mod tests {
             lease: InputLeaseState::default(),
             parked_input: Vec::new(),
             agent: None,
+            terminal_modes: None,
         };
 
         let mut master: libc::c_int = -1;
@@ -22205,5 +22948,171 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn decoded_row_ascii(row: &triage_term::DecodedCellRow) -> String {
+        let mut s = String::new();
+        for col in 0..row.stored_cols {
+            let content = row.cell_words[col * triage_term::CELL_WORDS + 3];
+            let cp = content & triage_term::CONTENT_CODEPOINT_MASK;
+            if cp != 0
+                && let Some(ch) = char::from_u32(cp)
+            {
+                s.push(ch);
+            }
+        }
+        s.trim_end().to_owned()
+    }
+
+    #[test]
+    fn virtual_scrollback_stitches_journal_prefix_and_in_mem_seam_and_clears_on_csi_3j() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("session.log");
+        let size = SessionSize {
+            rows: 4,
+            cols: 24,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Ingest 3,700 numbered lines in 100-line chunks so `Terminal` evicts ~197
+        // oldest rows from its 3,500-row in-memory ring while `ScrollbackJournal`
+        // retains all 3,697 scrolled lines.
+        for batch in 0..37 {
+            let mut chunk = Vec::new();
+            for offset in 0..100 {
+                let idx = batch * 100 + offset;
+                chunk.extend_from_slice(format!("row-{idx:04}\r\n").as_bytes());
+            }
+            output.ingest(&chunk).expect("ingest numbered batch");
+        }
+
+        let mut cursor = TerminalSyncCursor::default();
+        let initial = output.build_sync_frame(&mut cursor, true);
+        // 3,700 lines ending in `\r\n` leave the cursor on line 3,700 (empty),
+        // so 3,701 total lines minus 4 visible rows = 3,697 scrollback rows.
+        assert_eq!(initial.total_scrollback_rows, 3697);
+
+        // Fetch `[150 .. 250)` spanning the seam at archived_prefix_count (~197):
+        // rows `150..197` come from `ScrollbackJournal` and rows `197..250` come
+        // from `Terminal`'s in-memory scrollback.
+        let sid = SessionId::new("seam-test").expect("valid session id");
+        let page = output.fetch_scrollback_rows(sid.clone(), 150, 100);
+        assert_eq!(page.start_row, 150);
+        assert_eq!(page.row_count, 100);
+        let decoded = triage_term::decode_tcg1_batch(page.compression, &page.payload)
+            .expect("decode seam page");
+        assert_eq!(decoded.len(), 100);
+        for (offset, row) in decoded.iter().enumerate() {
+            let expected_idx = 150 + offset;
+            assert_eq!(row.row_index, offset as u32);
+            assert_eq!(
+                decoded_row_ascii(row),
+                format!("row-{expected_idx:04}"),
+                "mismatch across journal/in-memory seam at virtual row {expected_idx}"
+            );
+        }
+
+        // `CSI 3J` advances `erase_scrollback_gen` and clears client scrollback to 0
+        // without deleting the on-disk journal files.
+        output.ingest(b"\x1b[3J").expect("ingest CSI 3J");
+        let PollTerminalSyncOutcome::Frame(after_clear) =
+            output.poll_sync_frame(&mut cursor, false)
+        else {
+            panic!("expected sync frame after CSI 3J");
+        };
+        assert_eq!(after_clear.total_scrollback_rows, 0);
+        assert!(after_clear.erase_scrollback_gen > initial.erase_scrollback_gen);
+        assert_ne!(
+            after_clear.mode_flags & triage_term::MODE_SAW_ERASE_SCROLLBACK,
+            0
+        );
+        let empty_page = output.fetch_scrollback_rows(sid, 0, 64);
+        assert_eq!(empty_page.row_count, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handover_preserves_sideband_terminal_modes() {
+        let temp = unique_log_dir();
+        let session_dir = temp.join("sessions").join("session-handover-modes");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        let log_path = session_dir.join("segment-000001.tlog");
+        fs::write(&log_path, b"prompt> ").expect("write tail log");
+
+        let h_sess = crate::handover::HandoverSession {
+            id: SessionId::new("session-handover-modes").unwrap(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "cat".into()],
+            cwd: None,
+            size: SessionSize {
+                rows: 6,
+                cols: 30,
+                ..SessionSize::default()
+            },
+            log_path,
+            output_seq: 1,
+            bytes_logged: 8,
+            logged_output_seq: Some(1),
+            logged_tail_bytes: Some(8),
+            last_activity_ms: 0,
+            last_input_ms: 0,
+            pid: std::process::id(),
+            process_identity: None,
+            judge_override: None,
+            lease: InputLeaseState::default(),
+            parked_input: Vec::new(),
+            agent: None,
+            terminal_modes: Some(triage_term::HandoverTerminalModes {
+                app_cursor_keys: true,
+                app_keypad: true,
+                origin_mode: false,
+                auto_wrap: true,
+                report_focus: true,
+                mouse_mode: 3,
+                mouse_report_mode: 2,
+                kitty_keyboard_flags: 5,
+                title: "Adopted TUI".into(),
+            }),
+        };
+
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let mut ws = libc::winsize {
+            ws_row: 6,
+            ws_col: 30,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let ret = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut ws,
+            )
+        };
+        assert_eq!(ret, 0, "openpty failed");
+
+        let mut runtime = spawn_adopted_pty_runtime(&h_sess, master).expect("spawn adopted");
+        unsafe {
+            libc::close(slave);
+        }
+
+        let mut cursor = TerminalSyncCursor::default();
+        let frame = runtime.output.build_sync_frame(&mut cursor, true);
+        assert_ne!(frame.mode_flags & triage_term::MODE_APP_CURSOR_KEYS, 0);
+        assert_ne!(frame.mode_flags & triage_term::MODE_APP_KEYPAD, 0);
+        assert_ne!(frame.mode_flags & triage_term::MODE_REPORT_FOCUS, 0);
+        assert_eq!(frame.mouse_mode, 3);
+        assert_eq!(frame.mouse_report_mode, 2);
+        assert_eq!(frame.kitty_keyboard_flags, 5);
+        assert_eq!(frame.title.as_deref(), Some("Adopted TUI"));
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

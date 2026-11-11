@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use triage_core::judge::SessionJudgePolicy;
 use triage_core::session::{
-    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession, InputLeaseRequest,
-    LeaseChange, ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEventEnvelope,
-    SessionEventReceiver, SessionId, SessionSnapshot, StartSessionRequest, StyledRowsRequest,
-    StyledRowsResponse, SubscribeSessionEventsRequest, WriteInputRequest,
+    AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession,
+    FetchTerminalRowsRequest, FetchTerminalRowsResponse, InputLeaseRequest, LeaseChange,
+    PollTerminalSyncOutcome, ResizeSessionRequest, RestoreSessionRequest, SessionApi, SessionEvent,
+    SessionEventEnvelope, SessionEventReceiver, SessionId, SessionSnapshot, StartSessionRequest,
+    StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest, SyncTerminalRequest,
+    SyncTerminalResponse, TerminalSyncCursor, WriteInputRequest,
 };
 
 pub mod flatbuffers_proto;
@@ -28,6 +30,16 @@ pub enum ProtocolFormat {
 
 pub const PROTOCOL_VERSION: &str = "2026-05-20";
 const MAX_EVENTS_PER_SUBSCRIPTION_DRAIN: usize = 256;
+const MAX_IN_FLIGHT_SYNC_FRAMES: u64 = 2;
+
+#[derive(Debug)]
+struct TerminalSyncSubState {
+    session_id: SessionId,
+    cursor: TerminalSyncCursor,
+    last_acked_frame_seq: u64,
+    dirty: bool,
+    next_synth_event_seq: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SubscriptionId(String);
@@ -159,6 +171,8 @@ pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     authenticated: bool,
     next_subscription_id: u64,
     subscriptions: HashMap<SubscriptionId, SessionEventReceiver>,
+    terminal_sync_subs: HashMap<SubscriptionId, TerminalSyncSubState>,
+    session_to_sync_sub: HashMap<SessionId, SubscriptionId>,
     /// Connection-wide push channel, independent of session subscriptions. The
     /// daemon broadcasts `ServerMessage`s (e.g. snippet updates) here so the
     /// client learns about sessions it never attached to.
@@ -178,6 +192,8 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            terminal_sync_subs: HashMap::new(),
+            session_to_sync_sub: HashMap::new(),
             global_rx: None,
             format: ProtocolFormat::Flatbuffers,
             peer_addr: None,
@@ -193,6 +209,8 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             authenticated: false,
             next_subscription_id: 1,
             subscriptions: HashMap::new(),
+            terminal_sync_subs: HashMap::new(),
+            session_to_sync_sub: HashMap::new(),
             global_rx: None,
             format: ProtocolFormat::Flatbuffers,
             peer_addr: None,
@@ -251,6 +269,38 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         serialize_server_message(&response)
     }
 
+    /// Handles a JSON text message, returning `None` for fire-and-forget
+    /// `AckTerminalSync` frames that omit `id` and succeed cleanly.
+    pub fn handle_text_message_optional(&mut self, message: &str) -> Option<String> {
+        let response = match serde_json::from_str::<Value>(message) {
+            Ok(value) => {
+                let id = request_id_from_value(&value);
+                match serde_json::from_value::<ClientMessage>(value) {
+                    Ok(parsed) => {
+                        let is_fire_and_forget_ack = is_absent_id(&parsed.id)
+                            && matches!(parsed.request, ClientRequest::AckTerminalSync { .. });
+                        let resp = self.handle_message(parsed);
+                        if is_fire_and_forget_ack && matches!(resp, ServerMessage::Response { .. })
+                        {
+                            return None;
+                        }
+                        resp
+                    }
+                    Err(error) => ServerMessage::Error {
+                        id,
+                        error: ProtocolError::new("invalid_request", error.to_string()),
+                    },
+                }
+            }
+            Err(error) => ServerMessage::Error {
+                id: None,
+                error: ProtocolError::new("invalid_json", error.to_string()),
+            },
+        };
+
+        Some(serialize_server_message(&response))
+    }
+
     pub fn handle_binary_message(&mut self, message: &[u8]) -> Vec<u8> {
         let response = match ::flatbuffers::root::<
             triage_core::generated::triage::generated::ClientMessage,
@@ -267,6 +317,34 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         };
 
         flatbuffers_proto::serialize_server_message(&response)
+    }
+
+    /// Handles a FlatBuffers binary message, returning `None` for fire-and-forget
+    /// `AckTerminalSync` frames that omit `id` and succeed cleanly.
+    pub fn handle_binary_message_optional(&mut self, message: &[u8]) -> Option<Vec<u8>> {
+        let response = match ::flatbuffers::root::<
+            triage_core::generated::triage::generated::ClientMessage,
+        >(message)
+        {
+            Ok(fb_msg) => match flatbuffers_proto::parse_client_message(fb_msg) {
+                Ok(parsed) => {
+                    let is_fire_and_forget_ack = is_absent_id(&parsed.id)
+                        && matches!(parsed.request, ClientRequest::AckTerminalSync { .. });
+                    let resp = self.handle_message(parsed);
+                    if is_fire_and_forget_ack && matches!(resp, ServerMessage::Response { .. }) {
+                        return None;
+                    }
+                    resp
+                }
+                Err(error) => ServerMessage::Error { id: None, error },
+            },
+            Err(error) => ServerMessage::Error {
+                id: None,
+                error: ProtocolError::new("invalid_flatbuffer", error.to_string()),
+            },
+        };
+
+        Some(flatbuffers_proto::serialize_server_message(&response))
     }
 
     pub fn handle_message(&mut self, message: ClientMessage) -> ServerMessage {
@@ -294,17 +372,124 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
         let mut messages = Vec::new();
         let mut closed_subscriptions = Vec::new();
 
-        for (subscription_id, receiver) in &self.subscriptions {
-            for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
-                match receiver.try_recv() {
-                    Ok(envelope) => messages.push(ServerMessage::Event {
-                        subscription_id: subscription_id.clone(),
-                        envelope,
-                    }),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        closed_subscriptions.push(subscription_id.clone());
-                        break;
+        {
+            let Self {
+                api,
+                subscriptions,
+                terminal_sync_subs,
+                ..
+            } = self;
+
+            for (subscription_id, receiver) in subscriptions.iter() {
+                if let Some(sync_state) = terminal_sync_subs.get_mut(subscription_id) {
+                    let mut saw_disconnect = false;
+                    for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
+                        match receiver.try_recv() {
+                            Ok(envelope) => match &envelope.event {
+                                SessionEvent::Output { .. }
+                                | SessionEvent::ResyncRequired { .. } => {
+                                    sync_state.dirty = true;
+                                }
+                                SessionEvent::Snapshot { .. } => {
+                                    sync_state.dirty = true;
+                                    messages.push(ServerMessage::Event {
+                                        subscription_id: subscription_id.clone(),
+                                        envelope,
+                                    });
+                                }
+                                SessionEvent::Exited { .. } => {
+                                    if sync_state.dirty {
+                                        if let Ok(PollTerminalSyncOutcome::Frame(frame)) = api
+                                            .poll_terminal_sync(
+                                                sync_state.session_id.clone(),
+                                                &mut sync_state.cursor,
+                                                false,
+                                            )
+                                        {
+                                            let seq = sync_state.next_synth_event_seq;
+                                            sync_state.next_synth_event_seq =
+                                                sync_state.next_synth_event_seq.wrapping_add(1);
+                                            messages.push(ServerMessage::Event {
+                                                subscription_id: subscription_id.clone(),
+                                                envelope: SessionEventEnvelope {
+                                                    event_seq: seq,
+                                                    event: SessionEvent::TerminalSync {
+                                                        session_id: sync_state.session_id.clone(),
+                                                        frame,
+                                                    },
+                                                },
+                                            });
+                                        }
+                                        sync_state.dirty = false;
+                                    }
+                                    messages.push(ServerMessage::Event {
+                                        subscription_id: subscription_id.clone(),
+                                        envelope,
+                                    });
+                                }
+                                SessionEvent::LeaseChanged { .. }
+                                | SessionEvent::TerminalSync { .. } => {
+                                    messages.push(ServerMessage::Event {
+                                        subscription_id: subscription_id.clone(),
+                                        envelope,
+                                    });
+                                }
+                            },
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                saw_disconnect = true;
+                                closed_subscriptions.push(subscription_id.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    let in_flight = sync_state
+                        .cursor
+                        .next_frame_seq
+                        .saturating_sub(sync_state.last_acked_frame_seq);
+                    if sync_state.dirty && (saw_disconnect || in_flight < MAX_IN_FLIGHT_SYNC_FRAMES)
+                    {
+                        match api.poll_terminal_sync(
+                            sync_state.session_id.clone(),
+                            &mut sync_state.cursor,
+                            false,
+                        ) {
+                            Ok(PollTerminalSyncOutcome::Frame(frame)) => {
+                                sync_state.dirty = false;
+                                let seq = sync_state.next_synth_event_seq;
+                                sync_state.next_synth_event_seq =
+                                    sync_state.next_synth_event_seq.wrapping_add(1);
+                                messages.push(ServerMessage::Event {
+                                    subscription_id: subscription_id.clone(),
+                                    envelope: SessionEventEnvelope {
+                                        event_seq: seq,
+                                        event: SessionEvent::TerminalSync {
+                                            session_id: sync_state.session_id.clone(),
+                                            frame,
+                                        },
+                                    },
+                                });
+                            }
+                            Ok(PollTerminalSyncOutcome::Idle) | Err(_) => {
+                                sync_state.dirty = false;
+                            }
+                            Ok(PollTerminalSyncOutcome::HoldForSynchronizedUpdate) => {}
+                        }
+                    }
+                } else {
+                    for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
+                        match receiver.try_recv() {
+                            Ok(envelope) => messages.push(ServerMessage::Event {
+                                subscription_id: subscription_id.clone(),
+                                envelope,
+                            }),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
+                                closed_subscriptions.push(subscription_id.clone());
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -312,6 +497,11 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
 
         for subscription_id in closed_subscriptions {
             self.subscriptions.remove(&subscription_id);
+            if let Some(removed) = self.terminal_sync_subs.remove(&subscription_id)
+                && self.session_to_sync_sub.get(&removed.session_id) == Some(&subscription_id)
+            {
+                self.session_to_sync_sub.remove(&removed.session_id);
+            }
             messages.push(ServerMessage::SubscriptionClosed { subscription_id });
         }
 
@@ -590,6 +780,90 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 self.api.set_session_custom_label(session_id, label)?;
                 Ok(ServerResult::Unit)
             }
+            ClientRequest::SyncTerminal { request } => {
+                let session_id = request.session_id.clone();
+                let want_subscribe = request.subscribe;
+                if let Some(existing_sub_id) = self.session_to_sync_sub.get(&session_id).cloned()
+                    && self.subscriptions.contains_key(&existing_sub_id)
+                    && let Some(sub_state) = self.terminal_sync_subs.get_mut(&existing_sub_id)
+                {
+                    if request.known_frame_seq == 0
+                        || request.known_frame_seq != sub_state.cursor.next_frame_seq
+                    {
+                        sub_state.cursor.reset_keep_seq();
+                    }
+                    let (snapshot, lease, frame) = self
+                        .api
+                        .sync_terminal_session(request, &mut sub_state.cursor)?;
+                    sub_state.last_acked_frame_seq = frame.frame_seq;
+                    sub_state.dirty = true;
+                    let subscription_id = if snapshot.exited || !want_subscribe {
+                        self.subscriptions.remove(&existing_sub_id);
+                        self.terminal_sync_subs.remove(&existing_sub_id);
+                        self.session_to_sync_sub.remove(&session_id);
+                        None
+                    } else {
+                        if let Ok(fresh_rx) = self.api.subscribe_session_events(session_id.clone())
+                        {
+                            self.subscriptions.insert(existing_sub_id.clone(), fresh_rx);
+                        }
+                        Some(existing_sub_id.as_str().to_string())
+                    };
+                    return Ok(ServerResult::SyncTerminal {
+                        response: Box::new(SyncTerminalResponse {
+                            subscription_id,
+                            snapshot,
+                            lease,
+                            frame,
+                        }),
+                    });
+                }
+
+                self.session_to_sync_sub.remove(&session_id);
+                let mut cursor = TerminalSyncCursor::default();
+                let (snapshot, lease, frame) =
+                    self.api.sync_terminal_session(request, &mut cursor)?;
+                let mut subscription_id_out = None;
+                if want_subscribe && !snapshot.exited {
+                    let receiver = self.api.subscribe_session_events(session_id.clone())?;
+                    let subscription_id = self.next_subscription_id();
+                    let frame_seq = frame.frame_seq;
+                    subscription_id_out = Some(subscription_id.as_str().to_string());
+                    self.subscriptions.insert(subscription_id.clone(), receiver);
+                    self.terminal_sync_subs.insert(
+                        subscription_id.clone(),
+                        TerminalSyncSubState {
+                            session_id: session_id.clone(),
+                            cursor,
+                            last_acked_frame_seq: frame_seq,
+                            dirty: true,
+                            next_synth_event_seq: 1,
+                        },
+                    );
+                    self.session_to_sync_sub.insert(session_id, subscription_id);
+                }
+                Ok(ServerResult::SyncTerminal {
+                    response: Box::new(SyncTerminalResponse {
+                        subscription_id: subscription_id_out,
+                        snapshot,
+                        lease,
+                        frame,
+                    }),
+                })
+            }
+            ClientRequest::FetchTerminalRows { request } => {
+                let response = self.api.fetch_terminal_rows(request)?;
+                Ok(ServerResult::FetchTerminalRows { response })
+            }
+            ClientRequest::AckTerminalSync {
+                subscription_id,
+                frame_seq,
+            } => {
+                if let Some(sub_state) = self.terminal_sync_subs.get_mut(&subscription_id) {
+                    sub_state.last_acked_frame_seq = sub_state.last_acked_frame_seq.max(frame_seq);
+                }
+                Ok(ServerResult::Unit)
+            }
         }
     }
 
@@ -613,6 +887,14 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
 
 fn request_id_from_value(value: &Value) -> Option<Value> {
     value.get("id").filter(|id| !id.is_null()).cloned()
+}
+
+fn is_absent_id(id: &Option<Value>) -> bool {
+    match id {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => s.is_empty(),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -721,6 +1003,16 @@ pub enum ClientRequest {
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+    },
+    SyncTerminal {
+        request: SyncTerminalRequest,
+    },
+    FetchTerminalRows {
+        request: FetchTerminalRowsRequest,
+    },
+    AckTerminalSync {
+        subscription_id: SubscriptionId,
+        frame_seq: u64,
     },
 }
 
@@ -990,6 +1282,12 @@ pub enum ServerResult {
         battery_percent: Option<u8>,
         #[serde(default)]
         battery_state: triage_core::host::BatteryState,
+    },
+    SyncTerminal {
+        response: Box<SyncTerminalResponse>,
+    },
+    FetchTerminalRows {
+        response: FetchTerminalRowsResponse,
     },
 }
 
@@ -1352,6 +1650,8 @@ mod tests {
         rail_layout: Mutex<triage_core::session::RailLayout>,
         set_pins_calls: SetPinsCalls,
         set_custom_label_calls: SetCustomLabelCalls,
+        terminal_seqno: Arc<Mutex<usize>>,
+        hold_sync_update: Arc<Mutex<bool>>,
     }
 
     impl SessionApi for FakeSessionApi {
@@ -1496,6 +1796,79 @@ mod tests {
                 layout.custom_labels.remove(session_id.as_str());
             }
             Ok(())
+        }
+
+        fn sync_terminal_session(
+            &self,
+            request: SyncTerminalRequest,
+            cursor: &mut TerminalSyncCursor,
+        ) -> Result<(
+            SessionSnapshot,
+            InputLeaseState,
+            triage_core::session::TerminalSyncFrame,
+        )> {
+            let seqno = (*self.terminal_seqno.lock().unwrap()).max(1);
+            cursor.primary.initialized = true;
+            cursor.primary.synced_seqno = seqno;
+            cursor.next_frame_seq = cursor.next_frame_seq.wrapping_add(1);
+            let mut snapshot = test_snapshot();
+            if let Some(sz) = request.size {
+                snapshot.size = sz;
+            }
+            let frame = triage_core::session::TerminalSyncFrame {
+                frame_seq: cursor.next_frame_seq,
+                rows: snapshot.size.rows as u16,
+                cols: snapshot.size.cols as u16,
+                total_scrollback_rows: 42,
+                viewport_compression: 0,
+                viewport_payload: vec![0x54, 0x43, 0x47, 0x31, 0, 0, 0, 0, 0, 0, 0, 0],
+                ..Default::default()
+            };
+            Ok((snapshot, InputLeaseState::default(), frame))
+        }
+
+        fn poll_terminal_sync(
+            &self,
+            _session_id: SessionId,
+            cursor: &mut TerminalSyncCursor,
+            force_full: bool,
+        ) -> Result<PollTerminalSyncOutcome> {
+            if *self.hold_sync_update.lock().unwrap() {
+                return Ok(PollTerminalSyncOutcome::HoldForSynchronizedUpdate);
+            }
+            let seqno = *self.terminal_seqno.lock().unwrap();
+            if !force_full && seqno <= cursor.primary.synced_seqno {
+                return Ok(PollTerminalSyncOutcome::Idle);
+            }
+            cursor.primary.synced_seqno = seqno;
+            cursor.next_frame_seq = cursor.next_frame_seq.wrapping_add(1);
+            Ok(PollTerminalSyncOutcome::Frame(Box::new(
+                triage_core::session::TerminalSyncFrame {
+                    frame_seq: cursor.next_frame_seq,
+                    rows: 24,
+                    cols: 80,
+                    total_scrollback_rows: 42 + seqno as u64,
+                    viewport_compression: 1,
+                    viewport_payload: vec![1, 2, 3, 4],
+                    ..Default::default()
+                },
+            )))
+        }
+
+        fn fetch_terminal_rows(
+            &self,
+            request: FetchTerminalRowsRequest,
+        ) -> Result<FetchTerminalRowsResponse> {
+            Ok(FetchTerminalRowsResponse {
+                session_id: request.session_id,
+                start_row: request.start_row,
+                row_count: request.row_count,
+                total_scrollback_rows: 1000,
+                trimmed_top_rows: 5,
+                erase_scrollback_gen: 2,
+                compression: 1,
+                payload: vec![9, 8, 7, 6],
+            })
         }
     }
 
@@ -2740,6 +3113,228 @@ mod tests {
         for msg in samples {
             let wire = serde_json::to_value(&msg).expect("serialize ServerMessage");
             assert_eq!(Some(msg.kind()), wire.get("type").and_then(Value::as_str));
+        }
+    }
+
+    #[test]
+    fn flatbuffers_and_json_terminal_sync_roundtrip() {
+        let api = FakeSessionApi::default();
+        let (tx, rx) = mpsc::channel();
+        api.next_subscription.lock().unwrap().replace(rx);
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        let sync_req = ClientMessage {
+            id: Some(json!("sync-1")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    client_id: ClientId::new("client-1").unwrap(),
+                    mode: AttachMode::InteractiveController,
+                    size: Some(SessionSize {
+                        rows: 30,
+                        cols: 100,
+                        pixel_width: 1000,
+                        pixel_height: 600,
+                        dpi: 144,
+                    }),
+                    resize_pty: true,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        };
+
+        let req_bytes = flatbuffers_proto::serialize_client_message(&sync_req);
+        let parsed_req = flatbuffers_proto::parse_client_message(
+            flatbuffers::root::<fb::ClientMessage>(&req_bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed_req, sync_req);
+
+        let resp_bytes = connection.handle_binary_message(&req_bytes);
+        let borrowed = flatbuffers_proto::parse_fb_server_message_borrowed(&resp_bytes).unwrap();
+        assert_eq!(
+            borrowed,
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("sync-1"),
+                result: flatbuffers_proto::ServerResultBorrowed::SyncTerminal {
+                    subscription_id: Some("sub-1"),
+                    frame_seq: 1,
+                    rows: 30,
+                    cols: 100,
+                    total_scrollback_rows: 42,
+                    viewport_compression: 0,
+                    viewport_payload: &[0x54, 0x43, 0x47, 0x31, 0, 0, 0, 0, 0, 0, 0, 0],
+                },
+            }
+        );
+
+        let fetch_req = ClientMessage {
+            id: Some(json!("fetch-1")),
+            request: ClientRequest::FetchTerminalRows {
+                request: FetchTerminalRowsRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    start_row: 128,
+                    row_count: 64,
+                },
+            },
+        };
+        let fetch_bytes = flatbuffers_proto::serialize_client_message(&fetch_req);
+        let fetch_resp = connection.handle_binary_message(&fetch_bytes);
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&fetch_resp).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::Response {
+                id: Some("fetch-1"),
+                result: flatbuffers_proto::ServerResultBorrowed::FetchTerminalRows {
+                    session_id: "session-1",
+                    start_row: 128,
+                    row_count: 64,
+                    total_scrollback_rows: 1000,
+                    compression: 1,
+                    payload: &[9, 8, 7, 6],
+                },
+            }
+        );
+
+        let fetch_json = serde_json::to_string(&fetch_req).unwrap();
+        let fetch_json_resp: ServerMessage =
+            serde_json::from_str(&connection.handle_text_message(&fetch_json)).unwrap();
+        assert!(matches!(
+            fetch_json_resp,
+            ServerMessage::Response {
+                result: ServerResult::FetchTerminalRows { .. },
+                ..
+            }
+        ));
+        drop(tx);
+    }
+
+    #[test]
+    fn terminal_sync_coalesces_slow_links_and_holds_mode_2026() {
+        let api = FakeSessionApi::default();
+        let terminal_seqno = Arc::clone(&api.terminal_seqno);
+        let hold_sync = Arc::clone(&api.hold_sync_update);
+        let (tx, rx) = mpsc::channel();
+        api.next_subscription.lock().unwrap().replace(rx);
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        let sync_resp = connection.handle_message(ClientMessage {
+            id: Some(json!("sync-init")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: SessionId::new("session-1").unwrap(),
+                    client_id: ClientId::new("client-1").unwrap(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        assert!(matches!(
+            sync_resp,
+            ServerMessage::Response {
+                result: ServerResult::SyncTerminal { .. },
+                ..
+            }
+        ));
+        assert!(connection.drain_events().is_empty());
+
+        // Frame 2 (in_flight becomes 1 < 2)
+        *terminal_seqno.lock().unwrap() = 2;
+        tx.send(test_output_event(1)).unwrap();
+        let drained_1 = connection.drain_events();
+        assert_eq!(drained_1.len(), 1);
+        assert!(matches!(
+            &drained_1[0],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::TerminalSync { frame, .. },
+                    ..
+                },
+                ..
+            } if frame.frame_seq == 2
+        ));
+
+        // Frame 3 (in_flight becomes 2 == MAX_IN_FLIGHT_SYNC_FRAMES)
+        *terminal_seqno.lock().unwrap() = 3;
+        tx.send(test_output_event(2)).unwrap();
+        let drained_2 = connection.drain_events();
+        assert_eq!(drained_2.len(), 1);
+        assert!(matches!(
+            &drained_2[0],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::TerminalSync { frame, .. },
+                    ..
+                },
+                ..
+            } if frame.frame_seq == 3
+        ));
+
+        // Burst of 5 more outputs while client has only acked frame 1:
+        // raw Output events are suppressed AND frame 4 is held back!
+        for i in 3..8 {
+            *terminal_seqno.lock().unwrap() = i + 1;
+            tx.send(test_output_event(i as u64)).unwrap();
+        }
+        assert!(connection.drain_events().is_empty());
+
+        // Mode 2026 synchronized update begins before ACK arrives:
+        *hold_sync.lock().unwrap() = true;
+        let ack_bytes = flatbuffers_proto::serialize_client_message(&ClientMessage {
+            id: None,
+            request: ClientRequest::AckTerminalSync {
+                subscription_id: SubscriptionId::new("sub-1").unwrap(),
+                frame_seq: 3,
+            },
+        });
+        // Fire-and-forget ACK produces no response frame.
+        assert!(
+            connection
+                .handle_binary_message_optional(&ack_bytes)
+                .is_none()
+        );
+        // Still held while Mode 2026 is active:
+        assert!(connection.drain_events().is_empty());
+
+        // Mode 2026 ends (?2026l): all 5 intermediate outputs collapse into one frame 4!
+        *hold_sync.lock().unwrap() = false;
+        let drained_3 = connection.drain_events();
+        assert_eq!(drained_3.len(), 1);
+        match &drained_3[0] {
+            ServerMessage::Event {
+                envelope:
+                    SessionEventEnvelope {
+                        event: SessionEvent::TerminalSync { frame, .. },
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(frame.frame_seq, 4);
+                assert_eq!(frame.total_scrollback_rows, 42 + 8);
+                let ev_bytes = flatbuffers_proto::serialize_server_message(&drained_3[0]);
+                assert_eq!(
+                    flatbuffers_proto::parse_fb_server_message_borrowed(&ev_bytes).unwrap(),
+                    flatbuffers_proto::ServerMessageBorrowed::Event {
+                        subscription_id: "sub-1",
+                        event_seq: 3,
+                        event: flatbuffers_proto::SessionEventBorrowed::TerminalSync {
+                            session_id: "session-1",
+                            frame_seq: 4,
+                            rows: 24,
+                            cols: 80,
+                            total_scrollback_rows: 50,
+                            viewport_compression: 1,
+                            viewport_payload: &[1, 2, 3, 4],
+                        },
+                    }
+                );
+            }
+            other => panic!("unexpected message: {other:?}"),
         }
     }
 }

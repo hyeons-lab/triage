@@ -1,8 +1,9 @@
 use crate::generated::triage::generated as fb;
 use crate::session::{
-    AttachSessionResponse, CompletedSession, InputLeaseHolder, InputLeaseState, LeaseChange,
-    SessionContext, SessionSize, SessionSnapshot, StyledRow, StyledRowsResponse, StyledSpan,
-    TerminalColor, TerminalCursor, TerminalStyle,
+    AttachSessionResponse, CompletedSession, FetchTerminalRowsResponse, InputLeaseHolder,
+    InputLeaseState, LeaseChange, SessionContext, SessionSize, SessionSnapshot, StyledRow,
+    StyledRowsResponse, StyledSpan, SyncTerminalResponse, TerminalColor, TerminalCursor,
+    TerminalStyle, TerminalSyncFrame,
 };
 use flatbuffers::FlatBufferBuilder;
 
@@ -321,6 +322,95 @@ pub fn build_styled_rows_response<'a>(
             output_seq: res.output_seq,
             start: res.start as u32,
             rows: Some(rows_vec),
+        },
+    )
+}
+
+pub fn build_terminal_sync_frame<'a>(
+    builder: &mut FlatBufferBuilder<'a>,
+    frame: &TerminalSyncFrame,
+) -> flatbuffers::WIPOffset<fb::TerminalSyncFrame<'a>> {
+    let title = frame.title.as_deref().map(|t| builder.create_string(t));
+    let viewport_payload = if frame.viewport_payload.is_empty() {
+        None
+    } else {
+        Some(builder.create_vector(&frame.viewport_payload))
+    };
+    let pushed_scrollback_payload = if frame.pushed_scrollback_payload.is_empty() {
+        None
+    } else {
+        Some(builder.create_vector(&frame.pushed_scrollback_payload))
+    };
+    fb::TerminalSyncFrame::create(
+        builder,
+        &fb::TerminalSyncFrameArgs {
+            frame_seq: frame.frame_seq,
+            rows: frame.rows,
+            cols: frame.cols,
+            total_scrollback_rows: frame.total_scrollback_rows,
+            trimmed_top_rows: frame.trimmed_top_rows,
+            erase_scrollback_gen: frame.erase_scrollback_gen,
+            cursor_x: frame.cursor_x,
+            cursor_y: frame.cursor_y,
+            cursor_style: frame.cursor_style,
+            mode_flags: frame.mode_flags,
+            mouse_mode: frame.mouse_mode,
+            mouse_report_mode: frame.mouse_report_mode,
+            kitty_keyboard_flags: frame.kitty_keyboard_flags,
+            title,
+            viewport_compression: frame.viewport_compression,
+            viewport_payload,
+            pushed_scrollback_start_row: frame.pushed_scrollback_start_row,
+            pushed_scrollback_row_count: frame.pushed_scrollback_row_count,
+            pushed_scrollback_compression: frame.pushed_scrollback_compression,
+            pushed_scrollback_payload,
+        },
+    )
+}
+
+pub fn build_sync_terminal_result<'a>(
+    builder: &mut FlatBufferBuilder<'a>,
+    res: &SyncTerminalResponse,
+) -> flatbuffers::WIPOffset<fb::SyncTerminalResult<'a>> {
+    let subscription_id = res
+        .subscription_id
+        .as_deref()
+        .map(|s| builder.create_string(s));
+    let snapshot = build_session_snapshot(builder, &res.snapshot);
+    let lease = build_input_lease_state(builder, &res.lease);
+    let frame = build_terminal_sync_frame(builder, &res.frame);
+    fb::SyncTerminalResult::create(
+        builder,
+        &fb::SyncTerminalResultArgs {
+            subscription_id,
+            snapshot: Some(snapshot),
+            lease: Some(lease),
+            frame: Some(frame),
+        },
+    )
+}
+
+pub fn build_fetch_terminal_rows_result<'a>(
+    builder: &mut FlatBufferBuilder<'a>,
+    res: &FetchTerminalRowsResponse,
+) -> flatbuffers::WIPOffset<fb::FetchTerminalRowsResult<'a>> {
+    let session_id = builder.create_string(res.session_id.as_str());
+    let payload = if res.payload.is_empty() {
+        None
+    } else {
+        Some(builder.create_vector(&res.payload))
+    };
+    fb::FetchTerminalRowsResult::create(
+        builder,
+        &fb::FetchTerminalRowsResultArgs {
+            session_id: Some(session_id),
+            start_row: res.start_row,
+            row_count: res.row_count,
+            total_scrollback_rows: res.total_scrollback_rows,
+            trimmed_top_rows: res.trimmed_top_rows,
+            erase_scrollback_gen: res.erase_scrollback_gen,
+            compression: res.compression,
+            payload,
         },
     )
 }

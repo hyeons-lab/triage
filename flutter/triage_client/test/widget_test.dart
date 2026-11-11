@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show max, min;
+import 'dart:typed_data' show Uint8List;
 import 'package:flutter/foundation.dart'
     show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter/gestures.dart'
@@ -25,14 +27,17 @@ import 'package:triage_client/session_grouping.dart' show otherGroupPinKey;
 import 'package:triage_client/services/server_store.dart';
 import 'package:triage_client/services/storage.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
-import 'package:triage_client/terminal/terminal_intent.dart';
-import 'package:triage_client/terminal/terminal_store.dart'
-    show
-        kHistoryFirstWindowBytes,
-        kHistoryLeaseProbeBytes,
-        kHistoryReplayMaxBytes;
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
-import 'package:xterm2/xterm.dart' as xt;
+
+List<String> readTerminalBufferLines(TerminalCellBuffer terminal) => [
+  for (var i = 0; i < terminal.totalLines; i++)
+    terminal.lineAtVirtualRow(i)?.toPlainText() ?? '',
+];
+
+String readTerminalBufferText(TerminalCellBuffer terminal) =>
+    readTerminalBufferLines(terminal).join('\n');
 
 /// One history window a test serves for a session: the raw tail bytes, the
 /// absolute log offset they start at, and the output sequence they run
@@ -243,7 +248,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final List<String> subscribeSessionCalls = [];
 
   /// Sessions the daemon answers without a subscription id: the response
-  /// shape `_checkedSubscribeSessionEvents` fails closed on. Distinct from
+  /// shape `syncTerminalSession` fails closed on. Distinct from
   /// an outright throw, like [emptyIdStartSessionCommands].
   final Set<String> emptyIdSubscribeSessions = {};
   final Map<String, List<String>> snapshotVisibleRows = {};
@@ -252,6 +257,41 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
   final Map<String, Completer<Map<String, dynamic>>> snapshotCompleters = {};
   final Map<String, Completer<Map<String, dynamic>>> attachCompleters = {};
   final Map<String, List<dynamic>> snapshotStyledRowsMap = {};
+
+  /// Cell-grid synchronization fake state.
+  bool unsupportedTerminalSync = false;
+  final List<
+    ({
+      String sessionId,
+      String mode,
+      int? cols,
+      int? rows,
+      bool resizePty,
+      bool restoreIfExited,
+      bool subscribe,
+      int knownFrameSeq,
+    })
+  >
+  syncTerminalCalls = [];
+  final List<({String sessionId, int startRow, int rowCount})>
+  fetchTerminalRowsCalls = [];
+  final List<({String subscriptionId, int frameSeq})> ackTerminalSyncCalls = [];
+  final Map<String, List<String>> fakeScrollbackLines = {};
+  final Map<String, int> fakeTrimmedTopRows = {};
+  final Map<String, int> fakeEraseScrollbackGen = {};
+  final Map<String, int> _sessionFrameSeqs = {};
+  final Map<String, int> _sessionLastCols = {};
+  Map<String, dynamic>? Function(String sessionId, int knownFrameSeq)?
+  syncResponseBuilder;
+  Completer<Map<String, dynamic>>? Function(
+    String sessionId,
+    int startRow,
+    int rowCount,
+  )?
+  fetchRowsGate;
+
+  int nextFrameSeqFor(String sessionId) =>
+      _sessionFrameSeqs[sessionId] = (_sessionFrameSeqs[sessionId] ?? 0) + 1;
 
   int connectCalls = 0;
 
@@ -511,6 +551,350 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
       'holder': holder == null ? null : {'client_id': holder},
       'generation': 0,
     };
+  }
+
+  Map<String, dynamic> buildFakeSyncFrameMap(
+    String sessionId, {
+    required List<String> viewportRows,
+    int? cols,
+    int? rows,
+    int? totalScrollbackRows,
+    int? frameSeq,
+    bool fullViewport = true,
+  }) {
+    final targetCols = max(1, cols ?? _sessionLastCols[sessionId] ?? 80);
+    _sessionLastCols[sessionId] = targetCols;
+    final targetRows = max(max(1, rows ?? 24), viewportRows.length);
+    final scrollbackCount =
+        totalScrollbackRows ?? (fakeScrollbackLines[sessionId]?.length ?? 0);
+    final seq = frameSeq ?? nextFrameSeqFor(sessionId);
+    final payload = encodeTcg1PlainTextRows(viewportRows, cols: targetCols);
+    final modeFlags =
+        kModeCursorVisible |
+        kModeAutoWrap |
+        (fullViewport ? kModeFullViewport : 0);
+    return {
+      'session_id': sessionId,
+      'frame_seq': seq,
+      'rows': targetRows,
+      'cols': targetCols,
+      'total_scrollback_rows': scrollbackCount,
+      'trimmed_top_rows': fakeTrimmedTopRows[sessionId] ?? 0,
+      'erase_scrollback_gen': fakeEraseScrollbackGen[sessionId] ?? 0,
+      'cursor_x': 0,
+      'cursor_y': max(0, min(targetRows - 1, viewportRows.length - 1)),
+      'cursor_style': 0,
+      'mode_flags': modeFlags,
+      'mouse_mode': 0,
+      'mouse_report_mode': 0,
+      'kitty_keyboard_flags': 0,
+      'title': null,
+      'viewport_compression': kCellCompressionNone,
+      'viewport_payload': payload,
+      'pushed_scrollback_start_row': 0,
+      'pushed_scrollback_row_count': 0,
+      'pushed_scrollback_compression': kCellCompressionNone,
+      'pushed_scrollback_payload': Uint8List(0),
+    };
+  }
+
+  List<String> _extractPlainRowsFromSnapshot(
+    String sessionId,
+    Map<String, dynamic> snapshot,
+  ) {
+    final visible = snapshot['visible_rows'] as List<dynamic>?;
+    if (visible != null && visible.isNotEmpty) {
+      return visible.map((e) => e?.toString() ?? '').toList();
+    }
+    final styled = snapshot['styled_rows'] as List<dynamic>?;
+    if (styled != null && styled.isNotEmpty) {
+      return styled.map((row) {
+        final spans =
+            (row as Map<String, dynamic>?)?['spans'] as List<dynamic>?;
+        return spans
+                ?.map(
+                  (s) =>
+                      (s as Map<String, dynamic>?)?['text']?.toString() ?? '',
+                )
+                .join() ??
+            '';
+      }).toList();
+    }
+    return snapshotVisibleRows[sessionId] ??
+        <String>['line 1 from $sessionId', 'line 2 from $sessionId'];
+  }
+
+  Map<String, dynamic> _normalizeSyncCompletion(
+    String sessionId,
+    String clientId,
+    String mode,
+    bool subscribe,
+    bool restoredAtEntry,
+    int? effectiveCols,
+    int? effectiveRows,
+    Map<String, dynamic> raw,
+  ) {
+    final inner = raw['response'] is Map<String, dynamic>
+        ? Map<String, dynamic>.of(raw['response'] as Map<String, dynamic>)
+        : Map<String, dynamic>.of(raw);
+    final rawSnapshot = inner['snapshot'] is Map<String, dynamic>
+        ? Map<String, dynamic>.of(inner['snapshot'] as Map<String, dynamic>)
+        : <String, dynamic>{};
+    if (restoredAtEntry) {
+      rawSnapshot['exited'] = false;
+    }
+    final subId = inner.containsKey('subscription_id')
+        ? inner['subscription_id']
+        : (subscribe
+              ? (emptyIdSubscribeSessions.contains(sessionId)
+                    ? ''
+                    : 'sub-$sessionId')
+              : null);
+    final rowsList = _extractPlainRowsFromSnapshot(sessionId, rawSnapshot);
+    final frame =
+        inner['frame'] as Map<String, dynamic>? ??
+        buildFakeSyncFrameMap(
+          sessionId,
+          viewportRows: rowsList,
+          cols: effectiveCols,
+          rows: effectiveRows,
+        );
+    return {
+      'response': {
+        ...inner,
+        'snapshot': rawSnapshot,
+        'frame': frame,
+        'lease':
+            inner['lease'] ?? _attachLeaseFor(sessionId, clientId, mode),
+        'subscription_id': subId,
+      },
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> syncTerminalSession({
+    required String sessionId,
+    required String clientId,
+    String mode = 'Observer',
+    int? cols,
+    int? rows,
+    bool resizePty = false,
+    bool restoreIfExited = true,
+    bool subscribe = true,
+    int knownFrameSeq = 0,
+  }) async {
+    if (unsupportedTerminalSync) {
+      throw TriageUnsupportedProtocolException(
+        'unknown variant `sync_terminal`',
+      );
+    }
+    syncTerminalCalls.add((
+      sessionId: sessionId,
+      mode: mode,
+      cols: cols,
+      rows: rows,
+      resizePty: resizePty,
+      restoreIfExited: restoreIfExited,
+      subscribe: subscribe,
+      knownFrameSeq: knownFrameSeq,
+    ));
+    attachSessionCalls.add(sessionId);
+    attachSessionModes.add(mode);
+    snapshotSessionCalls.add(sessionId);
+    if (subscribe) {
+      subscribeSessionCalls.add(sessionId);
+    }
+
+    var restoredAtEntry = false;
+    if (restoreIfExited && exitedSessionIds.contains(sessionId)) {
+      restoredAtEntry = true;
+      restoreSessionCalls.add(sessionId);
+      restoreSessionSizes[sessionId] = '${cols ?? 80}x${rows ?? 24}';
+      exitedSessionIds.remove(sessionId);
+    }
+
+    if (resizePty && cols != null && rows != null) {
+      resizeSessionCalls.add('$sessionId:$cols:$rows');
+      final resized = resizedVisibleRows[sessionId];
+      if (resized != null) {
+        snapshotVisibleRows[sessionId] = resized;
+      }
+    }
+
+    final effectiveCols = (resizePty && cols != null)
+        ? cols
+        : ((_snapshotSize['cols'] as int?) ?? cols ?? 80);
+    final effectiveRows = (resizePty && rows != null)
+        ? rows
+        : ((_snapshotSize['rows'] as int?) ?? rows ?? 24);
+
+    final customSync = syncResponseBuilder?.call(sessionId, knownFrameSeq);
+    if (customSync != null) {
+      return _normalizeSyncCompletion(
+        sessionId,
+        clientId,
+        mode,
+        subscribe,
+        restoredAtEntry,
+        effectiveCols,
+        effectiveRows,
+        customSync,
+      );
+    }
+
+    final customSnapshot = attachSnapshotBuilder?.call(sessionId, null);
+    if (customSnapshot != null) {
+      return _normalizeSyncCompletion(
+        sessionId,
+        clientId,
+        mode,
+        subscribe,
+        restoredAtEntry,
+        effectiveCols,
+        effectiveRows,
+        {'snapshot': customSnapshot},
+      );
+    }
+
+    final attachCompleter = attachCompleters[sessionId];
+    if (attachCompleter != null) {
+      final completed = await attachCompleter.future;
+      return _normalizeSyncCompletion(
+        sessionId,
+        clientId,
+        mode,
+        subscribe,
+        restoredAtEntry,
+        effectiveCols,
+        effectiveRows,
+        completed,
+      );
+    }
+
+    final snapCompleter = snapshotCompleters[sessionId];
+    if (snapCompleter != null) {
+      final completed = await snapCompleter.future;
+      return _normalizeSyncCompletion(
+        sessionId,
+        clientId,
+        mode,
+        subscribe,
+        restoredAtEntry,
+        effectiveCols,
+        effectiveRows,
+        completed,
+      );
+    }
+
+    final hasCustomVisibleRows = snapshotVisibleRows.containsKey(sessionId);
+    final visibleRows =
+        snapshotVisibleRows[sessionId] ??
+        <String>['line 1 from $sessionId', 'line 2 from $sessionId'];
+    final snapshotSize = (resizePty && cols != null && rows != null)
+        ? <String, dynamic>{'rows': rows, 'cols': cols}
+        : _snapshotSize;
+    final subId = subscribe
+        ? (emptyIdSubscribeSessions.contains(sessionId) ? '' : 'sub-$sessionId')
+        : null;
+
+    return {
+      'response': {
+        'lease': _attachLeaseFor(sessionId, clientId, mode),
+        'subscription_id': subId,
+        'snapshot': {
+          if (!hasCustomVisibleRows || attachRepoRoots.containsKey(sessionId))
+            'context': {
+              if (!hasCustomVisibleRows)
+                'branch': sessionId == 'main'
+                    ? 'main'
+                    : 'experiment/flutter-spike',
+              if (attachRepoRoots.containsKey(sessionId))
+                'repository_root': attachRepoRoots[sessionId],
+            },
+          'size': snapshotSize,
+          'exited': exitedSessionIds.contains(sessionId),
+          'agent': snapshotAgents[sessionId],
+          'visible_rows': visibleRows,
+          'styled_rows': visibleRows
+              .map(
+                (row) => {
+                  'spans': [
+                    {
+                      'text': row,
+                      'style': {
+                        'foreground': null,
+                        'background': null,
+                        'bold': false,
+                        'dim': false,
+                        'italic': false,
+                        'underline': false,
+                        'reverse': false,
+                      },
+                    },
+                  ],
+                },
+              )
+              .toList(),
+          'cursor': {'row': max(0, visibleRows.length - 1), 'col': 0},
+        },
+        'frame': buildFakeSyncFrameMap(
+          sessionId,
+          viewportRows: visibleRows,
+          cols: effectiveCols,
+          rows: effectiveRows,
+        ),
+      },
+    };
+  }
+
+  @override
+  Future<Map<String, dynamic>> fetchTerminalRows({
+    required String sessionId,
+    required int startRow,
+    required int rowCount,
+  }) async {
+    if (unsupportedTerminalSync) {
+      throw TriageUnsupportedProtocolException(
+        'unknown variant `fetch_terminal_rows`',
+      );
+    }
+    fetchTerminalRowsCalls.add((
+      sessionId: sessionId,
+      startRow: startRow,
+      rowCount: rowCount,
+    ));
+    final gate = fetchRowsGate?.call(sessionId, startRow, rowCount);
+    if (gate != null) {
+      return gate.future;
+    }
+    final allLines = fakeScrollbackLines[sessionId] ?? const <String>[];
+    final safeStart = startRow < 0
+        ? 0
+        : (startRow > allLines.length ? allLines.length : startRow);
+    final safeEnd = min<int>(allLines.length, safeStart + max<int>(0, rowCount));
+    final slice = allLines.sublist(safeStart, safeEnd);
+    final cols = _sessionLastCols[sessionId] ?? 80;
+    return {
+      'session_id': sessionId,
+      'start_row': safeStart,
+      'row_count': slice.length,
+      'total_scrollback_rows': allLines.length,
+      'trimmed_top_rows': fakeTrimmedTopRows[sessionId] ?? 0,
+      'erase_scrollback_gen': fakeEraseScrollbackGen[sessionId] ?? 0,
+      'compression': kCellCompressionNone,
+      'payload': encodeTcg1PlainTextRows(slice, cols: cols),
+    };
+  }
+
+  @override
+  void ackTerminalSync({
+    required String subscriptionId,
+    required int frameSeq,
+  }) {
+    ackTerminalSyncCalls.add((
+      subscriptionId: subscriptionId,
+      frameSeq: frameSeq,
+    ));
   }
 
   @override
@@ -914,32 +1298,64 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     });
   }
 
-  void emitOutput(String sessionId, String text, {int outputSeq = 1}) {
+  void emitTerminalSync(
+    String sessionId,
+    List<String> viewportRows, {
+    int? frameSeq,
+    int? cols,
+    int? rows,
+    int? totalScrollbackRows,
+    String? subscriptionId,
+  }) {
+    snapshotVisibleRows[sessionId] = List<String>.of(viewportRows);
+    final frame = buildFakeSyncFrameMap(
+      sessionId,
+      viewportRows: viewportRows,
+      cols: cols,
+      rows: rows,
+      totalScrollbackRows: totalScrollbackRows,
+      frameSeq: frameSeq,
+    );
     _testEventController.add({
       'type': 'event',
       'envelope': {
-        'event': {
-          'Output': {
-            'session_id': sessionId,
-            'output_seq': outputSeq,
-            'bytes': utf8.encode(text),
-          },
-        },
+        'subscription_id': subscriptionId ?? 'sub-$sessionId',
+        'event': {'TerminalSync': frame},
       },
     });
   }
 
+  void emitOutput(String sessionId, String text, {int outputSeq = 1}) {
+    final addedLines = text
+        .split(RegExp(r'\r?\n'))
+        .where((line) => line.isNotEmpty)
+        .toList();
+    final baseRows =
+        snapshotVisibleRows[sessionId] ??
+        <String>['line 1 from $sessionId', 'line 2 from $sessionId'];
+    final nextRows = <String>[...baseRows, ...addedLines];
+    final nextSeq = max(outputSeq, nextFrameSeqFor(sessionId));
+    emitTerminalSync(sessionId, nextRows, frameSeq: nextSeq);
+  }
+
   Map<String, dynamic> attachSnapshotResponse(
     String sessionId,
-    List<String> visibleRows,
-  ) {
+    List<String> visibleRows, {
+    int? frameSeq,
+  }) {
+    final snapshotSize = _snapshotSize;
+    final cols = (snapshotSize['cols'] as int?) ?? 80;
+    final rows = (snapshotSize['rows'] as int?) ?? 24;
     return {
       'response': {
+        'subscription_id': emptyIdSubscribeSessions.contains(sessionId)
+            ? ''
+            : 'sub-$sessionId',
         'snapshot': {
           'context': {
             'branch': sessionId == 'main' ? 'main' : 'experiment/flutter-spike',
           },
-          'size': _snapshotSize,
+          'size': snapshotSize,
           'output_seq': 0,
           'exited': exitedSessionIds.contains(sessionId),
           'visible_rows': visibleRows,
@@ -963,8 +1379,15 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
                 },
               )
               .toList(),
-          'cursor': {'row': visibleRows.length - 1, 'col': 0},
+          'cursor': {'row': max(0, visibleRows.length - 1), 'col': 0},
         },
+        'frame': buildFakeSyncFrameMap(
+          sessionId,
+          viewportRows: visibleRows,
+          cols: cols,
+          rows: rows,
+          frameSeq: frameSeq,
+        ),
       },
     };
   }
@@ -1013,7 +1436,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
               'exited': false,
               'visible_rows': visibleRows,
               'styled_rows': mappedRows,
-              'cursor': {'row': visibleRows.length - 1, 'col': 0},
+              'cursor': {'row': max(0, visibleRows.length - 1), 'col': 0},
               if (size != null) 'size': {'rows': size.$1, 'cols': size.$2},
             },
           },
@@ -1022,30 +1445,14 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     });
   }
 
-  /// Emits a server-pushed resync carrying a full-history snapshot. The
-  /// daemon serves these unwindowed at the history cap; the client must
-  /// replay them at the platform budgets, not the held window.
-  void emitResyncRequired(
-    String sessionId,
-    List<int> rawOutput, {
-    int start = 1000000,
-    int seq = 50,
-  }) {
+  /// Emits a server-pushed `ResyncRequired` event, causing the client to run a
+  /// full `SyncTerminal` refresh (`knownFrameSeq: 0`).
+  void emitResyncRequired(String sessionId) {
     _testEventController.add({
       'type': 'event',
       'envelope': {
         'event': {
-          'ResyncRequired': {
-            'session_id': sessionId,
-            'snapshot': {
-              'size': {'rows': 24, 'cols': 80},
-              'exited': false,
-              'raw_output': rawOutput,
-              'raw_output_start': start,
-              'bytes_logged': start + rawOutput.length,
-              'output_seq': seq,
-            },
-          },
+          'ResyncRequired': {'session_id': sessionId},
         },
       },
     });
@@ -1311,24 +1718,23 @@ void main() {
 
     expect(find.text('Loading session flutter-spike...'), findsOneWidget);
 
-    // Git context is seeded after the session list lands, so this early in the
-    // load the row has no branch yet and still falls back to its stable title.
-    // Once context arrives the same row leads with 'main' instead.
     await tester.tap(find.text('triage / main').first);
     await tester.pumpAndSettle();
     expect(find.text('line 1 from main'), findsOneWidget);
 
-    client.emitOutput(
+    client.emitTerminalSync(
       'flutter-spike',
-      '\nlive output during attach',
-      outputSeq: 7,
+      ['flutter-spike attached', 'live output during attach'],
+      frameSeq: 7,
     );
     await tester.pump();
 
     delayedAttach.complete(
-      client.attachSnapshotResponse('flutter-spike', [
-        'flutter-spike attached',
-      ]),
+      client.attachSnapshotResponse(
+        'flutter-spike',
+        ['flutter-spike attached'],
+        frameSeq: 1,
+      ),
     );
     await tester.pumpAndSettle();
 
@@ -1337,18 +1743,22 @@ void main() {
     await tester.tap(find.text('experiment/flutter-spike').first);
     await tester.pump();
 
-    // Before the post-select refresh resolves, fallback rows only show the
-    // attach snapshot. Live output is held in xterm (not rendered in this
-    // FLUTTER_TEST fallback path) and lands in session.rows when the daemon
-    // snapshot refresh below catches up.
+    // Buffered TerminalSync frames drain immediately when the loading placeholder
+    // resolves, updating the synchronized cell grid and acknowledging frame 7
+    // even before the post-select metadata refresh completes.
     expect(find.text('flutter-spike attached'), findsOneWidget);
-    expect(find.text('live output during attach'), findsNothing);
+    expect(find.text('live output during attach'), findsOneWidget);
+    expect(
+      client.ackTerminalSyncCalls.any((c) => c.frameSeq == 7),
+      isTrue,
+    );
 
     delayedRefresh.complete(
-      client.attachSnapshotResponse('flutter-spike', [
-        'flutter-spike attached',
-        'live output during attach',
-      ]),
+      client.attachSnapshotResponse(
+        'flutter-spike',
+        ['flutter-spike attached', 'live output during attach'],
+        frameSeq: 8,
+      ),
     );
     await tester.pumpAndSettle();
 
@@ -1621,133 +2031,75 @@ void main() {
     expect(client.restoreSessionSizes['main'], '84x38');
   });
 
-  // Pumps the app, loads 'main', strands it unsubscribed via one failed
-  // revive, then parks the retry's refresh attach with the empty subscribe
-  // id disarmed so the unit resubscribe succeeds. Shared by the two revive
-  // tests below so their preconditions cannot drift apart unnoticed.
-  Future<
-    ({
-      FakeTriageWebSocketClient client,
-      Completer<Map<String, dynamic>> parkedAttach,
-      Finder Function() mainTile,
-    })
-  >
-  stageParkedReviveRetry(WidgetTester tester) async {
-    Finder mainTile() => find.byWidgetPredicate(
-      (w) => w is SessionListTile && w.title.contains('main'),
-    );
-
-    final client = FakeTriageWebSocketClient();
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
-
-    // Load 'main', then strand it unsubscribed: an exited report during a
-    // metadata refresh revives it, and the revive's resubscribe fails.
-    await tester.tap(mainTile());
-    await tester.pumpAndSettle();
-    expect(client.subscribeSessionCalls, contains('main'));
-
-    client.exitedSessionIds.add('main');
-    client.emptyIdSubscribeSessions.add('main');
-    await tester.tap(mainTile());
-    await tester.pumpAndSettle();
-
-    // The unit resubscribe must succeed for the refresh to reach the
-    // revive, so disarm the empty id and park the refresh attach instead.
-    // The caller fails it (or the revive's fresh attach) from here.
-    client.emptyIdSubscribeSessions.remove('main');
-    final parkedAttach = Completer<Map<String, dynamic>>();
-    client.attachCompleters['main'] = parkedAttach;
-    final subscribesBefore = client.subscribeSessionCalls.length;
-    final attachesBefore = client.attachSessionCalls.length;
-    await tester.tap(mainTile());
-    await tester.pumpAndSettle();
-    // The resubscribe unit ran (proving the first tap left the session
-    // unsubscribed) and its refresh attach is now parked on our completer.
-    expect(client.subscribeSessionCalls.length, greaterThan(subscribesBefore));
-    expect(client.attachSessionCalls.length, greaterThan(attachesBefore));
-
-    return (client: client, parkedAttach: parkedAttach, mainTile: mainTile);
-  }
-
   testWidgets(
-    'a revive that cannot resubscribe fails the load instead of attaching',
+    'a resubscribe whose sync_terminal returns no subscription id marks load failed and retries cleanly',
     (WidgetTester tester) async {
-      final staged = await stageParkedReviveRetry(tester);
-      final client = staged.client;
-      final parkedAttach = staged.parkedAttach;
+      Finder mainTile() => find.byWidgetPredicate(
+        (w) => w is SessionListTile && w.title.contains('main'),
+      );
 
-      // Re-arm once the attach is parked: the revive's resubscribe must
-      // fail for this leg.
-      client.emptyIdSubscribeSessions.add('main');
-      parkedAttach.complete({
-        'response': {
-          'snapshot': {
-            'context': {'branch': 'main'},
-            'size': {'rows': 24, 'cols': 80},
-            'exited': true,
-          },
-        },
-      });
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
-      // The revive's resubscribe failed: the tile must read load failed so
-      // the next select retries, not attached over a dead subscription.
+      await tester.tap(mainTile());
+      await tester.pumpAndSettle();
+      expect(client.subscribeSessionCalls, contains('main'));
+
+      // Switch back to flutter-spike, then drop the socket and reconnect while
+      // main is unselected so main loses its subscription. Force the
+      // resubscribe sync_terminal on selection to return an empty subscription
+      // id.
+      await tester.tap(
+        find.byWidgetPredicate(
+          (w) => w is SessionListTile && w.title.contains('flutter-spike'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await client.emitSocketClosed();
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
+
+      client.emptyIdSubscribeSessions.add('main');
+      await tester.tap(mainTile());
+      await tester.pumpAndSettle();
+
       expect(find.text('load failed'), findsOneWidget);
+
+      // Disarming the empty subscription id lets the next selection recover.
+      client.emptyIdSubscribeSessions.remove('main');
+      await tester.tap(mainTile());
+      await tester.pumpAndSettle();
+      expect(find.text('load failed'), findsNothing);
     },
   );
 
   testWidgets(
-    'a revive that fails to attach logs and retries instead of failing the load',
+    're-selecting a session that exited on the daemon atomically restores and resubscribes via sync_terminal',
     (WidgetTester tester) async {
-      final staged = await stageParkedReviveRetry(tester);
-      final client = staged.client;
-      final parkedAttach = staged.parkedAttach;
-      final mainTile = staged.mainTile;
+      Finder mainTile() => find.byWidgetPredicate(
+        (w) => w is SessionListTile && w.title.contains('main'),
+      );
 
-      parkedAttach.complete({
-        'response': {
-          'snapshot': {
-            'context': {'branch': 'main'},
-            'size': {'rows': 24, 'cols': 80},
-            'exited': true,
-          },
-        },
-      });
-      // Swap before the revive runs: the refresh attach already holds
-      // parkedAttach; the revive's fresh attach reads this entry. A
-      // completion schedules microtasks, so this synchronous swap lands
-      // strictly before the resumed refresh reaches the revive.
-      final failingFreshAttach = Completer<Map<String, dynamic>>();
-      client.attachCompleters['main'] = failingFreshAttach;
-      // Fail it only once the revive is awaiting: completing with error
-      // before any listener attaches reports the error unhandled to the
-      // test framework, even though the revive would catch it.
-      final freshAttachIssued = client.attachSessionCalls.length + 1;
-      for (
-        var i = 0;
-        i < 100 && client.attachSessionCalls.length < freshAttachIssued;
-        i++
-      ) {
-        await tester.pump(const Duration(milliseconds: 10));
-      }
-      expect(client.attachSessionCalls.length, freshAttachIssued);
-      failingFreshAttach.completeError(StateError('revive attach failed'));
+      final client = FakeTriageWebSocketClient();
+      await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
-      // Attach-step failure logs and renders the pre-revive snapshot, with
-      // no load-failed paint and no dropped subscription.
-      expect(find.text('load failed'), findsNothing);
+      await tester.tap(mainTile());
+      await tester.pumpAndSettle();
+      expect(client.subscribeSessionCalls, contains('main'));
 
-      // The fake's restore clears the exited mark, so re-mark it, and lift
-      // the failing completer so the retry's own attach is a normal one: the
-      // next refresh must retry the revive (restore again) rather than sit
-      // attached, and still paint nothing.
+      client.emitExited('main');
       client.exitedSessionIds.add('main');
-      client.attachCompleters.remove('main');
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey<String>('flutter-spike')));
+      await tester.pumpAndSettle();
+
       final restoresBefore = client.restoreSessionCalls.length;
       await tester.tap(mainTile());
       await tester.pumpAndSettle();
+
       expect(client.restoreSessionCalls.length, greaterThan(restoresBefore));
       expect(find.text('load failed'), findsNothing);
     },
@@ -1826,83 +2178,69 @@ void main() {
   });
 
   testWidgets(
-    'resync-required snapshot replays unwindowed, not at held window',
+    'resync-required event triggers full sync_terminal refresh and exposes full virtual scrollback',
     (WidgetTester tester) async {
       final client = FakeTriageWebSocketClient();
       await tester.pumpWidget(TriageClientApp(client: client));
       await tester.pumpAndSettle();
 
-      // 500 lines x 300 B = 150 KiB: the platform budgets (256 KiB) keep
-      // all of it, while the 64 KiB held window trims to ~218 lines. The
-      // ResyncRequired call site must replay unwindowed; read the buffer
-      // through the pane widget, since the fallback rendered rows never
-      // fit enough to discriminate. Fit the view first: history stays
-      // staged until a real grid size lands, which never happens under
-      // FLUTTER_TEST.
-      tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+      final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+      pane.onViewFit!(95, 34);
       await tester.pumpAndSettle();
-      final buf = StringBuffer();
-      for (var i = 0; i < 500; i++) {
-        buf.writeln('history line $i'.padRight(299));
-      }
-      client.emitResyncRequired('flutter-spike', utf8.encode(buf.toString()));
+
+      client.fakeScrollbackLines['flutter-spike'] = List<String>.generate(
+        1500,
+        (i) => 'history line $i',
+      );
+      client.snapshotVisibleRows['flutter-spike'] = const <String>[
+        'resynced viewport row',
+      ];
+      client.emitResyncRequired('flutter-spike');
       await tester.pumpAndSettle();
 
       final terminal = tester
           .widget<TerminalPane>(find.byType(TerminalPane))
           .terminal;
-      // Each 300-char line wraps to ~4 rows at the fitted width, so the
-      // trimmed mutant (~218 logical lines) still shows ~870 buffer rows:
-      // pin the oldest line's survival, not just a row count.
-      final seen = StringBuffer();
-      for (var i = 0; i < terminal.buffer.lines.length; i++) {
-        seen.writeln(terminal.buffer.lines[i].toString());
-      }
-      expect(seen.toString(), contains('history line 0'));
-      expect(terminal.buffer.lines.length, greaterThanOrEqualTo(1500));
+      expect(client.syncTerminalCalls.last.knownFrameSeq, 0);
+      expect(terminal.totalLines, greaterThanOrEqualTo(1500));
+
+      // Demand-page the oldest block and verify line 0 is intact.
+      tester.widget<TerminalPane>(find.byType(TerminalPane)).onNearTop!();
+      await tester.pumpAndSettle();
+      expect(terminal.lineAtVirtualRow(0)?.toPlainText(), 'history line 0');
     },
   );
 
-  testWidgets('exited-session restore adopts a prefix-only prepared snapshot', (
-    WidgetTester tester,
-  ) async {
-    final client = FakeTriageWebSocketClient(
-      exitedSessionIds: {'flutter-spike'},
-    );
-    // The journaled scrollback the restore echo carries after the raw
-    // tail is gone: prefix bytes with no `raw_output` at all.
-    const prefixLine = 'restored journal prefix line';
-    client.restoreHistoryPrefix['flutter-spike'] = utf8.encode(
-      '$prefixLine\r\n',
-    );
-    await tester.pumpWidget(TriageClientApp(client: client));
-    await tester.pumpAndSettle();
+  testWidgets(
+    'exited-session restore synchronizes journaled scrollback and viewport via sync_terminal',
+    (WidgetTester tester) async {
+      final client = FakeTriageWebSocketClient(
+        exitedSessionIds: {'flutter-spike'},
+      );
+      const prefixLine = 'restored journal prefix line';
+      client.fakeScrollbackLines['flutter-spike'] = const <String>[prefixLine];
+      client.snapshotVisibleRows['flutter-spike'] = const <String>[
+        'restored prompt',
+      ];
+      await tester.pumpWidget(TriageClientApp(client: client));
+      await tester.pumpAndSettle();
 
-    // Precondition: the restore echo size must mismatch the attach
-    // snapshot size (24x80), or the fallback gate never runs. Both the
-    // estimated size and any leaked fitted size satisfy this; assert it
-    // so a harness change fails loudly instead of vacuously.
-    expect(client.restoreSessionCalls, contains('flutter-spike'));
-    expect(client.restoreSessionSizes['flutter-spike'], isNot('80x24'));
+      expect(client.restoreSessionCalls, contains('flutter-spike'));
+      expect(client.restoreSessionSizes['flutter-spike'], isNot('80x24'));
 
-    // The raw-only gate would discard the prefix-only prepared snapshot
-    // as history-less; the helper gate adopts it and the terminal paints
-    // the prefix. Reverting the call site to the raw-only check must
-    // fail this test. The load stages history until the view fits a real
-    // grid, which never happens under FLUTTER_TEST, so drive the fit
-    // directly like the reclaim tests do.
-    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
-    await tester.pumpAndSettle();
+      final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+      pane.onViewFit!(95, 34);
+      await tester.pumpAndSettle();
+      pane.onNearTop!();
+      await tester.pumpAndSettle();
 
-    final terminal = tester
-        .widget<TerminalPane>(find.byType(TerminalPane))
-        .terminal;
-    final seen = StringBuffer();
-    for (var i = 0; i < terminal.buffer.lines.length; i++) {
-      seen.writeln(terminal.buffer.lines[i].toString());
-    }
-    expect(seen.toString(), contains(prefixLine));
-  });
+      final terminal = tester
+          .widget<TerminalPane>(find.byType(TerminalPane))
+          .terminal;
+      expect(readTerminalBufferText(terminal), contains(prefixLine));
+      expect(readTerminalBufferText(terminal), contains('restored prompt'));
+    },
+  );
 
   testWidgets('refreshes selected remote session from daemon snapshot', (
     WidgetTester tester,
@@ -5806,10 +6144,6 @@ void main() {
 
   group('history paging', () {
     test('barren-page predicate truth table', () {
-      // A page continues past itself only when it added nothing while
-      // the user is still near the top; every other combination
-      // re-seats on the landed content. Shared by both pane
-      // implementations, so this pins the web behavior too.
       expect(
         shouldContinuePastBarrenPage(addedLines: 0, nearTop: true),
         isTrue,
@@ -5832,14 +6166,6 @@ void main() {
       );
     });
 
-    List<int> historyLines(int from, int to) {
-      final buf = StringBuffer();
-      for (var i = from; i < to; i++) {
-        buf.writeln('history line $i');
-      }
-      return utf8.encode(buf.toString());
-    }
-
     List<StyledRow> fallbackRows(int count) => List.generate(
       count,
       (i) => StyledRow(
@@ -5847,46 +6173,57 @@ void main() {
       ),
     );
 
-    List<int?> windowsFor(FakeTriageWebSocketClient client, String sid) => [
-      for (var i = 0; i < client.attachSessionCalls.length; i++)
-        if (client.attachSessionCalls[i] == sid &&
-            client.attachSessionHistoryBytes[i] != kHistoryLeaseProbeBytes)
-          client.attachSessionHistoryBytes[i],
-    ];
+    TerminalSyncFrameData makeScrollbackFrame({
+      required int frameSeq,
+      required int totalScrollbackRows,
+      int cols = 80,
+      int rows = 24,
+    }) {
+      return TerminalSyncFrameData(
+        frameSeq: frameSeq,
+        rows: rows,
+        cols: cols,
+        totalScrollbackRows: totalScrollbackRows,
+        trimmedTopRows: 0,
+        eraseScrollbackGen: 0,
+        cursorX: 0,
+        cursorY: 0,
+        cursorStyle: 0,
+        modeFlags: kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+        mouseMode: 0,
+        mouseReportMode: 0,
+        kittyKeyboardFlags: 0,
+        title: null,
+        viewportCompression: kCellCompressionNone,
+        viewportPayload: encodeTcg1PlainTextRows(const <String>['prompt']),
+        pushedScrollbackStartRow: 0,
+        pushedScrollbackRowCount: 0,
+        pushedScrollbackCompression: kCellCompressionNone,
+        pushedScrollbackPayload: Uint8List(0),
+      );
+    }
 
     testWidgets(
-      'scrolling to the top re-attaches with a doubled window and grows buffer past 1000 lines',
+      'scrolling to the top demand-pages top 128-row virtual scrollback block via fetchTerminalRows',
       (WidgetTester tester) async {
         final client = FakeTriageWebSocketClient();
         client.snapshotVisibleRows['flutter-spike'] = List.generate(
           100,
           (i) => 'Log line $i',
         );
-        // 1,200 lines in the first window trims to the 1,000-line first-page
-        // budget; 2,000 lines in the 128 KiB window scales the budget to 2,000
-        // lines and grows the terminal buffer past 1,500 lines.
-        final first = historyLines(800, 2000);
-        final second = historyLines(0, 2000);
-        client.attachHistoryWindows['flutter-spike'] = {
-          65536: (bytes: first, start: 100000, seq: 7),
-          131072: (
-            bytes: second,
-            start: 100000 - (second.length - first.length),
-            seq: 7,
-          ),
-        };
+        client.fakeScrollbackLines['flutter-spike'] = List.generate(
+          400,
+          (i) => 'scrollback line $i',
+        );
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
 
         final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
-        await tester.pump(const Duration(milliseconds: 1600));
 
-        expect(windowsFor(client, 'flutter-spike'), [65536]);
-        final firstLines = pane.terminal.buffer.lines.length;
-        expect(firstLines, greaterThanOrEqualTo(1000));
-        expect(firstLines, lessThan(1100));
+        expect(pane.terminal.totalScrollbackRows, 400);
+        expect(pane.terminal.lineAtVirtualRow(0), isNull);
 
         final scrollViewFinder = find.descendant(
           of: find.byType(TerminalPane),
@@ -5898,43 +6235,33 @@ void main() {
         controller.jumpTo(0);
         await tester.pumpAndSettle();
 
-        expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
+        expect(client.fetchTerminalRowsCalls, isNotEmpty);
+        expect(client.fetchTerminalRowsCalls.first.startRow, 0);
         expect(
-          pane.terminal.buffer.lines.length,
-          greaterThan(firstLines + 500),
+          pane.terminal.lineAtVirtualRow(0)?.toPlainText(),
+          'scrollback line 0',
         );
       },
     );
 
     testWidgets(
-      'scrolling to the top when raw_output_start is 0 but first-page line trim dropped lines still pages 128 KiB and stops once all lines are retained',
+      'once virtual row 0 is cached, subsequent scroll-to-top does not re-fetch and surfaces NoOlderScrollbackPill that auto-dismisses after 3 seconds',
       (WidgetTester tester) async {
         final client = FakeTriageWebSocketClient();
         client.snapshotVisibleRows['flutter-spike'] = List.generate(
           100,
           (i) => 'Log line $i',
         );
-        // 1,800 lines (~31 KiB) fits inside the first 64 KiB byte window so
-        // the daemon reports raw_output_start == 0 on both 64 KiB and 128 KiB,
-        // while the 1,000-line first-page trim drops the oldest 800 lines.
-        final payload = historyLines(0, 1800);
-        expect(payload.length, lessThan(65536));
-        client.attachHistoryWindows['flutter-spike'] = {
-          65536: (bytes: payload, start: 0, seq: 7),
-          131072: (bytes: payload, start: 0, seq: 7),
-        };
+        client.fakeScrollbackLines['flutter-spike'] = List.generate(
+          100,
+          (i) => 'scrollback line $i',
+        );
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
 
         final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
-        await tester.pump(const Duration(milliseconds: 1600));
-
-        expect(windowsFor(client, 'flutter-spike'), [65536]);
-        final firstLines = pane.terminal.buffer.lines.length;
-        expect(firstLines, greaterThanOrEqualTo(1000));
-        expect(firstLines, lessThan(1100));
 
         final scrollViewFinder = find.descendant(
           of: find.byType(TerminalPane),
@@ -5944,63 +6271,13 @@ void main() {
             .widget<SingleChildScrollView>(scrollViewFinder)
             .controller!;
         controller.jumpTo(0);
-        await tester.pumpAndSettle();
-
-        expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
-        expect(
-          pane.terminal.buffer.lines.length,
-          greaterThan(firstLines + 700),
-        );
-
-        // Once all 1,800 lines are retained at raw_output_start == 0,
-        // effectiveStart is 0 and a subsequent scroll-to-top does not page.
-        await tester.pump(const Duration(milliseconds: 1600));
-        controller.jumpTo(0);
-        await tester.pumpAndSettle();
-        expect(windowsFor(client, 'flutter-spike'), [65536, 131072]);
-      },
-    );
-
-    testWidgets(
-      'barren pages in TriageClientApp auto-continue through max window, show NoOlderScrollbackPill, and auto-dismiss after 3 seconds',
-      (WidgetTester tester) async {
-        final client = FakeTriageWebSocketClient();
-        client.snapshotVisibleRows['flutter-spike'] = List.generate(
-          100,
-          (i) => 'Log line $i',
-        );
-        final barrenBytes = historyLines(0, 100);
-        // Compaction floor at raw_output_start == 100000: widening the window
-        // from 64 KiB -> 128 KiB -> 256 KiB returns the same start and bytes.
-        client.attachHistoryWindows['flutter-spike'] = {
-          65536: (bytes: barrenBytes, start: 100000, seq: 7),
-          131072: (bytes: barrenBytes, start: 100000, seq: 7),
-          262144: (bytes: barrenBytes, start: 100000, seq: 7),
-        };
-        await tester.pumpWidget(TriageClientApp(client: client));
-        await tester.pumpAndSettle();
-
-        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
-        pane.onViewFit!(80, 24);
-        await tester.pumpAndSettle();
-        await tester.pump(const Duration(milliseconds: 1600));
-        expect(windowsFor(client, 'flutter-spike'), [65536]);
-
-        final scrollViewFinder = find.descendant(
-          of: find.byType(TerminalPane),
-          matching: find.byType(SingleChildScrollView),
-        );
-        final controller = tester
-            .widget<SingleChildScrollView>(scrollViewFinder)
-            .controller!;
-        controller.jumpTo(0);
-        // Pump frames to let 128 KiB and 256 KiB auto-continue and exhaust at
-        // 256 KiB without advancing past the 3-second pill auto-hide timer.
+        // Pump frames to let the first fetch resolve and auto-continue hit
+        // row 0 already resident without advancing past the 3s pill timer.
         for (var i = 0; i < 6; i++) {
           await tester.pump(const Duration(milliseconds: 20));
         }
 
-        expect(windowsFor(client, 'flutter-spike'), [65536, 131072, 262144]);
+        expect(client.fetchTerminalRowsCalls, hasLength(1));
         expect(find.text('No older scrollback in reach'), findsOneWidget);
 
         await tester.pump(const Duration(seconds: 3));
@@ -6011,7 +6288,7 @@ void main() {
     Future<void> pumpStandalonePane(
       WidgetTester tester, {
       required TerminalController controller,
-      required xt.Terminal terminal,
+      required TerminalCellBuffer terminal,
       required String terminalId,
       bool Function()? onNearTop,
     }) async {
@@ -6037,11 +6314,14 @@ void main() {
       'a barren page auto-continues, then reports no older scrollback',
       (WidgetTester tester) async {
         final controller = TerminalController();
-        final terminal = xt.Terminal(maxLines: 50000);
+        final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+        addTearDown(() {
+          controller.dispose();
+          terminal.dispose();
+        });
         var pages = 0;
         bool onNearTop() {
           pages++;
-          // The first two launches land (barren); the third is gated.
           return pages < 3;
         }
 
@@ -6059,19 +6339,18 @@ void main() {
         final scrollController = tester
             .widget<SingleChildScrollView>(scrollViewFinder)
             .controller!;
-        // The scrolled-up user whose page landed with no new lines.
         scrollController.jumpTo(0);
         await tester.pumpAndSettle();
         expect(pages, 1);
 
-        // First landed page is barren: auto-continue with a deeper window.
+        // First landed page is barren: auto-continue.
         controller.notifyHistoryPageStarted();
         controller.notifyHistoryReplayed();
         await tester.pumpAndSettle();
         expect(pages, 2);
         expect(find.text('No older scrollback in reach'), findsNothing);
 
-        // Second landed page is barren too, and the deeper page is gated:
+        // Second landed page is barren too, and the third check is gated:
         // report the exhausted scrollback instead of going silently inert.
         controller.notifyHistoryPageStarted();
         controller.notifyHistoryReplayed();
@@ -6082,7 +6361,9 @@ void main() {
 
         // A subsequent fruitful page dismisses the pill immediately.
         controller.notifyHistoryPageStarted();
-        terminal.write('older line\n' * 30);
+        terminal.applySyncFrame(
+          makeScrollbackFrame(frameSeq: 1, totalScrollbackRows: 30),
+        );
         controller.notifyHistoryReplayed();
         await tester.pumpAndSettle();
         expect(find.text('No older scrollback in reach'), findsNothing);
@@ -6093,7 +6374,11 @@ void main() {
       WidgetTester tester,
     ) async {
       final controller = TerminalController();
-      final terminal = xt.Terminal(maxLines: 50000);
+      final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+      addTearDown(() {
+        controller.dispose();
+        terminal.dispose();
+      });
       var pages = 0;
       bool onNearTop() {
         pages++;
@@ -6118,9 +6403,11 @@ void main() {
       await tester.pumpAndSettle();
       expect(pages, 1);
 
-      // The landed page grew the buffer: nothing more to do.
+      // The landed page grew totalLines: nothing more to do.
       controller.notifyHistoryPageStarted();
-      terminal.write('fresh line\n' * 60);
+      terminal.applySyncFrame(
+        makeScrollbackFrame(frameSeq: 1, totalScrollbackRows: 60),
+      );
       controller.notifyHistoryReplayed();
       await tester.pumpAndSettle();
       expect(pages, 1);
@@ -6138,74 +6425,78 @@ void main() {
         rows: [],
         isExited: true,
       );
+      addTearDown(session.dispose);
 
       expect(session.isExited, isTrue);
-      expect(session.store.state.exited, isTrue);
+      expect(session.terminal.cursorVisible, isFalse);
     });
 
     test(
-      'applyHistory preserves exited state when view is ready and when view is pending',
+      'markExited hides cursor and live TerminalSync frame restores cursor visibility on revive',
       () {
         final session = SessionVm(
           title: 'exited-session',
-          status: 'exited',
+          status: 'attached',
           statusColor: const Color(0xff7fd1c7),
           icon: Icons.terminal,
           rows: [],
+          isRemote: true,
         );
+        addTearDown(session.dispose);
 
-        // Before view is ready
-        session.applyHistory(
-          utf8.encode('historical prompt'),
-          throughOutputSeq: 5,
-          isExited: true,
-        );
+        session.markExited();
         expect(session.isExited, isTrue);
-        expect(session.store.state.exited, isTrue);
+        expect(session.terminal.cursorVisible, isFalse);
 
-        // Flushing view ready maintains exited state
         session.noteViewFit(80, 24);
         expect(session.isExited, isTrue);
-        expect(session.store.state.exited, isTrue);
+        expect(session.terminal.cursorVisible, isFalse);
 
-        // Subsequent applyHistory with isExited: true maintains exited state
-        session.applyHistory(
-          utf8.encode('more prompt'),
-          throughOutputSeq: 10,
-          isExited: true,
-        );
-        expect(session.isExited, isTrue);
-        expect(session.store.state.exited, isTrue);
-
-        // Reviving session with isExited: false clears exited state
-        session.applyHistory(
-          utf8.encode('revived prompt'),
-          throughOutputSeq: 15,
-          isExited: false,
+        // Revived session receives a live TerminalSync frame with cursor visible.
+        session.isExited = false;
+        session.applyTerminalSyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 2,
+            rows: 24,
+            cols: 80,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 2,
+            cursorY: 0,
+            cursorStyle: 0,
+            modeFlags: kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[r'$ ']),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
         );
         expect(session.isExited, isFalse);
-        expect(session.store.state.exited, isFalse);
+        expect(session.terminal.cursorVisible, isTrue);
       },
     );
 
-    test(
-      'user input is dropped when session is exited and accepted when revived',
-      () {
-        final session = SessionVm(
-          title: 'exited-session',
-          status: 'exited',
-          statusColor: const Color(0xff7fd1c7),
-          icon: Icons.terminal,
-          rows: [],
-          isExited: true,
-        );
+    testWidgets(
+      'user input is dropped when remote session is exited and sent once revived',
+      (WidgetTester tester) async {
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
 
-        expect(session.store.state.exited, isTrue);
+        client.emitExited('flutter-spike');
+        await tester.pumpAndSettle();
 
-        // Transition session to running
-        session.store.dispatch(const Attach());
-        session.isExited = false;
-        expect(session.store.state.exited, isFalse);
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.controller.sendInput('ignored');
+        await tester.pumpAndSettle();
+        expect(client.writeInputCalls, isEmpty);
       },
     );
   });
@@ -6288,182 +6579,124 @@ void main() {
 
   group('Lazy history attach & paging', () {
     testWidgets(
-      'initial attach uses first-page cap, loaded re-select probes lease cap, and near-top paging doubles window until log start',
+      'initial attach synchronizes only selected session, lazy-loads second session on tap, re-select sends delta knownFrameSeq, and near-top fetches row 0',
       (WidgetTester tester) async {
-        const totalLogged = 100000;
         final client = FakeTriageWebSocketClient();
-        client.attachSnapshotBuilder = (sessionId, historyBytes) {
-          final cap = historyBytes ?? totalLogged;
-          final rawStart = totalLogged > cap ? totalLogged - cap : 0;
-          return {
-            'context': {
-              'branch': sessionId == 'main'
-                  ? 'main'
-                  : 'experiment/flutter-spike',
-            },
-            'size': {'rows': 24, 'cols': 80},
-            'exited': false,
-            'output_seq': 1,
-            'raw_output_start': rawStart,
-            'bytes_logged': totalLogged,
-            'raw_output': utf8.encode('line from $sessionId\r\n'),
-            'visible_rows': ['line from $sessionId'],
-          };
-        };
+        client.fakeScrollbackLines['flutter-spike'] = List<String>.generate(
+          200,
+          (i) => 'scrollback-$i',
+        );
 
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
 
-        // First attach for 'flutter-spike' requests the 64 KiB first window.
+        // Only the initially selected session is synchronized on connect.
         expect(client.attachSessionCalls, ['flutter-spike']);
-        expect(client.attachSessionHistoryBytes, [kHistoryFirstWindowBytes]);
+        expect(client.syncTerminalCalls.single.knownFrameSeq, 0);
 
-        // Switching to 'main' loads it for the first time with 64 KiB.
+        // Switching to 'main' lazy-loads it for the first time with knownFrameSeq 0.
         await tester.tap(find.text('triage / main').first);
         await tester.pumpAndSettle();
         expect(client.attachSessionCalls.last, 'main');
-        expect(client.attachSessionHistoryBytes.last, kHistoryFirstWindowBytes);
+        expect(client.syncTerminalCalls.last.knownFrameSeq, 0);
 
-        // Switching back to already-loaded 'flutter-spike' issues only the
-        // 1 KiB lease/metadata probe (both the select lease probe and the
-        // metadata-only refresh use kHistoryLeaseProbeBytes).
-        final callsBeforeReselect = client.attachSessionHistoryBytes.length;
+        // Switching back to already-loaded 'flutter-spike' sends a delta sync
+        // with its last applied frame sequence (> 0).
+        var pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        final syncCountBeforeReselect = client.syncTerminalCalls.length;
         await tester.tap(find.text('experiment/flutter-spike').first);
         await tester.pumpAndSettle();
-        final reselectCaps = client.attachSessionHistoryBytes.sublist(
-          callsBeforeReselect,
-        );
-        expect(reselectCaps, isNotEmpty);
-        expect(
-          reselectCaps.every((cap) => cap == kHistoryLeaseProbeBytes),
-          isTrue,
-        );
-
-        // Triggering near-top paging doubles the window (64 KiB -> 128 KiB),
-        // which reaches raw_output_start == 0 for a 100 KB log.
-        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
-        pane.onNearTop!();
+        pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
-        expect(client.attachSessionCalls.last, 'flutter-spike');
-        expect(
-          client.attachSessionHistoryBytes.last,
-          kHistoryFirstWindowBytes * 2,
-        );
-
-        // Once raw_output_start reaches 0, subsequent near-top triggers stop
-        // issuing further attaches.
-        final callsAtLogStart = client.attachSessionCalls.length;
-        pane.onNearTop!();
+        await tester.tap(find.text('main').first);
         await tester.pumpAndSettle();
-        expect(client.attachSessionCalls.length, callsAtLogStart);
+        final deltaCallsStart = client.syncTerminalCalls.length;
+        await tester.tap(find.text('experiment/flutter-spike').first);
+        await tester.pumpAndSettle();
+
+        expect(syncCountBeforeReselect, greaterThan(0));
+        final reselectSyncs = client.syncTerminalCalls.sublist(deltaCallsStart);
+        expect(reselectSyncs, isNotEmpty);
+        expect(reselectSyncs.every((c) => c.knownFrameSeq > 0), isTrue);
+
+        // Near-top trigger fetches the top scrollback page once, and stops once
+        // virtual row 0 is resident.
+        pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        expect(pane.onNearTop!(), isTrue);
+        await tester.pumpAndSettle();
+        expect(client.fetchTerminalRowsCalls.last.sessionId, 'flutter-spike');
+        expect(client.fetchTerminalRowsCalls.last.startRow, 0);
+
+        final fetchesBeforeRepeat = client.fetchTerminalRowsCalls.length;
+        expect(pane.onNearTop!(), isFalse);
+        await tester.pumpAndSettle();
+        expect(client.fetchTerminalRowsCalls.length, fetchesBeforeRepeat);
       },
     );
 
     testWidgets(
-      'near-top paging sizes next window from live-grown heldSpan, bails when raw_output_start does not move backward, and preserves in-flight live chunks',
+      'in-flight live TerminalSync frame arriving during fetchTerminalRows demand-page preserves both live viewport and fetched scrollback',
       (WidgetTester tester) async {
-        const initialTotalLogged = 500000;
-        var nextSnapshotStart = initialTotalLogged - kHistoryFirstWindowBytes;
-        var nextSnapshotSeq = 1;
-        var nextSnapshotText = 'initial-page\r\n';
-        final attachCompleter = Completer<Map<String, dynamic>>();
         final client = FakeTriageWebSocketClient();
-        client.attachCompleters['flutter-spike'] = attachCompleter;
-        client.attachSnapshotBuilder = (sessionId, historyBytes) {
-          // Gate the 256 KiB page on attachCompleter so the test can inject a
-          // live Output chunk while that attach RPC is in flight.
-          if (historyBytes == kHistoryReplayMaxBytes) {
-            return null;
-          }
-          return {
-            'context': {'branch': sessionId},
-            'size': {'rows': 24, 'cols': 80},
-            'exited': false,
-            'output_seq': nextSnapshotSeq,
-            'raw_output_start': nextSnapshotStart,
-            'bytes_logged': initialTotalLogged,
-            'raw_output': utf8.encode(nextSnapshotText),
-            'visible_rows': ['row'],
-          };
-        };
+        client.fakeScrollbackLines['flutter-spike'] = List<String>.generate(
+          64,
+          (i) => 'paged-older-history-$i',
+        );
+        final pageGate = Completer<Map<String, dynamic>>();
+        client.fetchRowsGate = (sessionId, startRow, rowCount) => pageGate;
 
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
-        expect(client.attachSessionHistoryBytes, [kHistoryFirstWindowBytes]);
 
         final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
 
-        // Stream live output so heldSpan (appliedLogBytes - start = 96 KiB)
-        // exceeds session.historyWindowBytes (64 KiB) while leaving headroom
-        // below kHistoryReplayMaxBytes (256 KiB) for a second page.
-        final initialTailLen = utf8.encode(nextSnapshotText).length;
-        final liveGrowthBytes = (96 * 1024) - initialTailLen;
-        client.emitOutput('flutter-spike', 'a' * liveGrowthBytes, outputSeq: 2);
+        // Trigger demand-paging for row 0, which waits on pageGate.
+        expect(pane.onNearTop!(), isTrue);
         await tester.pump();
 
-        // First near-top page requests 2 * heldSpan (2 * 96 KiB = 192 KiB, not
-        // 2 * 64 KiB = 128 KiB). Because the daemon returns the same
-        // raw_output_start (non-progressing), the store is not cleared,
-        // historyWindowBytes advances to 192 KiB, and the barren-page
-        // continuation immediately launches the next page at
-        // kHistoryReplayMaxBytes (256 KiB), which waits on attachCompleter.
-        pane.onNearTop!();
-        await tester.pump();
-        await tester.pump();
-        expect(client.attachSessionHistoryBytes, [
-          kHistoryFirstWindowBytes,
-          kHistoryLeaseProbeBytes,
-          192 * 1024,
-          kHistoryReplayMaxBytes,
-        ]);
-
-        // Live chunk seq 4 arrives while attachSession (snapshot at seq 3) is in flight.
-        client.emitOutput(
+        // Live TerminalSync frame arrives while fetchTerminalRows is in flight.
+        client.emitTerminalSync(
           'flutter-spike',
-          'live-during-page-flight\r\n',
-          outputSeq: 4,
+          const <String>['live-during-page-flight'],
+          totalScrollbackRows: 64,
+          frameSeq: 10,
         );
         await tester.pump();
 
-        attachCompleter.complete({
-          'response': {
-            'lease': {
-              'holder': {'client_id': 'test-client'},
-              'generation': 0,
-            },
-            'snapshot': {
-              'context': {'branch': 'flutter-spike'},
-              'size': {'rows': 24, 'cols': 80},
-              'exited': false,
-              'output_seq': 3,
-              'raw_output_start': 100000,
-              'bytes_logged': initialTotalLogged,
-              'raw_output': utf8.encode('paged-older-history\r\n'),
-              'visible_rows': ['row'],
-            },
-          },
+        pageGate.complete({
+          'session_id': 'flutter-spike',
+          'start_row': 0,
+          'row_count': 64,
+          'total_scrollback_rows': 64,
+          'trimmed_top_rows': 0,
+          'erase_scrollback_gen': 0,
+          'compression': kCellCompressionNone,
+          'payload': encodeTcg1PlainTextRows(
+            client.fakeScrollbackLines['flutter-spike']!,
+            cols: 80,
+          ),
         });
         await tester.pumpAndSettle();
 
-        final lines = pane.terminal.buffer.lines;
-        final bufferText = [
-          for (var i = 0; i < lines.length; i++) lines[i].toString(),
-        ].join('\n');
-        expect(bufferText, contains('paged-older-history'));
+        final bufferText = readTerminalBufferText(pane.terminal);
+        expect(bufferText, contains('paged-older-history-0'));
         expect(bufferText, contains('live-during-page-flight'));
       },
     );
 
     testWidgets(
-      're-selecting a fitted session sends one attachSession probe without clearing terminal or bumping focusCursorRevision and fails safe on refresh error',
+      're-selecting a fitted session sends one delta syncTerminalSession probe without clearing terminal and fails safe on refresh error',
       (WidgetTester tester) async {
         final client = FakeTriageWebSocketClient();
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
 
-        // Fit 'flutter-spike', then switch to 'main' and fit 'main'.
         var pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
@@ -6481,28 +6714,25 @@ void main() {
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
 
-        // Re-selecting 'flutter-spike' (already fitted and subscribed) must
-        // issue a single metadata attachSession probe (not a duplicate select
-        // lease probe + refresh probe), must not clear the terminal, and must
-        // not bump focusCursorRevision on a no-op metadata refresh.
-        final callsBeforeReselect = client.attachSessionHistoryBytes.length;
+        final callsBeforeReselect = client.syncTerminalCalls.length;
         await tester.tap(find.text('experiment/flutter-spike').first);
         await tester.pumpAndSettle();
 
-        final reselectCaps = client.attachSessionHistoryBytes.sublist(
+        final reselectCalls = client.syncTerminalCalls.sublist(
           callsBeforeReselect,
         );
-        expect(reselectCaps, [kHistoryLeaseProbeBytes]);
+        expect(reselectCalls, hasLength(1));
+        expect(reselectCalls.single.knownFrameSeq, greaterThan(0));
         expect(clearsOnSpike, 0);
         pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
         expect(pane.focusCursorRevision, spikeRevBefore + 1);
 
-        // If the metadata refresh fails on a subsequent re-select, hasInputLease
+        // If the delta refresh fails on a subsequent re-select, hasInputLease
         // must fail safe to false so typing re-acquires the InteractiveController lease.
         await tester.tap(find.text('main').first);
         await tester.pumpAndSettle();
         client.attachSnapshotBuilder = (_, _) =>
-            throw Exception('attach failed');
+            throw Exception('sync_terminal failed');
         await tester.tap(find.text('experiment/flutter-spike').first);
         await tester.pumpAndSettle();
         client.attachSnapshotBuilder = null;
@@ -6519,82 +6749,15 @@ void main() {
     );
 
     testWidgets(
-      'HTTP history transport probes lease over WebSocket, loads initial window over HTTP, and splices backward range pages',
+      'daemon predating SyncTerminal surfaces explicit upgrade-required state and message',
       (WidgetTester tester) async {
-        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
-        client.httpHistoryBuilder =
-            ({
-              required sessionId,
-              windowBytes,
-              afterByte,
-              afterSeq,
-              beforeByte,
-            }) {
-              if (beforeByte != null) {
-                return {
-                  'session_id': sessionId,
-                  'size': {'rows': 24, 'cols': 80},
-                  'exited': false,
-                  'output_seq': 5,
-                  'bytes_logged': 100020,
-                  'raw_output_start': 0,
-                  'raw_output_end': beforeByte,
-                  'raw_output_truncated': true,
-                  'raw_output': utf8.encode('http-older-slice\r\n'),
-                  'raw_output_prefix': const <int>[],
-                };
-              }
-              return {
-                'session_id': sessionId,
-                'size': {'rows': 24, 'cols': 80},
-                'exited': false,
-                'output_seq': 5,
-                'bytes_logged': 100020,
-                'raw_output_start': 100000,
-                'raw_output_end': 100020,
-                'raw_output_truncated': false,
-                'raw_output': utf8.encode('http-initial-tail\r\n'),
-                'raw_output_prefix': const <int>[],
-              };
-            };
-
+        final client = FakeTriageWebSocketClient()
+          ..unsupportedTerminalSync = true;
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
 
-        // Initial attach uses the 1 KiB metadata/lease probe over WebSocket
-        // and fetches the 64 KiB initial window over HTTP.
-        expect(client.attachSessionHistoryBytes, [kHistoryLeaseProbeBytes]);
-        expect(client.fetchSessionHistoryCalls.length, 1);
-        expect(
-          client.fetchSessionHistoryCalls.single.windowBytes,
-          kHistoryFirstWindowBytes,
-        );
-        expect(client.fetchSessionHistoryCalls.single.beforeByte, isNull);
-
-        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
-        pane.onViewFit!(80, 24);
-        await tester.pumpAndSettle();
-
-        // Near-top scroll pages backward over HTTP using before_byte without
-        // issuing another WebSocket attachSession call.
-        final attachesBeforePage = client.attachSessionCalls.length;
-        pane.onNearTop!();
-        await tester.pumpAndSettle();
-
-        expect(client.attachSessionCalls.length, attachesBeforePage);
-        expect(client.fetchSessionHistoryCalls.length, 2);
-        final pageCall = client.fetchSessionHistoryCalls.last;
-        expect(pageCall.windowBytes, kHistoryFirstWindowBytes * 2);
-        expect(pageCall.beforeByte, 100000);
-        expect(pageCall.afterByte, 100000 + 'http-initial-tail\r\n'.length);
-        expect(pageCall.afterSeq, 5);
-
-        final lines = pane.terminal.buffer.lines;
-        final bufferText = [
-          for (var i = 0; i < lines.length; i++) lines[i].toString(),
-        ].join('\n');
-        expect(bufferText, contains('http-older-slice'));
-        expect(bufferText, contains('http-initial-tail'));
+        expect(find.text('upgrade daemon'), findsWidgets);
+        expect(find.text(kUnsupportedTerminalSyncMessage), findsOneWidget);
       },
     );
 
@@ -6794,7 +6957,7 @@ void main() {
 
   group('Scrollback layout and refit above viewable area', () {
     test(
-      'SessionVm resizes native terminal to fitted dimensions before replaying history above viewable area',
+      'SessionVm applies wide 120-column cell frames without client-side 80-column wrapping',
       () {
         final vm = SessionVm(
           title: 'session-wide-scrollback',
@@ -6806,84 +6969,109 @@ void main() {
         );
         addTearDown(vm.dispose);
 
-        // Build a 100-column line that scrolls above a 10-row viewport.
-        // Without resizing `vm.terminal` before `HistoryBytes` replay, this line
-        // would be written while `vm.terminal` is still at its 80x24 default and
-        // wrap at column 80.
         final wideHeader = 'W' * 100;
-        final payload = StringBuffer('$wideHeader\r\n');
-        for (var i = 0; i < 20; i++) {
-          payload.write('row-$i\r\n');
-        }
-
-        vm.applyHistory(
-          utf8.encode(payload.toString()),
-          throughOutputSeq: 1,
-          rawOutputStart: 0,
-        );
         vm.noteViewFit(120, 10);
+        vm.applyTerminalSyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: 10,
+            cols: 120,
+            totalScrollbackRows: 1,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 0,
+            modeFlags: kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(
+              const <String>['row-0'],
+              cols: 120,
+            ),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 1,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(
+              <String>[wideHeader],
+              cols: 120,
+            ),
+          ),
+        );
 
         expect(vm.terminal.viewWidth, 120);
         expect(vm.terminal.viewHeight, 10);
-        expect(vm.terminal.buffer.lines[0].toString().trimRight(), wideHeader);
+        expect(vm.terminal.lineAtVirtualRow(0)?.toPlainText(), wideHeader);
       },
     );
 
     testWidgets(
-      'Refit button re-lays out scrollback history above viewable area at the current terminal width',
+      'Refit button resizes daemon PTY and re-fetches reflowed scrollback rows at the wider width',
       (WidgetTester tester) async {
         SharedPreferences.setMockInitialValues({});
         final wideScrollbackLine = 'S' * 100;
-        final payload = StringBuffer('$wideScrollbackLine\r\n');
-        for (var i = 0; i < 35; i++) {
-          payload.write('visible-or-scrolled-$i\r\n');
-        }
-        final historyBytes = utf8.encode(payload.toString());
-
         final client = FakeTriageWebSocketClient();
-        client.attachHistoryWindows['flutter-spike'] = {
-          kHistoryFirstWindowBytes: (bytes: historyBytes, start: 0, seq: 5),
-        };
+        client.fakeScrollbackLines['flutter-spike'] = <String>[
+          'S' * 80,
+          'S' * 20,
+        ];
+        client.snapshotVisibleRows['flutter-spike'] = const <String>[
+          'visible-row-0',
+        ];
 
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
 
         final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
-        // Simulate an initial 80x24 fit where the 100-col scrollback line wrapped
-        // at column 80 into two lines ('S' * 80 and 'S' * 20).
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
-        expect(pane.terminal.buffer.lines[0].toString().trimRight(), 'S' * 80);
-        expect(pane.terminal.buffer.lines[1].toString().trimRight(), 'S' * 20);
+        pane.onNearTop!();
+        await tester.pumpAndSettle();
 
-        // Now widen the terminal to 120x24 and press Refit in the workspace header.
+        expect(pane.terminal.lineAtVirtualRow(0)?.toPlainText(), 'S' * 80);
+        expect(pane.terminal.lineAtVirtualRow(1)?.toPlainText(), 'S' * 20);
+
+        // Widen to 120x24, press Refit, and emit the daemon's reflowed 120-col
+        // TerminalSync frame; the cached 80-col scrollback page must be invalidated
+        // and re-fetched at 120 columns.
         pane.terminal.resize(120, 24);
         await tester.tap(find.byTooltip('Refit terminal to this device'));
         await tester.pumpAndSettle();
 
-        expect(
-          pane.terminal.buffer.lines[0].toString().trimRight(),
+        client.fakeScrollbackLines['flutter-spike'] = <String>[
           wideScrollbackLine,
+        ];
+        client.emitTerminalSync(
+          'flutter-spike',
+          const <String>['visible-row-0'],
+          cols: 120,
+          rows: 24,
+          totalScrollbackRows: 1,
+          frameSeq: 20,
         );
+        await tester.pumpAndSettle();
+
+        expect(pane.terminal.lineAtVirtualRow(0), isNull);
+        pane.onNearTop!();
+        await tester.pumpAndSettle();
         expect(
-          pane.terminal.buffer.lines[1].toString().trimRight(),
-          'visible-or-scrolled-0',
+          pane.terminal.lineAtVirtualRow(0)?.toPlainText(),
+          wideScrollbackLine,
         );
       },
     );
 
     testWidgets(
-      'metadata refresh on re-select resizes host without clobbering live SIGWINCH output via HTTP history replay',
+      'delta sync on re-select resizes host without clobbering live SIGWINCH output',
       (WidgetTester tester) async {
         SharedPreferences.setMockInitialValues({});
-        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
-        client.attachHistoryWindows['flutter-spike'] = {
-          kHistoryFirstWindowBytes: (
-            bytes: utf8.encode('initial prompt\r\n'),
-            start: 0,
-            seq: 1,
-          ),
-        };
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = const <String>[
+          'initial prompt',
+        ];
 
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
@@ -6892,114 +7080,70 @@ void main() {
         pane.onViewFit!(120, 40);
         await tester.pumpAndSettle();
 
-        // Simulate a live SIGWINCH redraw or agent output arriving at seq 2,
-        // while the server's HTTP history snapshot still only carries seq 1.
-        client.emitOutput(
+        client.emitTerminalSync(
           'flutter-spike',
-          'live-redraw-after-sigwinch\r\n',
-          outputSeq: 2,
+          const <String>['initial prompt', 'live-redraw-after-sigwinch'],
+          cols: 120,
+          rows: 40,
+          frameSeq: 5,
         );
         await tester.pumpAndSettle();
 
         // Another device resizes the PTY to 47x19; switching away and back
-        // triggers a metadata refresh (`includeHistory: false`) that resizes
-        // the host back to 120x40. It must not run a full HTTP history replay
-        // that wipes out seq 2.
+        // triggers a delta sync that resizes the host back to 120x40 while
+        // preserving the live redraw row.
         client.emitSnapshot('flutter-spike', ['narrow'], size: (19, 47));
         await tester.pumpAndSettle();
 
         await tester.tap(find.text('triage / main'));
         await tester.pumpAndSettle();
-        final historyCallsBefore = client.fetchSessionHistoryCalls.length;
+        final beforeReselect = client.resizeSessionCalls.length;
+        client.syncResponseBuilder = (sid, knownFrameSeq) {
+          if (sid == 'flutter-spike' && knownFrameSeq > 0) {
+            return {
+              'frame': client.buildFakeSyncFrameMap(
+                sid,
+                viewportRows: const <String>[],
+                cols: 120,
+                rows: 40,
+                fullViewport: false,
+                frameSeq: 6,
+              ),
+              'snapshot': {
+                'size': {'rows': 40, 'cols': 120},
+                'exited': false,
+              },
+            };
+          }
+          return null;
+        };
 
-        await tester.tap(find.text('experiment/flutter-spike').first);
+        await tester.tap(find.text('triage / flutter-spike').first);
         await tester.pumpAndSettle();
 
-        expect(client.fetchSessionHistoryCalls.length, historyCallsBefore);
+        expect(client.syncTerminalCalls.last.knownFrameSeq, 5);
+        expect(
+          client.resizeSessionCalls.sublist(beforeReselect),
+          contains('flutter-spike:120:40'),
+        );
         final reselectedPane = tester.widget<TerminalPane>(
           find.byType(TerminalPane),
         );
-        final bufferText = List.generate(
-          reselectedPane.terminal.buffer.lines.length,
-          (i) => reselectedPane.terminal.buffer.lines[i].toString(),
-        ).join('\n');
-        expect(bufferText, contains('live-redraw-after-sigwinch'));
-      },
-    );
-
-    test(
-      'SessionVm.applyHistory preserves pending live chunks when store isPagingHistory is active even if preservePendingLive is false',
-      () {
-        final vm = SessionVm(
-          title: 'triage / paging-live-preserve',
-          sessionId: 'paging-live-preserve',
-          status: 'attached',
-          statusColor: const Color(0xff7fd1c7),
-          icon: Icons.terminal,
-          rows: const [],
-          isRemote: true,
-          loaded: false,
+        expect(
+          readTerminalBufferText(reselectedPane.terminal),
+          contains('live-redraw-after-sigwinch'),
         );
-        vm.noteViewFit(80, 24);
-        vm.store.beginHistoryPaging();
-        try {
-          vm.applyLiveBytes(
-            utf8.encode('in-flight-live-line\r\n'),
-            outputSeq: 2,
-          );
-          vm.applyHistory(
-            utf8.encode('history-line\r\n'),
-            throughOutputSeq: 1,
-            rawOutputStart: 0,
-            windowBytes: kHistoryFirstWindowBytes,
-            preservePendingLive: false,
-          );
-        } finally {
-          vm.store.endHistoryPaging();
-        }
-        final bufferText = List.generate(
-          vm.terminal.buffer.lines.length,
-          (i) => vm.terminal.buffer.lines[i].toString(),
-        ).join('\n');
-        expect(bufferText, contains('history-line'));
-        expect(bufferText, contains('in-flight-live-line'));
-        vm.dispose();
       },
     );
 
     testWidgets(
-      'history refresh on reconnect defers in-flight live output until missed HTTP delta lands in order',
+      'reconnect runs full sync_terminal with subscribe and applies subsequent live TerminalSync frames in order',
       (WidgetTester tester) async {
         SharedPreferences.setMockInitialValues({});
-        final initialBytes = utf8.encode('initial prompt\r\n');
-        final missedDeltaBytes = utf8.encode('missed-delta\r\n');
-        final parkedDeltaFetch = Completer<Map<String, dynamic>>();
-
-        final client = FakeTriageWebSocketClient()..enableHttpHistory = true;
-        client.asyncHttpHistoryBuilder =
-            ({
-              required sessionId,
-              windowBytes,
-              afterByte,
-              afterSeq,
-              beforeByte,
-            }) async {
-              if (afterByte != null) {
-                return parkedDeltaFetch.future;
-              }
-              return {
-                'session_id': sessionId,
-                'size': {'rows': 24, 'cols': 80},
-                'exited': false,
-                'output_seq': 1,
-                'bytes_logged': initialBytes.length,
-                'raw_output_start': 0,
-                'raw_output_end': initialBytes.length,
-                'raw_output_truncated': false,
-                'raw_output': initialBytes,
-                'raw_output_prefix': const <int>[],
-              };
-            };
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = const <String>[
+          'initial prompt',
+        ];
 
         await tester.pumpWidget(TriageClientApp(client: client));
         await tester.pumpAndSettle();
@@ -7008,51 +7152,46 @@ void main() {
         pane.onViewFit!(80, 24);
         await tester.pumpAndSettle();
 
-        // Simulate a socket drop and reconnect so the already-loaded session
-        // runs `_resubscribeAndRefreshHistory` (`includeHistory: true`) at the
-        // matching 80x24 host size (`canUseDelta: true`).
+        final parkedReconnect = Completer<Map<String, dynamic>>();
+        client.attachCompleters['flutter-spike'] = parkedReconnect;
         await client.emitSocketClosed();
         await tester.pump(const Duration(seconds: 2));
         await tester.pump();
-        expect(
-          client.fetchSessionHistoryCalls.last.afterByte,
-          initialBytes.length,
-        );
 
-        // Emit a new live WebSocket Output chunk (`seq = 3`) while the HTTP
-        // delta fetch (`seq = 2`) is still in flight.
-        client.emitOutput(
+        expect(client.syncTerminalCalls.last.knownFrameSeq, 0);
+        expect(client.syncTerminalCalls.last.subscribe, isTrue);
+
+        parkedReconnect.complete(
+          client.attachSnapshotResponse(
+            'flutter-spike',
+            const <String>['initial prompt', 'missed-delta'],
+            frameSeq: 10,
+          ),
+        );
+        client.attachCompleters.remove('flutter-spike');
+        await tester.pumpAndSettle();
+
+        client.emitTerminalSync(
           'flutter-spike',
-          'live-during-refresh\r\n',
-          outputSeq: 3,
+          const <String>[
+            'initial prompt',
+            'missed-delta',
+            'live-after-reconnect',
+          ],
+          frameSeq: 11,
         );
-        await tester.pump();
-
-        parkedDeltaFetch.complete({
-          'session_id': 'flutter-spike',
-          'size': {'rows': 24, 'cols': 80},
-          'exited': false,
-          'output_seq': 2,
-          'bytes_logged': initialBytes.length + missedDeltaBytes.length,
-          'raw_output_start': initialBytes.length,
-          'raw_output_end': initialBytes.length + missedDeltaBytes.length,
-          'raw_output_truncated': false,
-          'raw_output': missedDeltaBytes,
-          'raw_output_prefix': const <int>[],
-        });
         await tester.pumpAndSettle();
 
         final refreshedPane = tester.widget<TerminalPane>(
           find.byType(TerminalPane),
         );
-        final nonEmptyLines = List.generate(
-          refreshedPane.terminal.buffer.lines.length,
-          (i) => refreshedPane.terminal.buffer.lines[i].toString().trimRight(),
+        final nonEmptyLines = readTerminalBufferLines(
+          refreshedPane.terminal,
         ).where((line) => line.isNotEmpty).toList();
         expect(nonEmptyLines, [
           'initial prompt',
           'missed-delta',
-          'live-during-refresh',
+          'live-after-reconnect',
         ]);
       },
     );

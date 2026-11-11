@@ -4,8 +4,41 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/models/terminal_models.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_mouse_encoder.dart';
+import 'package:triage_client/widgets/terminal_grid_render_box.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
-import 'package:xterm2/xterm.dart' hide TerminalController, TerminalStyle;
+
+TerminalCellLine _cellLine(String text, {int cols = 80}) {
+  return TerminalCellLine.fromSpec(
+    <String?>[for (final r in text.runes) String.fromCharCode(r)],
+    width: cols,
+  );
+}
+
+void _seedBufferLines(
+  TerminalCellBuffer terminal,
+  List<String> lines, {
+  int? cols,
+  int? rows,
+}) {
+  final targetCols = cols ?? terminal.viewWidth;
+  final targetRows = rows ?? terminal.viewHeight;
+  final cellLines = <TerminalCellLine>[
+    for (final text in lines) _cellLine(text, cols: targetCols),
+  ];
+  final sbCount = cellLines.length > targetRows
+      ? cellLines.length - targetRows
+      : 0;
+  terminal.seedLinesForTest(
+    cols: targetCols,
+    rows: targetRows,
+    scrollback: sbCount > 0
+        ? cellLines.sublist(0, sbCount)
+        : const <TerminalCellLine>[],
+    viewport: cellLines.sublist(sbCount),
+  );
+}
 
 void main() {
   group('TerminalPane hardware Tab and Shift+Tab key handling', () {
@@ -13,7 +46,7 @@ void main() {
       testWidgets('receives Shift+Tab and Tab on $platform', (tester) async {
         debugDefaultTargetPlatformOverride = platform;
         try {
-          final terminal = Terminal();
+          final terminal = TerminalCellBuffer();
           final controller = TerminalController();
           final inputs = <String>[];
           controller.addInputListener((data) {
@@ -51,19 +84,16 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          // Shift+Tab sends back-tab escape sequence (\x1b[Z)
           await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
           await tester.sendKeyEvent(LogicalKeyboardKey.tab);
           await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
           await tester.pump();
 
-          // Plain Tab sends literal tab character (\t)
           await tester.sendKeyEvent(LogicalKeyboardKey.tab);
           await tester.pump();
 
           expect(inputs, ['\x1b[Z', '\t']);
 
-          // Focus remains on the terminal and is not stolen by focus traversal
           final terminalFocus = Focus.of(
             tester.element(find.byType(SingleChildScrollView)),
           );
@@ -79,7 +109,7 @@ void main() {
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         final inputs = <String>[];
         controller.addInputListener((data) {
@@ -117,15 +147,10 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        // Hold shift down
         await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
-        // Initial tab down
         await tester.sendKeyDownEvent(LogicalKeyboardKey.tab);
-        // Repeated tab event
         await tester.sendKeyRepeatEvent(LogicalKeyboardKey.tab);
-        // Tab up
         await tester.sendKeyUpEvent(LogicalKeyboardKey.tab);
-        // Shift up
         await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
         await tester.pump();
 
@@ -145,7 +170,7 @@ void main() {
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         final inputs = <String>[];
         controller.addInputListener((data) {
@@ -183,11 +208,8 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        // Initial tab down
         await tester.sendKeyDownEvent(LogicalKeyboardKey.tab);
-        // Repeated tab event
         await tester.sendKeyRepeatEvent(LogicalKeyboardKey.tab);
-        // Tab up
         await tester.sendKeyUpEvent(LogicalKeyboardKey.tab);
         await tester.pump();
 
@@ -207,7 +229,7 @@ void main() {
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         final inputs = <String>[];
         controller.addInputListener((data) {
@@ -231,25 +253,21 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        // Ctrl+Tab
         await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
         await tester.sendKeyEvent(LogicalKeyboardKey.tab);
         await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
         await tester.pump();
 
-        // Alt+Tab
         await tester.sendKeyDownEvent(LogicalKeyboardKey.altLeft);
         await tester.sendKeyEvent(LogicalKeyboardKey.tab);
         await tester.sendKeyUpEvent(LogicalKeyboardKey.altLeft);
         await tester.pump();
 
-        // Meta+Tab
         await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
         await tester.sendKeyEvent(LogicalKeyboardKey.tab);
         await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
         await tester.pump();
 
-        // Ctrl+Shift+Tab
         await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
         await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
         await tester.sendKeyEvent(LogicalKeyboardKey.tab);
@@ -257,7 +275,6 @@ void main() {
         await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
         await tester.pump();
 
-        // Right-hand Ctrl+Tab, Alt+Tab, and Meta+Tab
         for (final modifier in [
           LogicalKeyboardKey.controlRight,
           LogicalKeyboardKey.altRight,
@@ -280,11 +297,13 @@ void main() {
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal(maxLines: 100);
-        terminal.resize(40, 4);
-        for (var i = 0; i < 30; i++) {
-          terminal.write('line $i\r\n');
-        }
+        final terminal = TerminalCellBuffer(cols: 40, rows: 4);
+        _seedBufferLines(
+          terminal,
+          <String>[for (var i = 0; i < 30; i++) 'line $i'],
+          cols: 40,
+          rows: 4,
+        );
         final controller = TerminalController();
 
         await tester.pumpWidget(
@@ -331,7 +350,7 @@ void main() {
     ) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         var interactions = 0;
         controller.addInteractionListener(() {
@@ -372,7 +391,7 @@ void main() {
     testWidgets('ignores Tab when session is exited', (tester) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         final inputs = <String>[];
         controller.addInputListener((data) {
@@ -423,7 +442,7 @@ void main() {
     testWidgets('ignores Tab when a modal route is active', (tester) async {
       debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
       try {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         final inputs = <String>[];
         controller.addInputListener((data) {
@@ -453,7 +472,6 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        // Push a modal dialog over the terminal
         showDialog<void>(
           context: savedContext,
           builder: (context) => const AlertDialog(
@@ -463,11 +481,9 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        // Press Tab while dialog is active
         await tester.sendKeyEvent(LogicalKeyboardKey.tab);
         await tester.pump();
 
-        // ModalRoute is not current for the terminal, so Tab is ignored
         expect(inputs, isEmpty);
       } finally {
         debugDefaultTargetPlatformOverride = null;
@@ -480,7 +496,7 @@ void main() {
       WidgetTester tester, {
       VoidCallback? onInteraction,
     }) async {
-      final terminal = Terminal();
+      final terminal = TerminalCellBuffer();
       final controller = TerminalController();
       final inputs = <String>[];
       controller.addInputListener((data) {
@@ -538,12 +554,11 @@ void main() {
       expect(inputs, ['\n']);
     });
 
-    testWidgets('plain Enter is left to the emulator default', (tester) async {
+    testWidgets('plain Enter is ignored on the outer fallback key handler', (
+      tester,
+    ) async {
       final inputs = await pumpPane(tester);
 
-      // Our layer sends nothing: xterm's own handler owns plain Enter (CR)
-      // in production. (The fallback view mounts no TerminalView, so there
-      // is no emulator echo to observe here.)
       await tester.sendKeyEvent(LogicalKeyboardKey.enter);
       await tester.pump();
 
@@ -578,8 +593,12 @@ void main() {
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
         try {
-          final terminal = Terminal();
-          terminal.write('\x1b[?1049h\x1b[?1000h\x1b[?1006h');
+          final terminal = TerminalCellBuffer();
+          terminal.setModesForTest(
+            altScreen: true,
+            mouseMode: kMouseModeNormal,
+            mouseReportMode: kMouseReportSgr,
+          );
           final controller = TerminalController();
           final inputs = <String>[];
           controller.addInputListener(inputs.add);
@@ -604,8 +623,6 @@ void main() {
           final center = tester.getCenter(find.byType(TerminalPane));
           final trackpad = TestPointer(1, PointerDeviceKind.trackpad);
           await tester.sendEventToBinding(trackpad.panZoomStart(center));
-          // Positive panDelta.dy (two-finger swipe down with natural scrolling)
-          // scrolls UP toward older content (wheelUp = button 64).
           await tester.sendEventToBinding(
             trackpad.panZoomUpdate(center, pan: const Offset(0, 24)),
           );
@@ -615,7 +632,6 @@ void main() {
           expect(inputs, contains(startsWith('\x1b[<64;')));
           inputs.clear();
 
-          // Mouse wheel scroll down (positive scrollDelta.dy) emits wheelDown (65).
           final mouse = TestPointer(2, PointerDeviceKind.mouse);
           await tester.sendEventToBinding(mouse.hover(center));
           await tester.sendEventToBinding(mouse.scroll(const Offset(0, 24)));
@@ -631,7 +647,7 @@ void main() {
     testWidgets(
       'placeholder-to-loaded session swap with rebindSessionController stays pinned to bottom',
       (tester) async {
-        final placeholderTerminal = Terminal();
+        final placeholderTerminal = TerminalCellBuffer();
         final placeholderController = TerminalController();
         const terminalId = 'triage / session-swap-scroll';
 
@@ -657,7 +673,7 @@ void main() {
         );
         await tester.pumpAndSettle();
 
-        final loadedTerminal = Terminal();
+        final loadedTerminal = TerminalCellBuffer();
         final loadedController = TerminalController();
         final loadedRows = <StyledRow>[
           for (var i = 0; i < 120; i++)
@@ -667,13 +683,12 @@ void main() {
               ],
             ),
         ];
-        // Simulate _loadDaemonSessionInto: rebind controller and replay history
-        // before the widget rebuilds with the loaded terminal.
         TerminalPane.rebindSessionController(terminalId, loadedController);
         loadedController.clear();
-        for (var i = 0; i < 120; i++) {
-          loadedTerminal.write('Line $i\r\n');
-        }
+        _seedBufferLines(
+          loadedTerminal,
+          <String>[for (var i = 0; i < 120; i++) 'Line $i'],
+        );
         loadedController.notifyHistoryReplayed();
 
         await tester.pumpWidget(
@@ -708,15 +723,15 @@ void main() {
           closeTo(scrollPosition.maxScrollExtent, 1.0),
         );
 
-        // Trigger refit(), then immediately scroll up and emit in-place
-        // spinner output; the viewport must stay at the user's scrolled
-        // offset instead of snapping back.
         loadedController.refit();
         await tester.pump();
         scrollPosition.jumpTo(300.0);
         await tester.pump();
         for (var i = 0; i < 10; i++) {
-          loadedTerminal.write('\x1b[10;3H* spinner $i');
+          loadedTerminal.setViewportLineForTest(
+            9,
+            _cellLine('  * spinner $i', cols: loadedTerminal.viewWidth),
+          );
           await tester.pump(const Duration(milliseconds: 16));
         }
         expect(scrollPosition.pixels, closeTo(300.0, 1.0));
@@ -728,7 +743,7 @@ void main() {
     testWidgets(
       'ignores user terminal output, key events, and emulator query responses when isExited or isObscured',
       (tester) async {
-        final terminal = Terminal();
+        final terminal = TerminalCellBuffer();
         final controller = TerminalController();
         final inputs = <String>[];
         controller.addInputListener(inputs.add);
@@ -751,7 +766,6 @@ void main() {
           );
         }
 
-        // 1. Exited session drops user typing, Shift+Enter/Tab, and emulator query responses.
         await tester.pumpWidget(buildHost(isExited: true, isObscured: false));
         await tester.pumpAndSettle();
 
@@ -766,7 +780,6 @@ void main() {
         terminal.onOutput?.call('\x1b[1;1R');
         expect(inputs, isEmpty);
 
-        // 2. Obscured session drops user typing and hardware keys.
         await tester.pumpWidget(buildHost(isExited: false, isObscured: true));
         await tester.pumpAndSettle();
 
@@ -775,7 +788,6 @@ void main() {
         await tester.pump();
         expect(inputs, isEmpty);
 
-        // 3. Unobscured live session accepts user input while still dropping emulator query responses.
         await tester.pumpWidget(buildHost(isExited: false, isObscured: false));
         await tester.pumpAndSettle();
 
@@ -812,9 +824,13 @@ void main() {
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
         try {
-          final terminal = Terminal(maxLines: 100);
-          terminal.resize(20, 2);
-          terminal.write('first line\r\nsecond line');
+          final terminal = TerminalCellBuffer(cols: 20, rows: 2);
+          _seedBufferLines(
+            terminal,
+            const <String>['first line', 'second line'],
+            cols: 20,
+            rows: 2,
+          );
           final controller = TerminalController();
           final inputs = <String>[];
           controller.addInputListener(inputs.add);
@@ -854,9 +870,13 @@ void main() {
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.linux;
         try {
-          final terminal = Terminal(maxLines: 100);
-          terminal.resize(20, 2);
-          terminal.write('alpha\r\nbeta');
+          final terminal = TerminalCellBuffer(cols: 20, rows: 2);
+          _seedBufferLines(
+            terminal,
+            const <String>['alpha', 'beta'],
+            cols: 20,
+            rows: 2,
+          );
           final controller = TerminalController();
 
           await tester.pumpWidget(
@@ -875,8 +895,6 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          // Plain Ctrl+A must not trigger select-all, so a subsequent
-          // Ctrl+Shift+C has nothing to copy.
           await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
           await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
           await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
@@ -886,7 +904,6 @@ void main() {
           await tester.pump();
           expect(copiedText, isNull);
 
-          // Ctrl+Shift+A selects all and Ctrl+Shift+C copies it.
           await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
           await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
           await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
@@ -906,9 +923,13 @@ void main() {
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
         try {
-          final terminal = Terminal(maxLines: 100);
-          terminal.resize(20, 2);
-          terminal.write('target 1\r\ntarget 2');
+          final terminal = TerminalCellBuffer(cols: 20, rows: 2);
+          _seedBufferLines(
+            terminal,
+            const <String>['target 1', 'target 2'],
+            cols: 20,
+            rows: 2,
+          );
           final controller = TerminalController();
 
           await tester.pumpWidget(
@@ -927,23 +948,21 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          // Select the current 2-line buffer ('target 1\ntarget 2').
           await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
           await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
           await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
           await tester.pump();
 
-          // Simulate a scrollback page prepending 2 older lines ahead of the
-          // originally selected lines.
           controller.notifyHistoryPageStarted();
-          terminal.buffer.clear();
-          terminal.buffer.setCursor(0, 0);
-          terminal.write('older 1\r\nolder 2\r\ntarget 1\r\ntarget 2');
+          _seedBufferLines(
+            terminal,
+            const <String>['older 1', 'older 2', 'target 1', 'target 2'],
+            cols: 20,
+            rows: 2,
+          );
           controller.notifyHistoryReplayed();
           await tester.pump();
 
-          // Copying the selection after replay must copy the shifted original
-          // lines ('target 1\ntarget 2'), not the newly prepended top lines.
           await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
           await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
           await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
@@ -961,10 +980,11 @@ void main() {
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.android;
         try {
-          final terminal = Terminal(maxLines: 100);
-          terminal.resize(47, 41);
-          terminal.write(
-            '\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h',
+          final terminal = TerminalCellBuffer(cols: 47, rows: 41);
+          terminal.setModesForTest(
+            altScreen: true,
+            mouseMode: kMouseModeAnyEvent,
+            mouseReportMode: kMouseReportSgr,
           );
           final sentInputs = <String>[];
           final controller = TerminalController();
@@ -990,7 +1010,6 @@ void main() {
           );
           await tester.pumpAndSettle();
 
-          // Drag finger downward (scrolling up into older history) -> wheelUp (64).
           final gesture = await tester.startGesture(const Offset(200, 300));
           await gesture.moveBy(const Offset(0, 60));
           await gesture.up();
@@ -1003,7 +1022,6 @@ void main() {
           );
 
           sentInputs.clear();
-          // Drag finger upward (scrolling down toward newer output) -> wheelDown (65).
           final gestureDown = await tester.startGesture(const Offset(200, 300));
           await gestureDown.moveBy(const Offset(0, -60));
           await gestureDown.up();
@@ -1021,20 +1039,20 @@ void main() {
     );
 
     testWidgets(
-      'native TerminalView stays pinned to bottom across loading, history replay, session swaps, and live output without phantom onNearTop paging',
+      'TerminalGridView stays pinned to bottom across loading, history sync, session swaps, and live output without phantom onNearTop paging',
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.android;
         TerminalPane.debugForceNativeTerminalView = true;
         try {
           var nearTopCount = 0;
-          final termA = Terminal(maxLines: 500);
+          final termA = TerminalCellBuffer();
           final ctrlA = TerminalController();
-          final termB = Terminal(maxLines: 500);
+          final termB = TerminalCellBuffer();
           final ctrlB = TerminalController();
 
           Widget buildPane({
             required String id,
-            required Terminal terminal,
+            required TerminalCellBuffer terminal,
             required TerminalController controller,
             required bool isLoading,
             required int focusRev,
@@ -1062,7 +1080,6 @@ void main() {
             );
           }
 
-          // 1. Mount session A while loading with an empty buffer (maxScrollExtent == 0).
           await tester.pumpWidget(
             buildPane(
               id: 'native-scroll-a',
@@ -1075,10 +1092,10 @@ void main() {
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 60));
 
-          // Replay 120 lines of history into session A and finish loading.
-          for (var i = 0; i < 120; i++) {
-            termA.write('session A line $i\r\n');
-          }
+          _seedBufferLines(
+            termA,
+            <String>[for (var i = 0; i < 120; i++) 'session A line $i'],
+          );
           ctrlA.notifyHistoryReplayed();
           await tester.pumpWidget(
             buildPane(
@@ -1093,7 +1110,7 @@ void main() {
           await tester.pump(const Duration(milliseconds: 100));
 
           final scrollableFinder = find.descendant(
-            of: find.byType(TerminalView),
+            of: find.byType(TerminalGridView),
             matching: find.byType(Scrollable),
           );
           ScrollPosition pos() =>
@@ -1103,17 +1120,12 @@ void main() {
           expect(pos().pixels, closeTo(pos().maxScrollExtent, 1.0));
           expect(nearTopCount, 0);
 
-          // 2. Scroll session A up to the middle so RenderTerminal._stickToBottom
-          // becomes false and session A records a saved scroll offset.
           final midA = pos().maxScrollExtent * 0.4;
           pos().jumpTo(midA);
           await tester.pump();
           expect(pos().pixels, closeTo(midA, 1.0));
           expect(nearTopCount, 0);
 
-          // 3. Switch to session B while it is loading and still has an empty
-          // buffer (maxScrollExtent shrinks from session A's extent to 0),
-          // then replay 80 lines of history and stream live output.
           await tester.pumpWidget(
             buildPane(
               id: 'native-scroll-b',
@@ -1127,9 +1139,10 @@ void main() {
           await tester.pump(const Duration(milliseconds: 30));
           expect(nearTopCount, 0);
 
-          for (var i = 0; i < 80; i++) {
-            termB.write('session B line $i\r\n');
-          }
+          _seedBufferLines(
+            termB,
+            <String>[for (var i = 0; i < 80; i++) 'session B line $i'],
+          );
           ctrlB.notifyHistoryReplayed();
           await tester.pumpWidget(
             buildPane(
@@ -1148,11 +1161,10 @@ void main() {
           expect(pos().pixels, closeTo(extentBBeforeLive, 1.0));
           expect(nearTopCount, 0);
 
-          // 4. Write additional live output to session B and verify that
-          // RenderTerminal._stickToBottom is true and advances pixels to the
-          // new bottom extent.
           for (var i = 80; i < 110; i++) {
-            termB.write('session B live $i\r\n');
+            termB.appendOutputLineForTest(
+              _cellLine('session B live $i', cols: termB.viewWidth),
+            );
           }
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
@@ -1161,9 +1173,6 @@ void main() {
           expect(pos().pixels, closeTo(pos().maxScrollExtent, 1.0));
           expect(nearTopCount, 0);
 
-          // 5. Switch back to session A and verify its scrolled-up offset is
-          // restored on the very first frame (no 1-frame snap to bottom) and
-          // stays pinned across live output without triggering onNearTop.
           await tester.pumpWidget(
             buildPane(
               id: 'native-scroll-a',
@@ -1178,31 +1187,28 @@ void main() {
           await tester.pump(const Duration(milliseconds: 60));
           expect(pos().pixels, closeTo(midA, 1.0));
           for (var i = 0; i < 5; i++) {
-            termA.write('session A live while scrolled up $i\r\n');
+            termA.appendOutputLineForTest(
+              _cellLine(
+                'session A live while scrolled up $i',
+                cols: termA.viewWidth,
+              ),
+            );
           }
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
           expect(pos().pixels, closeTo(midA, 1.0));
           expect(nearTopCount, 0);
 
-          // 6. Explicitly scroll session A to top (0.0); onNearTop fires once,
-          // and a large backward history page (where addedLines * lh exceeds
-          // the previous maxScrollExtent) re-seats the viewport on the same
-          // content without flipping RenderTerminal._stickToBottom to true or
-          // re-triggering onNearTop.
           pos().jumpTo(0.0);
           await tester.pump();
           expect(nearTopCount, 1);
 
           ctrlA.notifyHistoryPageStarted();
           ctrlA.clear();
-          termA.useMainBuffer();
-          termA.mainBuffer.clear();
-          termA.altBuffer.clear();
-          termA.write('\x1b[H\x1b[2J\x1b[3J');
-          for (var i = 0; i < 280; i++) {
-            termA.write('session A paged line $i\r\n');
-          }
+          _seedBufferLines(
+            termA,
+            <String>[for (var i = 0; i < 280; i++) 'session A paged line $i'],
+          );
           ctrlA.notifyHistoryReplayed();
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 60));
@@ -1212,10 +1218,13 @@ void main() {
           expect(pagedPixels, lessThan(pos().maxScrollExtent - 100.0));
           expect(nearTopCount, 1);
 
-          // Live output after paging must keep the viewport pinned at
-          // pagedPixels rather than snapping to bottom.
           for (var i = 0; i < 5; i++) {
-            termA.write('session A live after page $i\r\n');
+            termA.appendOutputLineForTest(
+              _cellLine(
+                'session A live after page $i',
+                cols: termA.viewWidth,
+              ),
+            );
           }
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 50));
@@ -1237,7 +1246,7 @@ void main() {
         TerminalPane.debugForceNativeTerminalView = true;
         TerminalPane.destroySession('mobile-kbd-resize');
         try {
-          final term = Terminal(maxLines: 500);
+          final term = TerminalCellBuffer();
           final ctrl = TerminalController();
           final resizeOuts = <(int, int)>[];
           ctrl.addResizeOutListener((cols, rows) {
@@ -1268,8 +1277,6 @@ void main() {
           final initialRows = term.viewHeight;
           resizeOuts.clear();
 
-          // Simulate 10 intermediate frames of soft keyboard sliding up over 160ms
-          // (16ms per frame), shrinking the pane from 600px down to 300px.
           for (var step = 1; step <= 10; step++) {
             final h = 600.0 - step * 30.0;
             tester.binding.handleMetricsChanged();
@@ -1277,13 +1284,9 @@ void main() {
             await tester.pump(const Duration(milliseconds: 16));
           }
 
-          // While the keyboard animation is still in flight, neither the terminal
-          // grid nor resizeOut should have churned through intermediate row counts.
           expect(term.viewHeight, initialRows);
           expect(resizeOuts, isEmpty);
 
-          // Once the metrics settle timer (80ms) elapses, the terminal resizes
-          // once to the final settled height and emits a single resizeOut.
           await tester.pump(const Duration(milliseconds: 100));
           expect(term.viewHeight, lessThan(initialRows));
           expect(resizeOuts.length, 1);
@@ -1302,18 +1305,19 @@ void main() {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
         TerminalPane.debugForceNativeTerminalView = true;
         try {
-          final term = Terminal(maxLines: 500);
+          final term = TerminalCellBuffer();
           final ctrl = TerminalController();
           final sentInput = <String>[];
           ctrl.addInputListener(sentInput.add);
 
-          // Populate 60 lines of scrollback on the main buffer, then enable
-          // SGR mouse button + wheel reporting (?1000h ?1002h ?1006h) as a
-          // fullscreen TUI (or an adopted session before alt-screen entry) does.
-          for (var i = 0; i < 60; i++) {
-            term.write('scrollback line $i\r\n');
-          }
-          term.write('\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+          _seedBufferLines(
+            term,
+            <String>[for (var i = 0; i < 60; i++) 'scrollback line $i'],
+          );
+          term.setModesForTest(
+            mouseMode: kMouseModeButtonEvent,
+            mouseReportMode: kMouseReportSgr,
+          );
 
           await tester.pumpWidget(
             MaterialApp(
@@ -1337,8 +1341,6 @@ void main() {
           await tester.pump(const Duration(milliseconds: 100));
           sentInput.clear();
 
-          // Click near the top-left of the viewport (row ~2, not clamped to
-          // viewHeight - 1 by scrollback lineOffset).
           final paneRect = tester.getRect(find.byType(TerminalPane));
           final topTarget = paneRect.topLeft + const Offset(45, 45);
           await tester.tapAt(topTarget);
@@ -1367,12 +1369,16 @@ void main() {
         debugDefaultTargetPlatformOverride = TargetPlatform.android;
         TerminalPane.debugForceNativeTerminalView = true;
         try {
-          final term = Terminal(maxLines: 500);
+          final term = TerminalCellBuffer();
           final ctrl = TerminalController();
           final sentInput = <String>[];
           ctrl.addInputListener(sentInput.add);
 
-          term.write('\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h');
+          term.setModesForTest(
+            altScreen: true,
+            mouseMode: kMouseModeButtonEvent,
+            mouseReportMode: kMouseReportSgr,
+          );
 
           await tester.pumpWidget(
             MaterialApp(
@@ -1396,7 +1402,6 @@ void main() {
           await tester.pump(const Duration(milliseconds: 100));
           sentInput.clear();
 
-          // 1. Tap near the bottom scroll chip area on mobile.
           final paneRect = tester.getRect(find.byType(TerminalPane));
           final chipTarget = Offset(paneRect.center.dx, paneRect.bottom - 70);
           await tester.tapAt(chipTarget);
@@ -1406,8 +1411,6 @@ void main() {
           expect(sentInput[0], matches(RegExp(r'^\x1b\[<0;\d+;\d+M$')));
           expect(sentInput[1], matches(RegExp(r'^\x1b\[<0;\d+;\d+m$')));
 
-          // 2. A vertical swipe scrolls via wheel events (64/65) without
-          // emitting a spurious left-button click (0;col;rowM).
           sentInput.clear();
           await tester.dragFrom(paneRect.center, const Offset(0, -90));
           await tester.pump(const Duration(milliseconds: 350));
@@ -1428,12 +1431,12 @@ void main() {
     );
 
     testWidgets(
-      'fit, refit, and history replay reconcile terminal size with RenderTerminal when terminal was resized to a stale grid',
+      'fit, refit, and history replay reconcile terminal size with RenderTerminalGrid when terminal was resized to a stale grid',
       (WidgetTester tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
         TerminalPane.debugForceNativeTerminalView = true;
         try {
-          final term = Terminal(maxLines: 500);
+          final term = TerminalCellBuffer();
           final ctrl = TerminalController();
           final resizeOuts = <(int, int)>[];
           ctrl.addResizeOutListener(
@@ -1465,22 +1468,15 @@ void main() {
           expect(fittedCols, greaterThan(47));
           expect(fittedRows, greaterThan(19));
 
-          // Simulate a stale history or snapshot resize shrinking `term` while
-          // the outer 800x500 SizedBox (and RenderTerminal._viewportSize) does
-          // not change.
           term.resize(47, 19);
           expect(term.viewWidth, 47);
           expect(term.viewHeight, 19);
 
-          // `ctrl.fit()` must reconcile `term` back to RenderTerminal's cell grid.
           ctrl.fit();
           await tester.pump();
           expect(term.viewWidth, fittedCols);
           expect(term.viewHeight, fittedRows);
 
-          // Shrink again and verify `notifyHistoryReplayed()` also restores the
-          // live RenderTerminal dimensions without leaking a 100ms debounce
-          // timer that emits a delayed resizeOut.
           TerminalPane.invalidateCachedResizeOut('reconcile-stale-grid');
           term.resize(47, 19);
           resizeOuts.clear();
@@ -1491,8 +1487,6 @@ void main() {
           await tester.pump(const Duration(milliseconds: 150));
           expect(resizeOuts, isEmpty);
 
-          // Invalidating cached resizeOut causes the next fit() to re-emit
-          // resizeOut even though the local grid dimensions did not change.
           resizeOuts.clear();
           TerminalPane.invalidateCachedResizeOut('reconcile-stale-grid');
           ctrl.fit();
@@ -1512,9 +1506,9 @@ void main() {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
         TerminalPane.debugForceNativeTerminalView = true;
         try {
-          final placeholderTerm = Terminal(maxLines: 500);
+          final placeholderTerm = TerminalCellBuffer();
           final placeholderCtrl = TerminalController();
-          final loadedTerm = Terminal(maxLines: 500);
+          final loadedTerm = TerminalCellBuffer();
           final loadedCtrl = TerminalController();
           final loadedResizeOuts = <(int, int)>[];
           loadedCtrl.addResizeOutListener(
@@ -1522,7 +1516,7 @@ void main() {
           );
 
           Widget buildPane({
-            required Terminal terminal,
+            required TerminalCellBuffer terminal,
             required TerminalController controller,
             required bool isLoading,
           }) {
@@ -1563,8 +1557,6 @@ void main() {
             fittedCols,
           ));
 
-          // Swap in the loaded session under the same terminalId with
-          // isLoading: false; its resizeOut must fire with the fitted size.
           await tester.pumpWidget(
             buildPane(
               terminal: loadedTerm,

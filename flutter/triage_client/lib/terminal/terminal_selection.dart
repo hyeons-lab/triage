@@ -1,78 +1,213 @@
-import 'package:xterm2/xterm.dart' as xt;
+import 'package:flutter/foundation.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 
-/// Whether [range] still refers to rows that are inside [buffer].
-///
-/// A selection normally dies with its lines: ageing out of a full buffer
-/// detaches them, and the controller then stops returning a range at all. A
-/// scrollback clear (`ESC[3J`) does not work that way. It drops lines through
-/// `trimStart`, which leaves them attached deliberately, because anchors still
-/// holding them guard access with `assert(attached)` alone and would throw in
-/// release builds if they were detached. The controller therefore goes on
-/// handing out a range for a selection whose text is gone, with rows that have
-/// gone negative now that they sit before the start of the buffer.
-///
-/// Callers use this to retire such a selection themselves, which the fix for
-/// that trim leaves as their job.
-bool terminalSelectionIsLive(xt.Buffer buffer, xt.BufferRange range) {
-  final normalized = range.normalized;
-  return normalized.begin.y >= 0 && normalized.end.y < buffer.lines.length;
+/// Zero-based `(x: col, y: virtualRow)` coordinate in a [TerminalCellBuffer].
+@immutable
+class CellOffset {
+  const CellOffset(this.x, this.y);
+
+  final int x;
+  final int y;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is CellOffset && other.x == x && other.y == y);
+
+  @override
+  int get hashCode => Object.hash(x, y);
+
+  @override
+  String toString() => 'CellOffset($x, $y)';
 }
 
-/// Computes the `(base, extent)` cell offsets to pass to
-/// `TerminalController.setSelection` for a selection anchored at [anchorCell]
-/// and extended to [targetCell].
+@immutable
+class TerminalSelectionSegment {
+  const TerminalSelectionSegment({
+    required this.line,
+    this.start,
+    this.end,
+  });
+
+  final int line;
+  final int? start;
+  final int? end;
+}
+
+/// Half-open selection range over a [TerminalCellBuffer], tracking both the
+/// scrollback clear generation (`eraseScrollbackGen`) and top-trim baseline
+/// (`trimmedTopRows`) at the moment the selection was created.
+@immutable
+class TerminalSelectionRange {
+  const TerminalSelectionRange(
+    this.base,
+    this.extent, {
+    this.trimmedTopRows = 0,
+    this.eraseScrollbackGen = 0,
+    this.isAltScreen = false,
+  });
+
+  final CellOffset base;
+  final CellOffset extent;
+  final int trimmedTopRows;
+  final int eraseScrollbackGen;
+  final bool isAltScreen;
+
+  bool get isCollapsed => base == extent;
+
+  /// Returns `(begin, end)` in normalized `(row, col)` order without applying
+  /// top-trim compensation.
+  (CellOffset begin, CellOffset end) get normalized {
+    final forward =
+        extent.y > base.y || (extent.y == base.y && extent.x >= base.x);
+    return forward ? (base, extent) : (extent, base);
+  }
+
+  /// Returns `(begin, end)` shifted into [buffer]'s current virtual row space
+  /// after accounting for any top retention trims since the selection started.
+  (CellOffset begin, CellOffset end) normalizedIn(TerminalCellBuffer buffer) {
+    final delta = isAltScreen ? 0 : (trimmedTopRows - buffer.trimmedTopRows);
+    final shiftedBase = CellOffset(base.x, base.y + delta);
+    final shiftedExtent = CellOffset(extent.x, extent.y + delta);
+    final forward =
+        shiftedExtent.y > shiftedBase.y ||
+        (shiftedExtent.y == shiftedBase.y && shiftedExtent.x >= shiftedBase.x);
+    return forward
+        ? (shiftedBase, shiftedExtent)
+        : (shiftedExtent, shiftedBase);
+  }
+
+  /// Per-line half-open `[start, end)` segments in [buffer]'s current virtual
+  /// row space.
+  Iterable<TerminalSelectionSegment> toSegmentsIn(
+    TerminalCellBuffer buffer,
+  ) sync* {
+    final (begin, end) = normalizedIn(buffer);
+    if (begin == end) return;
+    if (begin.y == end.y) {
+      yield TerminalSelectionSegment(line: begin.y, start: begin.x, end: end.x);
+      return;
+    }
+    yield TerminalSelectionSegment(line: begin.y, start: begin.x);
+    for (var row = begin.y + 1; row < end.y; row++) {
+      yield TerminalSelectionSegment(line: row);
+    }
+    if (end.x > 0) {
+      yield TerminalSelectionSegment(line: end.y, start: 0, end: end.x);
+    }
+  }
+
+  /// Column range `[startCol, endCol)` selected on [virtualRow], or `null` when
+  /// [virtualRow] is outside the selection.
+  (int startCol, int endCol)? selectedColsOnRow(
+    TerminalCellBuffer buffer,
+    int virtualRow,
+  ) {
+    if (isAltScreen != buffer.isUsingAltBuffer) return null;
+    if (eraseScrollbackGen != buffer.eraseScrollbackGen) return null;
+    final (begin, end) = normalizedIn(buffer);
+    if (begin == end) return null;
+    if (virtualRow < begin.y || virtualRow > end.y) return null;
+    final cols = buffer.viewWidth;
+    if (begin.y == end.y) {
+      final s = begin.x.clamp(0, cols);
+      final e = end.x.clamp(s, cols);
+      return e > s ? (s, e) : null;
+    }
+    if (virtualRow == begin.y) {
+      final s = begin.x.clamp(0, cols);
+      return cols > s ? (s, cols) : null;
+    }
+    if (virtualRow == end.y) {
+      final e = end.x.clamp(0, cols);
+      return e > 0 ? (0, e) : null;
+    }
+    return cols > 0 ? (0, cols) : null;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is TerminalSelectionRange &&
+          other.base == base &&
+          other.extent == extent &&
+          other.trimmedTopRows == trimmedTopRows &&
+          other.eraseScrollbackGen == eraseScrollbackGen &&
+          other.isAltScreen == isAltScreen);
+
+  @override
+  int get hashCode => Object.hash(
+    base,
+    extent,
+    trimmedTopRows,
+    eraseScrollbackGen,
+    isAltScreen,
+  );
+}
+
+/// Whether [range] still refers to live rows in [buffer] on its original
+/// screen without having been invalidated by `CSI 3J` or trimmed past row 0.
+bool terminalSelectionIsLive(
+  TerminalCellBuffer buffer,
+  TerminalSelectionRange range,
+) {
+  if (range.isCollapsed) return false;
+  if (range.eraseScrollbackGen != buffer.eraseScrollbackGen) return false;
+  final (begin, end) = range.normalizedIn(buffer);
+  return begin.y >= 0 && end.y < buffer.totalLines;
+}
+
+/// Computes the `(base, extent)` cell offsets for a selection anchored at
+/// [anchorCell] and extended to [targetCell].
 ///
-/// `BufferRangeLine` treats its normalized `[begin, end)` range as half-open on
-/// the end column. When [targetCell] is at or after [anchorCell] in `(row, col)`
-/// order, `extent.x` is incremented by 1 so [targetCell] is included. When
-/// [targetCell] is before [anchorCell] (a backward drag or Shift-click),
-/// `BufferRangeLine.normalized` swaps `base` and `extent`, making `base` the
-/// exclusive upper bound; `base.x` is therefore incremented by 1 so
-/// [anchorCell] itself stays included.
-(xt.CellOffset base, xt.CellOffset extent)? resolveSelectionEndpoints({
-  required xt.CellOffset anchorCell,
-  required xt.CellOffset targetCell,
+/// Normalized `[begin, end)` ranges are half-open on the end column. When
+/// [targetCell] is at or after [anchorCell], `extent.x` is incremented by 1 so
+/// [targetCell] is included. When [targetCell] precedes [anchorCell], `base.x`
+/// is incremented by 1 so [anchorCell] stays included after normalization swaps
+/// the endpoints.
+(CellOffset base, CellOffset extent)? resolveSelectionEndpoints({
+  required CellOffset anchorCell,
+  required CellOffset targetCell,
   required int viewWidth,
   required int lineCount,
 }) {
   final lastRow = lineCount - 1;
   if (lastRow < 0 || viewWidth <= 0) return null;
   final maxCol = viewWidth - 1;
-  final safeAnchor = xt.CellOffset(
+  final safeAnchor = CellOffset(
     anchorCell.x.clamp(0, maxCol),
     anchorCell.y.clamp(0, lastRow),
   );
-  final safeTarget = xt.CellOffset(
+  final safeTarget = CellOffset(
     targetCell.x.clamp(0, maxCol),
     targetCell.y.clamp(0, lastRow),
   );
   final forward =
       safeTarget.y > safeAnchor.y ||
       (safeTarget.y == safeAnchor.y && safeTarget.x >= safeAnchor.x);
-  final base = xt.CellOffset(
+  final base = CellOffset(
     forward ? safeAnchor.x : safeAnchor.x + 1,
     safeAnchor.y,
   );
-  final extent = xt.CellOffset(
+  final extent = CellOffset(
     forward ? safeTarget.x + 1 : safeTarget.x,
     safeTarget.y,
   );
   return (base, extent);
 }
 
-/// Shifts [offset] down by [addedLines] after a scrollback page prepends older
-/// rows at the top of the buffer, clamping into `[0, lineCount - 1]`.
-xt.CellOffset? shiftCellOffsetForHistoryPage({
-  required xt.CellOffset offset,
+/// Shifts [offset] down by [addedLines] and clamps into `[0, lineCount - 1]`.
+CellOffset? shiftCellOffsetForHistoryPage({
+  required CellOffset offset,
   required int addedLines,
   required int lineCount,
 }) {
   final lastRow = lineCount - 1;
   if (lastRow < 0) return null;
-  return xt.CellOffset(offset.x, (offset.y + addedLines).clamp(0, lastRow));
+  return CellOffset(offset.x, (offset.y + addedLines).clamp(0, lastRow));
 }
 
-/// Whether a web keyboard event matches the terminal select-all shortcut:
+/// Whether a keyboard event matches the terminal select-all shortcut:
 /// Cmd+A (without Ctrl/Alt/Shift) or Ctrl+Shift+A (without Meta/Alt) so plain
 /// Ctrl+A (0x01 / start-of-line) still reaches the PTY.
 bool isWebSelectAllShortcut({
@@ -87,8 +222,6 @@ bool isWebSelectAllShortcut({
       (ctrlKey && shiftKey && !metaKey && !altKey);
 }
 
-/// Snapshot of xterm.js `getSelectionPosition()` buffer coordinates (`start`
-/// inclusive, `end` exclusive) captured before a scrollback history page.
 class WebSelectionRange {
   const WebSelectionRange({
     required this.startX,
@@ -103,11 +236,6 @@ class WebSelectionRange {
   final int endY;
 }
 
-/// Computes the `(column, row, length)` arguments for xterm.js
-/// `term.select(column, row, length)` after a scrollback page adds [addedLines]
-/// older rows at the top of a buffer with [lineCount] total lines and [cols]
-/// columns. Returns `null` when the grid is empty or the resulting selection
-/// has non-positive length.
 ({int column, int row, int length})? shiftWebSelectionForHistoryPage({
   required WebSelectionRange selection,
   required int addedLines,
@@ -125,58 +253,118 @@ class WebSelectionRange {
   return (column: startX, row: newStartY, length: length);
 }
 
-/// Rebuilds the plain text for a terminal selection [range], preserving the
-/// spaces that xterm.dart's own `Buffer.getText` drops.
-///
-/// `BufferLine.getText` emits nothing for any cell whose codePoint is 0, so the
-/// blank cells a program leaves behind when it lays out columns by *moving the
-/// cursor* (`ESC[C`, a tab, `ESC[G`) instead of writing literal spaces vanish on
-/// copy and the visible columns concatenate. ratatui-style TUIs (e.g. Claude
-/// Code) render exactly this way. This helper is the native (xterm.dart)
-/// counterpart of the web copy path: xterm.js's own `getSelection()` already
-/// backfills those nulls with spaces, so on web the fix is to prefer it over
-/// the browser's DOM selection rather than to reconstruct text here (see
-/// `terminal_pane_web.dart`).
-///
-/// The output is a strict superset of `Buffer.getText`'s: glyph cells (literal
-/// spaces included) are written verbatim, interior blank cells become a single
-/// space, trailing blanks stay dropped (so lines are not padded to full width),
-/// and the trailing half of a wide (CJK) glyph is skipped so it gains no stray
-/// space.
-String terminalSelectionText(xt.Buffer buffer, xt.BufferRange range) {
-  final normalized = range.normalized;
+/// Resolves a double-tap / long-press word selection around [cell] on loaded
+/// cells in [buffer].
+TerminalSelectionRange? selectWordRangeAt(
+  TerminalCellBuffer buffer,
+  CellOffset cell,
+) {
+  final total = buffer.totalLines;
+  if (total <= 0 || buffer.viewWidth <= 0) return null;
+  final row = cell.y.clamp(0, total - 1);
+  final line = buffer.lineAtVirtualRow(row);
+  if (line == null) return null;
+  final cols = buffer.viewWidth;
+  var col = cell.x.clamp(0, cols - 1);
+  if (col > 0 && line.getCodePoint(col) == 0 && line.getWidth(col - 1) == 2) {
+    col -= 1;
+  }
+
+  int classOf(int c) {
+    final cp = line.getCodePoint(c);
+    if (cp == 0 || cp == 0x20) return 0;
+    final ch = String.fromCharCode(cp);
+    if (_wordCharPattern.hasMatch(ch)) return 1;
+    return 2;
+  }
+
+  final targetClass = classOf(col);
+  if (targetClass == 0) {
+    // Select single cell on blank space.
+    final width = line.getWidth(col).clamp(1, 2);
+    return TerminalSelectionRange(
+      CellOffset(col, row),
+      CellOffset((col + width).clamp(0, cols), row),
+      trimmedTopRows: buffer.trimmedTopRows,
+      eraseScrollbackGen: buffer.eraseScrollbackGen,
+      isAltScreen: buffer.isUsingAltBuffer,
+    );
+  }
+
+  var start = col;
+  while (start > 0) {
+    var prev = start - 1;
+    if (prev > 0 &&
+        line.getCodePoint(prev) == 0 &&
+        line.getWidth(prev - 1) == 2) {
+      prev -= 1;
+    }
+    if (classOf(prev) != targetClass) break;
+    start = prev;
+  }
+
+  var end = col + line.getWidth(col).clamp(1, 2);
+  while (end < cols) {
+    if (classOf(end) != targetClass) break;
+    end += line.getWidth(end).clamp(1, 2);
+  }
+
+  return TerminalSelectionRange(
+    CellOffset(start, row),
+    CellOffset(end.clamp(start + 1, cols), row),
+    trimmedTopRows: buffer.trimmedTopRows,
+    eraseScrollbackGen: buffer.eraseScrollbackGen,
+    isAltScreen: buffer.isUsingAltBuffer,
+  );
+}
+
+final RegExp _wordCharPattern = RegExp(r'[A-Za-z0-9_./~:-]');
+
+/// Rebuilds the plain text for [range] in [buffer], preserving interior gap
+/// spaces while trimming trailing blank padding and suppressing newlines across
+/// soft-wrapped rows.
+String terminalSelectionText(
+  TerminalCellBuffer buffer,
+  TerminalSelectionRange range,
+) {
+  final (begin, _) = range.normalizedIn(buffer);
   final out = StringBuffer();
-  for (final segment in normalized.toSegments()) {
-    if (segment.line < 0 || segment.line >= buffer.height) {
+  var wroteAny = false;
+  for (final segment in range.toSegmentsIn(buffer)) {
+    if (segment.line < 0 || segment.line >= buffer.totalLines) {
       continue;
     }
-    final line = buffer.lines[segment.line];
-    // Mirror Buffer.getText's newline rule: no separator before the first
-    // selected line, before line 0, or before a soft-wrapped continuation.
-    if (!(segment.line == normalized.begin.y ||
-        segment.line == 0 ||
-        line.isWrapped)) {
+    final line = buffer.lineAtVirtualRow(segment.line);
+    if (wroteAny &&
+        segment.line != begin.y &&
+        segment.line > 0 &&
+        !buffer.isWrappedContinuation(segment.line)) {
       out.write('\n');
     }
-    out.write(
-      bufferLineSelectedText(
-        line,
-        segment.start ?? 0,
-        segment.end ?? line.length,
-      ),
-    );
+    wroteAny = true;
+    if (line != null) {
+      out.write(
+        bufferLineSelectedText(
+          line,
+          segment.start ?? 0,
+          segment.end ?? line.length,
+        ),
+      );
+    }
   }
   return out.toString();
 }
 
-/// Text for one line's selected half-open column range `[from, to)`. See
-/// [terminalSelectionText] for the cell-by-cell rule.
-String bufferLineSelectedText(xt.BufferLine line, int from, int to) {
+/// Extracts plain text for one line's half-open column range `[from, to)`.
+///
+/// Glyph cells (including literal spaces `0x20`) are emitted verbatim, interior
+/// unwritten cells (`codePoint == 0`) become `' '`, trailing unwritten cells
+/// stay dropped, and the trailing half of a wide (`width == 2`) glyph is
+/// skipped without adding a stray space.
+String bufferLineSelectedText(TerminalCellLine line, int from, int to) {
   from = from.clamp(0, line.length);
   to = to.clamp(from, line.length);
 
-  // Last cell in the range that actually holds a glyph. Blank cells past it are
-  // trailing padding and stay dropped, matching the original trim-on-copy.
   var lastGlyph = -1;
   for (var i = from; i < to; i++) {
     if (line.getCodePoint(i) != 0) {
@@ -188,15 +376,17 @@ String bufferLineSelectedText(xt.BufferLine line, int from, int to) {
   for (var i = from; i < to; i++) {
     final codePoint = line.getCodePoint(i);
     if (codePoint != 0) {
-      // Glyph cell — written exactly as Buffer.getText would, keeping a wide
-      // glyph only when its trailing half is inside the range.
-      if (i + line.getWidth(i) <= to) {
+      final width = line.getWidth(i);
+      if (i + width <= to) {
         out.writeCharCode(codePoint);
+        final extra = line.getCombining(i);
+        if (extra != null) {
+          for (final c in extra) {
+            out.writeCharCode(c);
+          }
+        }
       }
     } else if (i < lastGlyph) {
-      // Interior blank. The trailing half of a wide glyph (previous cell has
-      // width 2) carries codePoint 0 by design — skip it; every other interior
-      // blank becomes a space.
       final isWideTrailer = i > 0 && line.getWidth(i - 1) == 2;
       if (!isWideTrailer) {
         out.write(' ');

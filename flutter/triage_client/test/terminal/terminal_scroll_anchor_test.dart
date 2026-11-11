@@ -1,33 +1,41 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
-import 'package:xterm2/xterm.dart' as xt;
 
 const _viewHeight = 5;
 
-/// Fills the terminal until its buffer is full (every further write trims a line
-/// off the top), then writes a few extra lines so the buffer is firmly capped
-/// and the trim path has actually run before the test inspects it.
-xt.Terminal _fullTerminal({
+TerminalCellLine _lineFromText(String text, {int width = 40}) {
+  return TerminalCellLine.fromSpec(
+    <String?>[for (final r in text.runes) String.fromCharCode(r)],
+    width: width,
+  );
+}
+
+/// Fills a [TerminalCellBuffer] until its scrollback+viewport capacity reaches
+/// [maxLines], then appends extra lines so top retention trimming has run.
+TerminalCellBuffer _fullBuffer({
   required int maxLines,
   int viewHeight = _viewHeight,
 }) {
-  final terminal = xt.Terminal(maxLines: maxLines);
-  terminal.resize(40, viewHeight);
+  final buffer = TerminalCellBuffer(cols: 40, rows: viewHeight);
   var i = 0;
-  while (terminal.buffer.lines.length < maxLines) {
-    terminal.write('line${i++}\r\n');
+  while (buffer.totalLines < maxLines) {
+    buffer.appendOutputLineForTest(
+      _lineFromText('line${i++}'),
+      maxTotalLines: maxLines,
+    );
   }
   for (var extra = 0; extra < 3; extra++) {
-    terminal.write('cap$extra\r\n');
+    buffer.appendOutputLineForTest(
+      _lineFromText('cap$extra'),
+      maxTotalLines: maxLines,
+    );
   }
-  return terminal;
+  return buffer;
 }
 
-/// The scroll position's `maxScrollExtent` is the content height minus the
-/// viewport height, not the full content height, so anchor clamping and
-/// bottom detection see the same value the widget wiring passes in.
-double _maxExtent(xt.Terminal terminal, double lineHeight) =>
-    (terminal.buffer.lines.length - _viewHeight) * lineHeight;
+double _maxExtent(TerminalCellBuffer buffer, double lineHeight) =>
+    (buffer.totalLines - _viewHeight) * lineHeight;
 
 void main() {
   const lineHeight = 10.0;
@@ -43,13 +51,13 @@ void main() {
     });
 
     test('capturing at the bottom follows the bottom (no anchor)', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = _maxExtent(terminal, lineHeight);
+      final maxExtent = _maxExtent(buffer, lineHeight);
 
       anchor.capture(
-        buffer: terminal.buffer,
-        pixels: maxExtent, // pinned to the very bottom
+        buffer: buffer,
+        pixels: maxExtent,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
       );
@@ -58,14 +66,13 @@ void main() {
     });
 
     test('capturing just above the bottom holds an anchor', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = _maxExtent(terminal, lineHeight);
+      final maxExtent = _maxExtent(buffer, lineHeight);
 
-      // 1 line above bottom: must capture an anchor
       final oneLineAbove = maxExtent - lineHeight;
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: oneLineAbove,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -79,10 +86,9 @@ void main() {
         oneLineAbove,
       );
 
-      // 2 lines above bottom: must capture an anchor
       final twoLinesAbove = maxExtent - 2 * lineHeight;
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: twoLinesAbove,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -96,18 +102,16 @@ void main() {
         twoLinesAbove,
       );
 
-      // Just outside the 0.5px threshold: must capture an anchor
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: maxExtent - 0.6,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
       );
       expect(anchor.hasAnchor, isTrue);
 
-      // Within 0.5px of bottom: considered at bottom, no anchor
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: maxExtent - 0.3,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -116,13 +120,13 @@ void main() {
     });
 
     test('capturing above the bottom pins the top viewport line', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = _maxExtent(terminal, lineHeight);
-      const pixels = 100.0; // topRow == 10
+      final maxExtent = _maxExtent(buffer, lineHeight);
+      const pixels = 100.0;
 
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: pixels,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -139,10 +143,10 @@ void main() {
     });
 
     test('desiredOffset returns null when maxScrollExtent is non-positive', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: 100.0,
         maxScrollExtent: 300.0,
         lineHeight: lineHeight,
@@ -159,15 +163,11 @@ void main() {
     });
 
     test('pinned offset tracks the anchored line as scrollback trims', () {
-      final terminal = _fullTerminal(maxLines: 30);
-      final buffer = terminal.buffer;
-      final maxExtent = _maxExtent(terminal, lineHeight);
+      final buffer = _fullBuffer(maxLines: 30);
+      final maxExtent = _maxExtent(buffer, lineHeight);
       const anchorRow = 10;
 
-      // The same BufferLine the anchor will capture, tracked independently so we
-      // can assert the anchor follows it exactly.
-      final pinnedLine = buffer.lines[anchorRow];
-      expect(pinnedLine.index, anchorRow);
+      final pinnedText = buffer.lineAtVirtualRow(anchorRow)!.toPlainText();
 
       final anchor = TerminalScrollAnchor();
       anchor.capture(
@@ -177,34 +177,31 @@ void main() {
         lineHeight: lineHeight,
       );
 
-      // Stream more output. The buffer is full, so each new line trims one off
-      // the top and the pinned line's index drops by one.
       for (var i = 0; i < 5; i++) {
-        terminal.write('more$i\r\n');
+        buffer.appendOutputLineForTest(
+          _lineFromText('more$i'),
+          maxTotalLines: 30,
+        );
       }
 
-      expect(pinnedLine.attached, isTrue);
-      expect(pinnedLine.index, lessThan(anchorRow));
-
-      // The anchor's desired offset must equal the pinned line's current
-      // position: it cancels the trim drift instead of staying at the old
-      // pixel offset.
+      const shiftedRow = anchorRow - 5;
+      expect(buffer.lineAtVirtualRow(shiftedRow)!.toPlainText(), pinnedText);
       expect(
         anchor.desiredOffset(
           maxScrollExtent: maxExtent,
           lineHeight: lineHeight,
         ),
-        pinnedLine.index * lineHeight,
+        shiftedRow * lineHeight,
       );
     });
 
     test('capturing at or below zero pixels does not hold an anchor', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = _maxExtent(terminal, lineHeight);
+      final maxExtent = _maxExtent(buffer, lineHeight);
 
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: 0.0,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -212,7 +209,7 @@ void main() {
       expect(anchor.hasAnchor, isFalse);
 
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: -10.0,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -221,12 +218,12 @@ void main() {
     });
 
     test('capturing at top row 0 does not hold an anchor', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = _maxExtent(terminal, lineHeight);
+      final maxExtent = _maxExtent(buffer, lineHeight);
 
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: lineHeight / 2,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -237,9 +234,8 @@ void main() {
     test(
       'anchor is dropped when trimmed up to row 0 or non-positive desired offset',
       () {
-        final terminal = _fullTerminal(maxLines: 30);
-        final buffer = terminal.buffer;
-        final maxExtent = _maxExtent(terminal, lineHeight);
+        final buffer = _fullBuffer(maxLines: 30);
+        final maxExtent = _maxExtent(buffer, lineHeight);
         const anchorRow = 2;
 
         final anchor = TerminalScrollAnchor();
@@ -251,12 +247,13 @@ void main() {
         );
         expect(anchor.hasAnchor, isTrue);
 
-        // Trim buffer lines until the anchor row reaches row 0
         for (var i = 0; i < anchorRow; i++) {
-          terminal.write('trim$i\r\n');
+          buffer.appendOutputLineForTest(
+            _lineFromText('trim$i'),
+            maxTotalLines: 30,
+          );
         }
 
-        // At row 0 or less, desiredOffset must return null and drop anchor
         expect(
           anchor.desiredOffset(
             maxScrollExtent: maxExtent,
@@ -269,10 +266,9 @@ void main() {
     );
 
     test('anchor is dropped once its line is trimmed out of the buffer', () {
-      final terminal = _fullTerminal(maxLines: 30);
-      final buffer = terminal.buffer;
-      final maxExtent = _maxExtent(terminal, lineHeight);
-      const anchorRow = 3; // near the top, trimmed away quickly
+      final buffer = _fullBuffer(maxLines: 30);
+      final maxExtent = _maxExtent(buffer, lineHeight);
+      const anchorRow = 3;
 
       final anchor = TerminalScrollAnchor();
       anchor.capture(
@@ -283,9 +279,11 @@ void main() {
       );
       expect(anchor.hasAnchor, isTrue);
 
-      // Write well past the anchor's depth so the pinned line is trimmed off.
       for (var i = 0; i < anchorRow + 5; i++) {
-        terminal.write('flush$i\r\n');
+        buffer.appendOutputLineForTest(
+          _lineFromText('flush$i'),
+          maxTotalLines: 30,
+        );
       }
 
       expect(
@@ -299,13 +297,13 @@ void main() {
     });
 
     test('clone and copyFrom preserve anchor state and desired offset', () {
-      final terminal = _fullTerminal(maxLines: 30);
+      final buffer = _fullBuffer(maxLines: 30);
       final anchor = TerminalScrollAnchor();
-      final maxExtent = _maxExtent(terminal, lineHeight);
+      final maxExtent = _maxExtent(buffer, lineHeight);
       const anchorRow = 10;
 
       anchor.capture(
-        buffer: terminal.buffer,
+        buffer: buffer,
         pixels: anchorRow * lineHeight,
         maxScrollExtent: maxExtent,
         lineHeight: lineHeight,
@@ -343,12 +341,12 @@ void main() {
     test(
       'hasLineShifted is false until top trim changes anchored line index',
       () {
-        final terminal = _fullTerminal(maxLines: 30);
+        final buffer = _fullBuffer(maxLines: 30);
         final anchor = TerminalScrollAnchor();
-        final maxExtent = _maxExtent(terminal, lineHeight);
+        final maxExtent = _maxExtent(buffer, lineHeight);
 
         anchor.capture(
-          buffer: terminal.buffer,
+          buffer: buffer,
           pixels: 10 * lineHeight,
           maxScrollExtent: maxExtent,
           lineHeight: lineHeight,
@@ -356,13 +354,16 @@ void main() {
         expect(anchor.hasAnchor, isTrue);
         expect(anchor.hasLineShifted, isFalse);
 
-        // In-place cursor-addressed write does not trim or shift buffer lines.
-        terminal.write('\x1b[1;1Hspinner');
+        // In-place cursor-addressed viewport write does not trim scrollback.
+        buffer.setViewportLineForTest(0, _lineFromText('spinner'));
         expect(anchor.hasLineShifted, isFalse);
 
         // Appending a new line at full capacity trims 1 line off the top,
         // shifting the anchored line's index from 10 to 9.
-        terminal.write('\x1b[${terminal.viewHeight};1H\r\nnext line');
+        buffer.appendOutputLineForTest(
+          _lineFromText('next line'),
+          maxTotalLines: 30,
+        );
         expect(anchor.hasLineShifted, isTrue);
 
         anchor.markPinned();
@@ -425,9 +426,6 @@ void main() {
     });
 
     test('scrolling up inside the grace band keeps the pin', () {
-      // The direction guard is the whole premise of the feature, and proximity
-      // alone cannot carry this: both offsets sit inside the grace band, so
-      // only `pixels <= lastPixels` can reject it.
       expect(
         shouldReleaseScrollPin(
           lastPixels: maxExtent,
@@ -452,9 +450,6 @@ void main() {
     });
 
     test('a non-positive line height never releases', () {
-      // Scrolling down onto the bottom, so only the line-height guard can
-      // reject this: with `pixels <= lastPixels` the call would return false
-      // for the wrong reason and the test could not fail.
       expect(
         shouldReleaseScrollPin(
           lastPixels: 0,
@@ -469,8 +464,8 @@ void main() {
     test(
       'successive downward scroll events in grace band consistently release',
       () {
-        final terminal = _fullTerminal(maxLines: 30);
-        final maxExtent = _maxExtent(terminal, lineHeight);
+        final buffer = _fullBuffer(maxLines: 30);
+        final maxExtent = _maxExtent(buffer, lineHeight);
         final graceThreshold =
             maxExtent - kScrollPinReleaseGraceLines * lineHeight;
 

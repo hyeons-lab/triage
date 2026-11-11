@@ -27,6 +27,7 @@ include = [
 
 [dependencies]
 triage-core.workspace = true
+triage-term.workspace = true
 anyhow.workspace = true
 portable-pty.workspace = true
 serde = { workspace = true }

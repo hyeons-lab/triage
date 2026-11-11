@@ -29,6 +29,28 @@ class TriageAuthException implements Exception {
   String toString() => message;
 }
 
+/// Thrown when a remote daemon predates `SyncTerminal` / `FetchTerminalRows`
+/// cell-grid synchronization and rejects the request as an unrecognized payload
+/// or variant. Callers surface a clear daemon-upgrade-required message.
+class TriageUnsupportedProtocolException implements Exception {
+  TriageUnsupportedProtocolException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+bool isUnsupportedTerminalSyncError(Object error) {
+  if (error is TriageUnsupportedProtocolException) return true;
+  final text = error.toString().toLowerCase();
+  return text.contains('unknown variant') &&
+          (text.contains('sync_terminal') ||
+              text.contains('fetch_terminal_rows')) ||
+      text.contains('unsupported_payload') ||
+      text.contains('not recognized or supported by triage');
+}
+
 /// The daemon's error code for a request refused because the connection has not
 /// paired (`TransportError::Unauthorized`, whose message is the same string).
 const _unauthorizedCode = 'unauthorized';
@@ -613,17 +635,31 @@ class TriageWebSocketClient {
         final error = message['error'] as Map<String, dynamic>?;
         if (id != null && _pendingRequests.containsKey(id)) {
           _requestTimers.remove(id)?.cancel();
-          _pendingRequestTypes.remove(id);
+          final requestType = _pendingRequestTypes.remove(id);
           final code = error?['code']?.toString();
           final errorMessage =
               error?['message']?.toString() ?? code ?? 'Unknown error';
+          final lowerCode = (code ?? '').toLowerCase();
+          final lowerMsg = errorMessage.toLowerCase();
+          final isUnsupportedSync =
+              (requestType == 'sync_terminal' ||
+                  requestType == 'fetch_terminal_rows') &&
+              (lowerCode == 'unsupported_payload' ||
+                  lowerCode == 'invalid_flatbuffer' ||
+                  lowerMsg.contains('unknown variant') ||
+                  lowerMsg.contains('not recognized or supported'));
           // Classify pairing failures here, at the one place that sees the
           // daemon's error code, so callers route to pairing on a type rather
           // than sniffing message text. Fall back to the message only when
           // there is no code at all.
-          final failure = _isUnauthorized(code ?? errorMessage)
-              ? TriageAuthException(errorMessage)
-              : Exception(errorMessage);
+          final Object failure;
+          if (_isUnauthorized(code ?? errorMessage)) {
+            failure = TriageAuthException(errorMessage);
+          } else if (isUnsupportedSync) {
+            failure = TriageUnsupportedProtocolException(errorMessage);
+          } else {
+            failure = Exception(errorMessage);
+          }
           _pendingRequests.remove(id)!.completeError(failure);
         } else {
           _eventController.add(message);
@@ -1494,6 +1530,98 @@ class TriageWebSocketClient {
     });
   }
 
+  /// Synchronizes authoritative server-computed terminal cell-grid state for
+  /// [sessionId] in a single round-trip: optionally restores an exited session,
+  /// acquires or observes the input lease, optionally resizes the PTY, returns
+  /// the initial full `TerminalSyncFrame` + lightweight `SessionSnapshot`, and
+  /// registers a live `TerminalSync` subscription when [subscribe] is true.
+  Future<Map<String, dynamic>> syncTerminalSession({
+    required String sessionId,
+    required String clientId,
+    String mode = 'InteractiveController',
+    int? cols,
+    int? rows,
+    bool resizePty = false,
+    bool restoreIfExited = false,
+    bool subscribe = true,
+    int knownFrameSeq = 0,
+  }) async {
+    final hasSize = cols != null && rows != null;
+    return _send('sync_terminal', {
+      'request': {
+        'session_id': sessionId,
+        'client_id': clientId,
+        'mode': mode,
+        if (hasSize)
+          'size': {
+            'rows': rows,
+            'cols': cols,
+            'pixel_width': cols * 10,
+            'pixel_height': rows * 20,
+            'dpi': 96,
+          },
+        'resize_pty': resizePty,
+        'restore_if_exited': restoreIfExited,
+        'subscribe': subscribe,
+        'known_frame_seq': knownFrameSeq,
+      },
+    });
+  }
+
+  /// Demand-pages `[startRow .. startRow + rowCount)` of virtual scrollback
+  /// rows (`0` = oldest retained row) packed in `TCG1` cell-grid format.
+  Future<Map<String, dynamic>> fetchTerminalRows({
+    required String sessionId,
+    required int startRow,
+    required int rowCount,
+  }) async {
+    return _send('fetch_terminal_rows', {
+      'request': {
+        'session_id': sessionId,
+        'start_row': startRow,
+        'row_count': rowCount,
+      },
+    });
+  }
+
+  /// Fire-and-forget flow-control acknowledgment for [frameSeq] on
+  /// [subscriptionId]. Intentionally omits `id` so the daemon updates its
+  /// in-flight window without sending a response frame.
+  void ackTerminalSync({
+    required String subscriptionId,
+    required int frameSeq,
+  }) {
+    final channel = _channel;
+    if (channel == null || subscriptionId.isEmpty) {
+      return;
+    }
+    try {
+      if (isFlatBuffersNegotiated) {
+        final ackPayload = fbs.AckTerminalSyncRequestTableObjectBuilder(
+          subscriptionId: subscriptionId,
+          frameSeq: frameSeq,
+        );
+        final msg = fbs.ClientMessageObjectBuilder(
+          id: null,
+          payloadType:
+              fbs.ClientRequestPayloadTypeId.AckTerminalSyncRequestTable,
+          payload: ackPayload,
+        );
+        channel.sink.add(msg.toBytes());
+      } else {
+        channel.sink.add(
+          jsonEncode(<String, dynamic>{
+            'type': 'ack_terminal_sync',
+            'subscription_id': subscriptionId,
+            'frame_seq': frameSeq,
+          }),
+        );
+      }
+    } catch (_) {
+      // Connection teardown will be handled by the stream error/done callbacks.
+    }
+  }
+
   void _cleanupPendingRequests() {
     for (final timer in _requestTimers.values) {
       timer.cancel();
@@ -1880,9 +2008,73 @@ class TriageWebSocketClient {
           'battery_percent': stats.batteryPercent,
           'battery_state': _batteryStateName(() => stats.batteryState),
         };
+      case 22: // SyncTerminalResult
+        final sync = result as fbs.SyncTerminalResult;
+        return {
+          'result': 'sync_terminal',
+          'response': {
+            if (sync.subscriptionId != null)
+              'subscription_id': sync.subscriptionId,
+            'snapshot': _parseSessionSnapshot(sync.snapshot),
+            'lease': _parseLeaseState(sync.lease),
+            'frame': _parseTerminalSyncFrame(sync.frame),
+          },
+        };
+      case 23: // FetchTerminalRowsResult
+        final page = result as fbs.FetchTerminalRowsResult;
+        final rawPayload = page.payload;
+        return {
+          'result': 'fetch_terminal_rows',
+          'response': {
+            'session_id': page.sessionId,
+            'start_row': page.startRow,
+            'row_count': page.rowCount,
+            'total_scrollback_rows': page.totalScrollbackRows,
+            'trimmed_top_rows': page.trimmedTopRows,
+            'erase_scrollback_gen': page.eraseScrollbackGen,
+            'compression': page.compression,
+            'payload': rawPayload == null
+                ? Uint8List(0)
+                : (rawPayload is Uint8List
+                      ? rawPayload
+                      : Uint8List.fromList(rawPayload)),
+          },
+        };
       default:
         return _unhandled('server result', type.value);
     }
+  }
+
+  Map<String, dynamic> _parseTerminalSyncFrame(fbs.TerminalSyncFrame? frame) {
+    if (frame == null) return {};
+    final vp = frame.viewportPayload;
+    final sb = frame.pushedScrollbackPayload;
+    return {
+      'frame_seq': frame.frameSeq,
+      'rows': frame.rows,
+      'cols': frame.cols,
+      'total_scrollback_rows': frame.totalScrollbackRows,
+      'trimmed_top_rows': frame.trimmedTopRows,
+      'erase_scrollback_gen': frame.eraseScrollbackGen,
+      'cursor_x': frame.cursorX,
+      'cursor_y': frame.cursorY,
+      'cursor_style': frame.cursorStyle,
+      'mode_flags': frame.modeFlags,
+      'mouse_mode': frame.mouseMode,
+      'mouse_report_mode': frame.mouseReportMode,
+      'kitty_keyboard_flags': frame.kittyKeyboardFlags,
+      if (frame.title != null) 'title': frame.title,
+      'viewport_compression': frame.viewportCompression,
+      'viewport_payload': vp == null
+          ? Uint8List(0)
+          : (vp is Uint8List ? vp : Uint8List.fromList(vp)),
+      'pushed_scrollback_start_row': frame.pushedScrollbackStartRow,
+      'pushed_scrollback_row_count': frame.pushedScrollbackRowCount,
+      'pushed_scrollback_compression': frame.pushedScrollbackCompression,
+      'pushed_scrollback_payload': sb == null
+          ? Uint8List(0)
+          : (sb is Uint8List ? sb : Uint8List.fromList(sb)),
+    };
   }
 
   Map<String, dynamic> _parseAttachSessionResponse(
@@ -2112,6 +2304,14 @@ class TriageWebSocketClient {
           'Exited': {
             'session_id': exited.sessionId,
             'completed': _parseCompletedSession(exited.completed),
+          },
+        };
+      case 6: // TerminalSyncEvent
+        final sync = event as fbs.TerminalSyncEvent;
+        return {
+          'TerminalSync': {
+            'session_id': sync.sessionId,
+            'frame': _parseTerminalSyncFrame(sync.frame),
           },
         };
       default:
@@ -2412,6 +2612,62 @@ class TriageWebSocketClient {
           sessionId: extra?['session_id'] as String?,
           label: label,
           hasLabel: hasLabel,
+        );
+        break;
+
+      case 'sync_terminal':
+        payloadType = fbs.ClientRequestPayloadTypeId.SyncTerminalRequestTable;
+        final request = extra?['request'] as Map<String, dynamic>?;
+        final modeStr = request?['mode'] as String?;
+        final mode = switch (modeStr) {
+          null || 'Observer' => fbs.AttachMode.Observer,
+          'AgentController' => fbs.AttachMode.AgentController,
+          'InteractiveController' => fbs.AttachMode.InteractiveController,
+          _ => throw ArgumentError.value(
+            modeStr,
+            'mode',
+            'Unknown attach mode',
+          ),
+        };
+        final sizeMap = request?['size'] as Map<String, dynamic>?;
+        payload = fbs.SyncTerminalRequestTableObjectBuilder(
+          sessionId: request?['session_id'] as String?,
+          clientId: request?['client_id'] as String?,
+          mode: mode,
+          hasSize: sizeMap != null,
+          size: sizeMap == null
+              ? null
+              : fbs.SessionSizeObjectBuilder(
+                  rows: sizeMap['rows'] as int? ?? 24,
+                  cols: sizeMap['cols'] as int? ?? 80,
+                  pixelWidth: sizeMap['pixel_width'] as int? ?? 800,
+                  pixelHeight: sizeMap['pixel_height'] as int? ?? 480,
+                  dpi: sizeMap['dpi'] as int? ?? 96,
+                ),
+          resizePty: request?['resize_pty'] as bool? ?? false,
+          restoreIfExited: request?['restore_if_exited'] as bool? ?? false,
+          subscribe: request?['subscribe'] as bool? ?? true,
+          knownFrameSeq: (request?['known_frame_seq'] as num?)?.toInt() ?? 0,
+        );
+        break;
+
+      case 'fetch_terminal_rows':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.FetchTerminalRowsRequestTable;
+        final request = extra?['request'] as Map<String, dynamic>?;
+        payload = fbs.FetchTerminalRowsRequestTableObjectBuilder(
+          sessionId: request?['session_id'] as String?,
+          startRow: (request?['start_row'] as num?)?.toInt() ?? 0,
+          rowCount: (request?['row_count'] as num?)?.toInt() ?? 0,
+        );
+        break;
+
+      case 'ack_terminal_sync':
+        payloadType =
+            fbs.ClientRequestPayloadTypeId.AckTerminalSyncRequestTable;
+        payload = fbs.AckTerminalSyncRequestTableObjectBuilder(
+          subscriptionId: extra?['subscription_id'] as String?,
+          frameSeq: (extra?['frame_seq'] as num?)?.toInt() ?? 0,
         );
         break;
 

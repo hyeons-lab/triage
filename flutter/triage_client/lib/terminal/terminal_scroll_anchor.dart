@@ -1,4 +1,4 @@
-import 'package:xterm2/xterm.dart' as xt;
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 
 /// How close to the bottom a downward scroll must land before the pin is
 /// released. Wider than the single line `TerminalScrollAnchor.capture` uses to
@@ -11,13 +11,6 @@ const int kScrollPinReleaseGraceLines = 3;
 const double kNativeScrollSubpixelTolerance = 0.5;
 
 /// Whether a released pin's deferred trip to the bottom should now complete.
-///
-/// The snap cannot run while the user is still working the viewport: `jumpTo`
-/// calls `goIdle()`, which tears down the drag, hold, or fling in progress. A
-/// held pointer matters on its own because a finger placed down to stop a
-/// fling installs a hold activity, and a hold reports *not* scrolling, so the
-/// scroll state alone would call that settled. [hasAnchor] means the user
-/// re-pinned on the way and no longer wants the bottom.
 bool shouldFinishBottomSnap({
   required bool isScrolling,
   required bool pointerDown,
@@ -30,17 +23,7 @@ bool shouldFinishBottomSnap({
 }
 
 /// Whether a scroll event should release a held scroll pin and hand the
-/// viewport back to the emulator's stick-to-bottom following.
-///
-/// A pinned viewport plus a steadily growing buffer is a treadmill: every new
-/// line pushes the bottom further away while the pin holds the same line, so a
-/// user chasing live output (e.g. a composer at the very bottom of a busy agent
-/// session) can never arrive. Releasing when the user is actively scrolling
-/// *down* and already within [kScrollPinReleaseGraceLines] of the bottom tells
-/// the caller to drop the pin and snap the last few lines to the bottom, while
-/// upward or distant scrolling keeps the pin so background output never steals
-/// a reading position. Takes only scroll metrics and no widget state, so it is
-/// unit-testable without a laid-out render tree.
+/// viewport back to stick-to-bottom following.
 bool shouldReleaseScrollPin({
   required double? lastPixels,
   required double pixels,
@@ -52,131 +35,120 @@ bool shouldReleaseScrollPin({
   return pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight;
 }
 
-/// Pins a terminal viewport to a specific scrollback line so that scrollback
-/// trims don't drift the visible content.
+/// Pins a terminal viewport to a specific monotonic virtual scrollback line
+/// (`absoluteRow = trimmedTopRows + virtualRow`) so retention trims at the top
+/// of scrollback do not drift the visible content while the user is reading.
 ///
-/// xterm.dart measures the scroll offset from the top of the buffer and does
-/// not compensate `offset.pixels` when a full buffer trims lines off the top
-/// (once `maxLines` is reached, every new line drops the oldest). A scrolled-up
-/// viewport therefore creeps upward, one line per trimmed line.
-///
-/// We exploit xterm.dart's `BufferLine.index`, which is the line's current row
-/// in the buffer and decreases by exactly the number of lines trimmed above it.
-/// Pinning the viewport to `index * lineHeight` cancels the drift. This type is
-/// pure logic over the buffer + scroll metrics so it is unit-testable without a
-/// laid-out render tree.
-///
-/// A line can leave the buffer two ways, and they do not look alike. Ageing out
-/// of a full buffer detaches it, so `attached` turns false. A scrollback clear
-/// (`ESC[3J`) drops it through `trimStart`, which leaves it attached on purpose:
-/// anchors still holding it would throw in release builds if it were detached.
-/// Such a line reports a negative index, since it now sits before the start of
-/// the buffer, and that is what identifies it here.
+/// Works in O(1) arithmetic across the full 210,000-row virtual scrollback
+/// range, including unloaded rows, and automatically drops the anchor when the
+/// anchored row ages past row 0 or when `CSI 3J` clears scrollback.
 class TerminalScrollAnchor {
-  xt.BufferLine? _line;
+  TerminalCellBuffer? _buffer;
+  int? _anchoredAbsoluteRow;
+  int _eraseScrollbackGen = 0;
+  bool _isAltScreen = false;
   double _withinLine = 0;
   int? _lastLineIndex;
 
-  /// Whether a live anchor is held. When false the caller should follow the
-  /// bottom and leave xterm.dart's stick-to-bottom in control.
-  bool get hasAnchor => _line != null;
+  bool get hasAnchor => _buffer != null && _anchoredAbsoluteRow != null;
 
-  /// Whether the anchored buffer line has shifted row index since the anchor
-  /// was last captured or pinned (for example due to scrollback trimming or
-  /// reflow). When false, in-place TUI redraws have not moved the line and
-  /// re-pinning does not need to jump the scroll controller.
+  int? get _currentVirtualRow {
+    final buf = _buffer;
+    final absRow = _anchoredAbsoluteRow;
+    if (buf == null || absRow == null) return null;
+    if (buf.eraseScrollbackGen != _eraseScrollbackGen ||
+        buf.isUsingAltBuffer != _isAltScreen) {
+      return null;
+    }
+    return absRow - buf.trimmedTopRows;
+  }
+
+  /// Whether the anchored line's virtual row index has shifted since the anchor
+  /// was last captured or pinned.
   bool get hasLineShifted {
-    final line = _line;
-    if (line == null || !line.attached || line.index <= 0) return false;
-    return line.index != _lastLineIndex;
+    final idx = _currentVirtualRow;
+    if (idx == null || idx <= 0) return false;
+    return idx != _lastLineIndex;
   }
 
-  /// Record the anchored line's current buffer row index after re-pinning.
+  /// Records the anchored line's current virtual row index after re-pinning.
   void markPinned() {
-    _lastLineIndex = _line?.index;
+    _lastLineIndex = _currentVirtualRow;
   }
 
-  /// Drop the anchor (e.g. on a session/terminal swap).
+  /// Drops the anchor.
   void clear() {
-    _line = null;
+    _buffer = null;
+    _anchoredAbsoluteRow = null;
     _lastLineIndex = null;
   }
 
-  /// Clone this anchor.
   TerminalScrollAnchor clone() {
     final copy = TerminalScrollAnchor();
-    copy._line = _line;
+    copy._buffer = _buffer;
+    copy._anchoredAbsoluteRow = _anchoredAbsoluteRow;
+    copy._eraseScrollbackGen = _eraseScrollbackGen;
+    copy._isAltScreen = _isAltScreen;
     copy._withinLine = _withinLine;
     copy._lastLineIndex = _lastLineIndex;
     return copy;
   }
 
-  /// Copy anchor state from another anchor.
   void copyFrom(TerminalScrollAnchor other) {
-    _line = other._line;
+    _buffer = other._buffer;
+    _anchoredAbsoluteRow = other._anchoredAbsoluteRow;
+    _eraseScrollbackGen = other._eraseScrollbackGen;
+    _isAltScreen = other._isAltScreen;
     _withinLine = other._withinLine;
     _lastLineIndex = other._lastLineIndex;
   }
 
-  /// Capture an anchor from the current scroll metrics. Clears the anchor when
-  /// the viewport is at the bottom, or at or above row 0, so the caller follows
-  /// new output instead of pinning at the bottom or latching to the top line.
+  /// Captures an anchor from the current scroll metrics. Clears the anchor when
+  /// the viewport is at the bottom, or at or above row 0.
   void capture({
-    required xt.Buffer buffer,
+    required TerminalCellBuffer buffer,
     required double pixels,
     required double maxScrollExtent,
     required double lineHeight,
   }) {
-    final lineCount = buffer.lines.length;
-    // Use a 0.5px subpixel tolerance for native Flutter scroll physics.
-    // The web DOM adapter uses a 10px tolerance to absorb browser zoom jitter.
+    final lineCount = buffer.totalLines;
     if (lineHeight <= 0 ||
         lineCount <= 0 ||
+        buffer.isUsingAltBuffer ||
         pixels <= 0.0 ||
         pixels >= maxScrollExtent - kNativeScrollSubpixelTolerance) {
-      _line = null;
-      _lastLineIndex = null;
+      clear();
       return;
     }
     final topRow = pixels ~/ lineHeight;
     if (topRow <= 0 || topRow >= lineCount) {
-      _line = null;
-      _lastLineIndex = null;
+      clear();
       return;
     }
-    _line = buffer.lines[topRow];
+    _buffer = buffer;
+    _anchoredAbsoluteRow = buffer.trimmedTopRows + topRow;
+    _eraseScrollbackGen = buffer.eraseScrollbackGen;
+    _isAltScreen = buffer.isUsingAltBuffer;
     _withinLine = pixels - topRow * lineHeight;
-    _lastLineIndex = _line!.index;
+    _lastLineIndex = topRow;
   }
 
-  /// The scroll offset that keeps the anchored line pinned, clamped to
-  /// `[0, maxScrollExtent]`. Returns null when there is no live anchor: either
-  /// none was captured, or the anchored line has been trimmed out of the buffer
-  /// (in which case the anchor is dropped and the caller should stop tracking).
+  /// Returns the scroll offset that keeps the anchored line pinned, clamped to
+  /// `[0, maxScrollExtent]`, or `null` (clearing the anchor) if the line aged
+  /// out or scrollback was cleared.
   double? desiredOffset({
     required double maxScrollExtent,
     required double lineHeight,
   }) {
-    final line = _line;
-    if (line == null) return null;
-    if (!line.attached) {
-      _line = null;
-      _lastLineIndex = null;
-      return null;
-    }
-    // Cleared out of the scrollback rather than aged out, or trimmed up to
-    // row 0. Without this the row would compute a non-positive offset, clamp to
-    // zero, and pin the viewport to the top of the buffer instead of releasing it.
-    if (line.index <= 0) {
-      _line = null;
-      _lastLineIndex = null;
+    final idx = _currentVirtualRow;
+    if (idx == null || idx <= 0) {
+      clear();
       return null;
     }
     if (lineHeight <= 0 || maxScrollExtent <= 0.0) return null;
-    final desired = line.index * lineHeight + _withinLine;
+    final desired = idx * lineHeight + _withinLine;
     if (desired <= 0.0) {
-      _line = null;
-      _lastLineIndex = null;
+      clear();
       return null;
     }
     return desired.clamp(0.0, maxScrollExtent);

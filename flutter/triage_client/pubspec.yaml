@@ -34,7 +34,6 @@ dependencies:
 
   web_socket_channel: ^3.0.1
   flat_buffers: ^25.9.23
-  xterm2: ^5.4.0
   archive: ^4.0.0
 
   # The following adds the Cupertino Icons font to your application.

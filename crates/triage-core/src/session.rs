@@ -641,6 +641,200 @@ pub struct InputLeaseRequest {
     pub kind: InputControllerKind,
 }
 
+pub mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserializer, Serializer, de};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.is_empty() {
+            return serializer.serialize_str("");
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a base64 string or byte sequence")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(Vec::new());
+                }
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(de::Error::custom)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v.to_vec())
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(v)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024 * 1024));
+                while let Some(b) = seq.next_element()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Authoritative server-computed terminal cell-grid update (full viewport on
+/// attach/resize/mode switch, or dirty-row diff + boundary scrollback push on
+/// incremental live updates).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSyncFrame {
+    pub frame_seq: u64,
+    pub rows: u16,
+    pub cols: u16,
+    pub total_scrollback_rows: u64,
+    pub trimmed_top_rows: u64,
+    pub erase_scrollback_gen: u64,
+    pub cursor_x: u16,
+    pub cursor_y: u16,
+    pub cursor_style: u8,
+    pub mode_flags: u32,
+    pub mouse_mode: u8,
+    pub mouse_report_mode: u8,
+    pub kitty_keyboard_flags: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub viewport_compression: u8,
+    #[serde(default, with = "base64_bytes")]
+    pub viewport_payload: Vec<u8>,
+    pub pushed_scrollback_start_row: u64,
+    pub pushed_scrollback_row_count: u32,
+    pub pushed_scrollback_compression: u8,
+    #[serde(default, with = "base64_bytes")]
+    pub pushed_scrollback_payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTerminalRequest {
+    pub session_id: SessionId,
+    pub client_id: ClientId,
+    #[serde(default)]
+    pub mode: AttachMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<SessionSize>,
+    #[serde(default)]
+    pub resize_pty: bool,
+    #[serde(default)]
+    pub restore_if_exited: bool,
+    #[serde(default)]
+    pub subscribe: bool,
+    #[serde(default)]
+    pub known_frame_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncTerminalResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_id: Option<String>,
+    pub snapshot: SessionSnapshot,
+    pub lease: InputLeaseState,
+    pub frame: TerminalSyncFrame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchTerminalRowsRequest {
+    pub session_id: SessionId,
+    pub start_row: u64,
+    pub row_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchTerminalRowsResponse {
+    pub session_id: SessionId,
+    pub start_row: u64,
+    pub row_count: u32,
+    pub total_scrollback_rows: u64,
+    pub trimmed_top_rows: u64,
+    pub erase_scrollback_gen: u64,
+    pub compression: u8,
+    #[serde(default, with = "base64_bytes")]
+    pub payload: Vec<u8>,
+}
+
+/// Per-screen server-side diff cursor for one remote terminal subscriber.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalScreenCursor {
+    pub initialized: bool,
+    pub synced_seqno: usize,
+    pub first_visible_stable: isize,
+    pub physical_rows: usize,
+    pub physical_cols: usize,
+}
+
+/// Per-subscriber server-side diff baseline stored in `WebSocketSessionConnection`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TerminalSyncCursor {
+    pub primary: TerminalScreenCursor,
+    pub alt: TerminalScreenCursor,
+    pub last_alt_screen: Option<bool>,
+    pub last_erase_scrollback_gen: u64,
+    pub last_erase_display_gen: u64,
+    pub last_bell_gen: u64,
+    pub last_title_gen: u64,
+    pub last_mode_flags: u32,
+    pub last_mouse_mode: u32,
+    pub last_mouse_report_mode: u32,
+    pub last_kitty_flags: u32,
+    pub last_cursor_x: u32,
+    pub last_cursor_y: u32,
+    pub last_cursor_style: u32,
+    pub last_total_scrollback_rows: u64,
+    pub last_trimmed_top_rows: u64,
+    pub next_frame_seq: u64,
+}
+
+impl TerminalSyncCursor {
+    pub fn reset_keep_seq(&mut self) {
+        let next_seq = self.next_frame_seq;
+        *self = Self::default();
+        self.next_frame_seq = next_seq;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollTerminalSyncOutcome {
+    Idle,
+    HoldForSynchronizedUpdate,
+    Frame(Box<TerminalSyncFrame>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionEvent {
     ResyncRequired {
@@ -664,6 +858,10 @@ pub enum SessionEvent {
     Exited {
         session_id: SessionId,
         completed: CompletedSession,
+    },
+    TerminalSync {
+        session_id: SessionId,
+        frame: Box<TerminalSyncFrame>,
     },
 }
 
@@ -961,6 +1159,34 @@ pub trait SessionApi {
         let _ = (session_id, label);
         Ok(())
     }
+    /// Performs a 1-RTT terminal state sync (optional restore, optional PTY
+    /// resize, lease check/grant, metadata snapshot, and compressed viewport
+    /// cell frame).
+    fn sync_terminal_session(
+        &self,
+        _request: SyncTerminalRequest,
+        _cursor: &mut TerminalSyncCursor,
+    ) -> Result<(SessionSnapshot, InputLeaseState, TerminalSyncFrame)> {
+        anyhow::bail!("terminal cell sync is not supported by this session API")
+    }
+    /// Polls a session's authoritative terminal grid against `cursor` to emit
+    /// an incremental dirty-row diff when changes are pending.
+    fn poll_terminal_sync(
+        &self,
+        _session_id: SessionId,
+        _cursor: &mut TerminalSyncCursor,
+        _force_full: bool,
+    ) -> Result<PollTerminalSyncOutcome> {
+        anyhow::bail!("terminal cell sync is not supported by this session API")
+    }
+    /// Fetches a random-access `[start_row .. start_row + row_count)` slice of
+    /// packed scrollback rows for a session.
+    fn fetch_terminal_rows(
+        &self,
+        _request: FetchTerminalRowsRequest,
+    ) -> Result<FetchTerminalRowsResponse> {
+        anyhow::bail!("terminal row fetching is not supported by this session API")
+    }
 }
 
 impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
@@ -1099,6 +1325,27 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
     }
     fn set_session_custom_label(&self, session_id: SessionId, label: Option<String>) -> Result<()> {
         (**self).set_session_custom_label(session_id, label)
+    }
+    fn sync_terminal_session(
+        &self,
+        request: SyncTerminalRequest,
+        cursor: &mut TerminalSyncCursor,
+    ) -> Result<(SessionSnapshot, InputLeaseState, TerminalSyncFrame)> {
+        (**self).sync_terminal_session(request, cursor)
+    }
+    fn poll_terminal_sync(
+        &self,
+        session_id: SessionId,
+        cursor: &mut TerminalSyncCursor,
+        force_full: bool,
+    ) -> Result<PollTerminalSyncOutcome> {
+        (**self).poll_terminal_sync(session_id, cursor, force_full)
+    }
+    fn fetch_terminal_rows(
+        &self,
+        request: FetchTerminalRowsRequest,
+    ) -> Result<FetchTerminalRowsResponse> {
+        (**self).fetch_terminal_rows(request)
     }
 }
 
