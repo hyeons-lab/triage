@@ -23035,6 +23035,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn handover_preserves_sideband_terminal_modes() {
         let temp = unique_log_dir();

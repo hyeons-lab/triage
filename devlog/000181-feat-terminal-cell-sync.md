@@ -30,6 +30,7 @@
 - 2026-11-11T02:48-0800 `SessionVm(isExited: true)` called `markExited()` before lazy `_terminal` creation, leaving `terminal.cursorVisible` true on cold exited-session view models: propagated `!isExited` cursor visibility inside `_createTerminal()`.
 - 2026-11-11T03:05-0800 `_selectSession` scheduled a redundant post-frame delta `_refreshSessionSnapshot` even when `!subscribed` had already launched `_resubscribeAndRefreshHistory`: gated the post-frame fallback refresh on `sid == null || subscribed`.
 - 2026-11-11T08:01-0800 `libc::openpty` in `handover_terminal_modes_round_trip` passed `&mut ws`, triggering `clippy::unnecessary_mut_passed` on Linux (`*const winsize` on glibc vs `*mut winsize` on Darwin): cast `&ws as *const libc::winsize as *mut libc::winsize` matching the adjacent handover test.
+- 2026-11-11T08:39-0800 `handover_preserves_sideband_terminal_modes` in `crates/triaged/src/session.rs` lacked `#[cfg(unix)]`, failing Windows test compilation (`libc::openpty` and `spawn_adopted_pty_runtime` are Unix-only): added `#[cfg(unix)]` matching the adjacent `spawn_adopted_pty_runtime` tests.
 
 ## Progress
 
@@ -45,4 +46,5 @@
 ## Commits
 
 - `373d917`: feat: replace client terminal emulation with server cell sync and GPU grid renderer
-- `HEAD`: fix(triaged): avoid clippy unnecessary_mut_passed on Linux openpty test
+- `0043e42`: fix(triaged): avoid clippy unnecessary_mut_passed on Linux openpty test
+- `HEAD`: fix(triaged): gate Unix handover terminal mode test with cfg(unix)
