@@ -10,6 +10,8 @@
 - `2026-11-12T23:56-0800`: Wired hover tracking (`MouseRegion`), cursor updates (`click` / `text` / `basic`), external browser launch via `openExternalUri` (or optional `onOpenUrl`), `Ctrl+click`/`Cmd+click` bypass when `mouseMode > 0`, and mobile tap vs. long-press guard in `TerminalPane` (`lib/widgets/terminal_pane.dart`).
 - `2026-11-12T23:56-0800`: Added unit and widget test suites in `test/terminal/terminal_links_test.dart`, `test/terminal/terminal_grid_render_box_test.dart`, and `test/terminal/terminal_pane_links_test.dart`.
 
+- `2026-11-13T06:40-0800`: Fixed copy/paste on remote clients. Windows TUI (`crates/triage/src/main.rs`): added `BracketedPasteKeyDecoder` to rebuild `Event::Paste` from the per-key events crossterm emits on Windows, plus Ctrl+Shift+V / Shift+Insert reading the Windows clipboard directly. Flutter web (`terminal_pane.dart`, `web_paste_*.dart`): Ctrl+V defers to the native DOM `paste` event, with a `Clipboard.getData` fallback after 50ms.
+
 ## Decisions
 
 - **Strict hit-testing (`hitTestCellOffset`)**: `RenderTerminalGrid.getCellOffset` clamps out-of-bounds coordinates for drag selection, which would trigger false URL hits in right/bottom margins; adding a non-clamping `hitTestCellOffset` keeps link hovers and clicks scoped to actual rendered glyphs.
@@ -17,6 +19,8 @@
 - **Synchronous `HardwareKeyboard` hover refresh & selection guards**: Modifier transitions refresh hovered links synchronously for immediate cursor feedback; dragging past slop, clicking while a non-collapsed selection is active, or triggering mobile long-press selection cancels link activation so selection behavior stays intact.
 
 ## Issues
+
+- Windows terminals deliver bracketed paste as individual key events, and `navigator.clipboard.readText()` fails on insecure `http://` origins, so paste truncated or failed on remote clients.
 
 ## Commits
 

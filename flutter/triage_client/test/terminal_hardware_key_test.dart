@@ -1568,4 +1568,241 @@ void main() {
       },
     );
   });
+
+  group('TerminalPane paste handling', () {
+    void mockClipboard(String? text) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.getData') {
+              return text == null ? null : <String, dynamic>{'text': text};
+            }
+            return null;
+          });
+    }
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null);
+      TerminalPane.debugOverrideWebPaste = null;
+      TerminalPane.debugForceNativeTerminalView = false;
+      debugDefaultTargetPlatformOverride = null;
+    });
+
+    testWidgets(
+      'Web Ctrl+V defers to DOM paste without sending ^V or double-pasting',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        TerminalPane.debugOverrideWebPaste = true;
+        TerminalPane.debugForceNativeTerminalView = true;
+        mockClipboard('fallback-should-not-run');
+
+        final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+        final controller = TerminalController();
+        final inputs = <String>[];
+        var interactions = 0;
+        controller.addInputListener(inputs.add);
+        controller.addInteractionListener(() => interactions++);
+
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 640,
+                  height: 360,
+                  child: TerminalPane(
+                    terminalId: 'web-paste-dom',
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 0,
+                    bracketedPasteEnabled: true,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await tester.pump();
+
+          // Key handler must ignore Ctrl+V on web rather than emitting ^V (\x16).
+          expect(inputs, isEmpty);
+
+          final consumed = TerminalPane.dispatchWebDomPasteForTest(
+            'web-paste-dom',
+            'secret-auth-token',
+          );
+          expect(consumed, isTrue);
+          await tester.pump(const Duration(milliseconds: 80));
+
+          expect(inputs, ['\x1b[200~secret-auth-token\x1b[201~']);
+          expect(interactions, 1);
+        } finally {
+          TerminalPane.destroySession('web-paste-dom');
+          TerminalPane.debugOverrideWebPaste = null;
+          TerminalPane.debugForceNativeTerminalView = false;
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'Web paste falls back to Clipboard.getData when DOM paste does not fire',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        TerminalPane.debugOverrideWebPaste = true;
+        TerminalPane.debugForceNativeTerminalView = true;
+        mockClipboard('fallback-token');
+
+        final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+        final controller = TerminalController();
+        final inputs = <String>[];
+        controller.addInputListener(inputs.add);
+
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 640,
+                  height: 360,
+                  child: TerminalPane(
+                    terminalId: 'web-paste-fallback',
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 0,
+                    bracketedPasteEnabled: false,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await tester.pump(const Duration(milliseconds: 60));
+          await tester.pump();
+
+          expect(inputs, ['fallback-token']);
+        } finally {
+          TerminalPane.destroySession('web-paste-fallback');
+          TerminalPane.debugOverrideWebPaste = null;
+          TerminalPane.debugForceNativeTerminalView = false;
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'Web DOM paste yields to another focused TextField',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        TerminalPane.debugOverrideWebPaste = true;
+
+        final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+        final controller = TerminalController();
+        final inputs = <String>[];
+        controller.addInputListener(inputs.add);
+
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: Column(
+                  children: [
+                    const TextField(),
+                    Expanded(
+                      child: TerminalPane(
+                        terminalId: 'web-paste-textfield-yield',
+                        terminal: terminal,
+                        controller: controller,
+                        fallbackRows: const [],
+                        onTerminalResizeBind: (_) {},
+                        focusCursorRevision: 0,
+                        bracketedPasteEnabled: true,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.tap(find.byType(TextField));
+          await tester.pump();
+
+          final consumed = TerminalPane.dispatchWebDomPasteForTest(
+            'web-paste-textfield-yield',
+            'for-textfield',
+          );
+          expect(consumed, isFalse);
+          await tester.pump();
+          expect(inputs, isEmpty);
+        } finally {
+          TerminalPane.destroySession('web-paste-textfield-yield');
+          TerminalPane.debugOverrideWebPaste = null;
+          TerminalPane.debugForceNativeTerminalView = false;
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'Native Windows Ctrl+V reads clipboard immediately and notifies interaction',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+        TerminalPane.debugOverrideWebPaste = false;
+        mockClipboard('native-token');
+
+        final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+        final controller = TerminalController();
+        final inputs = <String>[];
+        var interactions = 0;
+        controller.addInputListener(inputs.add);
+        controller.addInteractionListener(() => interactions++);
+
+        try {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: 'native-paste',
+                  terminal: terminal,
+                  controller: controller,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 0,
+                  bracketedPasteEnabled: true,
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+          await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+          await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+          await tester.pump();
+
+          expect(inputs, ['\x1b[200~native-token\x1b[201~']);
+          expect(interactions, 1);
+        } finally {
+          TerminalPane.destroySession('native-paste');
+          TerminalPane.debugOverrideWebPaste = null;
+          TerminalPane.debugForceNativeTerminalView = false;
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+  });
 }
