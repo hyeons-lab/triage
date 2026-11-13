@@ -59,6 +59,8 @@ import 'package:triage_client/terminal/terminal_keyboard_mode.dart';
 import 'package:triage_client/terminal/terminal_links.dart';
 import 'package:triage_client/terminal/terminal_mouse_encoder.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
+import 'package:triage_client/terminal/web_paste_stub.dart'
+    if (dart.library.js_util) 'package:triage_client/terminal/web_paste_web.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
@@ -466,6 +468,20 @@ class TerminalPane extends StatefulWidget {
   @visibleForTesting
   static bool debugForceNativeTerminalView = false;
 
+  /// Overrides [kIsWeb] paste chord deferral in widget tests so both web
+  /// DOM-paste and native clipboard-paste paths can be verified on the VM.
+  @visibleForTesting
+  static bool? debugOverrideWebPaste;
+
+  /// Simulates a browser DOM `paste` event routed to the mounted pane for
+  /// [terminalId], returning whether the pane consumed it.
+  @visibleForTesting
+  static bool dispatchWebDomPasteForTest(String terminalId, String text) {
+    final pane = _TerminalPaneState._mountedPanes[terminalId];
+    if (pane == null) return false;
+    return pane._onWebDomPaste(text);
+  }
+
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
 }
@@ -578,6 +594,9 @@ class _TerminalPaneState extends State<TerminalPane>
   bool _ctrlArmed = false;
   bool _isPasting = false;
   bool _isPasteDialogShowing = false;
+  void Function()? _disposeWebPasteListener;
+  Timer? _webPasteFallbackTimer;
+  int _domPasteSeq = 0;
   final MobileAutoSpaceTracker _mobileAutoSpace = MobileAutoSpaceTracker();
 
   TerminalSelectionRange? _selection;
@@ -687,6 +706,9 @@ class _TerminalPaneState extends State<TerminalPane>
     _bindTerminal(_terminal, syncFocus: false);
     _mountedPanes[widget.terminalId] = this;
     _bindController(widget.controller);
+    if (kIsWeb) {
+      _disposeWebPasteListener = registerWebPasteListener(_onWebDomPaste);
+    }
     if (widget.focusCursorRevision > 0) {
       _scrollToCursor(requestFocus: true);
     }
@@ -984,6 +1006,10 @@ class _TerminalPaneState extends State<TerminalPane>
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
+    _webPasteFallbackTimer?.cancel();
+    _webPasteFallbackTimer = null;
+    _disposeWebPasteListener?.call();
+    _disposeWebPasteListener = null;
     _clearPointerReleaseTimers();
     if (runningUnderFlutterTest()) {
       _lastWorkspaceFittedSize = null;
@@ -1001,6 +1027,8 @@ class _TerminalPaneState extends State<TerminalPane>
       !widget.isExited &&
       _isRouteCurrentAndUnobscured &&
       _focusNode.hasFocus;
+
+  bool get _useWebPaste => TerminalPane.debugOverrideWebPaste ?? kIsWeb;
 
   void _onFocusChanged() {
     _syncFocusReporting();
@@ -3306,6 +3334,20 @@ class _TerminalPaneState extends State<TerminalPane>
       return KeyEventResult.ignored;
     }
     if (_isPasteChord(event)) {
+      if (_useWebPaste) {
+        if (event is KeyDownEvent) {
+          final seq = _domPasteSeq;
+          _webPasteFallbackTimer?.cancel();
+          _webPasteFallbackTimer = Timer(const Duration(milliseconds: 50), () {
+            if (!mounted || _domPasteSeq != seq) return;
+            unawaited(_pasteFromClipboard());
+          });
+        }
+        // Let the browser process the keystroke so it dispatches a native
+        // DOM `paste` ClipboardEvent (which also works on insecure `http://`
+        // URLs where `navigator.clipboard.readText()` is unavailable).
+        return KeyEventResult.ignored;
+      }
       unawaited(_pasteFromClipboard());
       return KeyEventResult.handled;
     }
@@ -3327,6 +3369,9 @@ class _TerminalPaneState extends State<TerminalPane>
         _disposeWebPasteListener != null &&
         (_isBrowserNativePasteKey(event) ||
             (!canReadWebClipboardAsync() && _isPasteChord(event)))) {
+      return KeyEventResult.ignored;
+    }
+    if (_useWebPaste && _isPasteChord(event)) {
       return KeyEventResult.ignored;
     }
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -3559,15 +3604,42 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  bool _hasNonTerminalEditableFocus() {
+    final primaryFocus = FocusManager.instance.primaryFocus;
+    if (primaryFocus == null || primaryFocus == _focusNode) {
+      return false;
+    }
+    final focusContext = primaryFocus.context;
+    if (focusContext == null) {
+      return false;
+    }
+    if (focusContext.widget is EditableText) {
+      return true;
+    }
+    return focusContext.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
   bool _onWebDomPaste(String text) {
     if (!mounted ||
         text.isEmpty ||
         widget.isExited ||
+        widget.isLoading ||
         !_isRouteCurrentAndUnobscured ||
-        !_focusNode.hasFocus ||
-        _isPasteDialogShowing) {
+        _isPasteDialogShowing ||
+        _hasNonTerminalEditableFocus()) {
       return false;
     }
+    if (!_focusNode.hasFocus) {
+      final activePanes = _mountedPanes.values
+          .where((pane) => pane.mounted && pane._isRouteCurrentAndUnobscured)
+          .length;
+      if (activePanes > 1) {
+        return false;
+      }
+    }
+    _domPasteSeq++;
+    _webPasteFallbackTimer?.cancel();
+    _webPasteFallbackTimer = null;
     if (!_isPasting) {
       unawaited(_handlePaste(text));
     }
@@ -3575,7 +3647,6 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   bool _isBracketedPasteEnabled() => _terminal.bracketedPasteMode;
-
   Future<void> _handlePaste(String text) async {
     if (!mounted ||
         text.isEmpty ||
@@ -3599,6 +3670,7 @@ class _TerminalPaneState extends State<TerminalPane>
     if (isBracketed || !isMultiLine(text)) {
       snapOnSend();
       final formatted = formatPasteInput(text, isBracketed);
+      widget.controller.notifyInteraction();
       widget.controller.sendInput(formatted);
       _clearSelection();
       return;
@@ -3619,6 +3691,7 @@ class _TerminalPaneState extends State<TerminalPane>
           chosenText,
           _isBracketedPasteEnabled(),
         );
+        widget.controller.notifyInteraction();
         widget.controller.sendInput(formatted);
         _clearSelection();
       }

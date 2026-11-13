@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -447,6 +448,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
     let mut sidebar_scroll_offset = 0usize;
     let mut last_sidebar_scroll_tick = Instant::now();
     let mut settings: Option<SettingsOverlay> = None;
+    let mut paste_decoder = BracketedPasteKeyDecoder::default();
+    let mut pending_events = VecDeque::new();
 
     loop {
         // Cheap non-blocking drain of the background poller's channel; the
@@ -481,14 +484,34 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
             needs_draw = false;
         }
 
-        if !event::poll(UI_EVENT_POLL)? {
-            continue;
-        }
+        let next_event = if let Some(ev) = pending_events.pop_front() {
+            ev
+        } else if !event::poll(UI_EVENT_POLL)? {
+            pending_events.extend(paste_decoder.flush_expired(Instant::now()));
+            let Some(ev) = pending_events.pop_front() else {
+                continue;
+            };
+            ev
+        } else {
+            let raw = event::read()?;
+            if matches!(raw, Event::Key(key) if key.kind != KeyEventKind::Press) {
+                continue;
+            }
+            if cfg!(windows) {
+                pending_events.extend(paste_decoder.push(raw, Instant::now()));
+                let Some(ev) = pending_events.pop_front() else {
+                    continue;
+                };
+                ev
+            } else {
+                raw
+            }
+        };
 
         // The `Event::Mouse` arm's inner `if` can't become a match guard (it
         // uses `?`), so this newer-clippy collapse suggestion doesn't apply.
         #[allow(clippy::collapsible_match)]
-        match event::read()? {
+        match next_event {
             Event::Key(key) if key.kind != KeyEventKind::Press => {}
             Event::Key(key) if should_exit(key) => {
                 needs_draw = true;
@@ -600,6 +623,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
                         continue;
                     }
                     selection = None;
+                    #[cfg(windows)]
+                    if is_explicit_paste_chord(key) {
+                        if let Some(text) = read_windows_clipboard() {
+                            needs_draw = true;
+                            pending_confirmation = None;
+                            app.refresh_selected_snapshot();
+                            app.write_input(paste_input(
+                                &text,
+                                app.view().snapshot.bracketed_paste_enabled,
+                            ));
+                        }
+                        continue;
+                    }
                     if let Some(bytes) = key_to_input(key) {
                         app.write_input(bytes);
                     }
@@ -1920,6 +1956,247 @@ fn paste_input(text: &str, bracketed_paste_enabled: bool) -> Vec<u8> {
     bytes
 }
 
+const BRACKETED_PASTE_START_TAIL: [char; 5] = ['[', '2', '0', '0', '~'];
+const BRACKETED_PASTE_END_TAIL: [char; 5] = ['[', '2', '0', '1', '~'];
+const BRACKETED_PASTE_PREFIX_TIMEOUT: Duration = Duration::from_millis(20);
+const BRACKETED_PASTE_BODY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Reconstructs `Event::Paste` on Windows where `crossterm` delivers
+/// terminal-synthesized `\x1b[200~...\x1b[201~` bracketed pastes as
+/// individual `Event::Key` records instead of `Event::Paste`.
+#[derive(Debug, Default)]
+struct BracketedPasteKeyDecoder {
+    state: BracketedPasteState,
+}
+
+#[derive(Debug, Default)]
+enum BracketedPasteState {
+    #[default]
+    Idle,
+    MatchingStart {
+        matched: Vec<KeyEvent>,
+        started_at: Instant,
+    },
+    InPaste {
+        buffer: String,
+        end_matched_len: usize,
+        last_activity: Instant,
+    },
+}
+
+impl BracketedPasteKeyDecoder {
+    fn push(&mut self, event: Event, now: Instant) -> Vec<Event> {
+        let Event::Key(key) = event else {
+            return match std::mem::take(&mut self.state) {
+                BracketedPasteState::Idle => vec![event],
+                BracketedPasteState::MatchingStart { matched, .. } => {
+                    let mut out: Vec<Event> = matched.into_iter().map(Event::Key).collect();
+                    out.push(event);
+                    out
+                }
+                in_paste @ BracketedPasteState::InPaste { .. } => {
+                    self.state = in_paste;
+                    vec![event]
+                }
+            };
+        };
+
+        match std::mem::take(&mut self.state) {
+            BracketedPasteState::Idle => {
+                if is_plain_escape_key(key) {
+                    self.state = BracketedPasteState::MatchingStart {
+                        matched: vec![key],
+                        started_at: now,
+                    };
+                    Vec::new()
+                } else {
+                    vec![Event::Key(key)]
+                }
+            }
+            BracketedPasteState::MatchingStart {
+                mut matched,
+                started_at,
+            } => {
+                let tail_idx = matched.len().saturating_sub(1);
+                if matches_bracketed_marker_char(key, BRACKETED_PASTE_START_TAIL[tail_idx]) {
+                    matched.push(key);
+                    if tail_idx + 1 == BRACKETED_PASTE_START_TAIL.len() {
+                        self.state = BracketedPasteState::InPaste {
+                            buffer: String::new(),
+                            end_matched_len: 0,
+                            last_activity: now,
+                        };
+                    } else {
+                        self.state = BracketedPasteState::MatchingStart {
+                            matched,
+                            started_at,
+                        };
+                    }
+                    Vec::new()
+                } else {
+                    let mut out: Vec<Event> = matched.into_iter().map(Event::Key).collect();
+                    out.extend(self.push(Event::Key(key), now));
+                    out
+                }
+            }
+            BracketedPasteState::InPaste {
+                mut buffer,
+                mut end_matched_len,
+                ..
+            } => {
+                if end_matched_len == 0 {
+                    if is_plain_escape_key(key) {
+                        end_matched_len = 1;
+                    } else {
+                        append_pasted_key(&mut buffer, key);
+                    }
+                    self.state = BracketedPasteState::InPaste {
+                        buffer,
+                        end_matched_len,
+                        last_activity: now,
+                    };
+                    return Vec::new();
+                }
+
+                let tail_idx = end_matched_len - 1;
+                if matches_bracketed_marker_char(key, BRACKETED_PASTE_END_TAIL[tail_idx]) {
+                    end_matched_len += 1;
+                    if end_matched_len > BRACKETED_PASTE_END_TAIL.len() {
+                        return vec![Event::Paste(buffer)];
+                    }
+                    self.state = BracketedPasteState::InPaste {
+                        buffer,
+                        end_matched_len,
+                        last_activity: now,
+                    };
+                    return Vec::new();
+                }
+
+                append_partial_end_marker(&mut buffer, tail_idx);
+                if is_plain_escape_key(key) {
+                    end_matched_len = 1;
+                } else {
+                    end_matched_len = 0;
+                    append_pasted_key(&mut buffer, key);
+                }
+                self.state = BracketedPasteState::InPaste {
+                    buffer,
+                    end_matched_len,
+                    last_activity: now,
+                };
+                Vec::new()
+            }
+        }
+    }
+
+    fn flush_expired(&mut self, now: Instant) -> Vec<Event> {
+        match std::mem::take(&mut self.state) {
+            BracketedPasteState::Idle => Vec::new(),
+            BracketedPasteState::MatchingStart {
+                matched,
+                started_at,
+            } => {
+                if now.duration_since(started_at) >= BRACKETED_PASTE_PREFIX_TIMEOUT {
+                    matched.into_iter().map(Event::Key).collect()
+                } else {
+                    self.state = BracketedPasteState::MatchingStart {
+                        matched,
+                        started_at,
+                    };
+                    Vec::new()
+                }
+            }
+            BracketedPasteState::InPaste {
+                mut buffer,
+                end_matched_len,
+                last_activity,
+            } => {
+                if now.duration_since(last_activity) >= BRACKETED_PASTE_BODY_TIMEOUT {
+                    if end_matched_len > 0 {
+                        append_partial_end_marker(&mut buffer, end_matched_len - 1);
+                    }
+                    vec![Event::Paste(buffer)]
+                } else {
+                    self.state = BracketedPasteState::InPaste {
+                        buffer,
+                        end_matched_len,
+                        last_activity,
+                    };
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
+fn is_plain_escape_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn matches_bracketed_marker_char(key: KeyEvent, expected: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c == expected)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn append_partial_end_marker(buffer: &mut String, matched_tail_count: usize) {
+    buffer.push('\x1b');
+    for ch in BRACKETED_PASTE_END_TAIL.iter().take(matched_tail_count) {
+        buffer.push(*ch);
+    }
+}
+
+fn append_pasted_key(buffer: &mut String, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            buffer.push(c);
+        }
+        KeyCode::Enter => buffer.push('\n'),
+        KeyCode::Tab => buffer.push('\t'),
+        _ => {}
+    }
+}
+
+fn is_explicit_paste_chord(key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    !alt && ((matches!(key.code, KeyCode::Insert) && shift && !ctrl)
+        || (matches!(key.code, KeyCode::Char('v' | 'V')) && ctrl && shift))
+}
+
+#[cfg(windows)]
+fn read_windows_clipboard() -> Option<String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+             $text = Get-Clipboard -Raw; \
+             if ($null -ne $text) { [Console]::Out.Write($text) }",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let normalized = text.replace("\r\n", "\n");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
 fn control_byte(character: char) -> Option<u8> {
     let upper = character.to_ascii_uppercase();
     if upper.is_ascii_alphabetic() {
@@ -2261,6 +2538,100 @@ mod tests {
             paste_input("safe\x1b[201~still pasted", true),
             b"\x1b[200~safestill pasted\x1b[201~"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_decoder_reconstructs_windows_key_stream() {
+        let mut decoder = BracketedPasteKeyDecoder::default();
+        let now = Instant::now();
+        let sequence = [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('~'), KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('~'), KeyModifiers::SHIFT),
+        ];
+
+        let mut emitted = Vec::new();
+        for key in sequence {
+            emitted.extend(decoder.push(Event::Key(key), now));
+        }
+
+        assert_eq!(emitted, vec![Event::Paste("tok\nen".to_string())]);
+    }
+
+    #[test]
+    fn bracketed_paste_decoder_flushes_plain_escape_and_mismatched_sequences() {
+        let mut decoder = BracketedPasteKeyDecoder::default();
+        let start = Instant::now();
+
+        assert!(
+            decoder
+                .push(
+                    Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                    start
+                )
+                .is_empty()
+        );
+        assert!(
+            decoder
+                .flush_expired(start + Duration::from_millis(5))
+                .is_empty()
+        );
+        assert_eq!(
+            decoder.flush_expired(start + BRACKETED_PASTE_PREFIX_TIMEOUT),
+            vec![Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]
+        );
+
+        let mismatch_events = [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        ];
+        let mut out = Vec::new();
+        for key in mismatch_events {
+            out.extend(decoder.push(Event::Key(key), start));
+        }
+        assert_eq!(
+            out,
+            mismatch_events
+                .into_iter()
+                .map(Event::Key)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn explicit_paste_chords_match_ctrl_shift_v_and_shift_insert_only() {
+        assert!(is_explicit_paste_chord(KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        assert!(is_explicit_paste_chord(KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_explicit_paste_chord(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_explicit_paste_chord(KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT
+        )));
     }
 
     #[test]
