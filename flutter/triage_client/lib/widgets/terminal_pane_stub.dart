@@ -1347,7 +1347,9 @@ class _TerminalPaneState extends State<TerminalPane>
       );
       return;
     }
-    _terminal.keyInput(up ? xt.TerminalKey.arrowUp : xt.TerminalKey.arrowDown);
+    // Alt-screen apps that never enabled mouse tracking get no wheel input.
+    // Translating the wheel to arrow keys here moved the app's composer /
+    // input history instead of scrolling anything.
   }
 
   void _endDrag() {

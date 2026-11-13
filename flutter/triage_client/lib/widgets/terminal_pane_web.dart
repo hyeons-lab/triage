@@ -1572,6 +1572,28 @@ class _TerminalPaneState extends State<TerminalPane>
     }
 
     try {
+      // xterm.js turns the wheel into Up/Down arrows on the alt screen when
+      // mouse tracking is off, which scrolls the app's composer. Swallow it.
+      final wheelTerm = _term;
+      js_util.callMethod(_term, 'attachCustomWheelEventHandler', [
+        js_util.allowInterop((dynamic event) {
+          try {
+            final buffer = js_util.getProperty(wheelTerm, 'buffer');
+            final active = js_util.getProperty(buffer, 'active');
+            final activeType = js_util.getProperty(active, 'type') as String?;
+            if (activeType != 'alternate') return true;
+            final modes = js_util.getProperty(wheelTerm, 'modes');
+            final mouseMode =
+                js_util.getProperty(modes, 'mouseTrackingMode') as String?;
+            return mouseMode != null && mouseMode != 'none';
+          } catch (_) {
+            return true;
+          }
+        }),
+      ]);
+    } catch (_) {}
+
+    try {
       final sessionId = _sanitizedId;
       js_util.callMethod(_term, 'attachCustomKeyEventHandler', [
         js_util.allowInterop((dynamic event) {
@@ -2549,10 +2571,9 @@ class _TerminalPaneState extends State<TerminalPane>
             final row = (rows ~/ 2).clamp(1, rows > 0 ? rows : 1);
             final seq = '\x1b[<$btn;$col;${row}M' * count;
             _containerEventOwners[_sanitizedId]?._sendInput(seq);
-          } else if (activeType == 'alternate') {
-            final key = rowsToScroll < 0 ? '\x1b[A' : '\x1b[B';
-            _containerEventOwners[_sanitizedId]?._sendInput(key * count);
           }
+          // Alt screen without mouse tracking: send nothing. Arrow keys here
+          // moved the app's composer / input history instead of scrolling.
           return;
         }
         final target = (viewportY + rowsToScroll).clamp(0, baseY);
