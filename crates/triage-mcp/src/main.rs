@@ -7,8 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use triage_core::session::{
     SESSION_MESSAGE_DEFAULT_WAIT_TIMEOUT_MS, SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
-    SendSessionMessageRequest, SessionApi, SessionId, StyledRowsRequest,
-    WaitForSessionMessagesRequest,
+    SendSessionMessageRequest, SessionApi, SessionId, SessionSize, StartSessionRequest,
+    StyledRowsRequest, WaitForSessionMessagesRequest,
 };
 #[cfg(any(unix, windows))]
 use triaged::ipc::{IpcClient, default_socket_path};
@@ -195,6 +195,8 @@ impl<A: SessionApi> McpServer<A> {
 
         match name {
             "list_sessions" => tool_result(list_sessions(&self.api)?),
+            "start_session" => tool_result(start_session(&self.api, arguments)?),
+            "shutdown_session" => tool_result(shutdown_session(&self.api, arguments)?),
             "snapshot_session" => tool_result(snapshot_session(&self.api, arguments)?),
             "styled_rows" => tool_result(styled_rows(&self.api, arguments)?),
             "send_session_message" => tool_result(send_session_message(&self.api, arguments)?),
@@ -217,6 +219,12 @@ fn decode_json_rpc_request(
 ) -> std::result::Result<JsonRpcRequest, (Value, JsonRpcError)> {
     let value = serde_json::from_str::<Value>(line)
         .map_err(|error| (Value::Null, JsonRpcError::parse_error(error.to_string())))?;
+    if !value.is_object() {
+        return Err((
+            Value::Null,
+            JsonRpcError::invalid_request("JSON-RPC request must be an object"),
+        ));
+    }
     let id = response_id_for_invalid_request(&value);
     serde_json::from_value::<JsonRpcRequest>(value).map_err(|error| {
         (
@@ -258,6 +266,48 @@ fn tool_definitions() -> Value {
                 "readOnlyHint": true,
                 "destructiveHint": false,
                 "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "start_session",
+            "title": "Start Triage Session",
+            "description": "Start an executable in a new daemon-owned terminal session with an explicit absolute working directory. Arguments are passed directly, without shell expansion. Returns session_id; track it to manage only this worker. Launch flags and initial prompts are runtime-specific. An ambiguous failure must be reconciled before retrying because this operation is not idempotent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "minLength": 1, "description": "Executable name or path, not a shell command line." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Literal argv entries, including any agent-specific initial prompt or launch flags. Defaults to []." },
+                    "cwd": { "type": "string", "minLength": 1, "description": "Absolute working directory on the daemon host." },
+                    "rows": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY rows (default 24)." },
+                    "cols": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY columns (default 80)." }
+                },
+                "required": ["command", "cwd"],
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "shutdown_session",
+            "title": "Shutdown Triage Session",
+            "description": "Stop the specified terminal session and its running work using the daemon's shutdown path. Only stop a session you currently own or that the user explicitly asked you to stop. Revalidate worker identity before using a saved ID: numeric IDs can be reused after a cold daemon restart. Returns its completed terminal output, not an agent review report. Repeated calls may fail if the session is already gone.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "minLength": 1, "description": "Exact, currently verified worker session id, or a current session explicitly selected by the user." }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
                 "openWorldHint": false
             }
         },
@@ -424,6 +474,85 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartSessionArguments {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: String,
+    #[serde(default = "default_session_rows")]
+    rows: usize,
+    #[serde(default = "default_session_cols")]
+    cols: usize,
+}
+
+fn default_session_rows() -> usize {
+    SessionSize::default().rows
+}
+
+fn default_session_cols() -> usize {
+    SessionSize::default().cols
+}
+
+fn start_session(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    arguments_object(&arguments)?;
+    let arguments: StartSessionArguments = serde_json::from_value(arguments).map_err(|error| {
+        JsonRpcError::invalid_params(format!("invalid start_session arguments: {error}"))
+    })?;
+    if arguments.command.trim().is_empty()
+        || arguments.command.contains('\0')
+        || arguments.args.iter().any(|arg| arg.contains('\0'))
+    {
+        return Err(JsonRpcError::invalid_params(
+            "command must be non-blank and command/args must not contain NUL bytes",
+        )
+        .into());
+    }
+    let cwd = PathBuf::from(&arguments.cwd);
+    if !cwd.is_absolute() || arguments.cwd.contains('\0') {
+        return Err(
+            JsonRpcError::invalid_params("cwd must be an absolute path without NUL bytes").into(),
+        );
+    }
+    let mut request = StartSessionRequest::new(arguments.command);
+    request.args = arguments.args;
+    request.cwd = Some(cwd);
+    request.size.rows = arguments.rows;
+    request.size.cols = arguments.cols;
+    request
+        .validate()
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    let session_id = api.start_session(request).context("starting session")?;
+    Ok(json!({ "session_id": session_id }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownSessionArguments {
+    session_id: String,
+}
+
+fn shutdown_session(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    arguments_object(&arguments)?;
+    let arguments: ShutdownSessionArguments =
+        serde_json::from_value(arguments).map_err(|error| {
+            JsonRpcError::invalid_params(format!("invalid shutdown_session arguments: {error}"))
+        })?;
+    let session_id = SessionId::new(arguments.session_id)
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    let completed = api
+        .shutdown_session(session_id.clone())
+        .with_context(|| format!("shutting down session {session_id}"))?;
+    Ok(json!({ "session_id": session_id, "completed": completed }))
 }
 
 fn list_sessions(api: &impl SessionApi) -> Result<Value> {
@@ -833,6 +962,7 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
     use triage_core::session::{
         AttachSessionRequest, AttachSessionResponse, CompletedSession, InputLeaseRequest,
         LeaseChange, RailLayout, ResizeSessionRequest, SessionEventReceiver, SessionMessage,
@@ -847,6 +977,9 @@ mod tests {
         inbox: RefCell<Vec<SessionMessage>>,
         labels: HashMap<String, String>,
         layout_error: bool,
+        starts: Rc<RefCell<Vec<StartSessionRequest>>>,
+        shutdowns: Rc<RefCell<Vec<SessionId>>>,
+        lifecycle_error: Option<&'static str>,
     }
 
     impl RecordingApi {
@@ -880,6 +1013,9 @@ mod tests {
                 inbox: RefCell::new(Vec::new()),
                 labels: HashMap::new(),
                 layout_error: false,
+                starts: Rc::new(RefCell::new(Vec::new())),
+                shutdowns: Rc::new(RefCell::new(Vec::new())),
+                lifecycle_error: None,
             }
         }
 
@@ -905,11 +1041,12 @@ mod tests {
             Ok(self.sessions.clone())
         }
 
-        fn start_session(
-            &self,
-            _request: triage_core::session::StartSessionRequest,
-        ) -> Result<SessionId> {
-            unimplemented!()
+        fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
+            self.starts.borrow_mut().push(request);
+            if let Some(error) = self.lifecycle_error {
+                bail!(error);
+            }
+            SessionId::new("worker-1")
         }
 
         fn attach_session(&self, _request: AttachSessionRequest) -> Result<AttachSessionResponse> {
@@ -1018,8 +1155,16 @@ mod tests {
             })
         }
 
-        fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
-            unimplemented!()
+        fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
+            self.shutdowns.borrow_mut().push(session_id);
+            if let Some(error) = self.lifecycle_error {
+                bail!(error);
+            }
+            Ok(CompletedSession {
+                output_seq: self.snapshot.output_seq,
+                bytes_logged: self.snapshot.bytes_logged,
+                visible_rows: self.snapshot.visible_rows.clone(),
+            })
         }
     }
 
@@ -1039,7 +1184,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
         assert_eq!(tools[0]["name"], "list_sessions");
         let names = tools
             .iter()
@@ -1049,6 +1194,8 @@ mod tests {
             names,
             [
                 "list_sessions",
+                "start_session",
+                "shutdown_session",
                 "snapshot_session",
                 "styled_rows",
                 "send_session_message",
@@ -1057,6 +1204,362 @@ mod tests {
                 "ack_session_messages",
             ]
         );
+    }
+
+    fn absolute_test_cwd() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn lifecycle_call<A: SessionApi>(
+        server: &McpServer<A>,
+        name: &str,
+        arguments: Value,
+    ) -> JsonRpcResponse {
+        server
+            .handle(JsonRpcRequest {
+                id: JsonRpcId::Request(json!("lifecycle")),
+                method: "tools/call".to_string(),
+                params: Some(json!({ "name": name, "arguments": arguments })),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn start_session_forwards_agent_executable_and_literal_arguments() {
+        for command in ["agy", "claude", "muse", "codex"] {
+            let server = McpServer::new(RecordingApi::new());
+            let cwd = absolute_test_cwd();
+            let args = vec![
+                "review a path with spaces",
+                "$(touch should-not-run)",
+                "",
+                "a'b\"c",
+            ];
+            let result = lifecycle_call(
+                &server,
+                "start_session",
+                json!({
+                    "command": command, "args": args, "cwd": cwd,
+                    "rows": 40, "cols": 120,
+                }),
+            )
+            .result
+            .unwrap();
+            assert_eq!(result["isError"], false);
+            assert_eq!(
+                result["structuredContent"],
+                json!({ "session_id": "worker-1" })
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                    .unwrap(),
+                result["structuredContent"]
+            );
+            let starts = server.api.starts.borrow();
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].command, command);
+            assert_eq!(starts[0].args, args);
+            assert_eq!(starts[0].cwd, Some(PathBuf::from(cwd)));
+            assert_eq!(starts[0].size.rows, 40);
+            assert_eq!(starts[0].size.cols, 120);
+        }
+    }
+
+    #[test]
+    fn start_session_defaults_options_and_does_not_fetch_snapshot_after_launch() {
+        let mut api = RecordingApi::new();
+        api.snapshot_error = Some("snapshot unavailable");
+        let server = McpServer::new(api);
+        let result = lifecycle_call(
+            &server,
+            "start_session",
+            json!({
+                "command": "worker", "cwd": absolute_test_cwd(),
+            }),
+        )
+        .result
+        .unwrap();
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["session_id"], "worker-1");
+        let starts = server.api.starts.borrow();
+        assert!(starts[0].args.is_empty());
+        assert_eq!(starts[0].size, SessionSize::default());
+    }
+
+    #[test]
+    fn lifecycle_rejects_invalid_arguments_before_calling_daemon() {
+        let cwd = absolute_test_cwd();
+        let valid_start = json!({ "command": "worker", "cwd": cwd });
+        let mut invalid_starts = vec![
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"command": "worker"}),
+        ];
+        for (field, value) in [
+            ("command", json!(" ")),
+            ("command", json!("wo\0rker")),
+            ("command", json!(4)),
+            ("cwd", json!("relative/path")),
+            ("cwd", json!("")),
+            ("cwd", json!(format!("{cwd}\0"))),
+            ("cwd", json!(null)),
+            ("args", json!("--flag")),
+            ("args", json!([42])),
+            ("args", json!(["arg\0"])),
+            ("args", json!(null)),
+            ("rows", json!(0)),
+            ("cols", json!(65536)),
+            ("rows", json!(-1)),
+            ("cols", json!(1.5)),
+            ("rows", json!("24")),
+            ("extra", json!(true)),
+        ] {
+            let mut invalid = valid_start.clone();
+            invalid[field] = value;
+            invalid_starts.push(invalid);
+        }
+        let invalid_shutdowns = vec![
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"session_id": " "}),
+            json!({"session_id": "../other"}),
+            json!({"session_id": "a\0b"}),
+            json!({"session_id": 42}),
+            json!({"session_id": "worker-1", "extra": true}),
+        ];
+        let server = McpServer::new(RecordingApi::new());
+        for (name, cases) in [
+            ("start_session", invalid_starts),
+            ("shutdown_session", invalid_shutdowns),
+        ] {
+            for arguments in cases {
+                let response = lifecycle_call(&server, name, arguments.clone());
+                assert_eq!(
+                    response
+                        .error
+                        .unwrap_or_else(|| panic!("{name}: {arguments}"))
+                        .code,
+                    -32602
+                );
+                assert!(server.api.starts.borrow().is_empty());
+                assert!(server.api.shutdowns.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_rejects_populated_positional_arrays() {
+        let server = McpServer::new(RecordingApi::new());
+        for (name, arguments) in [
+            (
+                "start_session",
+                json!(["worker", [], absolute_test_cwd(), 24, 80]),
+            ),
+            ("shutdown_session", json!(["worker-7"])),
+        ] {
+            let response = lifecycle_call(&server, name, arguments);
+            assert_eq!(
+                response
+                    .error
+                    .expect("positional arrays must be rejected")
+                    .code,
+                -32602
+            );
+            assert!(server.api.starts.borrow().is_empty());
+            assert!(server.api.shutdowns.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn start_session_rejects_explicit_null_dimensions() {
+        let server = McpServer::new(RecordingApi::new());
+        for field in ["rows", "cols"] {
+            let mut arguments = json!({"command": "worker", "cwd": absolute_test_cwd()});
+            arguments[field] = Value::Null;
+            let response = lifecycle_call(&server, "start_session", arguments);
+            assert_eq!(
+                response
+                    .error
+                    .expect("supplied dimensions must be integers")
+                    .code,
+                -32602
+            );
+            assert!(server.api.starts.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn shutdown_session_targets_exact_id_and_returns_completed_output() {
+        let server = McpServer::new(RecordingApi::new());
+        let result = lifecycle_call(
+            &server,
+            "shutdown_session",
+            json!({"session_id": "worker-7"}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(result["isError"], false);
+        assert_eq!(
+            *server.api.shutdowns.borrow(),
+            vec![SessionId::new("worker-7").unwrap()]
+        );
+        assert_eq!(
+            result["structuredContent"],
+            json!({
+                "session_id": "worker-7",
+                "completed": {"output_seq": 7, "bytes_logged": 12, "visible_rows": ["ready"]},
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_backend_failures_are_tool_errors() {
+        for (name, arguments) in [
+            (
+                "start_session",
+                json!({"command": "worker", "cwd": absolute_test_cwd()}),
+            ),
+            ("shutdown_session", json!({"session_id": "missing"})),
+        ] {
+            let mut api = RecordingApi::new();
+            api.lifecycle_error = Some("backend refused request");
+            let server = McpServer::new(api);
+            let response = lifecycle_call(&server, name, arguments);
+            assert!(response.error.is_none());
+            let result = response.result.unwrap();
+            assert_eq!(result["isError"], true);
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("backend refused request")
+            );
+            assert!(result.get("structuredContent").is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lifecycle_drives_real_pty_and_preserves_literal_argv() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+        use triaged::session::{SessionManager, SessionManagerConfig};
+
+        struct IsolatedSessions {
+            manager: Arc<SessionManager>,
+            directory: PathBuf,
+        }
+        impl Drop for IsolatedSessions {
+            fn drop(&mut self) {
+                for session in self.manager.list_sessions().unwrap_or_default() {
+                    let _ = self.manager.shutdown_session(session);
+                }
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "triage-mcp-worker-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let fixture = IsolatedSessions {
+            manager: Arc::new(SessionManager::new(SessionManagerConfig::new(
+                directory.join("logs"),
+            ))),
+            directory,
+        };
+        let cwd = fixture.directory.join("work tree");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let server = McpServer::new(Arc::clone(&fixture.manager));
+        let literal = "literal $(printf expanded) 'quotes'";
+        let result = lifecycle_call(&server, "start_session", json!({
+            "command": "/bin/sh",
+            "args": ["-c", "printf '%s\\n' \"mcp-worker:$TRIAGE_SESSION_ID\" \"$PWD\" \"$1\"; cat", "worker", literal],
+            "cwd": cwd,
+            "rows": 30,
+            "cols": 240,
+        })).result.unwrap();
+        assert_eq!(result["isError"], false, "{result}");
+        let session =
+            SessionId::new(result["structuredContent"]["session_id"].as_str().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = server.api.snapshot_session(session.clone()).unwrap();
+            let output = snapshot.visible_rows.join("\n");
+            if output.contains(literal)
+                && output.contains(&format!("mcp-worker:{session}"))
+                && output.contains(cwd.to_str().unwrap())
+            {
+                assert_eq!(snapshot.size.rows, 30);
+                assert_eq!(snapshot.size.cols, 240);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for worker output: {output}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let sent = lifecycle_call(
+            &server,
+            "send_session_message",
+            json!({
+                "from_session_id": session, "to_session_id": session, "body": "assignment",
+            }),
+        )
+        .result
+        .unwrap();
+        assert_eq!(sent["isError"], false);
+        let mail = lifecycle_call(
+            &server,
+            "receive_session_messages",
+            json!({"session_id": session}),
+        )
+        .result
+        .unwrap();
+        assert_eq!(
+            mail["structuredContent"]["messages"][0]["body"],
+            "assignment"
+        );
+        let stopped = lifecycle_call(&server, "shutdown_session", json!({"session_id": session}))
+            .result
+            .unwrap();
+        assert_eq!(stopped["isError"], false, "{stopped}");
+        assert_eq!(stopped["structuredContent"]["session_id"], session.as_str());
+        assert!(server.api.list_sessions().unwrap().is_empty());
+        let repeated = lifecycle_call(&server, "shutdown_session", json!({"session_id": session}))
+            .result
+            .unwrap();
+        assert_eq!(repeated["isError"], true);
+    }
+
+    #[test]
+    fn lifecycle_tools_advertise_mutation_and_non_idempotency() {
+        let tools = tool_definitions();
+        for name in ["start_session", "shutdown_session"] {
+            let tool = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["annotations"]["readOnlyHint"], false);
+            assert_eq!(tool["annotations"]["destructiveHint"], true);
+            assert_eq!(tool["annotations"]["idempotentHint"], false);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        }
     }
 
     #[test]
@@ -1455,5 +1958,54 @@ mod tests {
         });
 
         assert!(response.is_none());
+    }
+    #[test]
+    fn stdio_rejects_positional_lifecycle_envelopes() {
+        let api = RecordingApi::new();
+        let launch = json!({"name": "start_session", "arguments": {"command": "worker", "cwd": absolute_test_cwd()}});
+        let shutdown = json!({"name": "shutdown_session", "arguments": {"session_id": "worker-1"}});
+        let input = format!(
+            "{}\n{}\n",
+            json!(["launch", "tools/call", launch.clone()]),
+            json!(["stop", "tools/call", shutdown.clone()]),
+        );
+        let mut output = Vec::new();
+        run_stdio_with_client(api.clone(), std::io::Cursor::new(input), &mut output).unwrap();
+        assert!(
+            api.starts.borrow().is_empty(),
+            "a positional envelope launched a worker"
+        );
+        assert!(
+            api.shutdowns.borrow().is_empty(),
+            "a positional envelope stopped a worker"
+        );
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        for response in responses {
+            assert_eq!(response["error"]["code"], -32600);
+            assert_eq!(response["id"], Value::Null);
+        }
+        let valid = format!(
+            "{}\n{}\n",
+            json!({"jsonrpc": "2.0", "id": "launch", "method": "tools/call", "params": launch}),
+            json!({"jsonrpc": "2.0", "id": "stop", "method": "tools/call", "params": shutdown}),
+        );
+        let mut output = Vec::new();
+        run_stdio_with_client(api.clone(), std::io::Cursor::new(valid), &mut output).unwrap();
+        assert_eq!(api.starts.borrow().len(), 1);
+        assert_eq!(api.shutdowns.borrow().len(), 1);
+        let responses = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        for response in responses {
+            assert_eq!(response["result"]["isError"], false);
+        }
     }
 }
