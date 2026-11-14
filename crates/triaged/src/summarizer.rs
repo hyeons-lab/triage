@@ -1,18 +1,19 @@
-//! Local-LLM session summarizer.
+//! Local-LLM session summarizer and priority inference worker.
 //!
 //! Generates a short, one-line description of what a terminal session is doing
-//! (e.g. "running cargo test") for display in the client's side rail. All
-//! inference runs on a single dedicated worker thread that owns one
-//! [`cera::CeraEngine`] — the engine is heavy (hundreds of MB) and generation is
-//! CPU-bound, so serializing through one thread keeps inference off the tokio
-//! reactor and off the session actors, and avoids loading the model more than
-//! once. The model is downloaded + loaded lazily on the first job, so enabling
-//! the summarizer never blocks daemon startup.
+//! (e.g. "running cargo test") for display in the client's side rail, and serves
+//! Layer 3 tool-call approval judge queries via a Liquid `d1` decision model.
+//! All inference runs on a single dedicated worker thread so session summary
+//! decodes (`cera::CeraEngine`) and judge forward passes (`cera::d1::D1Engine`)
+//! never contend for the GPU or CPU cores, and arriving judge queries can preempt
+//! in-flight session summaries in one token. Both models are downloaded and
+//! loaded lazily on the first job of their respective kind, so neither blocks
+//! daemon startup and either feature can be disabled independently.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -66,7 +67,7 @@ const MAX_SNIPPET_WORDS: usize = 8;
 /// deterministic context header is prepended afterwards and is never truncated.
 const MAX_DETAIL_CHARS: usize = 480;
 
-/// Runtime parameters for the summarizer worker. Built from the daemon config.
+/// Runtime parameters for the summarizer model slot. Built from `[summarizer]`.
 #[derive(Debug, Clone)]
 pub struct SummarizerConfig {
     pub bundle_id: String,
@@ -76,9 +77,24 @@ pub struct SummarizerConfig {
     /// Token budget for the longer-form detail summary (a few sentences).
     pub detail_max_tokens: u32,
     pub cache_dir: PathBuf,
-    /// Upper bound on queued judge jobs. Summarize jobs are not bounded by this:
-    /// they coalesce into a map keyed by session, so their count is capped by
-    /// the number of live sessions rather than by a queue depth.
+    /// Upper bound on queued judge jobs when spawned via [`Summarizer::spawn`].
+    pub judge_queue_depth: usize,
+}
+
+/// Runtime parameters for the Layer 3 `d1` judge model slot. Built from `[judge]`.
+#[derive(Debug, Clone)]
+pub struct JudgeModelConfig {
+    pub model: String,
+    pub quant: String,
+    pub min_allow_confidence_pct: u8,
+    pub cache_dir: PathBuf,
+}
+
+/// Combined configuration for the shared background inference worker.
+#[derive(Debug, Clone)]
+pub struct InferenceWorkerConfig {
+    pub summarizer: Option<SummarizerConfig>,
+    pub judge: Option<JudgeModelConfig>,
     pub judge_queue_depth: usize,
 }
 
@@ -115,6 +131,13 @@ pub struct SnippetResult {
 /// answer, and through them so is an agent's tool-call loop.
 pub struct JudgeJob {
     pub request: JudgeRequest,
+    d1_request: Option<cera::d1::D1Request>,
+    /// Confidence floor (`1..=100`) overriding the worker's startup default when
+    /// provided by the live `JudgeState`.
+    pub min_allow_confidence_pct: Option<u8>,
+    /// Flipped to `true` when the waiting caller times out so queued or
+    /// about-to-run jobs are dropped before running a wasted forward pass.
+    pub cancelled: Arc<AtomicBool>,
     /// Capacity-1 so the worker's reply never blocks, even if the caller has
     /// already timed out and stopped listening.
     pub reply: SyncSender<JudgeVerdict>,
@@ -148,6 +171,15 @@ struct JobQueue {
     /// Upper bound on queued judge jobs. Past this, callers get a fallback
     /// `ask` immediately instead of queueing behind work they will outlive.
     judge_capacity: usize,
+    /// Latched once `load_summarizer_engine` fails so callers stop enqueueing
+    /// doomed snippet jobs.
+    summarizer_load_failed: AtomicBool,
+    /// Latched once `load_judge_engine` fails so callers fail fast without
+    /// cancelling live session summaries.
+    judge_load_failed: AtomicBool,
+    /// Latched when `run_worker` exits for any reason (handle retirement,
+    /// poisoned mutex, or panic unwind) so callers never stall on a dead queue.
+    worker_stopped: AtomicBool,
 }
 
 impl JobQueue {
@@ -157,6 +189,9 @@ impl JobQueue {
             signal: Condvar::new(),
             in_flight_summary: Mutex::new(None),
             judge_capacity,
+            summarizer_load_failed: AtomicBool::new(false),
+            judge_load_failed: AtomicBool::new(false),
+            worker_stopped: AtomicBool::new(false),
         }
     }
 
@@ -165,10 +200,25 @@ impl JobQueue {
     /// poisoned lock and a full queue are different problems and naming one as
     /// the other sends whoever reads the audit log to the wrong place.
     fn push_judge(&self, job: JudgeJob) -> Result<(), &'static str> {
+        if self.judge_load_failed.load(Ordering::Acquire) {
+            return Err("local model failed to load");
+        }
+        if self.worker_stopped.load(Ordering::Acquire) {
+            return Err("local model worker stopped");
+        }
         let Ok(mut inner) = self.inner.lock() else {
             tracing::error!("inference queue mutex is poisoned; judging is unavailable");
             return Err("local model queue is unavailable");
         };
+        if self.judge_load_failed.load(Ordering::Acquire) {
+            return Err("local model failed to load");
+        }
+        if self.worker_stopped.load(Ordering::Acquire) {
+            return Err("local model worker stopped");
+        }
+        inner
+            .judge
+            .retain(|queued| !queued.cancelled.load(Ordering::Acquire));
         if inner.judge.len() >= self.judge_capacity {
             return Err("judge queue is full");
         }
@@ -182,9 +232,19 @@ impl JobQueue {
     /// Queues a summarize job, replacing any not-yet-started job for the same
     /// session when this one describes a newer screen.
     fn push_summarize(&self, job: SummarizeJob) -> bool {
+        if self.summarizer_load_failed.load(Ordering::Acquire)
+            || self.worker_stopped.load(Ordering::Acquire)
+        {
+            return false;
+        }
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
+        if self.summarizer_load_failed.load(Ordering::Acquire)
+            || self.worker_stopped.load(Ordering::Acquire)
+        {
+            return false;
+        }
         let pushed = match inner.summarize.get(&job.session_id) {
             Some(existing) if existing.output_seq >= job.output_seq => false,
             _ => {
@@ -199,6 +259,46 @@ impl JobQueue {
         pushed
     }
 
+    fn mark_judge_load_failed(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.judge_load_failed.store(true, Ordering::Release);
+        let drained: Vec<JudgeJob> = inner.judge.drain(..).collect();
+        drop(inner);
+        for queued in drained {
+            if !queued.cancelled.load(Ordering::Acquire) {
+                reply_to(
+                    &queued,
+                    JudgeVerdict::fallback("local model failed to load"),
+                );
+            }
+        }
+    }
+
+    fn mark_summarizer_load_failed(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.summarizer_load_failed.store(true, Ordering::Release);
+        inner.summarize.clear();
+    }
+
+    fn mark_worker_stopped(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.worker_stopped.store(true, Ordering::Release);
+        inner.summarize.clear();
+        let drained: Vec<JudgeJob> = inner.judge.drain(..).collect();
+        drop(inner);
+        self.signal.notify_all();
+        let reason = if self.judge_load_failed.load(Ordering::Acquire) {
+            "local model failed to load"
+        } else {
+            "local model worker stopped"
+        };
+        for queued in drained {
+            if !queued.cancelled.load(Ordering::Acquire) {
+                reply_to(&queued, JudgeVerdict::fallback(reason));
+            }
+        }
+    }
+
     /// Blocks until a job is available, judge jobs first. Returns `None` once
     /// every [`Summarizer`] handle has been dropped and nothing is left to do,
     /// which is what retires the worker thread.
@@ -211,8 +311,10 @@ impl JobQueue {
             return None;
         };
         loop {
-            if let Some(job) = inner.judge.pop_front() {
-                return Some(Job::Judge(job));
+            while let Some(job) = inner.judge.pop_front() {
+                if !job.cancelled.load(Ordering::Acquire) {
+                    return Some(Job::Judge(job));
+                }
             }
             // Not `remove(..).map(Job::Summarize)`: that would route an
             // impossible `None` into this function's "retire the worker
@@ -224,7 +326,11 @@ impl JobQueue {
                 return Some(Job::Summarize(job));
             }
             // Only this thread's own Arc remains, so no handle can enqueue again.
-            if Arc::strong_count(self) == 1 {
+            if Arc::strong_count(self) == 1
+                || self.worker_stopped.load(Ordering::Acquire)
+                || (self.summarizer_load_failed.load(Ordering::Acquire)
+                    && self.judge_load_failed.load(Ordering::Acquire))
+            {
                 return None;
             }
             inner = self.signal.wait_timeout(inner, IDLE_POLL).ok()?.0;
@@ -256,7 +362,20 @@ impl JobQueue {
     /// between them would otherwise wait out a whole detail summary, which is
     /// long enough to burn the caller's timeout.
     fn has_pending_judge(&self) -> bool {
-        self.inner.lock().is_ok_and(|inner| !inner.judge.is_empty())
+        self.inner.lock().is_ok_and(|inner| {
+            inner
+                .judge
+                .iter()
+                .any(|job| !job.cancelled.load(Ordering::Acquire))
+        })
+    }
+
+    fn prune_cancelled_judges(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .judge
+                .retain(|queued| !queued.cancelled.load(Ordering::Acquire));
+        }
     }
 
     fn cancel_in_flight_summary(&self) {
@@ -283,111 +402,294 @@ impl Drop for InFlightGuard<'_> {
 }
 
 /// Handle to the inference worker. Cheap to clone (an `Arc` bump).
-/// A disabled handle accepts nothing, which is the state when summarization is
-/// turned off or the model fails to load.
+/// A disabled handle accepts nothing, which is the state when both
+/// summarization and Layer 3 judging are turned off.
 #[derive(Clone)]
 pub struct Summarizer {
     queue: Option<Arc<JobQueue>>,
+    summarizer_enabled: bool,
+    judge_enabled: bool,
 }
 
 impl Summarizer {
-    /// Spawns the worker thread. The engine is loaded lazily on the first job.
-    /// `on_result` is invoked on the worker thread for each produced snippet.
+    /// Spawns the worker thread for session summarization only. Kept as a
+    /// convenience wrapper around [`Self::spawn_worker`].
     pub fn spawn(
         config: SummarizerConfig,
         on_result: impl Fn(SnippetResult) + Send + 'static,
     ) -> Self {
+        let depth = config.judge_queue_depth;
+        Self::spawn_worker(
+            InferenceWorkerConfig {
+                summarizer: Some(config),
+                judge: None,
+                judge_queue_depth: depth,
+            },
+            on_result,
+        )
+    }
+
+    /// Spawns the shared inference worker thread when either summarization or
+    /// Layer 3 `d1` judging is configured. Both engines load lazily on the first
+    /// job of their respective kind.
+    pub fn spawn_worker(
+        config: InferenceWorkerConfig,
+        on_result: impl Fn(SnippetResult) + Send + 'static,
+    ) -> Self {
+        let summarizer_enabled = config.summarizer.is_some();
+        let judge_enabled = config.judge.is_some();
+        if !summarizer_enabled && !judge_enabled {
+            return Self::disabled();
+        }
         let queue = Arc::new(JobQueue::new(config.judge_queue_depth.max(1)));
         let worker_queue = Arc::clone(&queue);
         let builder = std::thread::Builder::new().name("triage-summarizer".to_string());
         if let Err(error) = builder.spawn(move || run_worker(config, worker_queue, on_result)) {
-            tracing::error!(%error, "failed to spawn summarizer thread; snippets disabled");
+            tracing::error!(%error, "failed to spawn inference worker thread");
             return Self::disabled();
         }
-        Self { queue: Some(queue) }
+        Self {
+            queue: Some(queue),
+            summarizer_enabled,
+            judge_enabled,
+        }
     }
 
-    /// A no-op summarizer that never produces snippets and never judges.
+    /// A no-op worker handle that never produces snippets and never judges.
     pub fn disabled() -> Self {
-        Self { queue: None }
+        Self {
+            queue: None,
+            summarizer_enabled: false,
+            judge_enabled: false,
+        }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.queue.is_some()
+        self.is_summarizer_enabled() || self.is_judge_enabled()
     }
 
-    /// Enqueues a job without blocking. Returns `false` if the summarizer is
-    /// disabled (the upstream debounce loop will re-enqueue on the next settle,
+    pub fn is_summarizer_enabled(&self) -> bool {
+        self.summarizer_enabled
+            && self.queue.as_ref().is_some_and(|q| {
+                !q.worker_stopped.load(Ordering::Acquire)
+                    && !q.summarizer_load_failed.load(Ordering::Acquire)
+            })
+    }
+
+    pub fn is_judge_enabled(&self) -> bool {
+        self.judge_enabled
+            && self.queue.as_ref().is_some_and(|q| {
+                !q.worker_stopped.load(Ordering::Acquire)
+                    && !q.judge_load_failed.load(Ordering::Acquire)
+            })
+    }
+
+    /// Enqueues a job without blocking. Returns `false` if session summarization
+    /// is disabled (the upstream debounce loop will re-enqueue on the next settle,
     /// so dropping here is acceptable).
     pub fn try_enqueue(&self, job: SummarizeJob) -> bool {
+        if !self.summarizer_enabled {
+            return false;
+        }
         match &self.queue {
             Some(queue) => queue.push_summarize(job),
             None => false,
         }
     }
 
-    /// Asks the model to judge one tool call, blocking up to `timeout`.
+    /// Asks the `d1` decision model to judge one tool call, blocking up to `timeout`.
     ///
-    /// Never fails: a disabled summarizer, a full judge queue, an unloaded
+    /// Never fails: a disabled judge worker, a full judge queue, an unloaded
     /// model, or an expired timeout all return a fallback `ask`. The caller is
     /// an agent's blocked tool-call loop, so a bounded wait matters more than a
     /// precise answer.
     pub fn judge(&self, request: JudgeRequest, timeout: Duration) -> JudgeVerdict {
+        self.judge_with_confidence(request, None, timeout)
+    }
+
+    /// Variant of [`Self::judge`] carrying an explicit confidence threshold
+    /// percentage (`1..=100`) from the live [`triage_core::config::JudgeConfig`].
+    pub fn judge_with_confidence(
+        &self,
+        request: JudgeRequest,
+        min_allow_confidence_pct: Option<u8>,
+        timeout: Duration,
+    ) -> JudgeVerdict {
+        if !self.judge_enabled {
+            return JudgeVerdict::fallback("local model is disabled");
+        }
         let Some(queue) = &self.queue else {
             return JudgeVerdict::fallback("local model is disabled");
         };
+        let d1_request = match crate::judge::build_bounded_d1_request(&request) {
+            Ok(req) => req,
+            Err(reason) => return JudgeVerdict::fallback(reason),
+        };
         let (reply, verdicts) = sync_channel(1);
-        if let Err(reason) = queue.push_judge(JudgeJob { request, reply }) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if let Err(reason) = queue.push_judge(JudgeJob {
+            request,
+            d1_request: Some(d1_request),
+            min_allow_confidence_pct,
+            cancelled: Arc::clone(&cancelled),
+            reply,
+        }) {
             return JudgeVerdict::fallback(reason);
         }
-        verdicts
-            .recv_timeout(timeout)
-            .unwrap_or_else(|_| JudgeVerdict::fallback("local model did not answer in time"))
+        match verdicts.recv_timeout(timeout) {
+            Ok(verdict) => verdict,
+            Err(RecvTimeoutError::Disconnected) => {
+                cancelled.store(true, Ordering::Release);
+                let reason = if queue.judge_load_failed.load(Ordering::Acquire) {
+                    "local model failed to load"
+                } else {
+                    queue.mark_worker_stopped();
+                    "local model worker stopped"
+                };
+                JudgeVerdict::fallback(reason)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                cancelled.store(true, Ordering::Release);
+                queue.prune_cancelled_judges();
+                JudgeVerdict::fallback("local model did not answer in time")
+            }
+        }
     }
 }
 
-fn run_worker(config: SummarizerConfig, queue: Arc<JobQueue>, on_result: impl Fn(SnippetResult)) {
-    let mut engine: Option<cera::CeraEngine> = None;
-    let mut load_failed = false;
+/// Latches `worker_stopped` and drains pending work if `run_worker` exits for
+/// any reason (handle retirement, mutex poisoning, or panic unwind).
+struct WorkerExitGuard<'a> {
+    queue: &'a JobQueue,
+}
+
+impl Drop for WorkerExitGuard<'_> {
+    fn drop(&mut self) {
+        self.queue.mark_worker_stopped();
+    }
+}
+
+fn run_worker(
+    config: InferenceWorkerConfig,
+    queue: Arc<JobQueue>,
+    on_result: impl Fn(SnippetResult),
+) {
+    // Declare engine slots before `_exit_guard` so Rust's LIFO drop order
+    // latches `worker_stopped` and drains waiting callers before running
+    // potentially slow Metal/GPU/mmap engine destructors on exit or unwind.
+    let mut summarizer_engine: Option<cera::CeraEngine> = None;
+    let mut judge_engine: Option<cera::d1::D1Engine> = None;
+    let _exit_guard = WorkerExitGuard { queue: &queue };
 
     while let Some(job) = queue.next_job() {
-        if !load_failed && engine.is_none() {
-            match load_engine(&config) {
-                Ok(loaded) => {
-                    tracing::info!(
-                        bundle_id = %config.bundle_id,
-                        quant = %config.quant,
-                        "loaded session summarizer model"
-                    );
-                    engine = Some(loaded);
-                }
-                Err(error) => {
-                    tracing::error!(%error, "failed to load summarizer model; snippets disabled");
-                    load_failed = true;
-                }
-            }
-        }
-        // One place that answers when there is no model, rather than one per
-        // way of getting here. A judge job left unanswered blocks its caller
-        // until that caller's own timeout, for an answer that will never come.
-        let Some(engine) = engine.as_ref() else {
-            if let Job::Judge(job) = job {
-                reply_to(&job, JudgeVerdict::fallback("local model failed to load"));
-            }
-            continue;
-        };
-
         match job {
-            Job::Judge(job) => run_judge_job(engine, &job),
-            Job::Summarize(job) => run_summarize_job(engine, &config, &queue, job, &on_result),
+            Job::Judge(job) => {
+                if job.cancelled.load(Ordering::Acquire) {
+                    continue;
+                }
+                let Some(ref judge_cfg) = config.judge else {
+                    reply_to(&job, JudgeVerdict::fallback("local model is disabled"));
+                    continue;
+                };
+                if !queue.judge_load_failed.load(Ordering::Acquire) && judge_engine.is_none() {
+                    let safe_model = crate::judge::redact_model_spec_for_log(&judge_cfg.model);
+                    match load_judge_engine(judge_cfg) {
+                        Ok(loaded) => {
+                            tracing::info!(
+                                model = %safe_model,
+                                quant = %judge_cfg.quant,
+                                kind = %loaded.kind(),
+                                backend = %loaded.report(),
+                                "loaded d1 approval judge model"
+                            );
+                            judge_engine = Some(loaded);
+                        }
+                        Err(error) => {
+                            let safe_error =
+                                crate::judge::redact_urls_in_text(&format!("{error:#}"));
+                            tracing::error!(
+                                error = %safe_error,
+                                model = %safe_model,
+                                quant = %judge_cfg.quant,
+                                "failed to load d1 approval judge model; Layer 3 judging disabled"
+                            );
+                            queue.mark_judge_load_failed();
+                        }
+                    }
+                }
+                if job.cancelled.load(Ordering::Acquire) {
+                    tracing::debug!("skipping timed-out judge job after model load");
+                } else if let Some(engine) = judge_engine.as_ref() {
+                    let min_pct = job
+                        .min_allow_confidence_pct
+                        .unwrap_or(judge_cfg.min_allow_confidence_pct);
+                    run_judge_job(engine, min_pct, &job);
+                } else {
+                    reply_to(&job, JudgeVerdict::fallback("local model failed to load"));
+                }
+                let summarizer_dead = config.summarizer.is_none()
+                    || queue.summarizer_load_failed.load(Ordering::Acquire);
+                let judge_dead =
+                    config.judge.is_none() || queue.judge_load_failed.load(Ordering::Acquire);
+                if summarizer_dead && judge_dead {
+                    break;
+                }
+            }
+            Job::Summarize(job) => {
+                let Some(ref sum_cfg) = config.summarizer else {
+                    continue;
+                };
+                if !queue.summarizer_load_failed.load(Ordering::Acquire)
+                    && summarizer_engine.is_none()
+                {
+                    let safe_bundle = crate::judge::redact_model_spec_for_log(&sum_cfg.bundle_id);
+                    match load_summarizer_engine(sum_cfg) {
+                        Ok(loaded) => {
+                            tracing::info!(
+                                bundle_id = %safe_bundle,
+                                quant = %sum_cfg.quant,
+                                "loaded session summarizer model"
+                            );
+                            summarizer_engine = Some(loaded);
+                        }
+                        Err(error) => {
+                            let safe_error =
+                                crate::judge::redact_urls_in_text(&format!("{error:#}"));
+                            tracing::error!(
+                                error = %safe_error,
+                                bundle_id = %safe_bundle,
+                                "failed to load summarizer model; snippets disabled"
+                            );
+                            queue.mark_summarizer_load_failed();
+                        }
+                    }
+                }
+                if let Some(engine) = summarizer_engine.as_ref() {
+                    run_summarize_job(engine, sum_cfg, &queue, job, &on_result);
+                }
+                let summarizer_dead = config.summarizer.is_none()
+                    || queue.summarizer_load_failed.load(Ordering::Acquire);
+                let judge_dead =
+                    config.judge.is_none() || queue.judge_load_failed.load(Ordering::Acquire);
+                if summarizer_dead && judge_dead {
+                    break;
+                }
+            }
         }
     }
 }
 
-/// Judges one tool call and replies. Any inference failure becomes a fallback
-/// `ask` rather than propagating, so the caller always gets an answer.
-fn run_judge_job(engine: &cera::CeraEngine, job: &JudgeJob) {
-    let verdict = match crate::judge::judge_with_model(engine, &job.request) {
+/// Judges one tool call via the `d1` decision model and replies. Any inference
+/// failure becomes a fallback `ask` rather than propagating, so the caller
+/// always gets an answer.
+fn run_judge_job(engine: &cera::d1::D1Engine, min_allow_confidence_pct: u8, job: &JudgeJob) {
+    let result = match &job.d1_request {
+        Some(d1_req) => {
+            crate::judge::judge_with_d1_request(engine, d1_req, min_allow_confidence_pct)
+        }
+        None => crate::judge::judge_with_d1(engine, &job.request, min_allow_confidence_pct),
+    };
+    let verdict = match result {
         Ok(verdict) => verdict,
         Err(error) => {
             tracing::warn!(%error, "judge inference failed; answering ask");
@@ -487,7 +789,9 @@ fn run_summarize_job(
     }
 }
 
-fn load_engine(config: &SummarizerConfig) -> Result<cera::CeraEngine, cera::session::CeraError> {
+fn load_summarizer_engine(
+    config: &SummarizerConfig,
+) -> Result<cera::CeraEngine, cera::session::CeraError> {
     let repo = cera::bundle::BundleRepo::new(&config.cache_dir);
     let engine_config = cera::EngineConfig {
         context_size: config.context_size as usize,
@@ -497,6 +801,12 @@ fn load_engine(config: &SummarizerConfig) -> Result<cera::CeraEngine, cera::sess
         gpu_depthformer: false,
     };
     cera::CeraEngine::from_bundle_id(&config.bundle_id, &config.quant, engine_config)
+}
+
+fn load_judge_engine(config: &JudgeModelConfig) -> anyhow::Result<cera::d1::D1Engine> {
+    let path =
+        crate::judge::resolve_d1_model_path(&config.model, &config.quant, &config.cache_dir)?;
+    cera::d1::D1Engine::open(&path, None, cera::BackendPreference::Auto)
 }
 
 /// Runs one inference and returns a sanitized one-line snippet, or `None` if the
@@ -615,9 +925,8 @@ fn generate_detail(
 /// deterministic greedy decoding (temperature 0) so output is stable across
 /// regenerations.
 ///
-/// The judge's decision decode deliberately does not use this and stays greedy
-/// whatever the manifest says; `judge_with_model` explains why, and
-/// `devlog/000126-feat-approval-judge.md` has the measurement behind it.
+/// The approval judge does not use this: Layer 3 runs a `d1` decision model via
+/// [`crate::judge::judge_with_d1`] with zero generated tokens.
 ///
 /// Both the `GenerationDefaults` match and the `Text` destructure are
 /// exhaustive (no wildcard arm, no `..`) on purpose: if cera grows another
@@ -689,21 +998,17 @@ fn sampling_opts_from_defaults(
     opts
 }
 
-/// A [`ModalitySink`] that accumulates all decoded text. Shared by the detail
-/// summary here and by the judge's decision decode, which want the same thing:
-/// every token, concatenated. The one-line label needs different behaviour and
-/// keeps its own sink.
-pub(crate) struct TextSink<'a> {
+/// A [`ModalitySink`] that accumulates all decoded text for the detail summary
+/// pass. The one-line label needs different behaviour and keeps its own sink.
+struct TextSink<'a> {
     tokenizer: &'a BpeTokenizer,
-    pub(crate) text: String,
-    /// How decode ended. The detail pass marks a summary that ran out of room;
-    /// the judge ignores it, since a grammar-constrained verdict is either
-    /// parseable or rejected outright.
+    text: String,
+    /// How decode ended. The detail pass marks a summary that ran out of room.
     finish: Option<FinishReason>,
 }
 
 impl<'a> TextSink<'a> {
-    pub(crate) fn new(tokenizer: &'a BpeTokenizer) -> Self {
+    fn new(tokenizer: &'a BpeTokenizer) -> Self {
         Self {
             tokenizer,
             text: String::new(),
@@ -1039,6 +1344,9 @@ mod tests {
             queue
                 .push_judge(JudgeJob {
                     request: judge_request(command),
+                    d1_request: None,
+                    min_allow_confidence_pct: None,
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     reply,
                 })
                 .is_ok()
@@ -1104,10 +1412,66 @@ mod tests {
         assert_eq!(
             queue.push_judge(JudgeJob {
                 request: judge_request("three"),
+                d1_request: None,
+                min_allow_confidence_pct: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
                 reply,
             }),
             Err("judge queue is full")
         );
+    }
+
+    #[test]
+    fn cancelled_judge_jobs_are_pruned_and_skipped_by_next_job() {
+        let queue = Arc::new(JobQueue::new(2));
+        let cancel_first = Arc::new(AtomicBool::new(false));
+        let (reply1, _rx1) = sync_channel(1);
+        queue
+            .push_judge(JudgeJob {
+                request: judge_request("expired-one"),
+                d1_request: None,
+                min_allow_confidence_pct: None,
+                cancelled: Arc::clone(&cancel_first),
+                reply: reply1,
+            })
+            .expect("queue first");
+
+        let cancel_second = Arc::new(AtomicBool::new(false));
+        let (reply2, _rx2) = sync_channel(1);
+        queue
+            .push_judge(JudgeJob {
+                request: judge_request("expired-two"),
+                d1_request: None,
+                min_allow_confidence_pct: None,
+                cancelled: Arc::clone(&cancel_second),
+                reply: reply2,
+            })
+            .expect("queue second");
+
+        // Mark the first job expired; `has_pending_judge` stays true while the
+        // second is still live, and `push_judge` reclaims the cancelled slot.
+        cancel_first.store(true, Ordering::Release);
+        assert!(queue.has_pending_judge());
+
+        let (reply3, _rx3) = sync_channel(1);
+        queue
+            .push_judge(JudgeJob {
+                request: judge_request("live-three"),
+                d1_request: None,
+                min_allow_confidence_pct: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                reply: reply3,
+            })
+            .expect("cancelled slot must be reclaimed instead of rejecting as full");
+
+        // Cancel the second job before dequeue; `next_job` skips it and yields `live-three`.
+        cancel_second.store(true, Ordering::Release);
+        let Some(Job::Judge(dequeued)) = queue.next_job() else {
+            panic!("expected live judge job");
+        };
+        assert_eq!(dequeued.request.command_line.as_deref(), Some("live-three"));
+        assert!(!queue.has_pending_judge());
+        assert!(queue.next_job().is_none());
     }
 
     #[test]
@@ -1167,6 +1531,289 @@ mod tests {
         let verdict = summarizer.judge(judge_request("rm -rf /"), Duration::from_secs(5));
         assert_eq!(verdict.decision, triage_core::judge::JudgeDecision::Ask);
         assert_eq!(verdict.source, triage_core::judge::JudgeSource::Fallback);
+    }
+
+    #[test]
+    fn decoupled_worker_handles_judge_only_and_summarizer_only_modes() {
+        // Both slots disabled -> no thread spawned.
+        let both_off = Summarizer::spawn_worker(
+            InferenceWorkerConfig {
+                summarizer: None,
+                judge: None,
+                judge_queue_depth: 4,
+            },
+            |_| {},
+        );
+        assert!(!both_off.is_enabled());
+        assert!(!both_off.try_enqueue(summarize_job("s", 1)));
+
+        // Judge-only mode (`[summarizer] enabled = false`, `[judge] enabled = true`):
+        // summarize jobs are dropped immediately without loading a summarizer model,
+        // while judge jobs reach the worker (and fall back cleanly when given an
+        // invalid local GGUF path).
+        let judge_only = Summarizer::spawn_worker(
+            InferenceWorkerConfig {
+                summarizer: None,
+                judge: Some(JudgeModelConfig {
+                    model: "/nonexistent/local/d1-model.gguf".to_string(),
+                    quant: "Q4_K_M".to_string(),
+                    min_allow_confidence_pct: 65,
+                    cache_dir: std::env::temp_dir(),
+                }),
+                judge_queue_depth: 4,
+            },
+            |_| {},
+        );
+        assert!(judge_only.is_enabled());
+        assert!(!judge_only.is_summarizer_enabled());
+        assert!(judge_only.is_judge_enabled());
+        assert!(!judge_only.try_enqueue(summarize_job("s", 1)));
+
+        let verdict = judge_only.judge(judge_request("pytest"), Duration::from_secs(2));
+        assert_eq!(verdict.decision, triage_core::judge::JudgeDecision::Ask);
+        assert_eq!(verdict.source, triage_core::judge::JudgeSource::Fallback);
+        assert_eq!(verdict.reason, "local model failed to load");
+        assert!(!judge_only.is_judge_enabled());
+        assert!(!judge_only.is_enabled());
+        let second_verdict = judge_only.judge(judge_request("pytest"), Duration::from_secs(2));
+        assert_eq!(second_verdict.reason, "local model failed to load");
+        drop(judge_only);
+
+        // Summarizer-only mode (`[judge] enabled = false`): `judge()` returns
+        // fallback immediately without queueing or touching any model.
+        let summarizer_only = Summarizer::spawn(
+            SummarizerConfig {
+                bundle_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+                quant: "Q4_0".to_string(),
+                context_size: 1024,
+                max_tokens: 24,
+                detail_max_tokens: 96,
+                cache_dir: std::env::temp_dir(),
+                judge_queue_depth: 4,
+            },
+            |_| {},
+        );
+        assert!(summarizer_only.is_summarizer_enabled());
+        assert!(!summarizer_only.is_judge_enabled());
+        let off_verdict = summarizer_only.judge(judge_request("pytest"), Duration::from_secs(1));
+        assert_eq!(off_verdict.decision, triage_core::judge::JudgeDecision::Ask);
+        assert_eq!(off_verdict.reason, "local model is disabled");
+        drop(summarizer_only);
+    }
+
+    #[test]
+    fn model_load_failure_latches_stop_doomed_enqueues_and_preserve_live_summaries() {
+        let queue = Arc::new(JobQueue::new(4));
+        let summarizer = Summarizer {
+            queue: Some(Arc::clone(&queue)),
+            summarizer_enabled: true,
+            judge_enabled: true,
+        };
+        assert!(summarizer.is_enabled());
+        assert!(summarizer.is_summarizer_enabled());
+        assert!(summarizer.is_judge_enabled());
+
+        // Queue a pending judge job and register an active summary cancel flag.
+        let pending_rx = push_judge(&queue, "queued-before-load-failure");
+        let summary_cancel = Arc::new(AtomicBool::new(false));
+        let _summary_guard = queue.register_summary(Arc::clone(&summary_cancel));
+        summary_cancel.store(false, Ordering::Release);
+
+        // Latch judge load failure: queued judge jobs drain immediately with
+        // `"local model failed to load"`, `is_judge_enabled()` flips false while
+        // `is_summarizer_enabled()` stays true, and subsequent `judge()` calls
+        // reject fast without cancelling the running summary.
+        queue.mark_judge_load_failed();
+        let drained_verdict = pending_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("queued judge job must receive immediate fallback on load failure");
+        assert_eq!(drained_verdict.reason, "local model failed to load");
+        assert!(!summarizer.is_judge_enabled());
+        assert!(summarizer.is_summarizer_enabled());
+        assert!(summarizer.is_enabled());
+
+        let later_verdict = summarizer.judge(judge_request("cargo test"), Duration::from_secs(5));
+        assert_eq!(later_verdict.reason, "local model failed to load");
+        assert!(
+            !summary_cancel.load(Ordering::Acquire),
+            "a permanently failed judge model must not cancel live session summaries"
+        );
+        assert!(summarizer.try_enqueue(summarize_job("live-session", 1)));
+
+        // Latch summarizer load failure: queued summaries clear and future
+        // `try_enqueue` calls reject immediately.
+        queue.mark_summarizer_load_failed();
+        assert!(!summarizer.is_summarizer_enabled());
+        assert!(!summarizer.is_enabled());
+        assert!(!summarizer.try_enqueue(summarize_job("live-session", 2)));
+        drop(_summary_guard);
+        drop(summarizer);
+        assert!(queue.next_job().is_none());
+    }
+
+    #[test]
+    fn worker_exit_guard_and_disconnected_reply_report_worker_stopped_without_stalling() {
+        let queue = Arc::new(JobQueue::new(4));
+        let summarizer = Summarizer {
+            queue: Some(Arc::clone(&queue)),
+            summarizer_enabled: true,
+            judge_enabled: true,
+        };
+
+        // Simulate one in-flight dequeued job (whose reply sender drops on panic)
+        // plus one still-queued job when `WorkerExitGuard` unwinds.
+        let in_flight_rx = push_judge(&queue, "in-flight");
+        let queued_rx = push_judge(&queue, "queued");
+        assert!(summarizer.try_enqueue(summarize_job("s1", 1)));
+
+        let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = WorkerExitGuard { queue: &queue };
+            let Some(Job::Judge(_in_flight)) = queue.next_job() else {
+                panic!("expected dequeued judge job");
+            };
+            panic!("simulated worker panic");
+        }));
+        assert!(panic_res.is_err());
+        assert!(matches!(
+            in_flight_rx.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+
+        let queued_verdict = queued_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("WorkerExitGuard must reply to queued judge jobs on unwind");
+        assert_eq!(queued_verdict.reason, "local model worker stopped");
+        assert!(!summarizer.is_enabled());
+        assert!(!summarizer.is_judge_enabled());
+        assert!(!summarizer.is_summarizer_enabled());
+        assert!(!summarizer.try_enqueue(summarize_job("s1", 2)));
+
+        let post_stop = summarizer.judge(judge_request("git status"), Duration::from_secs(5));
+        assert_eq!(post_stop.reason, "local model worker stopped");
+
+        // Also verify `judge_with_confidence` maps `RecvTimeoutError::Disconnected`
+        // (when a worker panics after popping the job) to `"local model worker stopped"`
+        // AND latches `worker_stopped` immediately before the worker finishes unwinding.
+        let live_queue = Arc::new(JobQueue::new(4));
+        let live_handle = Summarizer {
+            queue: Some(Arc::clone(&live_queue)),
+            summarizer_enabled: false,
+            judge_enabled: true,
+        };
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let consumer_queue = Arc::clone(&live_queue);
+        let worker = std::thread::spawn(move || {
+            let _guard = WorkerExitGuard {
+                queue: &consumer_queue,
+            };
+            if let Some(Job::Judge(job)) = consumer_queue.next_job() {
+                drop(job);
+            }
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let disconnected_verdict =
+            live_handle.judge(judge_request("cargo check"), Duration::from_secs(5));
+        assert_eq!(disconnected_verdict.reason, "local model worker stopped");
+        assert!(
+            !live_handle.is_judge_enabled(),
+            "Disconnected must latch worker_stopped before slow engine destructors finish"
+        );
+        let _ = release_tx.send(());
+        worker.join().expect("join simulated worker");
+
+        // Verify LIFO drop order when engine slots are declared before `_exit_guard`:
+        // `worker_stopped` is already true by the time an earlier-declared engine
+        // destructor runs.
+        struct EngineDropObserver<'a>(&'a JobQueue);
+        impl Drop for EngineDropObserver<'_> {
+            fn drop(&mut self) {
+                assert!(
+                    self.0.worker_stopped.load(Ordering::Acquire),
+                    "WorkerExitGuard must drop before earlier-declared engine slots"
+                );
+            }
+        }
+        let lifo_queue = Arc::new(JobQueue::new(4));
+        {
+            let _simulated_engine = EngineDropObserver(&lifo_queue);
+            let _exit_guard = WorkerExitGuard { queue: &lifo_queue };
+        }
+        assert!(lifo_queue.worker_stopped.load(Ordering::Acquire));
+
+        // Verify `run_worker` retires cleanly via `Arc::strong_count(self) == 1`
+        // once all external `Summarizer` handles drop (`WorkerExitGuard` must borrow
+        // `&JobQueue` rather than owning a second `Arc<JobQueue>`).
+        let retire_queue = Arc::new(JobQueue::new(4));
+        let weak_retire_queue = Arc::downgrade(&retire_queue);
+        let retire_handle = Summarizer {
+            queue: Some(Arc::clone(&retire_queue)),
+            summarizer_enabled: true,
+            judge_enabled: false,
+        };
+        let (retired_tx, retired_rx) = std::sync::mpsc::sync_channel(1);
+        let retire_worker = std::thread::spawn(move || {
+            run_worker(
+                InferenceWorkerConfig {
+                    summarizer: None,
+                    judge: None,
+                    judge_queue_depth: 4,
+                },
+                retire_queue,
+                |_| {},
+            );
+            let _ = retired_tx.send(());
+        });
+        drop(retire_handle);
+        if let Some(q) = weak_retire_queue.upgrade() {
+            q.signal.notify_all();
+        }
+        retired_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("run_worker must retire when external Summarizer handles drop");
+        retire_worker.join().expect("join retired worker");
+        assert!(weak_retire_queue.upgrade().is_none());
+    }
+
+    #[test]
+    fn over_budget_judge_requests_refuse_before_queueing_or_preempting_summaries() {
+        let queue = Arc::new(JobQueue::new(1));
+        let summarizer = Summarizer {
+            queue: Some(Arc::clone(&queue)),
+            summarizer_enabled: true,
+            judge_enabled: true,
+        };
+        let summary_cancel = Arc::new(AtomicBool::new(false));
+        let _summary_guard = queue.register_summary(Arc::clone(&summary_cancel));
+
+        // 2,000 ASCII control chars stay under `MAX_COMMAND_CHARS` (8,192) so
+        // Layer 0 deterministic length checks pass, yet expand 6x to >12,000 JSON
+        // bytes (>8,448 `MAX_D1_STATE_JSON_BYTES`).
+        let over_json_budget = judge_request(&"\x01".repeat(2_000));
+        let verdict = summarizer.judge(over_json_budget, Duration::from_secs(5));
+        assert_eq!(verdict.decision, triage_core::judge::JudgeDecision::Ask);
+        assert_eq!(verdict.source, triage_core::judge::JudgeSource::Fallback);
+        assert_eq!(verdict.reason, "command is too long to judge");
+        assert!(
+            !summary_cancel.load(Ordering::Acquire),
+            "over-budget judge request must not cancel a running summary"
+        );
+        assert!(
+            !queue.has_pending_judge(),
+            "over-budget judge request must not enqueue onto JobQueue"
+        );
+
+        // Even when the single queue slot is full or `judge_load_failed` is
+        // latched, an over-budget `command + cwd` still reports the deterministic
+        // budget refusal rather than `"judge queue is full"` or `"local model failed to load"`.
+        let _occupied = push_judge(&queue, "ls");
+        let mut over_combined_chars = judge_request(&"a".repeat(8_150));
+        over_combined_chars.cwd = Some("/".to_string() + &"w".repeat(60));
+        let full_verdict = summarizer.judge(over_combined_chars.clone(), Duration::from_secs(5));
+        assert_eq!(full_verdict.reason, "command is too long to judge");
+
+        queue.mark_judge_load_failed();
+        let failed_verdict = summarizer.judge(over_combined_chars, Duration::from_secs(5));
+        assert_eq!(failed_verdict.reason, "command is too long to judge");
     }
 
     #[test]
@@ -1440,8 +2087,8 @@ mod tests {
         use triage_core::session::SessionId;
 
         let config = SummarizerConfig {
-            bundle_id: "LFM2-2.6B-GGUF".to_string(),
-            quant: "Q4_K_M".to_string(),
+            bundle_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+            quant: "Q4_0".to_string(),
             context_size: 1024,
             max_tokens: 24,
             detail_max_tokens: 96,

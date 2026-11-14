@@ -426,6 +426,20 @@ pub struct JudgeConfig {
     /// Extra always-safe commands, matched as a leading token sequence (e.g.
     /// `"npm test"`). Additive to the built-in allowlist.
     pub allow_commands: Vec<String>,
+    /// Liquid `d1` decision model repository (`"LiquidAI/d1-2B-GGUF"`), direct
+    /// Hugging Face `.gguf` URL, or local `.gguf` file path used by Layer 3.
+    pub model: String,
+    /// Quantization tag when `model` names a Hugging Face repository without an
+    /// explicit `.gguf` artifact or inline `:quant` suffix (e.g. `"Q4_K_M"` or
+    /// `"Q8_0"`). May be empty when `enabled` is `false` or `model` already
+    /// carries a `.gguf` path/URL or `:quant` tag.
+    pub quant: String,
+    /// Minimum calibrated `allow` probability percentage (`1..=100`) required for
+    /// Layer 3 to auto-approve a command. Below this threshold (or whenever `ask`
+    /// wins), the judge returns `ask`.
+    pub min_allow_confidence_pct: u8,
+    /// Optional model cache directory override. `None` uses `~/.cache/triage/models`.
+    pub cache_dir: Option<String>,
 }
 
 impl JudgeConfig {
@@ -445,6 +459,23 @@ impl JudgeConfig {
             self.timeout_ms > 0,
             "judge.timeout_ms must be greater than zero"
         );
+        if !self.quant.trim().is_empty() {
+            validate_quant_tag("judge.quant", &self.quant)?;
+        }
+        if self.enabled {
+            ensure_non_empty("judge.model", &self.model)?;
+            let optional_quant = model_carries_explicit_gguf_or_quant(&self.model)?;
+            if self.quant.trim().is_empty() && !optional_quant {
+                validate_quant_tag("judge.quant", &self.quant)?;
+            }
+        }
+        ensure!(
+            (1..=100).contains(&self.min_allow_confidence_pct),
+            "judge.min_allow_confidence_pct must be between 1 and 100"
+        );
+        if let Some(ref dir) = self.cache_dir {
+            ensure_non_empty("judge.cache_dir", dir)?;
+        }
         Ok(())
     }
 }
@@ -457,6 +488,10 @@ impl Default for JudgeConfig {
             timeout_ms: 8_000,
             deny_substrings: Vec::new(),
             allow_commands: Vec::new(),
+            model: "LiquidAI/d1-2B-GGUF".to_string(),
+            quant: "Q4_K_M".to_string(),
+            min_allow_confidence_pct: 65,
+            cache_dir: None,
         }
     }
 }
@@ -503,7 +538,7 @@ impl Default for KeybindingsConfig {
 pub struct SummarizerConfig {
     /// Master switch. When false, no model is loaded and no snippets are produced.
     pub enabled: bool,
-    /// LeapBundles bundle id, e.g. `LFM2-2.6B-GGUF`.
+    /// LeapBundles bundle id, e.g. `LFM2.5-1.2B-Instruct-GGUF`.
     pub bundle_id: String,
     /// Quantization tag, e.g. `Q4_0`.
     pub quant: String,
@@ -552,20 +587,11 @@ impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // LFM2-2.6B rather than LFM2.5-1.2B, and specifically at Q4_K_M.
-            // The judge's model layer is only worth its place if the model can
-            // actually read the criteria it is given, and on a 20-command
-            // labeled set this is the smallest local model that does: 19/20 with
-            // no false allows, against 10/20 for the 1.2B, which answered `ask`
-            // to all twenty including `true`. It costs 0.20s per decision
-            // against 0.10s, and 1.46 GB resident against 664 MB.
-            //
-            // The quantization is part of the choice, not an afterthought: the
-            // same model at Q4_0 scores 15/20. Note this is LFM2, not LFM2.5;
-            // the LFM2.5 2.6B is a forced reasoning model whose template opens a
-            // `<think>` block, which a one-token grammar cannot work with.
-            bundle_id: "LFM2-2.6B-GGUF".to_string(),
-            quant: "Q4_K_M".to_string(),
+            // Tool-call judging runs on its own dedicated `d1` decision model
+            // (`JudgeConfig`), so session summarization uses the compact
+            // 1.2B instruct bundle (664 MB at Q4_0).
+            bundle_id: "LFM2.5-1.2B-Instruct-GGUF".to_string(),
+            quant: "Q4_0".to_string(),
             context_size: 1024,
             max_tokens: 24,
             detail_max_tokens: 180,
@@ -586,6 +612,106 @@ fn parse_socket_addr(field: &str, value: &str) -> Result<SocketAddr> {
 fn ensure_non_empty(field: &str, value: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{field} must not be empty");
     Ok(())
+}
+
+/// Validates a model quantization tag (such as `"Q4_K_M"` or `"Q8_0"`) before
+/// it is interpolated into a Hugging Face filename or cache key segment.
+pub fn validate_quant_tag(field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    ensure!(!trimmed.is_empty(), "{field} must not be empty");
+    ensure!(
+        !trimmed.starts_with('.') && !trimmed.ends_with('.') && !trimmed.contains(".."),
+        "{field} `{trimmed}` is not a valid quantization tag"
+    );
+    ensure!(
+        !trimmed.to_ascii_lowercase().ends_with(".gguf"),
+        "{field} `{trimmed}` must be a quantization tag (e.g. `Q4_K_M`), not a `.gguf` filename"
+    );
+    for ch in trimmed.chars() {
+        ensure!(
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'),
+            "{field} `{trimmed}` contains invalid character {ch:?}"
+        );
+    }
+    Ok(())
+}
+
+fn has_gguf_filename_suffix(s: &str) -> bool {
+    let name = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    let bytes = name.as_bytes();
+    bytes.len() > 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".gguf")
+}
+
+/// Returns `Ok(true)` when `judge.model` already identifies a concrete `.gguf`
+/// file/URL, explicit local filesystem path, or inline `:quant` tag (making a
+/// separate `judge.quant` optional), `Ok(false)` when `judge.quant` is still
+/// required, and `Err` when an inline `:quant` suffix is malformed.
+fn model_carries_explicit_gguf_or_quant(model: &str) -> Result<bool> {
+    let trimmed = model.trim();
+    let bytes = trimmed.as_bytes();
+    let is_http = (bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://"))
+        || (bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://"));
+    if is_http {
+        let Some((_, after_scheme)) = trimmed.split_once("://") else {
+            return Ok(false);
+        };
+        let Some((host, path)) = after_scheme.split_once('/') else {
+            return Ok(false);
+        };
+        if host.is_empty() {
+            return Ok(false);
+        }
+        let path_no_qs = path
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        return Ok(!path_no_qs.is_empty() && has_gguf_filename_suffix(path_no_qs));
+    }
+
+    let is_explicit_local = matches!(trimmed, "." | ".." | "~")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("~\\")
+        || trimmed.contains('\\')
+        || (bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2
+                || bytes[2] == b'/'
+                || bytes[2] == b'\\'
+                || has_gguf_filename_suffix(trimmed)));
+    if is_explicit_local || (has_gguf_filename_suffix(trimmed) && !trimmed.contains(':')) {
+        return Ok(true);
+    }
+
+    // Mirror `cera::bundle::hf::HfSpec::parse_repo_id` extraction (`owner/repo:quant@rev`
+    // or `owner/repo@rev:quant` or `repo:quant`).
+    let mut inline_quant: Option<&str> = None;
+    let mut base = trimmed;
+    if let Some((b, r)) = base.split_once('@') {
+        base = b;
+        if let Some((_rev_part, q)) = r.split_once(':') {
+            inline_quant = Some(q);
+        }
+    }
+    if inline_quant.is_none()
+        && let Some((b, q)) = base.split_once(':')
+    {
+        base = b;
+        inline_quant = Some(q.split_once('@').map_or(q, |(q_part, _)| q_part));
+    }
+    ensure!(
+        !base.trim().is_empty(),
+        "judge.model must include a repository name before `:quant` or `@revision`"
+    );
+    if let Some(q) = inline_quant {
+        validate_quant_tag("judge.model", q)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn ensure_non_empty_items(field: &str, values: &[String]) -> Result<()> {
@@ -650,6 +776,10 @@ default_enabled_per_session = true
 timeout_ms = 5000
 deny_substrings = ["terraform apply"]
 allow_commands = ["npm test"]
+model = "LiquidAI/d1-2B-GGUF"
+quant = "Q8_0"
+min_allow_confidence_pct = 75
+cache_dir = "~/.cache/triage/judge-models"
 
 [keybindings]
 overview = "ctrl+o"
@@ -683,9 +813,14 @@ pause_all = "ctrl+p"
         assert_eq!(config.mcp.tcp_bind, "127.0.0.1:7778");
         assert!(!config.grpc.enabled);
         assert_eq!(config.keybindings.next_attention, "g w");
+        assert!(config.judge.enabled);
+        assert_eq!(config.judge.model, "LiquidAI/d1-2B-GGUF");
+        assert_eq!(config.judge.quant, "Q4_K_M");
+        assert_eq!(config.judge.min_allow_confidence_pct, 65);
+        assert_eq!(config.judge.cache_dir, None);
         assert!(config.summarizer.enabled);
-        assert_eq!(config.summarizer.bundle_id, "LFM2-2.6B-GGUF");
-        assert_eq!(config.summarizer.quant, "Q4_K_M");
+        assert_eq!(config.summarizer.bundle_id, "LFM2.5-1.2B-Instruct-GGUF");
+        assert_eq!(config.summarizer.quant, "Q4_0");
         assert_eq!(config.summarizer.context_size, 1024);
     }
 
@@ -738,6 +873,13 @@ notify_sound = false
         assert_eq!(config.judge.timeout_ms, 5_000);
         assert_eq!(config.judge.deny_substrings, ["terraform apply"]);
         assert_eq!(config.judge.allow_commands, ["npm test"]);
+        assert_eq!(config.judge.model, "LiquidAI/d1-2B-GGUF");
+        assert_eq!(config.judge.quant, "Q8_0");
+        assert_eq!(config.judge.min_allow_confidence_pct, 75);
+        assert_eq!(
+            config.judge.cache_dir.as_deref(),
+            Some("~/.cache/triage/judge-models")
+        );
         assert_eq!(config.keybindings.overview, "ctrl+o");
     }
 
@@ -1002,5 +1144,92 @@ allow_commands = ["git status; rm -rf /"]
                 .contains("cannot contain shell control characters"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn judge_config_validates_model_and_confidence_bounds() {
+        for (toml_body, expected_substr) in [
+            (
+                "[judge]\nmodel = \"   \"\n",
+                "judge.model must not be empty",
+            ),
+            ("[judge]\nquant = \"\"\n", "judge.quant must not be empty"),
+            (
+                "[judge]\nquant = \"../evil\"\n",
+                "is not a valid quantization tag",
+            ),
+            (
+                "[judge]\nquant = \"sub/Q4_K_M\"\n",
+                "contains invalid character '/'",
+            ),
+            (
+                "[judge]\nquant = \"Q4_K_M.gguf\"\n",
+                "not a `.gguf` filename",
+            ),
+            (
+                "[judge]\nquant = \"Q4_K_M?foo=bar\"\n",
+                "contains invalid character '?'",
+            ),
+            (
+                "[judge]\nmin_allow_confidence_pct = 0\n",
+                "judge.min_allow_confidence_pct must be between 1 and 100",
+            ),
+            (
+                "[judge]\nmin_allow_confidence_pct = 101\n",
+                "judge.min_allow_confidence_pct must be between 1 and 100",
+            ),
+            (
+                "[judge]\ncache_dir = \"  \"\n",
+                "judge.cache_dir must not be empty",
+            ),
+            (
+                "[judge]\nmodel = \"https://huggingface.co/LiquidAI/d1-2B-GGUF\"\nquant = \"\"\n",
+                "judge.quant must not be empty",
+            ),
+            (
+                "[judge]\nmodel = \"LiquidAI/d1-2B-GGUF@v1.0\"\nquant = \"\"\n",
+                "judge.quant must not be empty",
+            ),
+            (
+                "[judge]\nmodel = \"LiquidAI/d1-2B-GGUF:../evil\"\nquant = \"\"\n",
+                "is not a valid quantization tag",
+            ),
+            (
+                "[judge]\nmodel = \"LiquidAI/d1-2B-GGUF:Q4_K_M.gguf\"\nquant = \"\"\n",
+                "not a `.gguf` filename",
+            ),
+            (
+                "[judge]\nmodel = \"/tmp/local-d1.gguf\"\nquant = \"../evil\"\n",
+                "is not a valid quantization tag",
+            ),
+            (
+                "[judge]\nenabled = false\nquant = \"../evil\"\n",
+                "is not a valid quantization tag",
+            ),
+        ] {
+            let error = Config::from_toml_str(toml_body)
+                .expect_err("invalid judge model config should fail");
+            assert!(
+                error.to_string().contains(expected_substr),
+                "expected {expected_substr:?} in {error}"
+            );
+        }
+
+        // Disabled judge or self-contained `.gguf` / local-path / inline `:quant`
+        // specs may omit `judge.quant` (`quant = ""`) while keeping other `[judge]`
+        // and `[remote]` settings intact.
+        for valid_toml in [
+            "[remote]\nbind = \"127.0.0.1:7777\"\n[judge]\nenabled = false\nmodel = \"\"\nquant = \"\"\ndeny_substrings = [\"terraform apply\"]\n",
+            "[judge]\nmodel = \"/models/local-d1.gguf\"\nquant = \"\"\n",
+            "[judge]\nmodel = \"./models/local-d1\"\nquant = \"\"\n",
+            "[judge]\nmodel = \"https://example.com/models/custom-d1.gguf?sig=1\"\nquant = \"\"\n",
+            "[judge]\nmodel = \"LiquidAI/d1-2B-GGUF/d1-2B-Q8_0.gguf\"\nquant = \"\"\n",
+            "[judge]\nmodel = \"LiquidAI/d1-2B-GGUF:Q8_0\"\nquant = \"\"\n",
+            "[judge]\nmodel = \"LiquidAI/d1-2B-GGUF@v1.0:Q8_0\"\nquant = \"\"\n",
+            "[judge]\nmodel = \"d1-2B-GGUF:Q4_K_M@v1.0\"\nquant = \"\"\n",
+        ] {
+            Config::from_toml_str(valid_toml)
+                .unwrap_or_else(|e| panic!("expected valid config for {valid_toml:?}, got: {e}"));
+        }
     }
 }
