@@ -974,6 +974,12 @@ impl WaitForSessionMessagesRequest {
 }
 
 pub trait SessionApi {
+    fn worker_operation(
+        &self,
+        _request: crate::workers::WorkerRequest,
+    ) -> Result<crate::workers::WorkerResponse> {
+        anyhow::bail!("managed workers are not supported by this session API")
+    }
     fn list_sessions(&self) -> Result<Vec<SessionId>>;
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId>;
     fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse>;
@@ -1198,6 +1204,12 @@ pub trait SessionApi {
 }
 
 impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
+    fn worker_operation(
+        &self,
+        request: crate::workers::WorkerRequest,
+    ) -> Result<crate::workers::WorkerResponse> {
+        (**self).worker_operation(request)
+    }
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
         (**self).list_sessions()
     }

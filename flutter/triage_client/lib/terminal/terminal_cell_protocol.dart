@@ -679,7 +679,8 @@ const int kMaxViewportRows = 4096;
 /// malformed wire envelopes cannot overflow 64-bit integers, exceed JS 53-bit
 /// safe-integer precision on Web, or stall scrollback range loops.
 const int kMaxScrollbackRows = 1 << 24;
-const int kMaxTrimmedTopRows = 1 << 50;
+// Wide shifts truncate to 32 bits on web; keep the 2^50 bound as a literal.
+const int kMaxTrimmedTopRows = 0x4000000000000;
 const int kMaxWireSafeInt = 0x1FFFFFFFFFFFFF;
 
 bool _isControlRune(int rune) => rune < 0x20 || (rune >= 0x7F && rune < 0xA0);

@@ -71,52 +71,81 @@ manual user prompting.
 | `wait_for_session_message` | `session_id`, `timeout_ms` (optional, default 30000, max 300000) | Blocks until unacked inbox mail is available or `timeout_ms` elapses, then returns the unacked messages (`[]` on timeout). |
 | `ack_session_messages` | `session_id`, `message_ids` | `{ok: true}`. Unknown ids are ignored. |
 
-## Delegating work to agent sessions
+## Managed cross-runtime delegation
 
-`start_session` can launch `agy`, `claude`, `muse`, `codex`, or another
-executable. The coordinator supplies that runtime's documented argv, including
-any initial prompt. For example, this tool argument object starts a fresh
-Codex session in an existing worktree (replace the example path):
+The daemon owns durable parent/topic groups and worker task records. The calling
+agent chooses native helpers when they support the requested provider/model and
+have capacity; otherwise it uses a configured Triage worker profile. This routing
+is documented in `skills/triage-coordination/SKILL.md` and in the tool metadata.
 
-```json
-{
-  "command": "codex",
-  "args": [],
-  "cwd": "/absolute/path/to/worktree",
-  "rows": 40,
-  "cols": 120
-}
+Configure profiles in `~/.config/triage/config.toml`. Confirm each installed CLI's
+interactive startup syntax before enabling a profile; add only supported model
+and effort flags for that version. Use absolute executable
+paths when the daemon's PATH differs from your shell. Authentication and permission
+configuration belong to each CLI and remain in force.
+
+```toml
+[workers.profiles.agy]
+command = "agy"
+args = ["--prompt-interactive", "{prompt}"]
+
+[workers.profiles.muse]
+command = "muse"
+args = ["{prompt}"]
+
+[workers.profiles.codex]
+command = "codex"
+args = ["{prompt}"]
+
+[workers.profiles.claude]
+command = "claude"
+args = ["{prompt}"]
 ```
 
-Executable lookup uses the daemon's environment; use an absolute executable
-path when its PATH differs from the coordinator's. Triage does not translate
-model, effort, or permission flags, configure the child's MCP connection, or
-create worktrees. Each child receives its own `TRIAGE_SESSION_ID`.
+Each profile requires exactly one `{prompt}` occurrence in its argv. The daemon
+substitutes a bootstrap containing the group topic, task, immediate parent, root,
+and worker/session IDs. It passes argv literally, without shell expansion. Model
+selection is part of the profile; there is no built-in model-name translation.
+Profiles are read on demand, so editing them does not require a daemon restart.
+Saved launch intentions retain the original profile arguments across retries.
 
-Keep the returned session ID together with a unique run/task identity in
-the run's durable state. Return success means
-the daemon created a PTY child; it does not mean the agent is ready, connected
-to MCP, or finished. Bootstrap inbox polling in the initial prompt or wait
-for a worker-ready message before dispatching an assignment. Use the existing
-messaging tools to send work (`wake: true` can nudge a recognized idle agent),
-wait for results, and acknowledge processed messages. Waiting blocks this
-stdio connection, so bound waits and use another connection if concurrent
-control is needed.
+| Tool | Required arguments | Behavior |
+| ---- | ------------------ | -------- |
+| `list_worker_profiles` | none | Configured executable/argv templates. |
+| `create_worker_group` | `parent_session_id`, `key`, `topic` | Durable group; a helper inherits its existing group. Repeat a root/key/topic to recover the same group. |
+| `list_worker_groups` | none | Open and closed groups, parent links, task state, and results. |
+| `get_worker_group` | `group_id` | One group with observed worker liveness. |
+| `spawn_worker` | `group_id`, `parent_session_id`, `key`, `profile`, `cwd`, `task` | Launch or reconcile one helper. `cwd` must be absolute. An identical retry returns the same task/session. Changed requests with the same key fail. |
+| `update_worker` | `group_id`, `task_id`, `session_id`, `phase` | Report `ready`, then `running`, then `succeeded` or `failed`; terminal updates require `result`. |
+| `cleanup_worker_group` | `group_id` | Cancel unfinished tasks and stop group workers; optional `subtree_session_id` limits cleanup to a worker and its descendants. |
 
-Store reports and run metadata outside mailboxes: mailboxes are in memory
-and mail can be lost when the daemon restarts. Acknowledge a result only after
-recording it. Terminal output from `snapshot_session` or `shutdown_session`
-is diagnostic output, not a structured review report.
+The root is never stopped by group cleanup. Stable incarnation IDs are persisted
+in the session manifest and transferred during handover, so an old worker number
+cannot authorize shutting down a replacement. Group cleanup retains all working
+directories and results, including unintegrated worktrees. Inspect cleanup `errors`
+and retry failures. Closed groups remain available through the read tools.
 
-Before calling `shutdown_session`, re-establish that the current session
-is still the intended worker using a fresh roster/snapshot and the worker's
-unique run/task handshake. Numeric session IDs can be reused after a cold
-daemon restart, so a persisted ID alone is not proof of ownership. If the
-worker's identity cannot be confirmed, leave it running and report the
-uncertainty. The local session API does not enforce a parent-child
-relationship. Never stop an unrelated user session.
+Workers need either Triage MCP configured in their runtime or the `triage-mcp`
+binary on PATH. The CLI fallback runs inside the worker, derives its session ID
+from `TRIAGE_SESSION_ID`, and submits an update over local IPC:
 
-Both lifecycle tools are non-idempotent; a lost
-response can leave an operation completed without the caller knowing, so
-reconcile with session state before retrying. There is no automatic retry
-or cancellation of a launch when its MCP connection closes.
+```bash
+triage-mcp worker-update GROUP_ID TASK_ID ready
+triage-mcp worker-update GROUP_ID TASK_ID running
+triage-mcp worker-update GROUP_ID TASK_ID succeeded --result-file result.md
+```
+
+Add `--socket PATH` for a custom daemon socket. Task and result bodies are limited
+to 64 KiB each; oversized results should summarize findings and point to retained
+artifacts. There are at most 128 workers per group, 256 retained groups, and a
+32 MiB registry budget (1 MiB reserved for cleanup transitions). An explicit null
+subtree is rejected; omit the field for full-group cleanup. Corrupt registries fail closed; ordinary terminal sessions
+remain usable. No registry entries or worktrees are automatically pruned.
+
+`launched` means a process started. Only worker updates establish readiness and
+completion. An absent/exited process without a terminal result is interrupted work.
+Group/task state persists across cold restart and handover; direct mail does not.
+The orchestrator must poll, supervise, retry with bounded attempts, and integrate
+results. There is no independent model scheduler, automatic worktree creation, or
+authentication bypass. Raw `start_session` remains available for basic launches
+without managed retry/ownership guarantees.

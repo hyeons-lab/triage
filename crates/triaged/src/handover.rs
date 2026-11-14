@@ -15,6 +15,8 @@ pub struct HandoverProcessIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoverSession {
     pub id: SessionId,
+    #[serde(default = "crate::session::new_session_instance")]
+    pub instance_id: String,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
