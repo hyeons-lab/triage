@@ -1936,8 +1936,10 @@ impl SessionManager {
         let summarizer_slot = summarizer_cfg.enabled.then(|| {
             let cache_dir = summarizer_cfg
                 .cache_dir
-                .clone()
-                .map(PathBuf::from)
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::judge::expand_home_prefix)
                 .unwrap_or_else(default_model_cache_dir);
             crate::summarizer::SummarizerConfig {
                 bundle_id: summarizer_cfg.bundle_id.clone(),
@@ -1952,8 +1954,10 @@ impl SessionManager {
         let judge_slot = judge_cfg.enabled.then(|| {
             let cache_dir = judge_cfg
                 .cache_dir
-                .clone()
-                .map(PathBuf::from)
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::judge::expand_home_prefix)
                 .unwrap_or_else(default_model_cache_dir);
             crate::summarizer::JudgeModelConfig {
                 model: judge_cfg.model.clone(),
@@ -6136,6 +6140,12 @@ fn run_debounce_loop(
         let Some(manager) = manager.upgrade() else {
             break;
         };
+        if !summarizer.is_summarizer_enabled() {
+            if let Ok(mut guard) = manager.dirty_tx.lock() {
+                *guard = None;
+            }
+            break;
+        }
         let now = Instant::now();
 
         let ready: Vec<SessionId> = pending

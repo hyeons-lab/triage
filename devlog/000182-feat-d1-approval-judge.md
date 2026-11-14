@@ -1,6 +1,7 @@
 # Devlog: Upgrade Cera to 0.7.4 and Adopt Liquid d1 Decision Model for Approval Judge
 
 - **Agent:** Antigravity (Gemini 4 Carbon High) @ triage branch feat/d1-approval-judge
+- **Agent:** Antigravity (model switch at 2026-11-12T18:28-0800) @ triage branch feat/d1-approval-judge
 - **Intent:** Upgrade the `cera` local inference engine dependency to the latest `0.7.4` release and replace the generative `LFM2-2.6B` grammar-constrained approval judge with a dedicated Liquid `d1` zero-output-token decision model (`cera::d1::D1Engine`), while decoupling the judge's model lifecycle from the session summarizer.
 
 ## What Changed
@@ -10,6 +11,7 @@
 - 2026-11-11T08:29-0800 `crates/triaged/src/judge.rs`: replaced generative `SYSTEM_PROMPT`, `DECISION_GRAMMAR`, and `judge_with_model` with `judge_with_d1`, `build_d1_request`, `interpret_d1_response`, `d1_model_download_url`, and `resolve_d1_model_path` backed by `cera::d1::D1Engine`. Added unit tests covering threshold enforcement, `deny` rejection, malformed probability refusal, structured JSON state construction, and URL/local-path resolution.
 - 2026-11-11T08:29-0800 `crates/triaged/src/summarizer.rs`, `crates/triaged/src/session.rs`, `crates/triaged/src/main.rs`: decoupled the worker into two lazy model slots (`Option<cera::CeraEngine>` for session summaries and `Option<cera::d1::D1Engine>` for Layer 3 judging) on the single priority inference thread via `InferenceWorkerConfig` and `SessionManager::start_inference`, so `[summarizer] enabled = false` keeps Layer 3 judging active while preserving single-token summary preemption when both are enabled.
 - 2026-11-11T08:29-0800 `flutter/triage_client/lib/main.dart`, `docs/approval-judge.md`, `docs/configuration.md`, `crates/triaged/README.md`: updated the Approval Judge settings badge to `Local AI · Liquid d1-2B` and documented the `d1` model architecture, configuration keys, and independent summarizer toggle.
+- 2026-11-12T18:28-0800 `crates/triage-core/src/{config,judge_rules,logging}.rs`, `crates/triaged/src/{judge,session,summarizer}.rs`, `flutter/triage_client/lib/main.dart`, `README.md`: Hardened `d1` configuration, worker lifecycle, and URL credential redaction across six review rounds: persisted `model`, `quant`, `min_allow_confidence_pct`, and `cache_dir` in `persist_judge_config_to`, expanded `~` home prefixes on `cache_dir` and local `.gguf` paths, validated `judge.quant` and candidate Hugging Face / HTTP `.gguf` URLs against `cera` cache-key rules before network access while allowing empty `quant` when `judge` is disabled or `model` is self-contained, enforced post-JSON-serialization byte caps on `D1Request` before queue preemption, pruned cancelled timed-out `JudgeJob` entries and latched per-engine load failures and `WorkerExitGuard` LIFO teardown before engine destructors, muted `cera::bundle=error` in `DEFAULT_FILTER`, and scrubbed embedded URL `userinfo`, `?query`, and `#fragment` secrets via `redact_model_spec_for_log` and `redact_urls_in_text`.
 
 ## Decisions
 
@@ -25,9 +27,15 @@
   - `LiquidAI/d1-2B-GGUF` (`Q4_K_M`, 1,048.7 MiB, `lfm3-d1` on Metal): **28/28 (100%)** on the primary benchmark at thresholds `0.50`, `0.65`, and `0.75` (`117.3 ms`/decision; `lowest Allow = 0.8086`, `highest Ask = 0.2471`), plus **22/22 (100%)** on the unseen 22-command stress set (`lowest Allow = 0.8884`, `highest Ask = 0.2484`, prompt-injection + curl-pipe scored `p_allow = 0.0146`), and **8/8** on opposite criteria-polarity controls.
 - 2026-11-11T08:18-0800 `BundleRepo::resolve_url` reuses cached files offline when `HEAD` fails, whereas `inspect_and_resolve_manifest` queries the Hugging Face commits API first. Resolving the canonical `https://huggingface.co/{owner}/{repo}/resolve/main/{stem}-{quant}.gguf` URL via `BundleRepo::resolve_url` first (falling back to `inspect_and_resolve_manifest` only on miss/404) keeps cached `d1` models offline-capable.
 
+## Issues
+
+- 2026-11-12T18:28-0800 Character-capped `D1Request` commands expanded up to 6x under JSON control-character escaping (`\u00XX`), risking right-truncation of the structured `state` JSON tail, and validating `D1Request` on the worker let oversized requests preempt queued jobs: enforced post-JSON byte bounds in `build_bounded_d1_request` on the caller thread before `queue.push_judge`.
+- 2026-11-12T18:28-0800 `HfSpec::parse` silently dropped unrecognized URL verbs and truncated 3-segment Hugging Face URLs into repo-root lookups, and forward URL delimiter scans missed `userinfo@host` when unencoded `?` or `#` appeared inside `userinfo` or broke early on escaped JSON quotes (`\"`): validated raw URL segment arity and `cera` cache-key segments up front, scanned `@host[:port]` right-to-left before `/`, and verified `redact_urls_in_text` over 400,000+ randomized composite error strings with zero leaks.
+
 ## Commits
 
-- `HEAD`: feat(judge): upgrade cera to 0.7.4 and adopt Liquid d1-2B decision model
+- `061e27a`: feat(judge): upgrade cera to 0.7.4 and adopt Liquid d1-2B decision model
+- `HEAD`: fix(judge): harden d1 config, worker lifecycle, and URL credential redaction
 
 ## Progress
 
