@@ -59,8 +59,6 @@ import 'package:triage_client/terminal/terminal_keyboard_mode.dart';
 import 'package:triage_client/terminal/terminal_links.dart';
 import 'package:triage_client/terminal/terminal_mouse_encoder.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
-import 'package:triage_client/terminal/web_paste_stub.dart'
-    if (dart.library.js_util) 'package:triage_client/terminal/web_paste_web.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
@@ -654,7 +652,6 @@ class _TerminalPaneState extends State<TerminalPane>
   bool _nearTopCheckScheduled = false;
   double _altScrollDeltaAccum = 0.0;
   final List<Timer> _pointerReleaseTimers = [];
-  VoidCallback? _disposeWebPasteListener;
 
   _AnchoredCell _anchorAt(CellOffset cell) => _AnchoredCell(
     cell: cell,
@@ -706,9 +703,6 @@ class _TerminalPaneState extends State<TerminalPane>
     _bindTerminal(_terminal, syncFocus: false);
     _mountedPanes[widget.terminalId] = this;
     _bindController(widget.controller);
-    if (kIsWeb) {
-      _disposeWebPasteListener = registerWebPasteListener(_onWebDomPaste);
-    }
     if (widget.focusCursorRevision > 0) {
       _scrollToCursor(requestFocus: true);
     }
@@ -1008,8 +1002,6 @@ class _TerminalPaneState extends State<TerminalPane>
     _autoScrollTimer?.cancel();
     _webPasteFallbackTimer?.cancel();
     _webPasteFallbackTimer = null;
-    _disposeWebPasteListener?.call();
-    _disposeWebPasteListener = null;
     _clearPointerReleaseTimers();
     if (runningUnderFlutterTest()) {
       _lastWorkspaceFittedSize = null;

@@ -2164,6 +2164,7 @@ fn append_pasted_key(buffer: &mut String, key: KeyEvent) {
     }
 }
 
+#[cfg(any(windows, test))]
 fn is_explicit_paste_chord(key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);

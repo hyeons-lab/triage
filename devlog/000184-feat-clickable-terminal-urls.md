@@ -12,6 +12,8 @@
 
 - `2026-11-13T06:40-0800`: Fixed copy/paste on remote clients. Windows TUI (`crates/triage/src/main.rs`): added `BracketedPasteKeyDecoder` to rebuild `Event::Paste` from the per-key events crossterm emits on Windows, plus Ctrl+Shift+V / Shift+Insert reading the Windows clipboard directly. Flutter web (`terminal_pane.dart`, `web_paste_*.dart`): Ctrl+V defers to the native DOM `paste` event, with a `Clipboard.getData` fallback after 50ms.
 
+- `2026-11-13T16:38-0800`: Rebased `feat/clickable-terminal-urls` onto the stacked `feat/terminal-cell-sync` -> `feat/d1-approval-judge` -> `feat/mcp-worker-sessions` chain. Unified duplicate `registerWebPasteListener` / `_disposeWebPasteListener` definitions between PR #212 (`platform_env_web.dart`) and PR #215 (`web_paste_*.dart`) into `platform_env_web.dart` (preserving capture-phase listener, `_isExternalEditableActive()`, `stopPropagation()`, and `text` fallback while removing the duplicate `web_paste_stub.dart` / `web_paste_web.dart` files), and gated `is_explicit_paste_chord` in `crates/triage/src/main.rs` with `#[cfg(any(windows, test))]` for clean non-Windows clippy builds.
+
 ## Decisions
 
 - **Strict hit-testing (`hitTestCellOffset`)**: `RenderTerminalGrid.getCellOffset` clamps out-of-bounds coordinates for drag selection, which would trigger false URL hits in right/bottom margins; adding a non-clamping `hitTestCellOffset` keeps link hovers and clicks scoped to actual rendered glyphs.
@@ -24,7 +26,9 @@
 
 ## Commits
 
-- `HEAD` — feat(client): make http/https URLs clickable in terminal grid
+- `e947156`: feat(client): make http/https URLs clickable in terminal grid
+- `ca0c2ad`: fix(client): restore paste in Windows TUI and Flutter web terminal
+- `HEAD`: fix(client): unify web DOM paste helper and gate Windows paste helper after stack rebase
 
 ## Progress
 
