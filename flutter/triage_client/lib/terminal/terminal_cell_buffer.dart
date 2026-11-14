@@ -348,6 +348,7 @@ class TerminalCellBuffer extends ChangeNotifier {
   int? _daemonEraseScrollbackGen;
   bool _scrollbackClearedLocally = false;
   int _lastFrameSeq = 0;
+  int _revision = 0;
 
   int _cursorX = 0;
   int _cursorY = 0;
@@ -389,6 +390,15 @@ class TerminalCellBuffer extends ChangeNotifier {
   int get reflowGen => _reflowGen;
   int get eraseScrollbackGen => _eraseScrollbackGen;
   int get lastFrameSeq => _lastFrameSeq;
+
+  /// Monotonic counter incremented on every buffer mutation.
+  int get revision => _revision;
+
+  @override
+  void notifyListeners() {
+    _revision += 1;
+    super.notifyListeners();
+  }
 
   int get cursorX => _cursorX;
   int get cursorY => _cursorY;

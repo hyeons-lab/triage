@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 import 'package:triage_client/terminal/terminal_cell_protocol.dart';
+import 'package:triage_client/terminal/terminal_links.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 
 typedef TerminalGridSizeCallback =
@@ -35,6 +36,7 @@ class TerminalGridView extends StatefulWidget {
     required this.buffer,
     required this.scrollController,
     this.selection,
+    this.hoveredLink,
     this.focusNode,
     this.autofocus = false,
     this.onKeyEvent,
@@ -52,6 +54,7 @@ class TerminalGridView extends StatefulWidget {
   final TerminalCellBuffer buffer;
   final ScrollController scrollController;
   final TerminalSelectionRange? selection;
+  final TerminalLink? hoveredLink;
   final FocusNode? focusNode;
   final bool autofocus;
   final FocusOnKeyEventCallback? onKeyEvent;
@@ -140,6 +143,7 @@ class TerminalGridViewState extends State<TerminalGridView> {
           offset: offset,
           scrollControllerIdentity: widget.scrollController,
           selection: widget.selection,
+          hoveredLink: widget.hoveredLink,
           hasFocus: _hasFocus,
           autoResize: widget.autoResize,
           stickToBottom: widget.stickToBottom,
@@ -173,6 +177,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
     required this.offset,
     required this.scrollControllerIdentity,
     required this.selection,
+    required this.hoveredLink,
     required this.hasFocus,
     required this.autoResize,
     required this.stickToBottom,
@@ -188,6 +193,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
   final ViewportOffset offset;
   final Object? scrollControllerIdentity;
   final TerminalSelectionRange? selection;
+  final TerminalLink? hoveredLink;
   final bool hasFocus;
   final bool autoResize;
   final bool stickToBottom;
@@ -205,6 +211,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
       offset: offset,
       scrollControllerIdentity: scrollControllerIdentity,
       selection: selection,
+      hoveredLink: hoveredLink,
       hasFocus: hasFocus,
       autoResize: autoResize,
       stickToBottom: stickToBottom,
@@ -227,6 +234,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
       ..buffer = buffer
       ..offset = offset
       ..selection = selection
+      ..hoveredLink = hoveredLink
       ..hasFocus = hasFocus
       ..autoResize = autoResize
       ..stickToBottom = stickToBottom
@@ -267,6 +275,7 @@ class RenderTerminalGrid extends RenderBox {
     required ViewportOffset offset,
     Object? scrollControllerIdentity,
     required TerminalSelectionRange? selection,
+    TerminalLink? hoveredLink,
     required bool hasFocus,
     required bool autoResize,
     required bool stickToBottom,
@@ -280,6 +289,7 @@ class RenderTerminalGrid extends RenderBox {
        _offset = offset,
        _scrollControllerIdentity = scrollControllerIdentity,
        _selection = selection,
+       _hoveredLink = hoveredLink,
        _hasFocus = hasFocus,
        _autoResize = autoResize,
        _stickToBottom = stickToBottom,
@@ -299,6 +309,7 @@ class RenderTerminalGrid extends RenderBox {
   Object? _scrollControllerIdentity;
   bool _scrollControllerSwapped = false;
   TerminalSelectionRange? _selection;
+  TerminalLink? _hoveredLink;
   bool _hasFocus;
   bool _autoResize;
   bool _stickToBottom;
@@ -333,6 +344,13 @@ class RenderTerminalGrid extends RenderBox {
 
   final LinkedHashMap<_GlyphCacheKey, TextPainter> _glyphCache =
       LinkedHashMap<_GlyphCacheKey, TextPainter>();
+
+  int _cachedLinksFirstRow = -1;
+  int _cachedLinksLastRow = -1;
+  int _cachedLinksRevision = -1;
+  int _cachedLinksCols = -1;
+  TerminalCellBuffer? _cachedLinksBuffer;
+  List<TerminalLink> _cachedLinks = const <TerminalLink>[];
 
   double get cellWidth => _cellWidth;
   double get lineHeight => _cellHeight;
@@ -445,6 +463,13 @@ class RenderTerminalGrid extends RenderBox {
   set selection(TerminalSelectionRange? value) {
     if (_selection == value) return;
     _selection = value;
+    markNeedsPaint();
+  }
+
+  TerminalLink? get hoveredLink => _hoveredLink;
+  set hoveredLink(TerminalLink? value) {
+    if (_hoveredLink == value) return;
+    _hoveredLink = value;
     markNeedsPaint();
   }
 
@@ -656,6 +681,46 @@ class RenderTerminalGrid extends RenderBox {
     final col = (dx / _cellWidth).floor().clamp(0, cols - 1);
     final row = ((dy + scrollY) / _cellHeight).floor().clamp(0, totalLines - 1);
     return CellOffset(col, row);
+  }
+
+  /// Strictly maps a local pixel [position] to a `(col, virtualRow)` cell
+  /// without clamping outside the active grid columns or total rows. Returns
+  /// `null` when [position] falls in margin padding or past the last row.
+  CellOffset? hitTestCellOffset(Offset position) {
+    if (!hasSize || _cellWidth <= 0 || _cellHeight <= 0) return null;
+    if (position.dx < 0 ||
+        position.dy < 0 ||
+        position.dx >= size.width ||
+        position.dy >= size.height) {
+      return null;
+    }
+    final cols = _buffer.viewWidth;
+    final totalLines = _buffer.totalLines;
+    if (cols <= 0 || totalLines <= 0) return null;
+    final col = (position.dx / _cellWidth).floor();
+    if (col < 0 || col >= cols) return null;
+    final scrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final row = ((position.dy + scrollY) / _cellHeight).floor();
+    if (row < 0 || row >= totalLines) return null;
+    return CellOffset(col, row);
+  }
+
+  /// Returns the detected [TerminalLink] covering local pixel [position], or
+  /// `null` when no URL is under that cell.
+  TerminalLink? linkAtOffset(Offset position) {
+    final cell = hitTestCellOffset(position);
+    if (cell == null) return null;
+    if (identical(_cachedLinksBuffer, _buffer) &&
+        _cachedLinksRevision == _buffer.revision &&
+        _cachedLinksCols == _buffer.viewWidth &&
+        cell.y >= _cachedLinksFirstRow &&
+        cell.y < _cachedLinksLastRow) {
+      for (final link in _cachedLinks) {
+        if (link.containsCell(cell)) return link;
+      }
+      return null;
+    }
+    return detectLinkAtCell(_buffer, cell);
   }
 
   /// Maps a local pixel [position] inside this [RenderBox] to a 0-based
@@ -967,7 +1032,19 @@ class RenderTerminalGrid extends RenderBox {
       }
     }
 
-    // 4. Cursor rendering.
+    // 4. Detected URL underlines (passive + hovered).
+    _paintLinks(
+      canvas,
+      offset,
+      scrollY,
+      firstRow,
+      lastRowExclusive,
+      gridCols,
+      defaultFg,
+      defaultBg,
+    );
+
+    // 5. Cursor rendering.
     if (_showCursor && _buffer.cursorVisible) {
       final cursorVirtualRow = _buffer.totalScrollbackRows + _buffer.cursorY;
       if (cursorVirtualRow >= firstRow && cursorVirtualRow < lastRowExclusive) {
@@ -988,6 +1065,111 @@ class RenderTerminalGrid extends RenderBox {
         missingMax != null &&
         onMissingRowsVisible != null) {
       _scheduleMissingRowsNotification(missingMin, missingMax);
+    }
+  }
+
+  List<TerminalLink> _visibleLinks(int firstRow, int lastRowExclusive) {
+    final rev = _buffer.revision;
+    final cols = _buffer.viewWidth;
+    if (!identical(_cachedLinksBuffer, _buffer) ||
+        _cachedLinksRevision != rev ||
+        _cachedLinksCols != cols ||
+        _cachedLinksFirstRow != firstRow ||
+        _cachedLinksLastRow != lastRowExclusive) {
+      _cachedLinksBuffer = _buffer;
+      _cachedLinksRevision = rev;
+      _cachedLinksCols = cols;
+      _cachedLinksFirstRow = firstRow;
+      _cachedLinksLastRow = lastRowExclusive;
+      _cachedLinks = detectLinksInRowRange(_buffer, firstRow, lastRowExclusive);
+    }
+    return _cachedLinks;
+  }
+
+  void _paintLinks(
+    Canvas canvas,
+    Offset offset,
+    double scrollY,
+    int firstRow,
+    int lastRowExclusive,
+    int gridCols,
+    Color defaultFg,
+    Color defaultBg,
+  ) {
+    final links = _visibleLinks(firstRow, lastRowExclusive);
+    if (links.isEmpty) return;
+
+    final linkPaint = Paint()..style = PaintingStyle.stroke;
+
+    for (final link in links) {
+      final isHovered = link == _hoveredLink;
+      linkPaint.strokeWidth = isHovered ? 1.5 : 1.0;
+
+      for (final seg in link.segments) {
+        if (seg.virtualRow < firstRow || seg.virtualRow >= lastRowExclusive) {
+          continue;
+        }
+        final line = _buffer.lineAtVirtualRow(seg.virtualRow);
+        if (line == null) continue;
+        final segStart = seg.startCol.clamp(0, gridCols);
+        final segEnd = seg.endCol.clamp(segStart, gridCols);
+        if (segEnd <= segStart) continue;
+
+        final underlineY =
+            offset.dy + (seg.virtualRow + 1) * _cellHeight - scrollY - 1.5;
+
+        if (isHovered) {
+          linkPaint.color = TriageTerminalPalette.cursor;
+          canvas.drawLine(
+            Offset(offset.dx + segStart * _cellWidth, underlineY),
+            Offset(offset.dx + segEnd * _cellWidth, underlineY),
+            linkPaint,
+          );
+          continue;
+        }
+
+        var runStart = -1;
+        Color? runColor;
+        for (var col = segStart; col < segEnd; col++) {
+          final attrs = line.getAttrs(col);
+          final skip = (attrs & (kAttrUnderline | kAttrInvisible)) != 0;
+          if (skip) {
+            if (runStart >= 0 && runColor != null) {
+              linkPaint.color = runColor.withValues(alpha: 0.45);
+              canvas.drawLine(
+                Offset(offset.dx + runStart * _cellWidth, underlineY),
+                Offset(offset.dx + col * _cellWidth, underlineY),
+                linkPaint,
+              );
+              runStart = -1;
+              runColor = null;
+            }
+            continue;
+          }
+          final fg = _effectiveCellForeground(line, col, defaultFg, defaultBg);
+          if (runStart < 0) {
+            runStart = col;
+            runColor = fg;
+          } else if (runColor != fg) {
+            linkPaint.color = runColor!.withValues(alpha: 0.45);
+            canvas.drawLine(
+              Offset(offset.dx + runStart * _cellWidth, underlineY),
+              Offset(offset.dx + col * _cellWidth, underlineY),
+              linkPaint,
+            );
+            runStart = col;
+            runColor = fg;
+          }
+        }
+        if (runStart >= 0 && runColor != null) {
+          linkPaint.color = runColor.withValues(alpha: 0.45);
+          canvas.drawLine(
+            Offset(offset.dx + runStart * _cellWidth, underlineY),
+            Offset(offset.dx + segEnd * _cellWidth, underlineY),
+            linkPaint,
+          );
+        }
+      }
     }
   }
 
