@@ -1,5 +1,9 @@
+import 'dart:math' show max;
+
 import 'package:flutter/foundation.dart';
+import 'package:triage_client/terminal/mobile_auto_space.dart';
 import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 
 /// Zero-based `(x: col, y: virtualRow)` coordinate in a [TerminalCellBuffer].
 @immutable
@@ -23,11 +27,7 @@ class CellOffset {
 
 @immutable
 class TerminalSelectionSegment {
-  const TerminalSelectionSegment({
-    required this.line,
-    this.start,
-    this.end,
-  });
+  const TerminalSelectionSegment({required this.line, this.start, this.end});
 
   final int line;
   final int? start;
@@ -44,6 +44,7 @@ class TerminalSelectionRange {
     this.extent, {
     this.trimmedTopRows = 0,
     this.eraseScrollbackGen = 0,
+    this.reflowGen,
     this.isAltScreen = false,
   });
 
@@ -51,6 +52,7 @@ class TerminalSelectionRange {
   final CellOffset extent;
   final int trimmedTopRows;
   final int eraseScrollbackGen;
+  final int? reflowGen;
   final bool isAltScreen;
 
   bool get isCollapsed => base == extent;
@@ -82,6 +84,9 @@ class TerminalSelectionRange {
   Iterable<TerminalSelectionSegment> toSegmentsIn(
     TerminalCellBuffer buffer,
   ) sync* {
+    if (isAltScreen != buffer.isUsingAltBuffer) return;
+    if (eraseScrollbackGen != buffer.eraseScrollbackGen) return;
+    if (reflowGen != null && reflowGen != buffer.reflowGen) return;
     final (begin, end) = normalizedIn(buffer);
     if (begin == end) return;
     if (begin.y == end.y) {
@@ -105,10 +110,14 @@ class TerminalSelectionRange {
   ) {
     if (isAltScreen != buffer.isUsingAltBuffer) return null;
     if (eraseScrollbackGen != buffer.eraseScrollbackGen) return null;
+    if (reflowGen != null && reflowGen != buffer.reflowGen) return null;
     final (begin, end) = normalizedIn(buffer);
     if (begin == end) return null;
     if (virtualRow < begin.y || virtualRow > end.y) return null;
-    final cols = buffer.viewWidth;
+    final line = buffer.lineAtVirtualRow(virtualRow);
+    final cols = line != null
+        ? max(buffer.viewWidth, line.length)
+        : buffer.viewWidth;
     if (begin.y == end.y) {
       final s = begin.x.clamp(0, cols);
       final e = end.x.clamp(s, cols);
@@ -133,6 +142,7 @@ class TerminalSelectionRange {
           other.extent == extent &&
           other.trimmedTopRows == trimmedTopRows &&
           other.eraseScrollbackGen == eraseScrollbackGen &&
+          other.reflowGen == reflowGen &&
           other.isAltScreen == isAltScreen);
 
   @override
@@ -141,56 +151,87 @@ class TerminalSelectionRange {
     extent,
     trimmedTopRows,
     eraseScrollbackGen,
+    reflowGen,
     isAltScreen,
   );
 }
 
 /// Whether [range] still refers to live rows in [buffer] on its original
-/// screen without having been invalidated by `CSI 3J` or trimmed past row 0.
+/// screen without having been invalidated by `CSI 3J`, column reflow, or
+/// trimmed past row 0.
 bool terminalSelectionIsLive(
   TerminalCellBuffer buffer,
   TerminalSelectionRange range,
 ) {
   if (range.isCollapsed) return false;
+  if (buffer.totalLines <= 0) return false;
+  if (range.isAltScreen != buffer.isUsingAltBuffer) return false;
   if (range.eraseScrollbackGen != buffer.eraseScrollbackGen) return false;
+  if (range.reflowGen != null && range.reflowGen != buffer.reflowGen) {
+    return false;
+  }
   final (begin, end) = range.normalizedIn(buffer);
-  return begin.y >= 0 && end.y < buffer.totalLines;
+  if (begin.y == end.y && end.x <= 0) return false;
+  final effectiveEndRow = (end.y > begin.y && end.x <= 0) ? end.y - 1 : end.y;
+  return effectiveEndRow >= 0 && begin.y < buffer.totalLines;
 }
 
 /// Computes the `(base, extent)` cell offsets for a selection anchored at
 /// [anchorCell] and extended to [targetCell].
 ///
 /// Normalized `[begin, end)` ranges are half-open on the end column. When
-/// [targetCell] is at or after [anchorCell], `extent.x` is incremented by 1 so
-/// [targetCell] is included. When [targetCell] precedes [anchorCell], `base.x`
-/// is incremented by 1 so [anchorCell] stays included after normalization swaps
-/// the endpoints.
+/// [targetCell] is at or after [anchorCell], `extent.x` advances past the full
+/// cell span of [targetCell] (`+2` for wide CJK/emoji cells when [buffer] is
+/// provided, else `+1`). When [targetCell] precedes [anchorCell], `base.x`
+/// advances past the full cell span of [anchorCell].
 (CellOffset base, CellOffset extent)? resolveSelectionEndpoints({
   required CellOffset anchorCell,
   required CellOffset targetCell,
   required int viewWidth,
   required int lineCount,
+  TerminalCellBuffer? buffer,
 }) {
   final lastRow = lineCount - 1;
   if (lastRow < 0 || viewWidth <= 0) return null;
-  final maxCol = viewWidth - 1;
-  final safeAnchor = CellOffset(
-    anchorCell.x.clamp(0, maxCol),
-    anchorCell.y.clamp(0, lastRow),
-  );
-  final safeTarget = CellOffset(
-    targetCell.x.clamp(0, maxCol),
-    targetCell.y.clamp(0, lastRow),
-  );
+  final anchorRow = anchorCell.y.clamp(0, lastRow);
+  final targetRow = targetCell.y.clamp(0, lastRow);
+  final anchorLine = buffer?.lineAtVirtualRow(anchorRow);
+  final targetLine = buffer?.lineAtVirtualRow(targetRow);
+  final anchorMaxCol = max(viewWidth, anchorLine?.length ?? 0) - 1;
+  final targetMaxCol = max(viewWidth, targetLine?.length ?? 0) - 1;
+
+  var anchorCol = anchorCell.x.clamp(0, anchorMaxCol);
+  if (anchorLine != null &&
+      anchorCol > 0 &&
+      anchorLine.getCodePoint(anchorCol) == 0 &&
+      anchorLine.getWidth(anchorCol - 1) == 2) {
+    anchorCol -= 1;
+  }
+  var targetCol = targetCell.x.clamp(0, targetMaxCol);
+  if (targetLine != null &&
+      targetCol > 0 &&
+      targetLine.getCodePoint(targetCol) == 0 &&
+      targetLine.getWidth(targetCol - 1) == 2) {
+    targetCol -= 1;
+  }
+
+  final safeAnchor = CellOffset(anchorCol, anchorRow);
+  final safeTarget = CellOffset(targetCol, targetRow);
   final forward =
       safeTarget.y > safeAnchor.y ||
       (safeTarget.y == safeAnchor.y && safeTarget.x >= safeAnchor.x);
+  final anchorSpan = anchorLine != null
+      ? anchorLine.getWidth(safeAnchor.x).clamp(1, 2)
+      : 1;
+  final targetSpan = targetLine != null
+      ? targetLine.getWidth(safeTarget.x).clamp(1, 2)
+      : 1;
   final base = CellOffset(
-    forward ? safeAnchor.x : safeAnchor.x + 1,
+    forward ? safeAnchor.x : safeAnchor.x + anchorSpan,
     safeAnchor.y,
   );
   final extent = CellOffset(
-    forward ? safeTarget.x + 1 : safeTarget.x,
+    forward ? safeTarget.x + targetSpan : safeTarget.x,
     safeTarget.y,
   );
   return (base, extent);
@@ -265,17 +306,20 @@ TerminalSelectionRange? selectWordRangeAt(
   final line = buffer.lineAtVirtualRow(row);
   if (line == null) return null;
   final cols = buffer.viewWidth;
-  var col = cell.x.clamp(0, cols - 1);
+  final maxCols = max(cols, line.length);
+  var col = cell.x.clamp(0, maxCols - 1);
   if (col > 0 && line.getCodePoint(col) == 0 && line.getWidth(col - 1) == 2) {
     col -= 1;
   }
 
   int classOf(int c) {
     final cp = line.getCodePoint(c);
-    if (cp == 0 || cp == 0x20) return 0;
-    final ch = String.fromCharCode(cp);
-    if (_wordCharPattern.hasMatch(ch)) return 1;
-    return 2;
+    if (cp == 0 || cp == 0x20 || cp == 0xA0 || cp == 0x3000) return 0;
+    if (cp < 0x80) {
+      final ch = String.fromCharCode(cp);
+      return _wordCharPattern.hasMatch(ch) ? 1 : 2;
+    }
+    return MobileAutoSpaceTracker.isWordChar(cp) ? 1 : 2;
   }
 
   final targetClass = classOf(col);
@@ -284,9 +328,10 @@ TerminalSelectionRange? selectWordRangeAt(
     final width = line.getWidth(col).clamp(1, 2);
     return TerminalSelectionRange(
       CellOffset(col, row),
-      CellOffset((col + width).clamp(0, cols), row),
+      CellOffset((col + width).clamp(0, maxCols), row),
       trimmedTopRows: buffer.trimmedTopRows,
       eraseScrollbackGen: buffer.eraseScrollbackGen,
+      reflowGen: buffer.reflowGen,
       isAltScreen: buffer.isUsingAltBuffer,
     );
   }
@@ -304,16 +349,17 @@ TerminalSelectionRange? selectWordRangeAt(
   }
 
   var end = col + line.getWidth(col).clamp(1, 2);
-  while (end < cols) {
+  while (end < maxCols) {
     if (classOf(end) != targetClass) break;
     end += line.getWidth(end).clamp(1, 2);
   }
 
   return TerminalSelectionRange(
     CellOffset(start, row),
-    CellOffset(end.clamp(start + 1, cols), row),
+    CellOffset(end.clamp(start + 1, maxCols), row),
     trimmedTopRows: buffer.trimmedTopRows,
     eraseScrollbackGen: buffer.eraseScrollbackGen,
+    reflowGen: buffer.reflowGen,
     isAltScreen: buffer.isUsingAltBuffer,
   );
 }
@@ -327,6 +373,11 @@ String terminalSelectionText(
   TerminalCellBuffer buffer,
   TerminalSelectionRange range,
 ) {
+  if (range.isAltScreen != buffer.isUsingAltBuffer ||
+      range.eraseScrollbackGen != buffer.eraseScrollbackGen ||
+      (range.reflowGen != null && range.reflowGen != buffer.reflowGen)) {
+    return '';
+  }
   final (begin, _) = range.normalizedIn(buffer);
   final out = StringBuffer();
   var wroteAny = false;
@@ -335,6 +386,9 @@ String terminalSelectionText(
       continue;
     }
     final line = buffer.lineAtVirtualRow(segment.line);
+    if (line == null) {
+      continue;
+    }
     if (wroteAny &&
         segment.line != begin.y &&
         segment.line > 0 &&
@@ -342,15 +396,13 @@ String terminalSelectionText(
       out.write('\n');
     }
     wroteAny = true;
-    if (line != null) {
-      out.write(
-        bufferLineSelectedText(
-          line,
-          segment.start ?? 0,
-          segment.end ?? line.length,
-        ),
-      );
-    }
+    out.write(
+      bufferLineSelectedText(
+        line,
+        segment.start ?? 0,
+        segment.end ?? line.length,
+      ),
+    );
   }
   return out.toString();
 }
@@ -367,7 +419,7 @@ String bufferLineSelectedText(TerminalCellLine line, int from, int to) {
 
   var lastGlyph = -1;
   for (var i = from; i < to; i++) {
-    if (line.getCodePoint(i) != 0) {
+    if (line.getCodePoint(i) != 0 && i + line.getWidth(i) <= to) {
       lastGlyph = i;
     }
   }
@@ -382,7 +434,7 @@ String bufferLineSelectedText(TerminalCellLine line, int from, int to) {
         final extra = line.getCombining(i);
         if (extra != null) {
           for (final c in extra) {
-            out.writeCharCode(c);
+            out.writeCharCode(sanitizeTerminalCodePoint(c == 0 ? 0xFFFD : c));
           }
         }
       }

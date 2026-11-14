@@ -7,10 +7,9 @@ import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 
 TerminalCellLine _lineFromText(String text, {int width = 20}) {
-  return TerminalCellLine.fromSpec(
-    <String?>[for (final r in text.runes) String.fromCharCode(r)],
-    width: width,
-  );
+  return TerminalCellLine.fromSpec(<String?>[
+    for (final r in text.runes) String.fromCharCode(r),
+  ], width: width);
 }
 
 void main() {
@@ -40,7 +39,9 @@ void main() {
     final targetRows = rows ?? buffer.viewHeight;
     final viewportLines = <String>[
       for (var r = 0; r < targetRows; r++)
-        buffer.lineAtVirtualRow(buffer.totalScrollbackRows + r)?.toPlainText() ??
+        buffer
+                .lineAtVirtualRow(buffer.totalScrollbackRows + r)
+                ?.toPlainText() ??
             '',
     ];
     buffer.applySyncFrame(
@@ -168,10 +169,10 @@ void main() {
           trimmedTopRows: 0,
           eraseScrollbackGen: oldGen,
           compression: kCellCompressionNone,
-          payload: encodeTcg1PlainTextRows(
-            const <String>['stale 0', 'stale 1'],
-            cols: 20,
-          ),
+          payload: encodeTcg1PlainTextRows(const <String>[
+            'stale 0',
+            'stale 1',
+          ], cols: 20),
         ),
       );
 

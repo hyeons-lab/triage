@@ -10,10 +10,9 @@ import 'package:triage_client/widgets/terminal_grid_render_box.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
 
 TerminalCellLine _cellLine(String text, {int cols = 80}) {
-  return TerminalCellLine.fromSpec(
-    <String?>[for (final r in text.runes) String.fromCharCode(r)],
-    width: cols,
-  );
+  return TerminalCellLine.fromSpec(<String?>[
+    for (final r in text.runes) String.fromCharCode(r),
+  ], width: cols);
 }
 
 void _seedBufferLines(
@@ -685,10 +684,9 @@ void main() {
         ];
         TerminalPane.rebindSessionController(terminalId, loadedController);
         loadedController.clear();
-        _seedBufferLines(
-          loadedTerminal,
-          <String>[for (var i = 0; i < 120; i++) 'Line $i'],
-        );
+        _seedBufferLines(loadedTerminal, <String>[
+          for (var i = 0; i < 120; i++) 'Line $i',
+        ]);
         loadedController.notifyHistoryReplayed();
 
         await tester.pumpWidget(
@@ -1092,10 +1090,9 @@ void main() {
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 60));
 
-          _seedBufferLines(
-            termA,
-            <String>[for (var i = 0; i < 120; i++) 'session A line $i'],
-          );
+          _seedBufferLines(termA, <String>[
+            for (var i = 0; i < 120; i++) 'session A line $i',
+          ]);
           ctrlA.notifyHistoryReplayed();
           await tester.pumpWidget(
             buildPane(
@@ -1139,10 +1136,9 @@ void main() {
           await tester.pump(const Duration(milliseconds: 30));
           expect(nearTopCount, 0);
 
-          _seedBufferLines(
-            termB,
-            <String>[for (var i = 0; i < 80; i++) 'session B line $i'],
-          );
+          _seedBufferLines(termB, <String>[
+            for (var i = 0; i < 80; i++) 'session B line $i',
+          ]);
           ctrlB.notifyHistoryReplayed();
           await tester.pumpWidget(
             buildPane(
@@ -1205,10 +1201,9 @@ void main() {
 
           ctrlA.notifyHistoryPageStarted();
           ctrlA.clear();
-          _seedBufferLines(
-            termA,
-            <String>[for (var i = 0; i < 280; i++) 'session A paged line $i'],
-          );
+          _seedBufferLines(termA, <String>[
+            for (var i = 0; i < 280; i++) 'session A paged line $i',
+          ]);
           ctrlA.notifyHistoryReplayed();
           await tester.pump();
           await tester.pump(const Duration(milliseconds: 60));
@@ -1220,10 +1215,7 @@ void main() {
 
           for (var i = 0; i < 5; i++) {
             termA.appendOutputLineForTest(
-              _cellLine(
-                'session A live after page $i',
-                cols: termA.viewWidth,
-              ),
+              _cellLine('session A live after page $i', cols: termA.viewWidth),
             );
           }
           await tester.pump();
@@ -1310,10 +1302,9 @@ void main() {
           final sentInput = <String>[];
           ctrl.addInputListener(sentInput.add);
 
-          _seedBufferLines(
-            term,
-            <String>[for (var i = 0; i < 60; i++) 'scrollback line $i'],
-          );
+          _seedBufferLines(term, <String>[
+            for (var i = 0; i < 60; i++) 'scrollback line $i',
+          ]);
           term.setModesForTest(
             mouseMode: kMouseModeButtonEvent,
             mouseReportMode: kMouseReportSgr,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -38,6 +38,7 @@ struct TerminalSyncSubState {
     cursor: TerminalSyncCursor,
     last_acked_frame_seq: u64,
     dirty: bool,
+    retried_poll_err: bool,
     next_synth_event_seq: u64,
 }
 
@@ -173,6 +174,7 @@ pub struct WebSocketSessionConnection<A, U = NoopAuthenticator> {
     subscriptions: HashMap<SubscriptionId, SessionEventReceiver>,
     terminal_sync_subs: HashMap<SubscriptionId, TerminalSyncSubState>,
     session_to_sync_sub: HashMap<SessionId, SubscriptionId>,
+    pending_events: VecDeque<ServerMessage>,
     /// Connection-wide push channel, independent of session subscriptions. The
     /// daemon broadcasts `ServerMessage`s (e.g. snippet updates) here so the
     /// client learns about sessions it never attached to.
@@ -194,6 +196,7 @@ impl<A: SessionApi> WebSocketSessionConnection<A, NoopAuthenticator> {
             subscriptions: HashMap::new(),
             terminal_sync_subs: HashMap::new(),
             session_to_sync_sub: HashMap::new(),
+            pending_events: VecDeque::new(),
             global_rx: None,
             format: ProtocolFormat::Flatbuffers,
             peer_addr: None,
@@ -211,6 +214,7 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             subscriptions: HashMap::new(),
             terminal_sync_subs: HashMap::new(),
             session_to_sync_sub: HashMap::new(),
+            pending_events: VecDeque::new(),
             global_rx: None,
             format: ProtocolFormat::Flatbuffers,
             peer_addr: None,
@@ -306,10 +310,16 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             triage_core::generated::triage::generated::ClientMessage,
         >(message)
         {
-            Ok(fb_msg) => match flatbuffers_proto::parse_client_message(fb_msg) {
-                Ok(parsed) => self.handle_message(parsed),
-                Err(error) => ServerMessage::Error { id: None, error },
-            },
+            Ok(fb_msg) => {
+                let id = fb_msg
+                    .id()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| Value::String(s.to_string()));
+                match flatbuffers_proto::parse_client_message(fb_msg) {
+                    Ok(parsed) => self.handle_message(parsed),
+                    Err(error) => ServerMessage::Error { id, error },
+                }
+            }
             Err(error) => ServerMessage::Error {
                 id: None,
                 error: ProtocolError::new("invalid_flatbuffer", error.to_string()),
@@ -326,18 +336,25 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             triage_core::generated::triage::generated::ClientMessage,
         >(message)
         {
-            Ok(fb_msg) => match flatbuffers_proto::parse_client_message(fb_msg) {
-                Ok(parsed) => {
-                    let is_fire_and_forget_ack = is_absent_id(&parsed.id)
-                        && matches!(parsed.request, ClientRequest::AckTerminalSync { .. });
-                    let resp = self.handle_message(parsed);
-                    if is_fire_and_forget_ack && matches!(resp, ServerMessage::Response { .. }) {
-                        return None;
+            Ok(fb_msg) => {
+                let id = fb_msg
+                    .id()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| Value::String(s.to_string()));
+                match flatbuffers_proto::parse_client_message(fb_msg) {
+                    Ok(parsed) => {
+                        let is_fire_and_forget_ack = is_absent_id(&parsed.id)
+                            && matches!(parsed.request, ClientRequest::AckTerminalSync { .. });
+                        let resp = self.handle_message(parsed);
+                        if is_fire_and_forget_ack && matches!(resp, ServerMessage::Response { .. })
+                        {
+                            return None;
+                        }
+                        resp
                     }
-                    resp
+                    Err(error) => ServerMessage::Error { id, error },
                 }
-                Err(error) => ServerMessage::Error { id: None, error },
-            },
+            }
             Err(error) => ServerMessage::Error {
                 id: None,
                 error: ProtocolError::new("invalid_flatbuffer", error.to_string()),
@@ -369,7 +386,13 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
     }
 
     pub fn drain_events(&mut self) -> Vec<ServerMessage> {
+        if !self.is_authenticated() {
+            return Vec::new();
+        }
         let mut messages = Vec::new();
+        while let Some(msg) = self.pending_events.pop_front() {
+            messages.push(msg);
+        }
         let mut closed_subscriptions = Vec::new();
 
         {
@@ -385,20 +408,28 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     let mut saw_disconnect = false;
                     for _ in 0..MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
                         match receiver.try_recv() {
-                            Ok(envelope) => match &envelope.event {
-                                SessionEvent::Output { .. }
-                                | SessionEvent::ResyncRequired { .. } => {
+                            Ok(mut envelope) => match envelope.event {
+                                SessionEvent::Output { .. } => {
                                     sync_state.dirty = true;
+                                    sync_state.retried_poll_err = false;
+                                    sync_state.next_synth_event_seq =
+                                        sync_state.next_synth_event_seq.max(envelope.event_seq);
                                 }
-                                SessionEvent::Snapshot { .. } => {
+                                SessionEvent::ResyncRequired {
+                                    session_id,
+                                    mut snapshot,
+                                    ..
+                                } => {
                                     sync_state.dirty = true;
-                                    messages.push(ServerMessage::Event {
-                                        subscription_id: subscription_id.clone(),
-                                        envelope,
-                                    });
-                                }
-                                SessionEvent::Exited { .. } => {
-                                    if sync_state.dirty {
+                                    sync_state.retried_poll_err = false;
+                                    let resync_exited = snapshot.exited;
+                                    let resync_output_seq = snapshot.output_seq;
+                                    let resync_bytes_logged = snapshot.bytes_logged;
+                                    snapshot.visible_rows.clear();
+                                    snapshot.styled_rows.clear();
+                                    snapshot.raw_output.clear();
+                                    snapshot.raw_output_prefix.clear();
+                                    if resync_exited {
                                         if let Ok(PollTerminalSyncOutcome::Frame(frame)) = api
                                             .poll_terminal_sync(
                                                 sync_state.session_id.clone(),
@@ -406,9 +437,10 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                                                 false,
                                             )
                                         {
-                                            let seq = sync_state.next_synth_event_seq;
-                                            sync_state.next_synth_event_seq =
-                                                sync_state.next_synth_event_seq.wrapping_add(1);
+                                            let seq = alloc_sync_event_seq(
+                                                &mut sync_state.next_synth_event_seq,
+                                                envelope.event_seq,
+                                            );
                                             messages.push(ServerMessage::Event {
                                                 subscription_id: subscription_id.clone(),
                                                 envelope: SessionEventEnvelope {
@@ -422,6 +454,96 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                                         }
                                         sync_state.dirty = false;
                                     }
+                                    let snap_seq = alloc_sync_event_seq(
+                                        &mut sync_state.next_synth_event_seq,
+                                        envelope.event_seq,
+                                    );
+                                    messages.push(ServerMessage::Event {
+                                        subscription_id: subscription_id.clone(),
+                                        envelope: SessionEventEnvelope {
+                                            event_seq: snap_seq,
+                                            event: SessionEvent::Snapshot {
+                                                session_id: session_id.clone(),
+                                                snapshot,
+                                            },
+                                        },
+                                    });
+                                    if resync_exited {
+                                        let exit_seq = alloc_sync_event_seq(
+                                            &mut sync_state.next_synth_event_seq,
+                                            envelope.event_seq,
+                                        );
+                                        messages.push(ServerMessage::Event {
+                                            subscription_id: subscription_id.clone(),
+                                            envelope: SessionEventEnvelope {
+                                                event_seq: exit_seq,
+                                                event: SessionEvent::Exited {
+                                                    session_id,
+                                                    completed: CompletedSession {
+                                                        output_seq: resync_output_seq,
+                                                        bytes_logged: resync_bytes_logged,
+                                                        visible_rows: Vec::new(),
+                                                    },
+                                                },
+                                            },
+                                        });
+                                    }
+                                }
+                                SessionEvent::Snapshot {
+                                    session_id,
+                                    mut snapshot,
+                                } => {
+                                    sync_state.dirty = true;
+                                    sync_state.retried_poll_err = false;
+                                    snapshot.visible_rows.clear();
+                                    snapshot.styled_rows.clear();
+                                    snapshot.raw_output.clear();
+                                    snapshot.raw_output_prefix.clear();
+                                    let snap_seq = alloc_sync_event_seq(
+                                        &mut sync_state.next_synth_event_seq,
+                                        envelope.event_seq,
+                                    );
+                                    messages.push(ServerMessage::Event {
+                                        subscription_id: subscription_id.clone(),
+                                        envelope: SessionEventEnvelope {
+                                            event_seq: snap_seq,
+                                            event: SessionEvent::Snapshot {
+                                                session_id,
+                                                snapshot,
+                                            },
+                                        },
+                                    });
+                                }
+                                SessionEvent::Exited { .. } => {
+                                    if sync_state.dirty {
+                                        if let Ok(PollTerminalSyncOutcome::Frame(frame)) = api
+                                            .poll_terminal_sync(
+                                                sync_state.session_id.clone(),
+                                                &mut sync_state.cursor,
+                                                false,
+                                            )
+                                        {
+                                            let seq = alloc_sync_event_seq(
+                                                &mut sync_state.next_synth_event_seq,
+                                                envelope.event_seq,
+                                            );
+                                            messages.push(ServerMessage::Event {
+                                                subscription_id: subscription_id.clone(),
+                                                envelope: SessionEventEnvelope {
+                                                    event_seq: seq,
+                                                    event: SessionEvent::TerminalSync {
+                                                        session_id: sync_state.session_id.clone(),
+                                                        frame,
+                                                    },
+                                                },
+                                            });
+                                        }
+                                        sync_state.dirty = false;
+                                    }
+                                    envelope.event_seq = alloc_sync_event_seq(
+                                        &mut sync_state.next_synth_event_seq,
+                                        envelope.event_seq,
+                                    );
                                     messages.push(ServerMessage::Event {
                                         subscription_id: subscription_id.clone(),
                                         envelope,
@@ -429,6 +551,10 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                                 }
                                 SessionEvent::LeaseChanged { .. }
                                 | SessionEvent::TerminalSync { .. } => {
+                                    envelope.event_seq = alloc_sync_event_seq(
+                                        &mut sync_state.next_synth_event_seq,
+                                        envelope.event_seq,
+                                    );
                                     messages.push(ServerMessage::Event {
                                         subscription_id: subscription_id.clone(),
                                         envelope,
@@ -457,9 +583,9 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                         ) {
                             Ok(PollTerminalSyncOutcome::Frame(frame)) => {
                                 sync_state.dirty = false;
-                                let seq = sync_state.next_synth_event_seq;
-                                sync_state.next_synth_event_seq =
-                                    sync_state.next_synth_event_seq.wrapping_add(1);
+                                sync_state.retried_poll_err = false;
+                                let seq =
+                                    alloc_sync_event_seq(&mut sync_state.next_synth_event_seq, 1);
                                 messages.push(ServerMessage::Event {
                                     subscription_id: subscription_id.clone(),
                                     envelope: SessionEventEnvelope {
@@ -471,8 +597,17 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                                     },
                                 });
                             }
-                            Ok(PollTerminalSyncOutcome::Idle) | Err(_) => {
+                            Ok(PollTerminalSyncOutcome::Idle) => {
                                 sync_state.dirty = false;
+                                sync_state.retried_poll_err = false;
+                            }
+                            Err(_) => {
+                                if !saw_disconnect && !sync_state.retried_poll_err {
+                                    sync_state.retried_poll_err = true;
+                                } else {
+                                    sync_state.dirty = false;
+                                    sync_state.retried_poll_err = false;
+                                }
                             }
                             Ok(PollTerminalSyncOutcome::HoldForSynchronizedUpdate) => {}
                         }
@@ -556,6 +691,12 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                     self.authenticated = true;
                     true
                 };
+                if !authenticated {
+                    self.subscriptions.clear();
+                    self.terminal_sync_subs.clear();
+                    self.session_to_sync_sub.clear();
+                    self.pending_events.clear();
+                }
 
                 let update = self.api.server_update_info();
                 let (disk_free_bytes, disk_total_bytes) = current_disk_bytes();
@@ -785,33 +926,163 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 let want_subscribe = request.subscribe;
                 if let Some(existing_sub_id) = self.session_to_sync_sub.get(&session_id).cloned()
                     && self.subscriptions.contains_key(&existing_sub_id)
-                    && let Some(sub_state) = self.terminal_sync_subs.get_mut(&existing_sub_id)
+                    && self.terminal_sync_subs.contains_key(&existing_sub_id)
                 {
+                    let (mut working_cursor, mut next_synth_event_seq) = {
+                        let sub = self
+                            .terminal_sync_subs
+                            .get(&existing_sub_id)
+                            .expect("checked contains_key");
+                        (sub.cursor.clone(), sub.next_synth_event_seq)
+                    };
+                    let pre_sync_next_frame_seq = working_cursor.next_frame_seq;
+                    let req_client_id = request.client_id.clone();
+                    let req_size = request.size.clone();
                     if request.known_frame_seq == 0
-                        || request.known_frame_seq != sub_state.cursor.next_frame_seq
+                        || request.known_frame_seq != working_cursor.next_frame_seq
                     {
-                        sub_state.cursor.reset_keep_seq();
+                        working_cursor.reset_viewport_keep_generations();
                     }
-                    let (snapshot, lease, frame) = self
+                    let (mut snapshot, mut lease, mut frame) = self
                         .api
-                        .sync_terminal_session(request, &mut sub_state.cursor)?;
-                    sub_state.last_acked_frame_seq = frame.frame_seq;
-                    sub_state.dirty = true;
-                    let subscription_id = if snapshot.exited || !want_subscribe {
+                        .sync_terminal_session(request, &mut working_cursor)?;
+
+                    // Drain queued events on the existing receiver into a staging
+                    // buffer so dead-actor notifications are discarded if the
+                    // session exited or was replaced by `restore_if_exited`.
+                    let mut rx_disconnected = false;
+                    let mut saw_output_or_snapshot = false;
+                    let mut staged_events = Vec::new();
+                    if let Some(existing_rx) = self.subscriptions.get(&existing_sub_id) {
+                        loop {
+                            match existing_rx.try_recv() {
+                                Ok(envelope) => stage_sync_channel_envelope(
+                                    &existing_sub_id,
+                                    envelope,
+                                    &mut staged_events,
+                                    &mut saw_output_or_snapshot,
+                                    &mut next_synth_event_seq,
+                                ),
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    rx_disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if snapshot.exited {
                         self.subscriptions.remove(&existing_sub_id);
                         self.terminal_sync_subs.remove(&existing_sub_id);
                         self.session_to_sync_sub.remove(&session_id);
-                        None
-                    } else {
-                        if let Ok(fresh_rx) = self.api.subscribe_session_events(session_id.clone())
-                        {
-                            self.subscriptions.insert(existing_sub_id.clone(), fresh_rx);
+                        self.pending_events
+                            .push_back(ServerMessage::SubscriptionClosed {
+                                subscription_id: existing_sub_id,
+                            });
+                        return Ok(ServerResult::SyncTerminal {
+                            response: Box::new(SyncTerminalResponse {
+                                subscription_id: None,
+                                snapshot,
+                                lease,
+                                frame,
+                            }),
+                        });
+                    }
+
+                    if rx_disconnected {
+                        staged_events.clear();
+                        saw_output_or_snapshot = false;
+                        next_synth_event_seq = 1;
+                        let fresh_rx = self.api.subscribe_session_events(session_id.clone()).ok();
+                        working_cursor = TerminalSyncCursor::default();
+                        working_cursor.next_frame_seq = pre_sync_next_frame_seq;
+                        (snapshot, lease, frame) = self.api.sync_terminal_session(
+                            SyncTerminalRequest {
+                                session_id: session_id.clone(),
+                                client_id: req_client_id,
+                                mode: triage_core::session::AttachMode::Observer,
+                                size: req_size,
+                                resize_pty: false,
+                                restore_if_exited: false,
+                                subscribe: false,
+                                known_frame_seq: 0,
+                            },
+                            &mut working_cursor,
+                        )?;
+                        if snapshot.exited {
+                            self.subscriptions.remove(&existing_sub_id);
+                            self.terminal_sync_subs.remove(&existing_sub_id);
+                            self.session_to_sync_sub.remove(&session_id);
+                            self.pending_events
+                                .push_back(ServerMessage::SubscriptionClosed {
+                                    subscription_id: existing_sub_id,
+                                });
+                            return Ok(ServerResult::SyncTerminal {
+                                response: Box::new(SyncTerminalResponse {
+                                    subscription_id: None,
+                                    snapshot,
+                                    lease,
+                                    frame,
+                                }),
+                            });
                         }
-                        Some(existing_sub_id.as_str().to_string())
-                    };
+                        let receiver = match fresh_rx {
+                            Some(rx) => {
+                                let mut fresh_disconnected = false;
+                                loop {
+                                    match rx.try_recv() {
+                                        Ok(envelope) => stage_sync_channel_envelope(
+                                            &existing_sub_id,
+                                            envelope,
+                                            &mut staged_events,
+                                            &mut saw_output_or_snapshot,
+                                            &mut next_synth_event_seq,
+                                        ),
+                                        Err(TryRecvError::Empty) => break,
+                                        Err(TryRecvError::Disconnected) => {
+                                            fresh_disconnected = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if fresh_disconnected {
+                                    staged_events.clear();
+                                    saw_output_or_snapshot = true;
+                                    next_synth_event_seq = 1;
+                                    self.api.subscribe_session_events_from(
+                                        SubscribeSessionEventsRequest {
+                                            session_id: session_id.clone(),
+                                            after_event_seq: Some(0),
+                                        },
+                                    )?
+                                } else {
+                                    rx
+                                }
+                            }
+                            None => {
+                                saw_output_or_snapshot = true;
+                                self.api.subscribe_session_events_from(
+                                    SubscribeSessionEventsRequest {
+                                        session_id: session_id.clone(),
+                                        after_event_seq: Some(0),
+                                    },
+                                )?
+                            }
+                        };
+                        self.subscriptions.insert(existing_sub_id.clone(), receiver);
+                    }
+                    self.pending_events.extend(staged_events);
+                    if let Some(sub_state) = self.terminal_sync_subs.get_mut(&existing_sub_id) {
+                        sub_state.cursor = working_cursor;
+                        sub_state.last_acked_frame_seq = frame.frame_seq;
+                        sub_state.dirty = saw_output_or_snapshot;
+                        sub_state.retried_poll_err = false;
+                        sub_state.next_synth_event_seq = next_synth_event_seq;
+                    }
                     return Ok(ServerResult::SyncTerminal {
                         response: Box::new(SyncTerminalResponse {
-                            subscription_id,
+                            subscription_id: Some(existing_sub_id.as_str().to_string()),
                             snapshot,
                             lease,
                             frame,
@@ -820,13 +1091,64 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 }
 
                 self.session_to_sync_sub.remove(&session_id);
+                let pre_rx = if want_subscribe {
+                    self.api.subscribe_session_events(session_id.clone()).ok()
+                } else {
+                    None
+                };
                 let mut cursor = TerminalSyncCursor::default();
                 let (snapshot, lease, frame) =
                     self.api.sync_terminal_session(request, &mut cursor)?;
                 let mut subscription_id_out = None;
                 if want_subscribe && !snapshot.exited {
-                    let receiver = self.api.subscribe_session_events(session_id.clone())?;
                     let subscription_id = self.next_subscription_id();
+                    let mut initial_dirty = false;
+                    let mut staged_initial = Vec::new();
+                    let mut pre_rx_disconnected = false;
+                    let mut next_synth_event_seq = 1u64;
+                    let receiver = match pre_rx {
+                        Some(rx) => {
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(envelope) => stage_sync_channel_envelope(
+                                        &subscription_id,
+                                        envelope,
+                                        &mut staged_initial,
+                                        &mut initial_dirty,
+                                        &mut next_synth_event_seq,
+                                    ),
+                                    Err(TryRecvError::Empty) => break,
+                                    Err(TryRecvError::Disconnected) => {
+                                        pre_rx_disconnected = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if pre_rx_disconnected {
+                                staged_initial.clear();
+                                initial_dirty = true;
+                                next_synth_event_seq = 1;
+                                self.api.subscribe_session_events_from(
+                                    SubscribeSessionEventsRequest {
+                                        session_id: session_id.clone(),
+                                        after_event_seq: Some(0),
+                                    },
+                                )?
+                            } else {
+                                rx
+                            }
+                        }
+                        None => {
+                            initial_dirty = true;
+                            self.api.subscribe_session_events_from(
+                                SubscribeSessionEventsRequest {
+                                    session_id: session_id.clone(),
+                                    after_event_seq: Some(0),
+                                },
+                            )?
+                        }
+                    };
+                    self.pending_events.extend(staged_initial);
                     let frame_seq = frame.frame_seq;
                     subscription_id_out = Some(subscription_id.as_str().to_string());
                     self.subscriptions.insert(subscription_id.clone(), receiver);
@@ -836,8 +1158,9 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                             session_id: session_id.clone(),
                             cursor,
                             last_acked_frame_seq: frame_seq,
-                            dirty: true,
-                            next_synth_event_seq: 1,
+                            dirty: initial_dirty,
+                            retried_poll_err: false,
+                            next_synth_event_seq,
                         },
                     );
                     self.session_to_sync_sub.insert(session_id, subscription_id);
@@ -860,7 +1183,8 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
                 frame_seq,
             } => {
                 if let Some(sub_state) = self.terminal_sync_subs.get_mut(&subscription_id) {
-                    sub_state.last_acked_frame_seq = sub_state.last_acked_frame_seq.max(frame_seq);
+                    let clamped = frame_seq.min(sub_state.cursor.next_frame_seq);
+                    sub_state.last_acked_frame_seq = sub_state.last_acked_frame_seq.max(clamped);
                 }
                 Ok(ServerResult::Unit)
             }
@@ -882,6 +1206,116 @@ impl<A: SessionApi, U: WebSocketAuthenticator> WebSocketSessionConnection<A, U> 
             .expect("generated subscription id must be valid");
         self.next_subscription_id += 1;
         subscription_id
+    }
+}
+
+fn alloc_sync_event_seq(next_seq: &mut u64, floor: u64) -> u64 {
+    let seq = (*next_seq).max(floor);
+    *next_seq = seq.saturating_add(1);
+    seq
+}
+
+fn stage_sync_channel_envelope(
+    subscription_id: &SubscriptionId,
+    mut envelope: SessionEventEnvelope,
+    staged: &mut Vec<ServerMessage>,
+    saw_output_or_snapshot: &mut bool,
+    next_synth_event_seq: &mut u64,
+) {
+    match envelope.event {
+        SessionEvent::Output { .. } => {
+            *saw_output_or_snapshot = true;
+            *next_synth_event_seq = (*next_synth_event_seq).max(envelope.event_seq);
+        }
+        SessionEvent::ResyncRequired {
+            session_id: snap_sid,
+            mut snapshot,
+            ..
+        } => {
+            *saw_output_or_snapshot = true;
+            let resync_exited = snapshot.exited;
+            let resync_output_seq = snapshot.output_seq;
+            let resync_bytes_logged = snapshot.bytes_logged;
+            if resync_exited || staged.len() < MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
+                snapshot.visible_rows.clear();
+                snapshot.styled_rows.clear();
+                snapshot.raw_output.clear();
+                snapshot.raw_output_prefix.clear();
+                let snap_seq = alloc_sync_event_seq(next_synth_event_seq, envelope.event_seq);
+                staged.push(ServerMessage::Event {
+                    subscription_id: subscription_id.clone(),
+                    envelope: SessionEventEnvelope {
+                        event_seq: snap_seq,
+                        event: SessionEvent::Snapshot {
+                            session_id: snap_sid.clone(),
+                            snapshot,
+                        },
+                    },
+                });
+            } else {
+                *next_synth_event_seq = (*next_synth_event_seq).max(envelope.event_seq);
+            }
+            if resync_exited {
+                let exit_seq = alloc_sync_event_seq(next_synth_event_seq, envelope.event_seq);
+                staged.push(ServerMessage::Event {
+                    subscription_id: subscription_id.clone(),
+                    envelope: SessionEventEnvelope {
+                        event_seq: exit_seq,
+                        event: SessionEvent::Exited {
+                            session_id: snap_sid,
+                            completed: CompletedSession {
+                                output_seq: resync_output_seq,
+                                bytes_logged: resync_bytes_logged,
+                                visible_rows: Vec::new(),
+                            },
+                        },
+                    },
+                });
+            }
+        }
+        SessionEvent::Snapshot {
+            session_id: snap_sid,
+            mut snapshot,
+        } => {
+            *saw_output_or_snapshot = true;
+            if staged.len() < MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
+                snapshot.visible_rows.clear();
+                snapshot.styled_rows.clear();
+                snapshot.raw_output.clear();
+                snapshot.raw_output_prefix.clear();
+                let seq = alloc_sync_event_seq(next_synth_event_seq, envelope.event_seq);
+                staged.push(ServerMessage::Event {
+                    subscription_id: subscription_id.clone(),
+                    envelope: SessionEventEnvelope {
+                        event_seq: seq,
+                        event: SessionEvent::Snapshot {
+                            session_id: snap_sid,
+                            snapshot,
+                        },
+                    },
+                });
+            } else {
+                *next_synth_event_seq = (*next_synth_event_seq).max(envelope.event_seq);
+            }
+        }
+        SessionEvent::Exited { .. } => {
+            envelope.event_seq = alloc_sync_event_seq(next_synth_event_seq, envelope.event_seq);
+            staged.push(ServerMessage::Event {
+                subscription_id: subscription_id.clone(),
+                envelope,
+            });
+        }
+        SessionEvent::LeaseChanged { .. } | SessionEvent::TerminalSync { .. } => {
+            if staged.len() < MAX_EVENTS_PER_SUBSCRIPTION_DRAIN {
+                envelope.event_seq = alloc_sync_event_seq(next_synth_event_seq, envelope.event_seq);
+                staged.push(ServerMessage::Event {
+                    subscription_id: subscription_id.clone(),
+                    envelope,
+                });
+            } else {
+                *next_synth_event_seq = (*next_synth_event_seq).max(envelope.event_seq);
+            }
+        }
     }
 }
 
@@ -1647,6 +2081,10 @@ mod tests {
         sessions: Mutex<Vec<SessionId>>,
         written: Arc<Mutex<Vec<WriteInputRequest>>>,
         next_subscription: Arc<Mutex<Option<SessionEventReceiver>>>,
+        subscribe_calls: Arc<Mutex<usize>>,
+        fail_sync_once: Arc<Mutex<bool>>,
+        fail_poll_once: Arc<Mutex<bool>>,
+        exited_snapshot: Arc<Mutex<bool>>,
         rail_layout: Mutex<triage_core::session::RailLayout>,
         set_pins_calls: SetPinsCalls,
         set_custom_label_calls: SetCustomLabelCalls,
@@ -1701,6 +2139,7 @@ mod tests {
             &self,
             _request: SubscribeSessionEventsRequest,
         ) -> Result<SessionEventReceiver> {
+            *self.subscribe_calls.lock().unwrap() += 1;
             self.next_subscription
                 .lock()
                 .unwrap()
@@ -1807,11 +2246,19 @@ mod tests {
             InputLeaseState,
             triage_core::session::TerminalSyncFrame,
         )> {
+            {
+                let mut fail = self.fail_sync_once.lock().unwrap();
+                if *fail {
+                    *fail = false;
+                    bail!("transient sync failure");
+                }
+            }
             let seqno = (*self.terminal_seqno.lock().unwrap()).max(1);
             cursor.primary.initialized = true;
             cursor.primary.synced_seqno = seqno;
             cursor.next_frame_seq = cursor.next_frame_seq.wrapping_add(1);
             let mut snapshot = test_snapshot();
+            snapshot.exited = *self.exited_snapshot.lock().unwrap();
             if let Some(sz) = request.size {
                 snapshot.size = sz;
             }
@@ -1833,6 +2280,13 @@ mod tests {
             cursor: &mut TerminalSyncCursor,
             force_full: bool,
         ) -> Result<PollTerminalSyncOutcome> {
+            {
+                let mut fail = self.fail_poll_once.lock().unwrap();
+                if *fail {
+                    *fail = false;
+                    bail!("transient poll error");
+                }
+            }
             if *self.hold_sync_update.lock().unwrap() {
                 return Ok(PollTerminalSyncOutcome::HoldForSynchronizedUpdate);
             }
@@ -3321,7 +3775,8 @@ mod tests {
                     flatbuffers_proto::parse_fb_server_message_borrowed(&ev_bytes).unwrap(),
                     flatbuffers_proto::ServerMessageBorrowed::Event {
                         subscription_id: "sub-1",
-                        event_seq: 3,
+                        // Coalesced Output envelopes 3..=7 advance next_synth_event_seq to 7.
+                        event_seq: 7,
                         event: flatbuffers_proto::SessionEventBorrowed::TerminalSync {
                             session_id: "session-1",
                             frame_seq: 4,
@@ -3335,6 +3790,580 @@ mod tests {
                 );
             }
             other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_parse_error_preserves_request_id_and_resync_keeps_subscription_and_events() {
+        let api = FakeSessionApi::default();
+        let subscribe_calls = Arc::clone(&api.subscribe_calls);
+        let fail_sync_once = Arc::clone(&api.fail_sync_once);
+        let terminal_seqno = Arc::clone(&api.terminal_seqno);
+        let (tx, rx) = mpsc::channel();
+        api.next_subscription.lock().unwrap().replace(rx);
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        // 1. FlatBuffers message with valid envelope id `"bad-fb-1"` but missing payload
+        // returns `ServerMessage::Error` carrying `id: Some("bad-fb-1")`.
+        let mut fbb = flatbuffers::FlatBufferBuilder::new();
+        let fb_id = fbb.create_string("bad-fb-1");
+        let bad_msg = fb::ClientMessage::create(
+            &mut fbb,
+            &fb::ClientMessageArgs {
+                id: Some(fb_id),
+                payload_type: fb::ClientRequestPayload::NONE,
+                payload: None,
+            },
+        );
+        fbb.finish(bad_msg, None);
+        let err_bytes = connection.handle_binary_message(fbb.finished_data());
+        assert_eq!(
+            flatbuffers_proto::parse_fb_server_message_borrowed(&err_bytes).unwrap(),
+            flatbuffers_proto::ServerMessageBorrowed::Error {
+                id: Some("bad-fb-1"),
+                error: flatbuffers_proto::ProtocolErrorBorrowed {
+                    code: "unsupported_payload",
+                    message: "The provided FlatBuffers payload type is not recognized or supported by Triage",
+                },
+            }
+        );
+
+        // 2. Initial SyncTerminal subscribes (`subscribe_calls == 1`).
+        let sid = SessionId::new("session-1").unwrap();
+        let cid = ClientId::new("client-1").unwrap();
+        let init_resp = connection.handle_message(ClientMessage {
+            id: Some(json!("sync-1")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        assert!(matches!(init_resp, ServerMessage::Response { .. }));
+        assert_eq!(*subscribe_calls.lock().unwrap(), 1);
+
+        // 3. Fallible SyncTerminal with `known_frame_seq: 0` does NOT reset cursor when RPC fails.
+        *fail_sync_once.lock().unwrap() = true;
+        let failed_sync = connection.handle_message(ClientMessage {
+            id: Some(json!("sync-fail")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: false,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        assert!(matches!(failed_sync, ServerMessage::Error { .. }));
+        assert!(
+            connection.terminal_sync_subs[&SubscriptionId::new("sub-1").unwrap()]
+                .cursor
+                .primary
+                .initialized
+        );
+
+        // 4. Queue a LeaseChanged + Snapshot (with legacy rows) before a `subscribe: false`
+        // resize SyncTerminal: subscription stays active without calling `subscribe_session_events`
+        // again, LeaseChanged survives, and Snapshot has legacy rows stripped!
+        let mut noisy_snapshot = test_snapshot();
+        noisy_snapshot.visible_rows = vec!["legacy-row".to_string()];
+        noisy_snapshot.raw_output = vec![1, 2, 3];
+        tx.send(SessionEventEnvelope {
+            event_seq: 10,
+            event: SessionEvent::LeaseChanged {
+                session_id: sid.clone(),
+                change: InputLeaseState::default().acquire(
+                    cid.clone(),
+                    triage_core::session::InputControllerKind::Interactive,
+                ),
+            },
+        })
+        .unwrap();
+        tx.send(SessionEventEnvelope {
+            event_seq: 11,
+            event: SessionEvent::Snapshot {
+                session_id: sid.clone(),
+                snapshot: noisy_snapshot,
+            },
+        })
+        .unwrap();
+
+        let resize_resp = connection.handle_message(ClientMessage {
+            id: Some(json!("sync-resize")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid,
+                    mode: AttachMode::InteractiveController,
+                    size: None,
+                    resize_pty: true,
+                    restore_if_exited: false,
+                    subscribe: false,
+                    known_frame_seq: 1,
+                },
+            },
+        });
+        match resize_resp {
+            ServerMessage::Response {
+                result: ServerResult::SyncTerminal { response },
+                ..
+            } => {
+                assert_eq!(response.subscription_id.as_deref(), Some("sub-1"));
+                assert_eq!(response.frame.frame_seq, 2);
+            }
+            other => panic!("unexpected resize resp: {other:?}"),
+        }
+        assert_eq!(*subscribe_calls.lock().unwrap(), 1);
+
+        // 5. Out-of-range AckTerminalSync (`u64::MAX`) clamps to `next_frame_seq` (2) so
+        // flow control still throttles after 2 unacked frames!
+        let _ = connection.handle_message(ClientMessage {
+            id: None,
+            request: ClientRequest::AckTerminalSync {
+                subscription_id: SubscriptionId::new("sub-1").unwrap(),
+                frame_seq: u64::MAX,
+            },
+        });
+        assert_eq!(
+            connection.terminal_sync_subs[&SubscriptionId::new("sub-1").unwrap()]
+                .last_acked_frame_seq,
+            2
+        );
+
+        let drained = connection.drain_events();
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            &drained[0],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::LeaseChanged { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        match &drained[1] {
+            ServerMessage::Event {
+                envelope:
+                    SessionEventEnvelope {
+                        event: SessionEvent::Snapshot { snapshot, .. },
+                        ..
+                    },
+                ..
+            } => {
+                assert!(snapshot.visible_rows.is_empty());
+                assert!(snapshot.raw_output.is_empty());
+            }
+            other => panic!("expected stripped Snapshot event, got {other:?}"),
+        }
+
+        // Confirm subscription is still live after `subscribe: false` sync!
+        *terminal_seqno.lock().unwrap() = 5;
+        tx.send(test_output_event(12)).unwrap();
+        assert_eq!(connection.drain_events().len(), 1);
+    }
+
+    #[test]
+    fn resync_lifecycle_preserves_generations_handles_resync_required_and_retries_poll_error() {
+        let api = FakeSessionApi::default();
+        let fail_poll_once = Arc::clone(&api.fail_poll_once);
+        let exited_snapshot = Arc::clone(&api.exited_snapshot);
+        let terminal_seqno = Arc::clone(&api.terminal_seqno);
+        let (tx, rx) = mpsc::channel();
+        api.next_subscription.lock().unwrap().replace(rx);
+        let mut connection = WebSocketSessionConnection::new(api);
+
+        let sid = SessionId::new("session-1").unwrap();
+        let cid = ClientId::new("client-1").unwrap();
+        let sub_id = SubscriptionId::new("sub-1").unwrap();
+        let _ = connection.handle_message(ClientMessage {
+            id: Some(json!("init")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+
+        // 1. Seed non-zero generation counters on the subscription cursor and force a
+        // full re-sync (`known_frame_seq: 0`): `reset_viewport_keep_generations` resets
+        // viewport initialization without zeroing `last_alt_screen` or bell/erase gens.
+        {
+            let sub = connection.terminal_sync_subs.get_mut(&sub_id).unwrap();
+            sub.cursor.last_alt_screen = Some(false);
+            sub.cursor.last_bell_gen = 9;
+            sub.cursor.last_erase_scrollback_gen = 4;
+            sub.cursor.last_title_gen = 12;
+        }
+        let _ = connection.handle_message(ClientMessage {
+            id: Some(json!("resync-full")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        {
+            let sub = &connection.terminal_sync_subs[&sub_id];
+            assert_eq!(sub.cursor.last_alt_screen, Some(false));
+            assert_eq!(sub.cursor.last_bell_gen, 9);
+            assert_eq!(sub.cursor.last_erase_scrollback_gen, 4);
+            assert_eq!(sub.cursor.last_title_gen, 11);
+        }
+
+        // 2. `ResyncRequired` emits a stripped `Snapshot`, and a transient `poll_terminal_sync`
+        // error keeps `dirty = true` for one retry tick rather than wedging updates.
+        let mut overflow_snap = test_snapshot();
+        overflow_snap.visible_rows = vec!["heavy".to_string()];
+        overflow_snap.raw_output = vec![9, 9];
+        *terminal_seqno.lock().unwrap() = 10;
+        *fail_poll_once.lock().unwrap() = true;
+        tx.send(SessionEventEnvelope {
+            event_seq: 20,
+            event: SessionEvent::ResyncRequired {
+                session_id: sid.clone(),
+                latest_event_seq: 20,
+                snapshot: overflow_snap,
+            },
+        })
+        .unwrap();
+
+        let first_drain = connection.drain_events();
+        assert_eq!(first_drain.len(), 1);
+        match &first_drain[0] {
+            ServerMessage::Event {
+                envelope:
+                    SessionEventEnvelope {
+                        event: SessionEvent::Snapshot { snapshot, .. },
+                        ..
+                    },
+                ..
+            } => {
+                assert!(snapshot.visible_rows.is_empty());
+                assert!(snapshot.raw_output.is_empty());
+            }
+            other => panic!("expected stripped Snapshot from ResyncRequired, got {other:?}"),
+        }
+
+        // Retry tick recovers the `TerminalSync` frame without needing new PTY output.
+        let retry_drain = connection.drain_events();
+        assert_eq!(retry_drain.len(), 1);
+        assert!(matches!(
+            &retry_drain[0],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::TerminalSync { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // 2b. `ResyncRequired` with `snapshot.exited == true` flushes the final
+        // `TerminalSync` frame, emits a stripped `Snapshot`, and synthesizes
+        // `SessionEvent::Exited` so replay-buffer overflow on child exit never
+        // strands the client in an attached state.
+        let mut exited_overflow_snap = test_snapshot();
+        exited_overflow_snap.exited = true;
+        exited_overflow_snap.output_seq = 99;
+        exited_overflow_snap.bytes_logged = 4096;
+        *terminal_seqno.lock().unwrap() = 11;
+        tx.send(SessionEventEnvelope {
+            event_seq: 21,
+            event: SessionEvent::ResyncRequired {
+                session_id: sid.clone(),
+                latest_event_seq: 21,
+                snapshot: exited_overflow_snap,
+            },
+        })
+        .unwrap();
+
+        let exited_resync_drain = connection.drain_events();
+        assert_eq!(exited_resync_drain.len(), 3);
+        assert!(matches!(
+            &exited_resync_drain[0],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::TerminalSync { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &exited_resync_drain[1],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::Snapshot { snapshot, .. },
+                    ..
+                },
+                ..
+            } if snapshot.exited && snapshot.visible_rows.is_empty()
+        ));
+        assert!(matches!(
+            &exited_resync_drain[2],
+            ServerMessage::Event {
+                envelope: SessionEventEnvelope {
+                    event: SessionEvent::Exited { completed, .. },
+                    ..
+                },
+                ..
+            } if completed.output_seq == 99 && completed.bytes_logged == 4096
+        ));
+        assert!(connection.drain_events().is_empty());
+
+        // 3. If the session exited before a re-sync, queued events on the closing channel
+        // are discarded rather than emitted alongside `SubscriptionClosed`.
+        tx.send(SessionEventEnvelope {
+            event_seq: 22,
+            event: SessionEvent::LeaseChanged {
+                session_id: sid.clone(),
+                change: InputLeaseState::default().acquire(
+                    cid.clone(),
+                    triage_core::session::InputControllerKind::Interactive,
+                ),
+            },
+        })
+        .unwrap();
+        *exited_snapshot.lock().unwrap() = true;
+        let exit_sync = connection.handle_message(ClientMessage {
+            id: Some(json!("exit-sync")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid,
+                    client_id: cid,
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        match exit_sync {
+            ServerMessage::Response {
+                result: ServerResult::SyncTerminal { response },
+                ..
+            } => {
+                assert!(response.subscription_id.is_none());
+                assert!(response.snapshot.exited);
+            }
+            other => panic!("unexpected exit_sync: {other:?}"),
+        }
+        let post_exit = connection.drain_events();
+        assert_eq!(
+            post_exit,
+            vec![ServerMessage::SubscriptionClosed {
+                subscription_id: sub_id,
+            }]
+        );
+    }
+
+    #[test]
+    fn reauth_hello_clears_subscriptions_event_seq_stays_monotonic_and_actor_revival_resets_gens() {
+        let auth = FakeAuthenticator {
+            require_pairing: true,
+            pairing_code: "123456".to_string(),
+            paired_token: "secret-token".to_string(),
+            client_id: ClientId::new("phone").unwrap(),
+        };
+        let api = FakeSessionApi::default();
+        let subscribe_calls = Arc::clone(&api.subscribe_calls);
+        let terminal_seqno = Arc::clone(&api.terminal_seqno);
+        let (tx1, rx1) = mpsc::channel();
+        api.next_subscription.lock().unwrap().replace(rx1);
+        let next_sub_slot = Arc::clone(&api.next_subscription);
+        let mut connection = WebSocketSessionConnection::with_authenticator(api, auth);
+
+        let sid = SessionId::new("session-1").unwrap();
+        let cid = ClientId::new("phone").unwrap();
+        let sub_id = SubscriptionId::new("sub-1").unwrap();
+
+        // Authenticate via Hello, establish SyncTerminal subscription, then send invalid Hello:
+        // connection must become unauthenticated and drop prior subscriptions + pending events.
+        let ok_hello = connection.handle_message(ClientMessage {
+            id: Some(json!("h1")),
+            request: ClientRequest::Hello {
+                client_id: Some(cid.clone()),
+                token: Some("secret-token".to_string()),
+            },
+        });
+        assert!(matches!(ok_hello, ServerMessage::Response { .. }));
+
+        let sync1 = connection.handle_message(ClientMessage {
+            id: Some(json!("s1")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        assert!(matches!(sync1, ServerMessage::Response { .. }));
+        assert_eq!(connection.terminal_sync_subs.len(), 1);
+
+        let bad_hello = connection.handle_message(ClientMessage {
+            id: Some(json!("h2")),
+            request: ClientRequest::Hello {
+                client_id: Some(cid.clone()),
+                token: Some("wrong-token".to_string()),
+            },
+        });
+        assert!(matches!(bad_hello, ServerMessage::Response { .. }));
+        assert!(connection.terminal_sync_subs.is_empty());
+        assert!(connection.subscriptions.is_empty());
+        *terminal_seqno.lock().unwrap() = 5;
+        let _ = tx1.send(test_output_event(10));
+        assert!(connection.drain_events().is_empty());
+
+        // Re-authenticate, subscribe fresh rx2, and verify actor revival (`rx_disconnected`
+        // on an active non-exited session) resets stale generation counters while advancing
+        // `frame_seq` monotonically.
+        let _ = connection.handle_message(ClientMessage {
+            id: Some(json!("h3")),
+            request: ClientRequest::Hello {
+                client_id: Some(cid.clone()),
+                token: Some("secret-token".to_string()),
+            },
+        });
+        let (tx2, rx2) = mpsc::channel();
+        next_sub_slot.lock().unwrap().replace(rx2);
+        let _ = connection.handle_message(ClientMessage {
+            id: Some(json!("s2")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: true,
+                    known_frame_seq: 0,
+                },
+            },
+        });
+        let sub_id_2 = SubscriptionId::new("sub-2").unwrap();
+        {
+            let sub = connection.terminal_sync_subs.get_mut(&sub_id_2).unwrap();
+            sub.cursor.next_frame_seq = 15;
+            sub.cursor.last_bell_gen = 99;
+            sub.cursor.last_erase_scrollback_gen = 44;
+        }
+        // Simulate actor restart: drop old sender tx2 and stage fresh rx3 for replacement.
+        drop(tx2);
+        let (tx3, rx3) = mpsc::channel();
+        next_sub_slot.lock().unwrap().replace(rx3);
+        let revived_resp = connection.handle_message(ClientMessage {
+            id: Some(json!("s3")),
+            request: ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id: sid.clone(),
+                    client_id: cid.clone(),
+                    mode: AttachMode::Observer,
+                    size: None,
+                    resize_pty: false,
+                    restore_if_exited: false,
+                    subscribe: false,
+                    known_frame_seq: 15,
+                },
+            },
+        });
+        match revived_resp {
+            ServerMessage::Response {
+                result: ServerResult::SyncTerminal { response },
+                ..
+            } => {
+                assert_eq!(response.subscription_id, Some("sub-2".to_string()));
+                assert!(response.frame.frame_seq > 15);
+            }
+            other => panic!("expected revived SyncTerminal response, got {other:?}"),
+        }
+        assert_eq!(*subscribe_calls.lock().unwrap(), 3);
+        assert_eq!(
+            connection.terminal_sync_subs[&sub_id_2]
+                .cursor
+                .last_bell_gen,
+            0
+        );
+        assert_eq!(
+            connection.terminal_sync_subs[&sub_id_2]
+                .cursor
+                .last_erase_scrollback_gen,
+            0
+        );
+
+        // Verify event_seq stays strictly monotonic across real events and synthesized
+        // TerminalSync / Snapshot / Exited envelopes.
+        let mut exited_snap = test_snapshot();
+        exited_snap.exited = true;
+        *terminal_seqno.lock().unwrap() = 20;
+        tx3.send(SessionEventEnvelope {
+            event_seq: 50,
+            event: SessionEvent::LeaseChanged {
+                session_id: sid.clone(),
+                change: InputLeaseState::default()
+                    .acquire(cid, triage_core::session::InputControllerKind::Interactive),
+            },
+        })
+        .unwrap();
+        tx3.send(SessionEventEnvelope {
+            event_seq: 51,
+            event: SessionEvent::ResyncRequired {
+                session_id: sid,
+                latest_event_seq: 51,
+                snapshot: exited_snap,
+            },
+        })
+        .unwrap();
+        let _ = sub_id;
+        let drained = connection.drain_events();
+        let seqs: Vec<u64> = drained
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::Event { envelope, .. } => Some(envelope.event_seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seqs.len(), 4);
+        for pair in seqs.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "expected strictly increasing event_seq, got {seqs:?}"
+            );
         }
     }
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,9 @@ pub const MAX_INLINE_PUSHED_SCROLLBACK_ROWS: usize = 64;
 
 /// Maximum column count encoded in the 12-bit `stored_cols` / `logical_cols` fields.
 pub const MAX_ENCODED_COLS: usize = 0x0FFF;
+
+/// Maximum uncompressed byte size accepted when decoding a `TCG1` cell batch (16 MiB).
+pub const MAX_DECOMPRESSED_TCG1_BYTES: usize = 16 * 1024 * 1024;
 
 // Line flag bits stored in the upper byte of the second line-header word.
 pub const LINE_FLAG_WRAPS_NEXT: u8 = 1 << 0;
@@ -94,10 +98,36 @@ pub struct HandoverTerminalModes {
     #[serde(default)]
     pub kitty_keyboard_flags: u32,
     #[serde(default)]
+    pub in_alt_screen: bool,
+    #[serde(default)]
+    pub primary_kitty_stack: Vec<u32>,
+    #[serde(default)]
+    pub alt_kitty_stack: Vec<u32>,
+    #[serde(default)]
+    pub bracketed_paste: bool,
+    #[serde(default)]
+    pub reverse_video: bool,
+    #[serde(default = "default_cursor_visible")]
+    pub cursor_visible: bool,
+    #[serde(default)]
+    pub cursor_style: u8,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
+    pub has_custom_title: bool,
+    #[serde(default)]
+    pub erase_scrollback_gen: u64,
+    #[serde(default)]
+    pub journal_clear_floor: u64,
+    #[serde(default)]
+    pub unjournaled_trimmed_top_rows: u64,
 }
 
 fn default_auto_wrap() -> bool {
+    true
+}
+
+fn default_cursor_visible() -> bool {
     true
 }
 
@@ -112,18 +142,259 @@ impl Default for HandoverTerminalModes {
             mouse_mode: 0,
             mouse_report_mode: 0,
             kitty_keyboard_flags: 0,
+            in_alt_screen: false,
+            primary_kitty_stack: Vec::new(),
+            alt_kitty_stack: Vec::new(),
+            bracketed_paste: false,
+            reverse_video: false,
+            cursor_visible: true,
+            cursor_style: 0,
             title: String::new(),
+            has_custom_title: false,
+            erase_scrollback_gen: 0,
+            journal_clear_floor: 0,
+            unjournaled_trimmed_top_rows: 0,
         }
     }
+}
+
+/// Applies persisted handover modes onto `terminal` without clobbering cursor
+/// position or erasing screen cells. Caller should run this while the PTY
+/// writer is replay-gated so synthetic escape sequences emit nothing to the
+/// child process.
+pub fn apply_handover_modes_to_terminal(terminal: &mut Terminal, modes: &HandoverTerminalModes) {
+    fn push_kitty_stack_seq(seq: &mut Vec<u8>, stack: &[u32]) {
+        seq.extend_from_slice(b"\x1b[<128u");
+        let start = stack.len().saturating_sub(128);
+        for &raw_flags in &stack[start..] {
+            let flags = raw_flags & 0x1f;
+            seq.extend_from_slice(b"\x1b[>");
+            let mut num_buf = [0u8; 16];
+            let len = write_usize_ascii(flags as usize, &mut num_buf);
+            seq.extend_from_slice(&num_buf[..len]);
+            seq.extend_from_slice(b";1u");
+        }
+    }
+
+    let fallback_single = [modes.kitty_keyboard_flags & 0x1f];
+    let (primary_stack, alt_stack): (&[u32], &[u32]) =
+        if !modes.primary_kitty_stack.is_empty() || !modes.alt_kitty_stack.is_empty() {
+            (&modes.primary_kitty_stack, &modes.alt_kitty_stack)
+        } else if (modes.kitty_keyboard_flags & 0x1f) != 0 {
+            if modes.in_alt_screen {
+                (&[], &fallback_single)
+            } else {
+                (&fallback_single, &[])
+            }
+        } else {
+            (&[], &[])
+        };
+
+    let mut seq = Vec::with_capacity(224);
+    let was_alt = terminal.is_alt_screen_active();
+    if modes.in_alt_screen {
+        if was_alt {
+            seq.extend_from_slice(b"\x1b[?47l");
+        }
+        push_kitty_stack_seq(&mut seq, primary_stack);
+        seq.extend_from_slice(b"\x1b[?47h");
+        push_kitty_stack_seq(&mut seq, alt_stack);
+    } else {
+        if was_alt || !alt_stack.is_empty() {
+            if !was_alt {
+                seq.extend_from_slice(b"\x1b[?47h");
+            }
+            push_kitty_stack_seq(&mut seq, alt_stack);
+            seq.extend_from_slice(b"\x1b[?47l");
+        }
+        push_kitty_stack_seq(&mut seq, primary_stack);
+    }
+    seq.extend_from_slice(if modes.app_cursor_keys {
+        b"\x1b[?1h"
+    } else {
+        b"\x1b[?1l"
+    });
+    seq.extend_from_slice(if modes.app_keypad { b"\x1b=" } else { b"\x1b>" });
+    seq.extend_from_slice(if modes.auto_wrap {
+        b"\x1b[?7h"
+    } else {
+        b"\x1b[?7l"
+    });
+    seq.extend_from_slice(if modes.bracketed_paste {
+        b"\x1b[?2004h"
+    } else {
+        b"\x1b[?2004l"
+    });
+    seq.extend_from_slice(if modes.reverse_video {
+        b"\x1b[?5h"
+    } else {
+        b"\x1b[?5l"
+    });
+    seq.extend_from_slice(if modes.report_focus {
+        b"\x1b[?1004h"
+    } else {
+        b"\x1b[?1004l"
+    });
+    seq.extend_from_slice(if modes.cursor_visible {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    });
+    if modes.cursor_style <= 6 {
+        seq.extend_from_slice(b"\x1b[");
+        seq.push(b'0' + modes.cursor_style);
+        seq.extend_from_slice(b" q");
+    }
+    seq.extend_from_slice(b"\x1b[?9;1000;1002;1003l");
+    match modes.mouse_mode {
+        1 => seq.extend_from_slice(b"\x1b[?9h"),
+        2 => seq.extend_from_slice(b"\x1b[?1000h"),
+        3 => seq.extend_from_slice(b"\x1b[?1002h"),
+        4 => seq.extend_from_slice(b"\x1b[?1003h"),
+        _ => {}
+    }
+    seq.extend_from_slice(b"\x1b[?1005;1006;1015;1016l");
+    match modes.mouse_report_mode {
+        1 => seq.extend_from_slice(b"\x1b[?1005h"),
+        2 => seq.extend_from_slice(b"\x1b[?1006h"),
+        3 => seq.extend_from_slice(b"\x1b[?1015h"),
+        4 => seq.extend_from_slice(b"\x1b[?1016h"),
+        _ => {}
+    }
+    terminal.advance_bytes(&seq);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltScreenTransition {
+    Entered,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferredInitialReplayModes {
+    pub in_alt_screen: bool,
+    pub first_alt_exit_offset: Option<usize>,
+    pub auto_wrap: bool,
+    pub origin_mode: bool,
+    first_auto_wrap_enabled: Option<bool>,
+    auto_wrap_before_alt_transition: bool,
+    saw_reset_before_auto_wrap: bool,
+    end_auto_wrap: bool,
+    first_origin_enabled: Option<bool>,
+    origin_before_alt_transition: bool,
+    saw_reset_or_restore_before_origin: bool,
+    saw_alt_exit_1049_before_origin: bool,
+    end_origin_mode: bool,
+}
+
+impl InferredInitialReplayModes {
+    /// Resolves `(auto_wrap, origin_mode)` for `effective_alt_screen`, allowing
+    /// callers to override `in_alt_screen` using external scrollback evidence.
+    pub fn modes_for_screen(&self, effective_alt_screen: bool) -> (bool, bool) {
+        let auto_wrap = match self.first_auto_wrap_enabled {
+            Some(false) => true,
+            Some(true) => !(effective_alt_screen && self.auto_wrap_before_alt_transition),
+            None if self.saw_reset_before_auto_wrap => true,
+            None => self.end_auto_wrap,
+        };
+        let origin_mode = match self.first_origin_enabled {
+            Some(true) => false,
+            Some(false) => effective_alt_screen && self.origin_before_alt_transition,
+            None if self.saw_reset_or_restore_before_origin
+                || (effective_alt_screen && self.saw_alt_exit_1049_before_origin) =>
+            {
+                false
+            }
+            None => self.end_origin_mode,
+        };
+        (auto_wrap, origin_mode)
+    }
+}
+
+/// Scans `bytes` with the VT sideband lexer and returns the direction of the
+/// first alternate-screen transition (`?47`, `?1047`, or `?1049`), if any.
+pub fn first_alt_screen_transition_in_raw_stream(bytes: &[u8]) -> Option<AltScreenTransition> {
+    let mut tracker = TerminalModeTracker::new();
+    tracker.scan_for_first_alt_transition(bytes)
+}
+
+/// Infers initial screen, auto-wrap (`?7`), and origin (`?6`) modes at the start
+/// of a truncated replay tail whose post-replay state is `end_modes`.
+pub fn infer_initial_replay_modes(
+    bytes: &[u8],
+    end_modes: &HandoverTerminalModes,
+) -> InferredInitialReplayModes {
+    let mut tracker = TerminalModeTracker::new();
+    tracker.scan_initial_replay_modes(bytes, end_modes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeScanState {
     Ground,
-    Escape,
+    Escape { has_intermediate: bool },
     Csi,
     Osc,
-    OscEscape,
+    StString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Utf8ScanState {
+    Ground,
+    Tail1,
+    Tail1C2,
+    Tail2,
+    E0,
+    Ed,
+    Tail3,
+    F0,
+    F4,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ModeStack4 {
+    entries: [u8; 4],
+    len: u8,
+}
+
+impl ModeStack4 {
+    fn clear(&mut self) {
+        self.entries = [0; 4];
+        self.len = 0;
+    }
+
+    fn set_only(&mut self, mode: u32) {
+        self.clear();
+        if (1..=4).contains(&mode) {
+            self.entries[0] = mode as u8;
+            self.len = 1;
+        }
+    }
+
+    fn apply(&mut self, mode: u8, enabled: bool) {
+        let mut write = 0usize;
+        for idx in 0..(self.len as usize) {
+            if self.entries[idx] != mode {
+                self.entries[write] = self.entries[idx];
+                write += 1;
+            }
+        }
+        if enabled && write < 4 {
+            self.entries[write] = mode;
+            write += 1;
+        }
+        for slot in &mut self.entries[write..] {
+            *slot = 0;
+        }
+        self.len = write as u8;
+    }
+
+    fn current(&self) -> u32 {
+        if self.len == 0 {
+            0
+        } else {
+            u32::from(self.entries[(self.len - 1) as usize])
+        }
+    }
 }
 
 /// Streaming sideband tracker for DEC private modes, bell, erase-scrollback,
@@ -138,10 +409,15 @@ pub struct TerminalModeTracker {
     app_cursor_keys: bool,
     app_keypad: bool,
     origin_mode: bool,
+    primary_saved_origin: Option<bool>,
+    alt_saved_origin: Option<bool>,
+    declrmm_69: bool,
     auto_wrap: bool,
     report_focus: bool,
     mouse_mode: u32,
     mouse_report_mode: u32,
+    mouse_mode_stack: ModeStack4,
+    mouse_report_mode_stack: ModeStack4,
     in_alt_screen: bool,
     primary_kitty_stack: Vec<u32>,
     alt_kitty_stack: Vec<u32>,
@@ -149,10 +425,24 @@ pub struct TerminalModeTracker {
     erase_display_gen: u64,
     bell_gen: u64,
     title_gen: u64,
+    handover_title: Option<String>,
+    saw_title_osc: bool,
+    in_tmux_title: bool,
     last_observed_title: String,
     sync_update_started_at: Option<Instant>,
     scan_state: EscapeScanState,
+    utf8_state: Utf8ScanState,
+    osc_head_len: u8,
+    osc_head: [u8; 3],
     csi_buf: Vec<u8>,
+    csi_private_prefix: Option<u8>,
+    csi_has_params: bool,
+    csi_has_intermediate: bool,
+    csi_single_intermediate: Option<u8>,
+    csi_ignore: bool,
+    csi_tab_cur_param: Option<u64>,
+    csi_tab_invalid: bool,
+    csi_tab_saw_oversized: bool,
     sanitize_scratch: Vec<u8>,
 }
 
@@ -168,10 +458,15 @@ impl TerminalModeTracker {
             app_cursor_keys: false,
             app_keypad: false,
             origin_mode: false,
+            primary_saved_origin: None,
+            alt_saved_origin: None,
+            declrmm_69: false,
             auto_wrap: true,
             report_focus: false,
             mouse_mode: 0,
             mouse_report_mode: 0,
+            mouse_mode_stack: ModeStack4::default(),
+            mouse_report_mode_stack: ModeStack4::default(),
             in_alt_screen: false,
             primary_kitty_stack: Vec::new(),
             alt_kitty_stack: Vec::new(),
@@ -179,16 +474,49 @@ impl TerminalModeTracker {
             erase_display_gen: 0,
             bell_gen: 0,
             title_gen: 0,
+            handover_title: None,
+            saw_title_osc: false,
+            in_tmux_title: false,
             last_observed_title: String::new(),
             sync_update_started_at: None,
             scan_state: EscapeScanState::Ground,
+            utf8_state: Utf8ScanState::Ground,
+            osc_head_len: 0,
+            osc_head: [0; 3],
             csi_buf: Vec::with_capacity(64),
+            csi_private_prefix: None,
+            csi_has_params: false,
+            csi_has_intermediate: false,
+            csi_single_intermediate: None,
+            csi_ignore: false,
+            csi_tab_cur_param: None,
+            csi_tab_invalid: false,
+            csi_tab_saw_oversized: false,
             sanitize_scratch: Vec::new(),
         }
     }
 
     /// Exports current mode state for zero-downtime daemon handover.
-    pub fn export_handover_modes(&self, current_title: &str) -> HandoverTerminalModes {
+    pub fn export_handover_modes(&self, terminal: &Terminal) -> HandoverTerminalModes {
+        let term_title = terminal.get_title();
+        let effective_title = if term_title == "wezterm" {
+            self.handover_title.as_deref().unwrap_or(term_title)
+        } else {
+            term_title
+        };
+        let has_custom_title =
+            term_title != "wezterm" || self.handover_title.is_some() || self.saw_title_osc;
+        let cursor = terminal.cursor_pos();
+        let cursor_style = match cursor.shape {
+            CursorShape::Default => 0u8,
+            CursorShape::BlinkingBlock => 1,
+            CursorShape::SteadyBlock => 2,
+            CursorShape::BlinkingUnderline => 3,
+            CursorShape::SteadyUnderline => 4,
+            CursorShape::BlinkingBar => 5,
+            CursorShape::SteadyBar => 6,
+        };
+        let in_alt_screen = terminal.is_alt_screen_active();
         HandoverTerminalModes {
             app_cursor_keys: self.app_cursor_keys,
             app_keypad: self.app_keypad,
@@ -197,29 +525,80 @@ impl TerminalModeTracker {
             report_focus: self.report_focus,
             mouse_mode: self.mouse_mode,
             mouse_report_mode: self.mouse_report_mode,
-            kitty_keyboard_flags: self.kitty_keyboard_flags(self.in_alt_screen),
-            title: current_title.to_owned(),
+            kitty_keyboard_flags: self.kitty_keyboard_flags(in_alt_screen),
+            in_alt_screen,
+            primary_kitty_stack: self.primary_kitty_stack.clone(),
+            alt_kitty_stack: self.alt_kitty_stack.clone(),
+            bracketed_paste: terminal.bracketed_paste_enabled(),
+            reverse_video: terminal.get_reverse_video(),
+            cursor_visible: cursor.visibility == CursorVisibility::Visible,
+            cursor_style,
+            title: effective_title.to_owned(),
+            has_custom_title,
+            erase_scrollback_gen: self.erase_scrollback_gen,
+            journal_clear_floor: 0,
+            unjournaled_trimmed_top_rows: 0,
         }
     }
 
-    /// Seeds initial mode state prior to replaying the recent raw log tail on
-    /// handover adoption, so modes entered before the 16 MiB tail survive while
-    /// any newer mode transitions inside the tail override them naturally.
+    /// Seeds initial screen state before replaying a truncated tail log.
+    pub fn set_in_alt_screen(&mut self, in_alt_screen: bool) {
+        self.in_alt_screen = in_alt_screen;
+    }
+
+    /// Restores authoritative mode state captured at handover completion.
     pub fn restore_handover_modes(&mut self, modes: &HandoverTerminalModes) {
         self.app_cursor_keys = modes.app_cursor_keys;
         self.app_keypad = modes.app_keypad;
         self.origin_mode = modes.origin_mode;
         self.auto_wrap = modes.auto_wrap;
         self.report_focus = modes.report_focus;
-        self.mouse_mode = modes.mouse_mode;
-        self.mouse_report_mode = modes.mouse_report_mode;
-        if modes.kitty_keyboard_flags != 0 {
-            self.primary_kitty_stack = vec![modes.kitty_keyboard_flags];
-            self.alt_kitty_stack = vec![modes.kitty_keyboard_flags];
+        self.mouse_mode = if (1..=4).contains(&modes.mouse_mode) {
+            modes.mouse_mode
+        } else {
+            0
+        };
+        self.mouse_report_mode = if (1..=4).contains(&modes.mouse_report_mode) {
+            modes.mouse_report_mode
+        } else {
+            0
+        };
+        self.mouse_mode_stack.set_only(self.mouse_mode);
+        self.mouse_report_mode_stack
+            .set_only(self.mouse_report_mode);
+        self.in_alt_screen = modes.in_alt_screen;
+        self.erase_scrollback_gen = self.erase_scrollback_gen.max(modes.erase_scrollback_gen);
+        if !modes.primary_kitty_stack.is_empty() || !modes.alt_kitty_stack.is_empty() {
+            let p_start = modes.primary_kitty_stack.len().saturating_sub(128);
+            self.primary_kitty_stack.clear();
+            self.primary_kitty_stack.extend(
+                modes.primary_kitty_stack[p_start..]
+                    .iter()
+                    .map(|&f| f & 0x1f),
+            );
+            let a_start = modes.alt_kitty_stack.len().saturating_sub(128);
+            self.alt_kitty_stack.clear();
+            self.alt_kitty_stack
+                .extend(modes.alt_kitty_stack[a_start..].iter().map(|&f| f & 0x1f));
+        } else {
+            self.primary_kitty_stack.clear();
+            self.alt_kitty_stack.clear();
+            let masked = modes.kitty_keyboard_flags & 0x1f;
+            if masked != 0 {
+                if self.in_alt_screen {
+                    self.alt_kitty_stack.push(masked);
+                } else {
+                    self.primary_kitty_stack.push(masked);
+                }
+            }
         }
-        if !modes.title.is_empty() && modes.title != self.last_observed_title {
+        if modes.has_custom_title || (!modes.title.is_empty() && modes.title != "wezterm") {
+            self.handover_title = Some(modes.title.clone());
+            self.saw_title_osc = true;
             self.last_observed_title.clone_from(&modes.title);
             self.title_gen = self.title_gen.wrapping_add(1);
+        } else {
+            self.handover_title = None;
         }
     }
 
@@ -252,6 +631,10 @@ impl TerminalModeTracker {
         self.mouse_report_mode
     }
 
+    pub fn in_alt_screen(&self) -> bool {
+        self.in_alt_screen
+    }
+
     /// Returns whether DEC Mode 2026 (`\x1b[?2026h` without matching `\x1b[?2026l`)
     /// is currently open and has been active for less than `max_hold`.
     pub fn is_in_synchronized_update(&self, now: Instant, max_hold: Duration) -> bool {
@@ -260,21 +643,26 @@ impl TerminalModeTracker {
     }
 
     /// Syncs `last_observed_title` against `terminal.get_title()` (falling back
-    /// to a handover-restored title when `terminal.get_title()` is still at its
-    /// default `"wezterm"` value) and returns `(effective_title, title_gen)`.
+    /// to a handover-restored title only until the session updates or resets its
+    /// title) and returns `(effective_title, title_gen)`.
     pub fn observe_terminal_title<'a>(&'a mut self, terminal: &'a Terminal) -> (&'a str, u64) {
         let term_title = terminal.get_title();
-        let effective = if term_title == "wezterm" && !self.last_observed_title.is_empty() {
-            self.last_observed_title.as_str()
+        if term_title != "wezterm" {
+            self.handover_title = None;
+        }
+        let effective = if term_title == "wezterm"
+            && let Some(ref h_title) = self.handover_title
+        {
+            h_title.as_str()
         } else {
-            if term_title != self.last_observed_title {
-                self.last_observed_title.clear();
-                self.last_observed_title.push_str(term_title);
-                self.title_gen = self.title_gen.wrapping_add(1);
-            }
-            self.last_observed_title.as_str()
+            term_title
         };
-        (effective, self.title_gen)
+        if effective != self.last_observed_title {
+            let owned = effective.to_owned();
+            self.last_observed_title = owned;
+            self.title_gen = self.title_gen.wrapping_add(1);
+        }
+        (self.last_observed_title.as_str(), self.title_gen)
     }
 
     /// Scans `bytes` for control / CSI / DEC private mode sequences, updates
@@ -285,133 +673,804 @@ impl TerminalModeTracker {
     /// directly (zero-copy common case) or `self.sanitize_scratch` when clamping
     /// rewrote an oversized tab repeat count.
     pub fn observe_and_sanitize<'a>(&'a mut self, bytes: &'a [u8], cols: usize) -> &'a [u8] {
+        let (slice, _, _) = self.scan_slice(bytes, cols, false);
+        slice
+    }
+
+    /// Like [`Self::observe_and_sanitize`], but stops immediately after the first
+    /// primary-screen scrollback clear (`CSI ... 3 ... J` outside alt-screen, or
+    /// `ESC c`), returning `(sanitized_prefix, raw_bytes_consumed, cleared_scrollback)`.
+    pub fn observe_and_sanitize_until_scrollback_clear<'a>(
+        &'a mut self,
+        bytes: &'a [u8],
+        cols: usize,
+    ) -> (&'a [u8], usize, bool) {
+        self.scan_slice(bytes, cols, true)
+    }
+
+    /// Scans `bytes` starting from a clone of `self`'s current mode state and
+    /// returns the raw byte offset immediately after the last primary-screen
+    /// scrollback clear (`CSI ... 3 ... J` outside alt-screen, or `ESC c`).
+    pub fn last_scrollback_clear_end_in_raw_stream(&self, bytes: &[u8]) -> Option<usize> {
+        let mut clone = self.clone();
+        let mut pos = 0usize;
+        let mut last_clear_end = None;
+        while pos < bytes.len() {
+            let (_, consumed, cleared) =
+                clone.observe_and_sanitize_until_scrollback_clear(&bytes[pos..], 80);
+            if consumed == 0 {
+                break;
+            }
+            pos += consumed;
+            if cleared {
+                last_clear_end = Some(pos);
+            }
+        }
+        last_clear_end
+    }
+
+    fn begin_utf8_lead(&mut self, b: u8) {
+        self.utf8_state = match b {
+            0xc2 => Utf8ScanState::Tail1C2,
+            0xc3..=0xdf => Utf8ScanState::Tail1,
+            0xe0 => Utf8ScanState::E0,
+            0xe1..=0xec | 0xee..=0xef => Utf8ScanState::Tail2,
+            0xed => Utf8ScanState::Ed,
+            0xf0 => Utf8ScanState::F0,
+            0xf1..=0xf3 => Utf8ScanState::Tail3,
+            0xf4 => Utf8ScanState::F4,
+            _ => Utf8ScanState::Ground,
+        };
+    }
+
+    fn scan_slice<'a>(
+        &'a mut self,
+        bytes: &'a [u8],
+        cols: usize,
+        stop_on_scrollback_clear: bool,
+    ) -> (&'a [u8], usize, bool) {
         let cols = cols.max(1);
+        if bytes.is_empty() {
+            return (bytes, 0, false);
+        }
         if self.scan_state == EscapeScanState::Ground
-            && !bytes.contains(&0x1b)
-            && !bytes.contains(&0x07)
+            && self.utf8_state == Utf8ScanState::Ground
+            && bytes.iter().all(|&b| b < 0x80 && b != 0x1b && b != 0x07)
         {
-            return bytes;
+            return (bytes, bytes.len(), false);
         }
 
+        let start_erase_gen = self.erase_scrollback_gen;
         let mut modified = false;
         let mut copied_up_to = 0usize;
+        let mut consumed = bytes.len();
 
         for (i, &b) in bytes.iter().enumerate() {
-            match self.scan_state {
-                EscapeScanState::Ground => {
-                    if b == 0x07 {
-                        self.bell_gen = self.bell_gen.wrapping_add(1);
-                    } else if b == 0x1b {
-                        self.scan_state = EscapeScanState::Escape;
+            let iter_prev_alt = self.in_alt_screen;
+            if self.utf8_state != Utf8ScanState::Ground {
+                match self.utf8_state {
+                    Utf8ScanState::Ground => unreachable!(),
+                    Utf8ScanState::Tail1C2 => {
+                        self.utf8_state = Utf8ScanState::Ground;
+                        if !(0x80..=0x9f).contains(&b) {
+                            // Either valid non-C1 (`U+00A0..U+00BF`) or invalid
+                            // continuation (`U+FFFD` in vtparse/utf8parse); both
+                            // consume `b` without dispatching a VT transition.
+                            continue;
+                        }
+                        // UTF-8 encoded C1 control (`U+0080..U+009F`): vtparse
+                        // dispatches this against the underlying Ground/Osc state.
+                    }
+                    Utf8ScanState::Tail1 => {
+                        self.utf8_state = Utf8ScanState::Ground;
+                        continue;
+                    }
+                    Utf8ScanState::Tail2 => {
+                        self.utf8_state = if (0x80..=0xbf).contains(&b) {
+                            Utf8ScanState::Tail1
+                        } else {
+                            Utf8ScanState::Ground
+                        };
+                        continue;
+                    }
+                    Utf8ScanState::E0 => {
+                        self.utf8_state = if (0xa0..=0xbf).contains(&b) {
+                            Utf8ScanState::Tail1
+                        } else {
+                            Utf8ScanState::Ground
+                        };
+                        continue;
+                    }
+                    Utf8ScanState::Ed => {
+                        self.utf8_state = if (0x80..=0x9f).contains(&b) {
+                            Utf8ScanState::Tail1
+                        } else {
+                            Utf8ScanState::Ground
+                        };
+                        continue;
+                    }
+                    Utf8ScanState::Tail3 => {
+                        self.utf8_state = if (0x80..=0xbf).contains(&b) {
+                            Utf8ScanState::Tail2
+                        } else {
+                            Utf8ScanState::Ground
+                        };
+                        continue;
+                    }
+                    Utf8ScanState::F0 => {
+                        self.utf8_state = if (0x90..=0xbf).contains(&b) {
+                            Utf8ScanState::Tail2
+                        } else {
+                            Utf8ScanState::Ground
+                        };
+                        continue;
+                    }
+                    Utf8ScanState::F4 => {
+                        self.utf8_state = if (0x80..=0x8f).contains(&b) {
+                            Utf8ScanState::Tail2
+                        } else {
+                            Utf8ScanState::Ground
+                        };
+                        continue;
                     }
                 }
-                EscapeScanState::Escape => match b {
-                    b'[' => {
-                        self.csi_buf.clear();
-                        self.scan_state = EscapeScanState::Csi;
+            }
+
+            // `Anywhere` transitions from vtparse (`CAN`, `SUB`, `ESC`, and 8-bit C1).
+            match b {
+                0x18 | 0x1a => {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
                     }
-                    b']' => {
-                        self.scan_state = EscapeScanState::Osc;
+                    self.in_tmux_title = false;
+                    self.scan_state = EscapeScanState::Ground;
+                    continue;
+                }
+                0x1b => {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
                     }
-                    b'=' => {
+                    if self.scan_state != EscapeScanState::StString {
+                        self.in_tmux_title = false;
+                    }
+                    self.scan_state = EscapeScanState::Escape {
+                        has_intermediate: false,
+                    };
+                    continue;
+                }
+                0x9c => {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
+                    } else if self.scan_state == EscapeScanState::StString && self.in_tmux_title {
+                        self.handover_title = None;
+                        self.saw_title_osc = true;
+                    }
+                    self.in_tmux_title = false;
+                    self.scan_state = EscapeScanState::Ground;
+                    continue;
+                }
+                0x90 | 0x98 | 0x9e | 0x9f
+                    if matches!(
+                        self.scan_state,
+                        EscapeScanState::Ground
+                            | EscapeScanState::Escape { .. }
+                            | EscapeScanState::Csi
+                            | EscapeScanState::Osc
+                            | EscapeScanState::StString
+                    ) =>
+                {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
+                    }
+                    self.in_tmux_title = false;
+                    self.scan_state = EscapeScanState::StString;
+                    continue;
+                }
+                0x9d => {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
+                    }
+                    self.in_tmux_title = false;
+                    self.enter_osc();
+                    continue;
+                }
+                0x9b => {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
+                    }
+                    self.in_tmux_title = false;
+                    self.enter_csi();
+                    continue;
+                }
+                0x80..=0x8f | 0x91..=0x97 | 0x99 | 0x9a => {
+                    if self.scan_state == EscapeScanState::Osc {
+                        self.finish_osc();
+                    }
+                    self.in_tmux_title = false;
+                    self.scan_state = EscapeScanState::Ground;
+                    continue;
+                }
+                _ => {}
+            }
+
+            match self.scan_state {
+                EscapeScanState::Ground => match b {
+                    0x07 => {
+                        self.bell_gen = self.bell_gen.wrapping_add(1);
+                    }
+                    0xc2..=0xf4 => {
+                        self.begin_utf8_lead(b);
+                    }
+                    _ => {}
+                },
+                EscapeScanState::Escape { has_intermediate } => match b {
+                    0x7f => {}
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                        if b == 0x07 {
+                            self.bell_gen = self.bell_gen.wrapping_add(1);
+                        }
+                    }
+                    0x20..=0x2f => {
+                        self.in_tmux_title = false;
+                        self.scan_state = EscapeScanState::Escape {
+                            has_intermediate: true,
+                        };
+                    }
+                    b'\\' if !has_intermediate => {
+                        if self.in_tmux_title {
+                            self.handover_title = None;
+                            self.saw_title_osc = true;
+                            self.in_tmux_title = false;
+                        }
+                        self.scan_state = EscapeScanState::Ground;
+                    }
+                    b'[' if !has_intermediate => {
+                        self.in_tmux_title = false;
+                        self.enter_csi();
+                    }
+                    b']' if !has_intermediate => {
+                        self.in_tmux_title = false;
+                        self.enter_osc();
+                    }
+                    b'k' if !has_intermediate => {
+                        self.in_tmux_title = true;
+                        self.scan_state = EscapeScanState::StString;
+                    }
+                    b'P' | b'X' | b'^' | b'_' if !has_intermediate => {
+                        self.in_tmux_title = false;
+                        self.scan_state = EscapeScanState::StString;
+                    }
+                    b'7' if !has_intermediate => {
+                        self.in_tmux_title = false;
+                        self.save_cursor_origin();
+                        self.scan_state = EscapeScanState::Ground;
+                    }
+                    b'8' if !has_intermediate => {
+                        self.in_tmux_title = false;
+                        self.restore_cursor_origin();
+                        self.scan_state = EscapeScanState::Ground;
+                    }
+                    b'=' if !has_intermediate => {
+                        self.in_tmux_title = false;
                         self.app_keypad = true;
                         self.scan_state = EscapeScanState::Ground;
                     }
-                    b'>' => {
+                    b'>' if !has_intermediate => {
+                        self.in_tmux_title = false;
                         self.app_keypad = false;
                         self.scan_state = EscapeScanState::Ground;
                     }
-                    b'c' => {
+                    b'c' if !has_intermediate => {
+                        self.in_tmux_title = false;
                         self.reset_modes();
                         self.scan_state = EscapeScanState::Ground;
                     }
-                    0x1b => {
-                        self.scan_state = EscapeScanState::Escape;
-                    }
-                    _ => {
+                    0x30..=0x7e => {
+                        self.in_tmux_title = false;
                         self.scan_state = EscapeScanState::Ground;
                     }
+                    _ => {}
                 },
-                EscapeScanState::Osc => {
-                    if b == 0x07 {
+                EscapeScanState::Osc => match b {
+                    0x07 => {
+                        self.finish_osc();
                         self.scan_state = EscapeScanState::Ground;
-                    } else if b == 0x1b {
-                        self.scan_state = EscapeScanState::OscEscape;
                     }
-                }
-                EscapeScanState::OscEscape => {
-                    if b == b'\\' || b == 0x07 {
-                        self.scan_state = EscapeScanState::Ground;
-                    } else if b == 0x1b {
-                        self.scan_state = EscapeScanState::OscEscape;
-                    } else {
-                        self.scan_state = EscapeScanState::Osc;
-                    }
-                }
-                EscapeScanState::Csi => {
-                    if (0x20..=0x3f).contains(&b) {
-                        if self.csi_buf.len() < 256 {
-                            self.csi_buf.push(b);
+                    0x20..=0x7e => {
+                        if (self.osc_head_len as usize) < self.osc_head.len() {
+                            self.osc_head[self.osc_head_len as usize] = b;
+                            self.osc_head_len += 1;
                         }
-                    } else {
+                    }
+                    0xc2..=0xf4 => {
+                        self.begin_utf8_lead(b);
+                    }
+                    _ => {}
+                },
+                EscapeScanState::StString => {
+                    // DCS, SOS, PM, APC, and TmuxTitle ignore 0x07 (BEL) and remain
+                    // open until ST (`ESC \` or `0x9c`), `CAN` (`0x18`), `SUB` (`0x1a`),
+                    // or a new `ESC` (`0x1b`), all handled by the Anywhere match above.
+                }
+                EscapeScanState::Csi => match b {
+                    0x7f => {}
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                        if b == 0x07 {
+                            self.bell_gen = self.bell_gen.wrapping_add(1);
+                        }
+                    }
+                    0x3c..=0x3f => {
+                        if !self.csi_has_params
+                            && !self.csi_has_intermediate
+                            && self.csi_private_prefix.is_none()
+                        {
+                            self.csi_private_prefix = Some(b);
+                            if self.csi_buf.len() < 4096 {
+                                self.csi_buf.push(b);
+                            }
+                        } else {
+                            self.csi_ignore = true;
+                        }
+                    }
+                    0x30..=0x3b => {
+                        if self.csi_has_intermediate
+                            || (!self.csi_has_params
+                                && self.csi_private_prefix.is_none()
+                                && b == b':')
+                        {
+                            self.csi_ignore = true;
+                        } else {
+                            self.csi_has_params = true;
+                            if self.csi_buf.len() < 4096 {
+                                self.csi_buf.push(b);
+                            }
+                            if !self.csi_ignore && self.csi_private_prefix.is_none() {
+                                if b == b';' || b == b':' {
+                                    // Multi-parameter or subparameter CHT/CBT is
+                                    // rejected as Unspecified by wezterm-escape-parser.
+                                    self.csi_tab_invalid = true;
+                                } else if !self.csi_tab_invalid && b.is_ascii_digit() {
+                                    let next = self
+                                        .csi_tab_cur_param
+                                        .unwrap_or(0)
+                                        .saturating_mul(10)
+                                        .saturating_add(u64::from(b - b'0'));
+                                    if next > cols as u64 {
+                                        self.csi_tab_saw_oversized = true;
+                                    }
+                                    self.csi_tab_cur_param = Some(next);
+                                }
+                            }
+                        }
+                    }
+                    0x20..=0x2f => {
+                        if !self.csi_has_intermediate {
+                            self.csi_has_intermediate = true;
+                            self.csi_single_intermediate = Some(b);
+                        } else {
+                            self.csi_single_intermediate = None;
+                        }
+                    }
+                    0x40..=0x7e => {
                         let final_byte = b;
                         self.scan_state = EscapeScanState::Ground;
-                        let params_len = self.csi_buf.len();
-                        self.inspect_csi_buf(final_byte);
 
-                        // Clamp single-chunk oversized CHT/CBT sequences (`\x1b[<N>I` or `\x1b[<N>Z`).
-                        if (final_byte == b'I' || final_byte == b'Z')
-                            && params_len > 0
-                            && self.csi_buf.iter().all(|c| c.is_ascii_digit())
-                            && let Some(val) = parse_u32_ascii(&self.csi_buf)
-                            && (val as usize) > cols
-                            && i >= params_len + 2
-                            && bytes[i - params_len - 2] == 0x1b
-                            && bytes[i - params_len - 1] == b'['
+                        if !self.csi_ignore
+                            && final_byte == b'p'
+                            && self.csi_private_prefix.is_none()
+                            && !self.csi_has_params
+                            && self.csi_single_intermediate == Some(b'!')
                         {
-                            let param_start = i - params_len;
-                            if !modified {
-                                self.sanitize_scratch.clear();
-                                self.sanitize_scratch.reserve(bytes.len());
-                                modified = true;
+                            self.apply_soft_reset();
+                        } else if !self.csi_ignore && !self.csi_has_intermediate {
+                            if self.csi_private_prefix.is_none() && !self.csi_has_params {
+                                if final_byte == b's' && !self.declrmm_69 {
+                                    self.save_cursor_origin();
+                                } else if final_byte == b'u' {
+                                    self.restore_cursor_origin();
+                                }
                             }
-                            self.sanitize_scratch
-                                .extend_from_slice(&bytes[copied_up_to..param_start]);
-                            let mut num_buf = [0u8; 16];
-                            let num_len = write_usize_ascii(cols, &mut num_buf);
-                            self.sanitize_scratch.extend_from_slice(&num_buf[..num_len]);
-                            self.sanitize_scratch.push(final_byte);
-                            copied_up_to = i + 1;
+                            self.inspect_csi_buf(final_byte);
+
+                            if (final_byte == b'I' || final_byte == b'Z')
+                                && self.csi_private_prefix.is_none()
+                                && !self.csi_tab_invalid
+                            {
+                                let step = self.csi_tab_cur_param.take().unwrap_or(1).max(1);
+                                if step <= u64::from(u32::MAX) && self.csi_tab_saw_oversized {
+                                    let clamped = (step as usize).min(cols);
+                                    // Replace the final `I`/`Z` byte with `\x1b[<clamped>I/Z`.
+                                    // Leading `0x1b` causes vtparse in `Terminal` to discard
+                                    // the in-flight oversized CSI (including split-chunk or
+                                    // C1 `0x9b` prefixes) without dispatching it, then run
+                                    // the clamped tabulation immediately.
+                                    if !modified {
+                                        self.sanitize_scratch.clear();
+                                        self.sanitize_scratch.reserve(bytes.len() + 16);
+                                        modified = true;
+                                    }
+                                    self.sanitize_scratch
+                                        .extend_from_slice(&bytes[copied_up_to..i]);
+                                    self.sanitize_scratch.extend_from_slice(b"\x1b[");
+                                    let mut num_buf = [0u8; 16];
+                                    let num_len = write_usize_ascii(clamped, &mut num_buf);
+                                    self.sanitize_scratch.extend_from_slice(&num_buf[..num_len]);
+                                    self.sanitize_scratch.push(final_byte);
+                                    copied_up_to = i + 1;
+                                }
+                            }
                         }
                         self.csi_buf.clear();
                     }
-                }
+                    _ => {}
+                },
+            }
+
+            let alt_changed = iter_prev_alt != self.in_alt_screen;
+            if stop_on_scrollback_clear
+                && (self.erase_scrollback_gen != start_erase_gen || alt_changed)
+            {
+                consumed = i + 1;
+                break;
             }
         }
 
+        let cleared = self.erase_scrollback_gen != start_erase_gen;
         if modified {
-            if copied_up_to < bytes.len() {
+            if copied_up_to < consumed {
                 self.sanitize_scratch
-                    .extend_from_slice(&bytes[copied_up_to..]);
+                    .extend_from_slice(&bytes[copied_up_to..consumed]);
             }
-            &self.sanitize_scratch
+            (&self.sanitize_scratch, consumed, cleared)
         } else {
-            bytes
+            (&bytes[..consumed], consumed, cleared)
         }
+    }
+
+    fn scan_for_first_alt_transition(&mut self, bytes: &[u8]) -> Option<AltScreenTransition> {
+        let mut first_alt = None;
+        for (idx, &b) in bytes.iter().enumerate() {
+            let was_esc = self.utf8_state == Utf8ScanState::Ground
+                && matches!(
+                    self.scan_state,
+                    EscapeScanState::Escape {
+                        has_intermediate: false
+                    }
+                );
+            let was_decstr = self.utf8_state == Utf8ScanState::Ground
+                && self.scan_state == EscapeScanState::Csi
+                && !self.csi_ignore
+                && self.csi_private_prefix.is_none()
+                && !self.csi_has_params
+                && self.csi_single_intermediate == Some(b'!')
+                && b == b'p';
+            let was_csi = self.utf8_state == Utf8ScanState::Ground
+                && self.scan_state == EscapeScanState::Csi
+                && !self.csi_ignore
+                && !self.csi_has_intermediate
+                && self.csi_private_prefix == Some(b'?');
+            let csi_snapshot = if was_csi && (b == b'h' || b == b'l') {
+                Some((self.csi_buf.clone(), b == b'h'))
+            } else {
+                None
+            };
+            let single = [b];
+            let _ = self.scan_slice(&single, 80, false);
+            if (was_esc && b == b'c') || was_decstr {
+                break;
+            }
+            if let Some((buf, enabled)) = csi_snapshot {
+                let body = buf.strip_prefix(b"?").unwrap_or(&buf);
+                for_each_wezterm_dec_private_mode(body, |code| {
+                    if first_alt.is_none() && matches!(code, 47 | 1047 | 1049) {
+                        first_alt = Some((
+                            idx,
+                            if enabled {
+                                AltScreenTransition::Entered
+                            } else {
+                                AltScreenTransition::Exited
+                            },
+                        ));
+                    }
+                });
+                if first_alt.is_some() {
+                    break;
+                }
+            }
+        }
+        first_alt.map(|(_, t)| t)
+    }
+
+    fn scan_initial_replay_modes(
+        &mut self,
+        bytes: &[u8],
+        end_modes: &HandoverTerminalModes,
+    ) -> InferredInitialReplayModes {
+        let mut first_alt: Option<(usize, AltScreenTransition)> = None;
+        let mut cur_in_alt: Option<bool> = None;
+        let mut saw_reset_before_alt = false;
+        let mut first_auto_wrap_enabled: Option<bool> = None;
+        let mut auto_wrap_before_alt_transition = false;
+        let mut saw_reset_before_auto_wrap = false;
+        let mut first_origin_enabled: Option<bool> = None;
+        let mut origin_before_alt_transition = false;
+        let mut saw_reset_or_restore_before_origin = false;
+        let mut saw_alt_exit_1049_before_origin = false;
+        let mut saved_initial_m0 = false;
+        let mut saved_primary_m0 = false;
+        let mut saved_alt_m0 = false;
+        let mut declrmm_active = false;
+
+        for (idx, &b) in bytes.iter().enumerate() {
+            let was_esc = self.utf8_state == Utf8ScanState::Ground
+                && matches!(
+                    self.scan_state,
+                    EscapeScanState::Escape {
+                        has_intermediate: false
+                    }
+                );
+            let was_decstr = self.utf8_state == Utf8ScanState::Ground
+                && self.scan_state == EscapeScanState::Csi
+                && !self.csi_ignore
+                && self.csi_private_prefix.is_none()
+                && !self.csi_has_params
+                && self.csi_single_intermediate == Some(b'!')
+                && b == b'p';
+            let was_plain_csi_no_params = self.utf8_state == Utf8ScanState::Ground
+                && self.scan_state == EscapeScanState::Csi
+                && !self.csi_ignore
+                && !self.csi_has_intermediate
+                && !self.csi_has_params
+                && self.csi_private_prefix.is_none();
+            let was_csi = self.utf8_state == Utf8ScanState::Ground
+                && self.scan_state == EscapeScanState::Csi
+                && !self.csi_ignore
+                && !self.csi_has_intermediate
+                && self.csi_private_prefix == Some(b'?');
+            let csi_snapshot = if was_csi && (b == b'h' || b == b'l') {
+                Some((self.csi_buf.clone(), b == b'h'))
+            } else {
+                None
+            };
+            let single = [b];
+            let _ = self.scan_slice(&single, 80, false);
+
+            if (was_esc && b == b'c') || was_decstr {
+                if first_alt.is_none() {
+                    saw_reset_before_alt = true;
+                }
+                if first_auto_wrap_enabled.is_none() {
+                    saw_reset_before_auto_wrap = true;
+                }
+                if first_origin_enabled.is_none() {
+                    saw_reset_or_restore_before_origin = true;
+                }
+                break;
+            }
+
+            let origin_still_m0 =
+                first_origin_enabled.is_none() && !saw_reset_or_restore_before_origin;
+            if origin_still_m0
+                && ((was_esc && b == b'7')
+                    || (was_plain_csi_no_params && b == b's' && !declrmm_active))
+            {
+                match cur_in_alt {
+                    None => saved_initial_m0 = true,
+                    Some(true) => saved_alt_m0 = true,
+                    Some(false) => saved_primary_m0 = true,
+                }
+            } else if origin_still_m0
+                && ((was_esc && b == b'8') || (was_plain_csi_no_params && b == b'u'))
+            {
+                let has_m0 = match cur_in_alt {
+                    None => saved_initial_m0,
+                    Some(true) => saved_alt_m0,
+                    Some(false) => saved_primary_m0,
+                };
+                if !has_m0 {
+                    saw_reset_or_restore_before_origin = true;
+                }
+            }
+
+            if let Some((buf, enabled)) = csi_snapshot {
+                let body = buf.strip_prefix(b"?").unwrap_or(&buf);
+                for_each_wezterm_dec_private_mode(body, |code| match code {
+                    69 => {
+                        declrmm_active = enabled;
+                    }
+                    47 | 1047 | 1049 => {
+                        let origin_still_m0 =
+                            first_origin_enabled.is_none() && !saw_reset_or_restore_before_origin;
+                        if first_alt.is_none() && !saw_reset_before_alt {
+                            first_alt = Some((
+                                idx,
+                                if enabled {
+                                    AltScreenTransition::Entered
+                                } else {
+                                    AltScreenTransition::Exited
+                                },
+                            ));
+                            if enabled {
+                                cur_in_alt = Some(true);
+                                saved_primary_m0 =
+                                    saved_initial_m0 || (code == 1049 && origin_still_m0);
+                                saved_alt_m0 = false;
+                            } else {
+                                cur_in_alt = Some(false);
+                                saved_primary_m0 = false;
+                                saved_alt_m0 = saved_initial_m0;
+                                if code == 1049 && origin_still_m0 {
+                                    saw_alt_exit_1049_before_origin = true;
+                                }
+                            }
+                        } else if let Some(in_alt) = cur_in_alt {
+                            if code == 1049 {
+                                if enabled && !in_alt {
+                                    if origin_still_m0 {
+                                        saved_primary_m0 = true;
+                                    }
+                                    cur_in_alt = Some(true);
+                                } else if !enabled && in_alt {
+                                    cur_in_alt = Some(false);
+                                    if origin_still_m0 && !saved_primary_m0 {
+                                        saw_reset_or_restore_before_origin = true;
+                                    }
+                                }
+                            } else {
+                                cur_in_alt = Some(enabled);
+                            }
+                        }
+                    }
+                    1048 if first_origin_enabled.is_none()
+                        && !saw_reset_or_restore_before_origin =>
+                    {
+                        if enabled {
+                            match cur_in_alt {
+                                None => saved_initial_m0 = true,
+                                Some(true) => saved_alt_m0 = true,
+                                Some(false) => saved_primary_m0 = true,
+                            }
+                        } else {
+                            let has_m0 = match cur_in_alt {
+                                None => saved_initial_m0,
+                                Some(true) => saved_alt_m0,
+                                Some(false) => saved_primary_m0,
+                            };
+                            if !has_m0 {
+                                saw_reset_or_restore_before_origin = true;
+                            }
+                        }
+                    }
+                    7 if first_auto_wrap_enabled.is_none() && !saw_reset_before_auto_wrap => {
+                        auto_wrap_before_alt_transition = first_alt.is_none();
+                        first_auto_wrap_enabled = Some(enabled);
+                    }
+                    6 if first_origin_enabled.is_none() && !saw_reset_or_restore_before_origin => {
+                        origin_before_alt_transition = first_alt.is_none();
+                        first_origin_enabled = Some(enabled);
+                    }
+                    _ => {}
+                });
+            }
+            if (first_alt.is_some() || saw_reset_before_alt)
+                && (first_auto_wrap_enabled.is_some() || saw_reset_before_auto_wrap)
+                && (first_origin_enabled.is_some() || saw_reset_or_restore_before_origin)
+            {
+                break;
+            }
+        }
+
+        let (in_alt_screen, first_alt_exit_offset) = match first_alt {
+            Some((_, AltScreenTransition::Entered)) => (false, None),
+            Some((off, AltScreenTransition::Exited)) => (true, Some(off)),
+            None if saw_reset_before_alt => (false, None),
+            None => (end_modes.in_alt_screen, None),
+        };
+        let mut inferred = InferredInitialReplayModes {
+            in_alt_screen,
+            first_alt_exit_offset,
+            auto_wrap: true,
+            origin_mode: false,
+            first_auto_wrap_enabled,
+            auto_wrap_before_alt_transition,
+            saw_reset_before_auto_wrap,
+            end_auto_wrap: end_modes.auto_wrap,
+            first_origin_enabled,
+            origin_before_alt_transition,
+            saw_reset_or_restore_before_origin,
+            saw_alt_exit_1049_before_origin,
+            end_origin_mode: end_modes.origin_mode,
+        };
+        let (auto_wrap, origin_mode) = inferred.modes_for_screen(in_alt_screen);
+        inferred.auto_wrap = auto_wrap;
+        inferred.origin_mode = origin_mode;
+        inferred
+    }
+
+    fn save_cursor_origin(&mut self) {
+        if self.in_alt_screen {
+            self.alt_saved_origin = Some(self.origin_mode);
+        } else {
+            self.primary_saved_origin = Some(self.origin_mode);
+        }
+    }
+
+    fn restore_cursor_origin(&mut self) {
+        self.origin_mode = if self.in_alt_screen {
+            self.alt_saved_origin.unwrap_or(false)
+        } else {
+            self.primary_saved_origin.unwrap_or(false)
+        };
+    }
+
+    fn enter_csi(&mut self) {
+        self.csi_buf.clear();
+        self.csi_private_prefix = None;
+        self.csi_has_params = false;
+        self.csi_has_intermediate = false;
+        self.csi_single_intermediate = None;
+        self.csi_ignore = false;
+        self.csi_tab_cur_param = None;
+        self.csi_tab_invalid = false;
+        self.csi_tab_saw_oversized = false;
+        self.scan_state = EscapeScanState::Csi;
+    }
+
+    fn apply_soft_reset(&mut self) {
+        self.app_cursor_keys = false;
+        self.app_keypad = false;
+        self.origin_mode = false;
+        self.primary_saved_origin = None;
+        self.alt_saved_origin = None;
+        self.declrmm_69 = false;
+        self.auto_wrap = true;
+        self.in_alt_screen = false;
+    }
+
+    fn enter_osc(&mut self) {
+        self.osc_head_len = 0;
+        self.osc_head = [0; 3];
+        self.scan_state = EscapeScanState::Osc;
+    }
+
+    fn finish_osc(&mut self) {
+        let head = &self.osc_head[..self.osc_head_len as usize];
+        // OSC 0 (`0;...`), OSC 2 (`2;...`), empty selector (`;...`), or Sun
+        // window title (`l...`) sets the window title in wezterm-term,
+        // superseding any handover fallback.
+        if head.starts_with(b"0;")
+            || head.starts_with(b"2;")
+            || head.starts_with(b";")
+            || head.starts_with(b"l")
+        {
+            self.handover_title = None;
+            self.saw_title_osc = true;
+        }
+        self.osc_head_len = 0;
     }
 
     fn reset_modes(&mut self) {
         self.app_cursor_keys = false;
         self.app_keypad = false;
         self.origin_mode = false;
+        self.primary_saved_origin = None;
+        self.alt_saved_origin = None;
+        self.declrmm_69 = false;
         self.auto_wrap = true;
         self.report_focus = false;
         self.mouse_mode = 0;
         self.mouse_report_mode = 0;
+        self.mouse_mode_stack.clear();
+        self.mouse_report_mode_stack.clear();
         self.in_alt_screen = false;
         self.primary_kitty_stack.clear();
         self.alt_kitty_stack.clear();
+        self.handover_title = None;
+        self.saw_title_osc = false;
+        self.in_tmux_title = false;
         self.sync_update_started_at = None;
+        self.erase_display_gen = self.erase_display_gen.wrapping_add(1);
+        self.erase_scrollback_gen = self.erase_scrollback_gen.wrapping_add(1);
     }
 
     fn active_kitty_stack_mut(&mut self) -> &mut Vec<u32> {
@@ -423,88 +1482,117 @@ impl TerminalModeTracker {
     }
 
     fn inspect_csi_buf(&mut self, final_byte: u8) {
+        if self.csi_private_prefix.is_some() && !matches!(final_byte, b'u' | b'h' | b'l') {
+            return;
+        }
+        let buf = std::mem::take(&mut self.csi_buf);
         match final_byte {
-            b'J' => {
-                let mut start = 0usize;
-                let buf = &self.csi_buf;
-                loop {
-                    let end = buf[start..]
-                        .iter()
-                        .position(|&c| c == b';')
-                        .map_or(buf.len(), |p| start + p);
-                    let code = parse_u32_ascii(&buf[start..end]).unwrap_or(0);
-                    if code == 2 {
+            b'J' if self.csi_private_prefix.is_none() => {
+                // `wezterm-escape-parser` only accepts 0 or 1 integer param for `J`.
+                if !buf.contains(&b';') && !buf.contains(&b':') {
+                    let code = if buf.is_empty() {
+                        Some(0)
+                    } else {
+                        parse_u32_strict_ascii(&buf)
+                    };
+                    if code == Some(2) {
                         self.erase_display_gen = self.erase_display_gen.wrapping_add(1);
-                    } else if code == 3 {
+                    } else if code == Some(3) && !self.in_alt_screen {
                         self.erase_scrollback_gen = self.erase_scrollback_gen.wrapping_add(1);
                     }
-                    if end >= buf.len() {
-                        break;
-                    }
-                    start = end + 1;
                 }
             }
-            b'u' => match self.csi_buf.first().copied() {
-                Some(b'>') => {
-                    let flags = self.csi_buf[1..]
-                        .split(|&c| c == b';')
-                        .next()
-                        .and_then(parse_u32_ascii)
-                        .unwrap_or(0);
-                    let stack = self.active_kitty_stack_mut();
-                    if stack.len() >= 16 {
-                        stack.remove(0);
+            b'u' => {
+                match buf.first().copied() {
+                    Some(b'>') if !buf[1..].contains(&b':') => {
+                        let parts: Vec<&[u8]> = buf[1..].split(|&c| c == b';').collect();
+                        let parsed = match parts.as_slice() {
+                            [b""] => Some((0u32, 1u32)),
+                            [f] => parse_u16_strict_ascii(f)
+                                .map(|flags| (u32::from(flags) & 0x1f, 1u32)),
+                            [f, m] => match (
+                                if f.is_empty() {
+                                    Some(0u16)
+                                } else {
+                                    parse_u16_strict_ascii(f)
+                                },
+                                parse_u16_strict_ascii(m),
+                            ) {
+                                (Some(flags), Some(mode @ 1..=3)) => {
+                                    Some((u32::from(flags) & 0x1f, u32::from(mode)))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some((flags, mode)) = parsed {
+                            let stack = self.active_kitty_stack_mut();
+                            let current = stack.last().copied().unwrap_or(0);
+                            let pushed = match mode {
+                                2 => current | flags,
+                                3 => current & !flags,
+                                _ => flags,
+                            };
+                            if stack.len() >= 128 {
+                                stack.remove(0);
+                            }
+                            stack.push(pushed);
+                        }
                     }
-                    stack.push(flags);
-                }
-                Some(b'<') => {
-                    let pop_count = self.csi_buf[1..]
-                        .split(|&c| c == b';')
-                        .next()
-                        .and_then(parse_u32_ascii)
-                        .unwrap_or(1)
-                        .max(1) as usize;
-                    let stack = self.active_kitty_stack_mut();
-                    let new_len = stack.len().saturating_sub(pop_count);
-                    stack.truncate(new_len);
-                }
-                Some(b'=') => {
-                    let mut parts = self.csi_buf[1..].split(|&c| c == b';');
-                    let flags = parts.next().and_then(parse_u32_ascii).unwrap_or(0);
-                    let mode = parts.next().and_then(parse_u32_ascii).unwrap_or(1);
-                    let stack = self.active_kitty_stack_mut();
-                    let current = stack.last().copied().unwrap_or(0);
-                    let updated = match mode {
-                        2 => current | flags,
-                        3 => current & !flags,
-                        _ => flags,
-                    };
-                    if let Some(top) = stack.last_mut() {
-                        *top = updated;
-                    } else {
-                        stack.push(updated);
+                    Some(b'<') if !buf[1..].contains(&b';') && !buf[1..].contains(&b':') => {
+                        let parsed = if buf[1..].is_empty() {
+                            Some(1usize)
+                        } else {
+                            parse_u32_strict_ascii(&buf[1..]).map(|n| n as usize)
+                        };
+                        if let Some(pop_count) = parsed {
+                            let stack = self.active_kitty_stack_mut();
+                            let new_len = stack.len().saturating_sub(pop_count);
+                            stack.truncate(new_len);
+                        }
                     }
+                    Some(b'=') if !buf[1..].contains(&b':') => {
+                        let parts: Vec<&[u8]> = buf[1..].split(|&c| c == b';').collect();
+                        let parsed = match parts.as_slice() {
+                            [f] if !f.is_empty() => parse_u16_strict_ascii(f)
+                                .map(|flags| (u32::from(flags) & 0x1f, 1u32)),
+                            [f, m] if !f.is_empty() => {
+                                match (parse_u16_strict_ascii(f), parse_u16_strict_ascii(m)) {
+                                    (Some(flags), Some(mode @ 1..=3)) => {
+                                        Some((u32::from(flags) & 0x1f, u32::from(mode)))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some((flags, mode)) = parsed {
+                            let stack = self.active_kitty_stack_mut();
+                            let current = stack.last().copied().unwrap_or(0);
+                            let updated = match mode {
+                                2 => current | flags,
+                                3 => current & !flags,
+                                _ => flags,
+                            };
+                            if let Some(top) = stack.last_mut() {
+                                *top = updated;
+                            } else {
+                                stack.push(updated);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
-            b'h' | b'l' if self.csi_buf.first() == Some(&b'?') => {
+            }
+            b'h' | b'l' if buf.first() == Some(&b'?') => {
                 let enabled = final_byte == b'h';
-                let mut codes = [0u32; 16];
-                let mut count = 0usize;
-                for p in self.csi_buf[1..].split(|&c| c == b';') {
-                    if let Some(code) = parse_u32_ascii(p)
-                        && count < codes.len()
-                    {
-                        codes[count] = code;
-                        count += 1;
-                    }
-                }
-                for &code in &codes[..count] {
-                    self.apply_dec_private_mode(code, enabled);
-                }
+                for_each_wezterm_dec_private_mode(&buf[1..], |code| {
+                    self.apply_dec_private_mode(u32::from(code), enabled);
+                });
             }
             _ => {}
         }
+        self.csi_buf = buf;
     }
 
     fn apply_dec_private_mode(&mut self, code: u32, enabled: bool) {
@@ -512,37 +1600,61 @@ impl TerminalModeTracker {
             1 => self.app_cursor_keys = enabled,
             6 => self.origin_mode = enabled,
             7 => self.auto_wrap = enabled,
-            47 | 1047 | 1049 => {
+            47 | 1047 => {
                 self.in_alt_screen = enabled;
-                if !enabled {
-                    self.alt_kitty_stack.clear();
+            }
+            1048 => {
+                if enabled {
+                    self.save_cursor_origin();
+                } else {
+                    self.restore_cursor_origin();
+                }
+            }
+            1049 => {
+                if enabled {
+                    if !self.in_alt_screen {
+                        self.primary_saved_origin = Some(self.origin_mode);
+                        self.in_alt_screen = true;
+                    }
+                } else if self.in_alt_screen {
+                    self.in_alt_screen = false;
+                    self.origin_mode = self.primary_saved_origin.unwrap_or(false);
                 }
             }
             66 => self.app_keypad = enabled,
+            69 => self.declrmm_69 = enabled,
             9 => {
-                self.mouse_mode = if enabled { 1 } else { 0 };
+                self.mouse_mode_stack.apply(1, enabled);
+                self.mouse_mode = self.mouse_mode_stack.current();
             }
             1000 => {
-                self.mouse_mode = if enabled { 2 } else { 0 };
+                self.mouse_mode_stack.apply(2, enabled);
+                self.mouse_mode = self.mouse_mode_stack.current();
             }
             1002 => {
-                self.mouse_mode = if enabled { 3 } else { 0 };
+                self.mouse_mode_stack.apply(3, enabled);
+                self.mouse_mode = self.mouse_mode_stack.current();
             }
             1003 => {
-                self.mouse_mode = if enabled { 4 } else { 0 };
+                self.mouse_mode_stack.apply(4, enabled);
+                self.mouse_mode = self.mouse_mode_stack.current();
             }
             1004 => self.report_focus = enabled,
             1005 => {
-                self.mouse_report_mode = if enabled { 1 } else { 0 };
+                self.mouse_report_mode_stack.apply(1, enabled);
+                self.mouse_report_mode = self.mouse_report_mode_stack.current();
             }
             1006 => {
-                self.mouse_report_mode = if enabled { 2 } else { 0 };
+                self.mouse_report_mode_stack.apply(2, enabled);
+                self.mouse_report_mode = self.mouse_report_mode_stack.current();
             }
             1015 => {
-                self.mouse_report_mode = if enabled { 3 } else { 0 };
+                self.mouse_report_mode_stack.apply(3, enabled);
+                self.mouse_report_mode = self.mouse_report_mode_stack.current();
             }
             1016 => {
-                self.mouse_report_mode = if enabled { 4 } else { 0 };
+                self.mouse_report_mode_stack.apply(4, enabled);
+                self.mouse_report_mode = self.mouse_report_mode_stack.current();
             }
             2026 => {
                 if enabled {
@@ -653,7 +1765,12 @@ impl Tcg1BatchBuilder {
                 }
                 let attrs = cell.attrs();
                 let text = cell.str();
-                let width = cell.width().clamp(1, 2);
+                let raw_width = cell.width().clamp(1, 2);
+                let width = if raw_width == 2 && col + 1 < clamped_cols {
+                    2
+                } else {
+                    1
+                };
                 let is_default_space = text == " " && attrs == &blank_attrs && width == 1;
 
                 let fg = encode_color(attrs.foreground());
@@ -671,7 +1788,7 @@ impl Tcg1BatchBuilder {
                 self.row_scratch[word_idx + 3] = content;
 
                 let mut cell_end = col + 1;
-                if width == 2 && col + 1 < clamped_cols {
+                if width == 2 {
                     let trail_idx = (col + 1) * CELL_WORDS;
                     self.row_scratch[trail_idx] = fg;
                     self.row_scratch[trail_idx + 1] = bg;
@@ -692,12 +1809,13 @@ impl Tcg1BatchBuilder {
             }
         }
 
-        let has_combining = !self.combining_scratch.is_empty();
+        let mut has_combining = false;
         for &(col, cp) in &self.combining_scratch {
             if (col as usize) < stored_cols {
                 self.combining_words.push(line_entry_idx);
                 self.combining_words.push(col);
                 self.combining_words.push(cp);
+                has_combining = true;
             }
         }
 
@@ -724,8 +1842,8 @@ impl Tcg1BatchBuilder {
         record_bytes: &[u8],
         fallback_cols: usize,
     ) {
-        let wraps_next = !record_bytes.ends_with(b"\r\n");
-        let body = if !wraps_next {
+        let wraps_next = !record_bytes.is_empty() && !record_bytes.ends_with(b"\r\n");
+        let body = if !record_bytes.is_empty() && record_bytes.ends_with(b"\r\n") {
             &record_bytes[..record_bytes.len() - 2]
         } else if let Some(stripped) = record_bytes.strip_suffix(b"\n") {
             stripped
@@ -742,6 +1860,8 @@ impl Tcg1BatchBuilder {
         let mut attr_flags = 0u32;
         let mut col = 0usize;
         let mut last_cell_col: Option<usize> = None;
+        let mut after_zwj = false;
+        let mut prev_was_unpaired_ri = false;
 
         let mut i = 0usize;
         while i < body.len() {
@@ -754,49 +1874,114 @@ impl Tcg1BatchBuilder {
                     if body[j] == b'm' {
                         apply_sgr_params(&body[i + 2..j], &mut fg, &mut bg, &mut attr_flags);
                     }
+                    after_zwj = false;
+                    prev_was_unpaired_ri = false;
                     i = j + 1;
                     continue;
                 }
                 break;
             }
 
-            let rest = &body[i..];
-            let ch = match std::str::from_utf8(rest) {
-                Ok(s) => s.chars().next().unwrap_or('\u{FFFD}'),
-                Err(err) => {
-                    let valid_len = err.valid_up_to();
-                    if valid_len > 0 {
-                        std::str::from_utf8(&rest[..valid_len])
-                            .ok()
-                            .and_then(|s| s.chars().next())
-                            .unwrap_or('\u{FFFD}')
-                    } else {
-                        i += err.error_len().unwrap_or(1).max(1);
-                        '\u{FFFD}'
+            let ch = if body[i] < 0x80 {
+                let c = body[i] as char;
+                i += 1;
+                c
+            } else {
+                let window = &body[i..(i + 4).min(body.len())];
+                match std::str::from_utf8(window) {
+                    Ok(s) => {
+                        let c = s.chars().next().unwrap_or('\u{FFFD}');
+                        i += c.len_utf8();
+                        c
+                    }
+                    Err(err) => {
+                        let valid_len = err.valid_up_to();
+                        if valid_len > 0 {
+                            let c = std::str::from_utf8(&window[..valid_len])
+                                .ok()
+                                .and_then(|s| s.chars().next())
+                                .unwrap_or('\u{FFFD}');
+                            i += c.len_utf8();
+                            c
+                        } else {
+                            i += err.error_len().unwrap_or(1).max(1);
+                            '\u{FFFD}'
+                        }
                     }
                 }
             };
-            if rest[0] < 0x80 || std::str::from_utf8(&rest[..ch.len_utf8().min(rest.len())]).is_ok()
-            {
-                i += ch.len_utf8();
-            }
 
             if ch.is_control() {
+                after_zwj = false;
+                prev_was_unpaired_ri = false;
                 continue;
             }
 
             let raw_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if raw_width == 0 {
+            let is_fitzpatrick = ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch);
+            let is_ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch);
+            let was_after_zwj = after_zwj;
+            let is_second_ri = is_ri && prev_was_unpaired_ri;
+
+            let attach_to_prev = if let Some(prev_col) = last_cell_col {
+                let prev_cp = self.row_scratch[prev_col * CELL_WORDS + 3] & CONTENT_CODEPOINT_MASK;
+                raw_width == 0
+                    || was_after_zwj
+                    || is_second_ri
+                    || (is_fitzpatrick && prev_cp >= 0x80)
+            } else {
+                raw_width == 0
+            };
+
+            if attach_to_prev {
+                after_zwj = ch == '\u{200D}';
+                prev_was_unpaired_ri = false;
                 if let Some(prev_col) = last_cell_col {
                     self.combining_scratch.push((prev_col as u32, ch as u32));
+                    let widens_cluster = ch == '\u{FE0F}'
+                        || (was_after_zwj && raw_width >= 2)
+                        || is_fitzpatrick
+                        || is_second_ri;
+                    if widens_cluster && prev_col + 1 == col && prev_col + 1 < MAX_ENCODED_COLS {
+                        let prev_word_idx = prev_col * CELL_WORDS;
+                        let prev_content = self.row_scratch[prev_word_idx + 3];
+                        let prev_width = (prev_content >> CONTENT_WIDTH_SHIFT) & 0x3;
+                        if prev_width == 1 {
+                            let needed = (prev_col + 2) * CELL_WORDS;
+                            if self.row_scratch.len() < needed {
+                                self.row_scratch.resize(needed, 0);
+                            }
+                            let base_fg = self.row_scratch[prev_word_idx];
+                            let base_bg = self.row_scratch[prev_word_idx + 1];
+                            let base_attr = self.row_scratch[prev_word_idx + 2];
+                            let base_cp = prev_content & CONTENT_CODEPOINT_MASK;
+                            self.row_scratch[prev_word_idx + 3] =
+                                base_cp | (2u32 << CONTENT_WIDTH_SHIFT);
+                            let trail_idx = (prev_col + 1) * CELL_WORDS;
+                            self.row_scratch[trail_idx] = base_fg;
+                            self.row_scratch[trail_idx + 1] = base_bg;
+                            self.row_scratch[trail_idx + 2] = base_attr;
+                            self.row_scratch[trail_idx + 3] = 0;
+                            col = prev_col + 2;
+                        }
+                    }
                 }
                 continue;
             }
 
+            after_zwj = false;
+            prev_was_unpaired_ri = is_ri;
+
             if col >= MAX_ENCODED_COLS {
+                last_cell_col = None;
+                prev_was_unpaired_ri = false;
                 continue;
             }
-            let width = raw_width.clamp(1, 2);
+            let width = if raw_width >= 2 && col + 1 < MAX_ENCODED_COLS {
+                2
+            } else {
+                1
+            };
             let needed_cols = (col + width).min(MAX_ENCODED_COLS);
             if self.row_scratch.len() < needed_cols * CELL_WORDS {
                 self.row_scratch.resize(needed_cols * CELL_WORDS, 0);
@@ -811,7 +1996,7 @@ impl Tcg1BatchBuilder {
             self.row_scratch[word_idx + 3] = content;
             last_cell_col = Some(col);
 
-            if width == 2 && col + 1 < MAX_ENCODED_COLS {
+            if width == 2 {
                 let trail_idx = (col + 1) * CELL_WORDS;
                 self.row_scratch[trail_idx] = fg;
                 self.row_scratch[trail_idx + 1] = bg;
@@ -823,11 +2008,14 @@ impl Tcg1BatchBuilder {
 
         let stored_cols = col.min(MAX_ENCODED_COLS);
         let logical_cols = fallback_cols.max(stored_cols).clamp(1, MAX_ENCODED_COLS);
-        let has_combining = !self.combining_scratch.is_empty();
+        let mut has_combining = false;
         for &(c_col, cp) in &self.combining_scratch {
-            self.combining_words.push(line_entry_idx);
-            self.combining_words.push(c_col);
-            self.combining_words.push(cp);
+            if (c_col as usize) < stored_cols {
+                self.combining_words.push(line_entry_idx);
+                self.combining_words.push(c_col);
+                self.combining_words.push(cp);
+                has_combining = true;
+            }
         }
 
         let mut flags = 0u8;
@@ -914,15 +2102,29 @@ pub fn decode_tcg1_batch(compression: u8, payload: &[u8]) -> Result<Vec<DecodedC
     if payload.is_empty() {
         return Ok(Vec::new());
     }
-    let raw_cow: Vec<u8> = match compression {
-        CELL_COMPRESSION_NONE => payload.to_vec(),
+    let raw_cow: Cow<'_, [u8]> = match compression {
+        CELL_COMPRESSION_NONE => {
+            if payload.len() > MAX_DECOMPRESSED_TCG1_BYTES {
+                return Err(format!(
+                    "TCG1 payload exceeds maximum size: {}",
+                    payload.len()
+                ));
+            }
+            Cow::Borrowed(payload)
+        }
         CELL_COMPRESSION_ZLIB => {
-            let mut decoder = ZlibDecoder::new(payload);
+            let decoder = ZlibDecoder::new(payload);
+            let mut limited = decoder.take((MAX_DECOMPRESSED_TCG1_BYTES as u64) + 1);
             let mut out = Vec::new();
-            decoder
+            limited
                 .read_to_end(&mut out)
                 .map_err(|e| format!("zlib decode failed: {e}"))?;
-            out
+            if out.len() > MAX_DECOMPRESSED_TCG1_BYTES {
+                return Err(format!(
+                    "decompressed TCG1 payload exceeds maximum size ({MAX_DECOMPRESSED_TCG1_BYTES} bytes)"
+                ));
+            }
+            Cow::Owned(out)
         }
         other => return Err(format!("unsupported cell compression code: {other}")),
     };
@@ -946,12 +2148,25 @@ pub fn decode_tcg1_batch(compression: u8, payload: &[u8]) -> Result<Vec<DecodedC
     }
     let line_count = word_at(1) as usize;
     let combining_count = word_at(2) as usize;
+    if line_count > 0x10000 {
+        return Err(format!("TCG1 line_count exceeds 65536: {line_count}"));
+    }
     let headers_end = 3usize
         .checked_add(line_count.checked_mul(2).ok_or("line_count overflow")?)
         .ok_or("headers_end overflow")?;
     if headers_end > total_words {
         return Err("TCG1 truncated in line headers".to_owned());
     }
+
+    let sanitize_cp = |cp: u32| -> u32 {
+        if cp == 0 {
+            0
+        } else if char::from_u32(cp).is_none() {
+            0xFFFD
+        } else {
+            cp
+        }
+    };
 
     let mut rows = Vec::with_capacity(line_count);
     let mut cell_cursor = headers_end;
@@ -961,6 +2176,14 @@ pub fn decode_tcg1_batch(compression: u8, payload: &[u8]) -> Result<Vec<DecodedC
         let stored_cols = (meta & 0x0FFF) as usize;
         let logical_cols = ((meta >> 12) & 0x0FFF) as usize;
         let flags = ((meta >> 24) & 0xFF) as u8;
+        if row_index >= 0x10000 {
+            return Err(format!("TCG1 row_index out of bounds: {row_index}"));
+        }
+        if stored_cols > logical_cols {
+            return Err(format!(
+                "TCG1 stored_cols ({stored_cols}) exceeds logical_cols ({logical_cols})"
+            ));
+        }
         let words_len = stored_cols * CELL_WORDS;
         if cell_cursor + words_len > total_words {
             return Err("TCG1 truncated in cell words".to_owned());
@@ -968,6 +2191,17 @@ pub fn decode_tcg1_batch(compression: u8, payload: &[u8]) -> Result<Vec<DecodedC
         let mut cell_words = Vec::with_capacity(words_len);
         for w_idx in cell_cursor..cell_cursor + words_len {
             cell_words.push(word_at(w_idx));
+        }
+        for col in 0..stored_cols {
+            let content_idx = col * CELL_WORDS + 3;
+            let content = cell_words[content_idx];
+            let cp = content & CONTENT_CODEPOINT_MASK;
+            if cp != 0 {
+                let safe_cp = sanitize_cp(cp);
+                if safe_cp != cp {
+                    cell_words[content_idx] = (content & !CONTENT_CODEPOINT_MASK) | safe_cp;
+                }
+            }
         }
         cell_cursor += words_len;
         rows.push(DecodedCellRow {
@@ -991,8 +2225,20 @@ pub fn decode_tcg1_batch(compression: u8, payload: &[u8]) -> Result<Vec<DecodedC
         let line_idx = word_at(base) as usize;
         let col = word_at(base + 1);
         let cp = word_at(base + 2);
-        if let Some(row) = rows.get_mut(line_idx) {
-            row.combining.push((col, cp));
+        let Some(row) = rows.get_mut(line_idx) else {
+            return Err(format!(
+                "TCG1 combining entry references out-of-bounds line_idx {line_idx} (line_count={line_count})"
+            ));
+        };
+        if (col as usize) >= row.stored_cols {
+            return Err(format!(
+                "TCG1 combining entry references out-of-bounds col {col} (stored_cols={})",
+                row.stored_cols
+            ));
+        }
+        let safe_cp = sanitize_cp(if cp == 0 { 0xFFFD } else { cp });
+        if (row.flags & LINE_FLAG_HAS_COMBINING) != 0 {
+            row.combining.push((col, safe_cp));
         }
     }
 
@@ -1110,14 +2356,11 @@ impl ClientSyncBaseline {
         let erase_display_gen = mode_tracker.erase_display_gen();
         let bell_gen = mode_tracker.bell_gen();
 
-        let saw_erase_scrollback = !force_full
-            && self.last_alt_screen.is_some()
+        let saw_erase_scrollback = self.last_alt_screen.is_some()
             && erase_scrollback_gen != self.last_erase_scrollback_gen;
-        let saw_erase_display = !force_full
-            && self.last_alt_screen.is_some()
-            && erase_display_gen != self.last_erase_display_gen;
-        let bell_rang =
-            !force_full && self.last_alt_screen.is_some() && bell_gen != self.last_bell_gen;
+        let saw_erase_display =
+            self.last_alt_screen.is_some() && erase_display_gen != self.last_erase_display_gen;
+        let bell_rang = self.last_alt_screen.is_some() && bell_gen != self.last_bell_gen;
         let title_changed = force_full
             || self.last_alt_screen.is_none()
             || current_title_gen != self.last_title_gen;
@@ -1151,7 +2394,14 @@ impl ClientSyncBaseline {
             Tcg1BatchBuilder::with_row_capacity(MAX_INLINE_PUSHED_SCROLLBACK_ROWS, physical_cols);
         let mut pushed_start_row = effective_scrollback_rows;
         let mut push_phys_range: Option<(usize, usize)> = None;
-        if !is_alt && !full_viewport && first_visible_stable > screen_baseline.first_visible_stable
+        let can_push_boundary_scrollback = !is_alt
+            && !force_full
+            && screen_baseline.initialized
+            && !alt_switched
+            && screen_baseline.physical_cols == physical_cols
+            && !saw_erase_scrollback;
+        if can_push_boundary_scrollback
+            && first_visible_stable > screen_baseline.first_visible_stable
         {
             let raw_delta = (first_visible_stable - screen_baseline.first_visible_stable) as usize;
             let push_count = raw_delta
@@ -1398,6 +2648,44 @@ fn encode_attrs(attrs: &CellAttributes) -> u32 {
     flags
 }
 
+const ALL_UNDERLINE_FLAGS: u32 = ATTR_UNDERLINE
+    | ATTR_DOUBLE_UNDERLINE
+    | ATTR_UNDERCURL
+    | ATTR_DOTTED_UNDERLINE
+    | ATTR_DASHED_UNDERLINE;
+
+fn apply_extended_color_colon(subparams: &[u8], out: &mut u32) {
+    let mut iter = subparams.split(|&b| b == b':');
+    let _ = iter.next(); // 38 or 48
+    match iter.next().and_then(parse_u32_ascii) {
+        Some(5) => {
+            if let Some(raw_c) = iter.next().and_then(parse_u32_ascii) {
+                let c = raw_c & 0xFF;
+                *out = if c < 16 {
+                    COLOR_NAMED | c
+                } else {
+                    COLOR_PALETTE | c
+                };
+            }
+        }
+        Some(2) => {
+            // Both `38:2:cs:r:g:b` (ITU T.416) and `38:2:r:g:b` appear in the wild.
+            let rem: Vec<Option<u32>> = iter.take(5).map(parse_u32_ascii).collect();
+            let rgb = if rem.len() >= 4 {
+                (rem[1], rem[2], rem[3])
+            } else if rem.len() == 3 {
+                (rem[0], rem[1], rem[2])
+            } else {
+                (None, None, None)
+            };
+            if let (Some(r), Some(g), Some(b)) = rgb {
+                *out = COLOR_RGB | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn apply_sgr_params(params: &[u8], fg: &mut u32, bg: &mut u32, attrs: &mut u32) {
     if params.is_empty() {
         *fg = COLOR_NORMAL;
@@ -1405,92 +2693,192 @@ fn apply_sgr_params(params: &[u8], fg: &mut u32, bg: &mut u32, attrs: &mut u32) 
         *attrs = 0;
         return;
     }
-    let mut nums = [0u32; 16];
-    let mut count = 0usize;
-    for part in params.split(|&b| b == b';') {
-        if count >= nums.len() {
-            break;
+    let mut parts = params.split(|&b| b == b';').peekable();
+    while let Some(part) = parts.next() {
+        if part.contains(&b':') {
+            let mut sub = part.split(|&b| b == b':');
+            let code = sub.next().and_then(parse_u32_ascii).unwrap_or(0);
+            match code {
+                4 => {
+                    *attrs &= !ALL_UNDERLINE_FLAGS;
+                    match sub.next().and_then(parse_u32_ascii).unwrap_or(1) {
+                        0 => {}
+                        1 => *attrs |= ATTR_UNDERLINE,
+                        2 => *attrs |= ATTR_UNDERLINE | ATTR_DOUBLE_UNDERLINE,
+                        3 => *attrs |= ATTR_UNDERLINE | ATTR_UNDERCURL,
+                        4 => *attrs |= ATTR_UNDERLINE | ATTR_DOTTED_UNDERLINE,
+                        5 => *attrs |= ATTR_UNDERLINE | ATTR_DASHED_UNDERLINE,
+                        _ => *attrs |= ATTR_UNDERLINE,
+                    }
+                }
+                38 => apply_extended_color_colon(part, fg),
+                48 => apply_extended_color_colon(part, bg),
+                58 => {}
+                0 => {
+                    *fg = COLOR_NORMAL;
+                    *bg = COLOR_NORMAL;
+                    *attrs = 0;
+                }
+                _ => {}
+            }
+            continue;
         }
-        nums[count] = parse_u32_ascii(part).unwrap_or(0);
-        count += 1;
-    }
-    let mut idx = 0usize;
-    while idx < count {
-        match nums[idx] {
+
+        let code = parse_u32_ascii(part).unwrap_or(0);
+        match code {
             0 => {
                 *fg = COLOR_NORMAL;
                 *bg = COLOR_NORMAL;
                 *attrs = 0;
             }
-            1 => {
-                *attrs = (*attrs & !ATTR_FAINT) | ATTR_BOLD;
-            }
-            2 => {
-                *attrs = (*attrs & !ATTR_BOLD) | ATTR_FAINT;
-            }
+            1 => *attrs = (*attrs & !ATTR_FAINT) | ATTR_BOLD,
+            2 => *attrs = (*attrs & !ATTR_BOLD) | ATTR_FAINT,
             3 => *attrs |= ATTR_ITALIC,
-            4 => *attrs |= ATTR_UNDERLINE,
+            4 => {
+                *attrs = (*attrs & !ALL_UNDERLINE_FLAGS) | ATTR_UNDERLINE;
+            }
             5 | 6 => *attrs |= ATTR_BLINK,
             7 => *attrs |= ATTR_INVERSE,
             8 => *attrs |= ATTR_INVISIBLE,
             9 => *attrs |= ATTR_STRIKETHROUGH,
+            21 => {
+                *attrs = (*attrs & !ALL_UNDERLINE_FLAGS) | ATTR_UNDERLINE | ATTR_DOUBLE_UNDERLINE;
+            }
             22 => *attrs &= !(ATTR_BOLD | ATTR_FAINT),
             23 => *attrs &= !ATTR_ITALIC,
-            24 => {
-                *attrs &= !(ATTR_UNDERLINE
-                    | ATTR_DOUBLE_UNDERLINE
-                    | ATTR_UNDERCURL
-                    | ATTR_DOTTED_UNDERLINE
-                    | ATTR_DASHED_UNDERLINE);
-            }
+            24 => *attrs &= !ALL_UNDERLINE_FLAGS,
             25 => *attrs &= !ATTR_BLINK,
             27 => *attrs &= !ATTR_INVERSE,
             28 => *attrs &= !ATTR_INVISIBLE,
             29 => *attrs &= !ATTR_STRIKETHROUGH,
-            30..=37 => *fg = COLOR_NAMED | (nums[idx] - 30),
+            30..=37 => *fg = COLOR_NAMED | (code - 30),
             39 => *fg = COLOR_NORMAL,
-            40..=47 => *bg = COLOR_NAMED | (nums[idx] - 40),
+            40..=47 => *bg = COLOR_NAMED | (code - 40),
             49 => *bg = COLOR_NORMAL,
-            90..=97 => *fg = COLOR_NAMED | (nums[idx] - 90 + 8),
-            100..=107 => *bg = COLOR_NAMED | (nums[idx] - 100 + 8),
-            38 if idx + 2 < count && nums[idx + 1] == 5 => {
-                let c = nums[idx + 2] & 0xFF;
-                *fg = if c < 16 {
-                    COLOR_NAMED | c
-                } else {
-                    COLOR_PALETTE | c
+            90..=97 => *fg = COLOR_NAMED | (code - 90 + 8),
+            100..=107 => *bg = COLOR_NAMED | (code - 100 + 8),
+            38 | 48 | 58 => {
+                let Some(mode_part) = parts.next() else {
+                    break;
                 };
-                idx += 2;
-            }
-            38 if idx + 4 < count && nums[idx + 1] == 2 => {
-                let r = nums[idx + 2] & 0xFF;
-                let g = nums[idx + 3] & 0xFF;
-                let b = nums[idx + 4] & 0xFF;
-                *fg = COLOR_RGB | (r << 16) | (g << 8) | b;
-                idx += 4;
-            }
-            48 if idx + 2 < count && nums[idx + 1] == 5 => {
-                let c = nums[idx + 2] & 0xFF;
-                *bg = if c < 16 {
-                    COLOR_NAMED | c
-                } else {
-                    COLOR_PALETTE | c
-                };
-                idx += 2;
-            }
-            48 if idx + 4 < count && nums[idx + 1] == 2 => {
-                let r = nums[idx + 2] & 0xFF;
-                let g = nums[idx + 3] & 0xFF;
-                let b = nums[idx + 4] & 0xFF;
-                *bg = COLOR_RGB | (r << 16) | (g << 8) | b;
-                idx += 4;
+                match parse_u32_ascii(mode_part) {
+                    Some(5) => {
+                        if let Some(c_part) = parts.next()
+                            && let Some(raw_c) = parse_u32_ascii(c_part)
+                        {
+                            let c = raw_c & 0xFF;
+                            let encoded = if c < 16 {
+                                COLOR_NAMED | c
+                            } else {
+                                COLOR_PALETTE | c
+                            };
+                            if code == 38 {
+                                *fg = encoded;
+                            } else if code == 48 {
+                                *bg = encoded;
+                            }
+                        }
+                    }
+                    Some(2) => {
+                        let r = parts.next().and_then(parse_u32_ascii);
+                        let g = parts.next().and_then(parse_u32_ascii);
+                        let b = parts.next().and_then(parse_u32_ascii);
+                        if let (Some(r), Some(g), Some(b)) = (r, g, b) {
+                            let encoded =
+                                COLOR_RGB | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+                            if code == 38 {
+                                *fg = encoded;
+                            } else if code == 48 {
+                                *bg = encoded;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
             53 => *attrs |= ATTR_OVERLINE,
             55 => *attrs &= !ATTR_OVERLINE,
             _ => {}
         }
-        idx += 1;
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeztermCsiToken {
+    Int(i64),
+    Punct(u8),
+}
+
+/// Mirrors `vtparse` (`MAX_PARAMS = 32`, with slot 0 occupied by `?`) followed
+/// by `wezterm_escape_parser::csi::CSIParser`'s DECSET/DECRST parameter walk.
+fn for_each_wezterm_dec_private_mode(body: &[u8], mut f: impl FnMut(u16)) {
+    let mut tokens = [WeztermCsiToken::Punct(0); 31];
+    let mut token_len = 0usize;
+    let mut cur_int: Option<i64> = None;
+
+    for &b in body {
+        if b.is_ascii_digit() {
+            let next = cur_int
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(i64::from(b - b'0'));
+            cur_int = Some(next);
+        } else if b == b';' || b == b':' {
+            if let Some(val) = cur_int.take()
+                && token_len < tokens.len()
+            {
+                tokens[token_len] = WeztermCsiToken::Int(val);
+                token_len += 1;
+            }
+            if token_len < tokens.len() {
+                tokens[token_len] = WeztermCsiToken::Punct(b);
+                token_len += 1;
+            }
+        } else {
+            return;
+        }
+    }
+    if let Some(val) = cur_int.take()
+        && token_len < tokens.len()
+    {
+        tokens[token_len] = WeztermCsiToken::Int(val);
+        token_len += 1;
+    }
+
+    let mut slice = &tokens[..token_len];
+    while !slice.is_empty() {
+        let WeztermCsiToken::Int(v) = slice[0] else {
+            break;
+        };
+        let Ok(code) = u16::try_from(v) else {
+            break;
+        };
+        f(code);
+        if slice.get(1) == Some(&WeztermCsiToken::Punct(b';')) {
+            slice = &slice[2..];
+        } else {
+            slice = &slice[1..];
+        }
+    }
+}
+
+fn parse_u16_strict_ascii(bytes: &[u8]) -> Option<u16> {
+    let val = parse_u32_strict_ascii(bytes)?;
+    u16::try_from(val).ok()
+}
+
+fn parse_u32_strict_ascii(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut acc = 0u32;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(acc)
 }
 
 fn parse_u32_ascii(bytes: &[u8]) -> Option<u32> {
@@ -1778,5 +3166,498 @@ mod tests {
         assert_ne!(rows[1].flags & LINE_FLAG_HAS_COMBINING, 0);
         assert_eq!(rows[1].stored_cols, 3); // '中' (cols 0,1) + 'a' (col 2)
         assert_eq!(rows[1].combining, vec![(2, 0x0300)]);
+    }
+
+    #[test]
+    fn handover_modes_preserve_stacks_alt_screen_and_allow_live_title_resets() {
+        let mut term1 = make_terminal(40, 10);
+        let mut tracker1 = TerminalModeTracker::new();
+        feed(
+            &mut term1,
+            &mut tracker1,
+            b"\x1b]0;Adopted TUI\x07\x1b[>1u\x1b[?1049h\x1b[>5u\x1b[?2004;5;1002;1006h",
+        );
+
+        let exported = tracker1.export_handover_modes(&term1);
+        assert!(exported.in_alt_screen);
+        assert_eq!(exported.primary_kitty_stack, vec![1]);
+        assert_eq!(exported.alt_kitty_stack, vec![5]);
+        assert_eq!(exported.kitty_keyboard_flags, 5);
+        assert!(exported.bracketed_paste);
+        assert!(exported.reverse_video);
+        assert_eq!(exported.title, "Adopted TUI");
+
+        // Adopt onto a second daemon whose replay tail did not include the old OSC/mode setup.
+        let mut term2 = make_terminal(40, 10);
+        let mut tracker2 = TerminalModeTracker::new();
+        tracker2.restore_handover_modes(&exported);
+        apply_handover_modes_to_terminal(&mut term2, &exported);
+
+        assert!(term2.is_alt_screen_active());
+        assert!(term2.bracketed_paste_enabled());
+        assert!(term2.get_reverse_video());
+        assert!(term2.is_mouse_grabbed());
+        assert_eq!(tracker2.kitty_keyboard_flags(true), 5);
+        assert_eq!(tracker2.kitty_keyboard_flags(false), 1);
+
+        // A second handover before any new OSC title must still preserve "Adopted TUI".
+        let exported2 = tracker2.export_handover_modes(&term2);
+        assert_eq!(exported2.title, "Adopted TUI");
+
+        // Leaving alt screen restores primary Kitty stack (`1`) while preserving
+        // alt screen's Kitty stack (`5`), matching wezterm-term (`Screen::keyboard_stack`).
+        feed(&mut term2, &mut tracker2, b"\x1b[?1049l");
+        assert_eq!(tracker2.kitty_keyboard_flags(false), 1);
+        assert_eq!(tracker2.kitty_keyboard_flags(true), 5);
+
+        // Live ESC c (`RIS`) resets modes, clears both Kitty stacks, bumps erase gens,
+        // and clears handover title fallback.
+        let pre_erase_sb = tracker2.erase_scrollback_gen();
+        let pre_erase_disp = tracker2.erase_display_gen();
+        feed(&mut term2, &mut tracker2, b"\x1bc");
+        assert_eq!(tracker2.kitty_keyboard_flags(false), 0);
+        assert_eq!(tracker2.kitty_keyboard_flags(true), 0);
+        assert_eq!(tracker2.erase_scrollback_gen(), pre_erase_sb + 1);
+        assert_eq!(tracker2.erase_display_gen(), pre_erase_disp + 1);
+        let (title_after_ris, _) = tracker2.observe_terminal_title(&term2);
+        assert_eq!(title_after_ris, "wezterm");
+    }
+
+    #[test]
+    fn sideband_lexer_matches_vtparse_on_osc_dcs_utf8_intermediates_and_split_cht() {
+        let mut term = make_terminal(25, 5);
+        let mut tracker = TerminalModeTracker::new();
+
+        // 1. Unterminated OSC aborted by ESC + `[?1049h` enters alt-screen just like vtparse.
+        feed(&mut term, &mut tracker, b"\x1b]0;unterminated\x1b[?1049h");
+        assert!(term.is_alt_screen_active());
+        assert!(tracker.in_alt_screen());
+
+        // 2. CSI 3J inside alt-screen does NOT increment primary erase_scrollback_gen.
+        let sb_gen = tracker.erase_scrollback_gen();
+        feed(&mut term, &mut tracker, b"\x1b[3J");
+        assert_eq!(tracker.erase_scrollback_gen(), sb_gen);
+
+        // Exit alt screen; `\x1b[2J\x1b[3J` on primary screen increments both gens,
+        // while multi-param `\x1b[2;3J` is ignored to match wezterm-escape-parser.
+        feed(&mut term, &mut tracker, b"\x1b[?1049l\x1b[2;3J");
+        assert_eq!(tracker.erase_scrollback_gen(), sb_gen);
+        feed(&mut term, &mut tracker, b"\x1b[2J\x1b[3J");
+        assert_eq!(tracker.erase_scrollback_gen(), sb_gen + 1);
+
+        // 3. CSI with space intermediate (`\x1b[3 J`) must NOT increment erase_scrollback_gen.
+        feed(&mut term, &mut tracker, b"\x1b[3 J");
+        assert_eq!(tracker.erase_scrollback_gen(), sb_gen + 1);
+
+        // 4. DCS/APC ignore embedded BEL (`0x07`) until ST (`ESC \`).
+        let bell_before = tracker.bell_gen();
+        feed(&mut term, &mut tracker, b"\x1bP1$r\x07payload\x1b\\");
+        feed(&mut term, &mut tracker, b"\x1b_Gi=1;\x07\x1b\\");
+        assert_eq!(tracker.bell_gen(), bell_before);
+
+        // 5. UTF-8 smart quotes (`0xe2 0x80 0x9c` / `0x9d`) inside OSC do not terminate OSC early.
+        feed(&mut term, &mut tracker, "\x1b]0;build “ok”\x07".as_bytes());
+        assert_eq!(term.get_title(), "build “ok”");
+        assert_eq!(tracker.bell_gen(), bell_before);
+
+        // 6. Up to 16 DEC private mode params (vtparse MAX_PARAMS=32 including `?` and `;`)
+        // are all applied, while params past slot 32 are ignored in lockstep with vtparse.
+        feed(
+            &mut term,
+            &mut tracker,
+            b"\x1b[?1;1;1;1;1;1;1;1;1;1;1;1;1;1;1004;2026h",
+        );
+        assert!(tracker.is_in_synchronized_update(Instant::now(), Duration::from_millis(50)));
+        assert!(tracker.export_handover_modes(&term).report_focus);
+        feed(&mut term, &mut tracker, b"\x1b[?2026l");
+        feed(
+            &mut term,
+            &mut tracker,
+            b"\x1b[?1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;2026h",
+        );
+        assert!(!tracker.is_in_synchronized_update(Instant::now(), Duration::from_millis(50)));
+
+        // 7. Split, zero-padded, DEL-embedded, and C1 `0x9b` CHT/CBT clamp cleanly,
+        // while multi-param `\x1b[2;999999I` stays a no-op matching wezterm-escape-parser.
+        feed(&mut term, &mut tracker, b"\r\x1b[2;999999I");
+        assert_eq!(term.cursor_pos().x, 0);
+
+        let zeros = vec![b'0'; 400];
+        feed(&mut term, &mut tracker, b"\r\x1b[");
+        feed(&mut term, &mut tracker, &zeros);
+        feed(&mut term, &mut tracker, b"9999\x7f9999I");
+        assert_eq!(term.cursor_pos().x, 24);
+
+        feed(&mut term, &mut tracker, b"\x9b999999999Z");
+        assert_eq!(term.cursor_pos().x, 0);
+    }
+
+    #[test]
+    fn sgr_journal_truncation_extended_params_zlib_cap_and_force_full_transients() {
+        // 1. Journal record > MAX_ENCODED_COLS drops post-limit combining marks instead of
+        // attaching them to column 4094, and handles >16 SGR params + colon undercurl/RGB.
+        let mut rec = Vec::from(&b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;4:3;38:2::12:34:56m"[..]);
+        rec.resize(rec.len() + MAX_ENCODED_COLS, b'x');
+        rec.extend_from_slice("y\u{0301}\r\n".as_bytes());
+
+        let mut builder = Tcg1BatchBuilder::with_row_capacity(1, 80);
+        builder.push_sgr_journal_record(0, &rec, 80);
+        let batch = builder.finish_encoded();
+        let rows = decode_tcg1_batch(batch.compression, &batch.payload).expect("decode long row");
+        assert_eq!(rows[0].stored_cols, MAX_ENCODED_COLS);
+        assert_eq!(rows[0].flags & LINE_FLAG_HAS_COMBINING, 0);
+        assert!(rows[0].combining.is_empty());
+        assert_eq!(
+            rows[0].cell_words[0],
+            COLOR_RGB | (12 << 16) | (34 << 8) | 56
+        );
+        assert_eq!(rows[0].cell_words[2], ATTR_UNDERLINE | ATTR_UNDERCURL);
+
+        // 2. Zlib bomb > MAX_DECOMPRESSED_TCG1_BYTES is rejected cleanly.
+        let mut z_enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        let zeros = vec![0u8; 64 * 1024];
+        for _ in 0..((MAX_DECOMPRESSED_TCG1_BYTES / zeros.len()) + 2) {
+            z_enc.write_all(&zeros).unwrap();
+        }
+        let bomb = z_enc.finish().unwrap();
+        let err = decode_tcg1_batch(CELL_COMPRESSION_ZLIB, &bomb).unwrap_err();
+        assert!(
+            err.contains("exceeds maximum size"),
+            "unexpected err: {err}"
+        );
+
+        // 3. Out-of-bounds combining `line_idx` is rejected cleanly.
+        let mut bad_raw = Vec::new();
+        push_u32_le(&mut bad_raw, TCG1_MAGIC);
+        push_u32_le(&mut bad_raw, 1); // 1 row
+        push_u32_le(&mut bad_raw, 1); // 1 combining entry
+        push_u32_le(&mut bad_raw, 0); // row_index = 0
+        push_u32_le(&mut bad_raw, 80 << 12); // stored_cols = 0, logical_cols = 80
+        push_u32_le(&mut bad_raw, 5); // line_idx = 5 (out of bounds!)
+        push_u32_le(&mut bad_raw, 0);
+        push_u32_le(&mut bad_raw, 0x0301);
+        assert!(decode_tcg1_batch(CELL_COMPRESSION_NONE, &bad_raw).is_err());
+
+        // 4. `force_full = true` on an initialized baseline still reports transient flags.
+        let mut term = make_terminal(20, 4);
+        let mut tracker = TerminalModeTracker::new();
+        let mut baseline = ClientSyncBaseline::new();
+        let metrics = VirtualScrollbackMetrics {
+            total_scrollback_rows: 0,
+            trimmed_top_rows: 0,
+        };
+        let _ = baseline.diff_terminal(&term, &mut tracker, metrics, true);
+        feed(&mut term, &mut tracker, b"\x07\x1b[2J\x1b[3J");
+        let forced = baseline
+            .diff_terminal(&term, &mut tracker, metrics, true)
+            .expect("forced full patch");
+        assert_ne!(forced.mode_flags & MODE_BELL_RANG, 0);
+        assert_ne!(forced.mode_flags & MODE_SAW_ERASE_DISPLAY, 0);
+        assert_ne!(forced.mode_flags & MODE_SAW_ERASE_SCROLLBACK, 0);
+    }
+
+    #[test]
+    fn utf8_rfc3629_kitty_handover_mouse_stack_and_tcg1_parity() {
+        let mut term = make_terminal(25, 5);
+        let mut tracker = TerminalModeTracker::new();
+
+        // 1. Truncated UTF-8 lead byte (`0xe2`) consumes an immediately-following
+        // `0x1b` as an invalid sequence (`U+FFFD`) in `vtparse`/`utf8parse`, so
+        // `\xe2\x1b[?1049h` does NOT enter alt-screen in either `Terminal` or tracker.
+        feed(&mut term, &mut tracker, b"\xe2\x1b[?1049h");
+        assert_eq!(term.is_alt_screen_active(), tracker.in_alt_screen());
+        assert!(!tracker.in_alt_screen());
+
+        // 2. Trailing UTF-8 lead byte in an otherwise-ASCII chunk inside OSC must not
+        // be bypassed by the Ground/ASCII fast path across chunk boundaries.
+        feed(&mut term, &mut tracker, b"\x1b]0;hi");
+        feed(&mut term, &mut tracker, b"\xe2");
+        feed(&mut term, &mut tracker, b"\x80\x9c\x07");
+        assert_eq!(term.get_title(), "hi\u{201c}");
+
+        // 3. Surrogate second byte (`0xed 0xa0`) resets UTF-8 state on `0xa0`, so a
+        // third byte `\x1b[?1049h` IS recognized as ESC by both `Terminal` and tracker.
+        feed(&mut term, &mut tracker, b"\xed\xa0\x1b[?1049h");
+        assert_eq!(term.is_alt_screen_active(), tracker.in_alt_screen());
+        assert!(tracker.in_alt_screen());
+        feed(&mut term, &mut tracker, b"\x1b[?1049l");
+
+        // 4. DEC mouse tracking & encoding stacks preserve remaining active modes on
+        // sibling disable (`?1006h?1015l?1005l` and `?1002h?1000h?1003l?1000l`).
+        feed(
+            &mut term,
+            &mut tracker,
+            b"\x1b[?1002h\x1b[?1000h\x1b[?1003l\x1b[?1006h\x1b[?1015l\x1b[?1005l",
+        );
+        assert_eq!(tracker.mouse_mode(), 2);
+        assert_eq!(tracker.mouse_report_mode(), 2);
+        feed(&mut term, &mut tracker, b"\x1b[?1000l");
+        assert_eq!(tracker.mouse_mode(), 3);
+
+        // 5. `apply_handover_modes_to_terminal` restores both primary and alt Kitty
+        // keyboard stacks onto `Terminal`.
+        feed(&mut term, &mut tracker, b"\x1b[>1;1u\x1b[?1049h\x1b[>11;1u");
+        let exported = tracker.export_handover_modes(&term);
+        let mut adopted = make_terminal(25, 5);
+        apply_handover_modes_to_terminal(&mut adopted, &exported);
+        assert!(adopted.is_alt_screen_active());
+        assert_eq!(
+            adopted.get_keyboard_encoding(),
+            term.get_keyboard_encoding()
+        );
+        adopted.advance_bytes(b"\x1b[?1049l");
+        term.advance_bytes(b"\x1b[?1049l");
+        assert_eq!(
+            adopted.get_keyboard_encoding(),
+            term.get_keyboard_encoding()
+        );
+
+        // 6. `decode_tcg1_batch` enforces Dart-parity header caps, codepoint sanitization,
+        // and `LINE_FLAG_HAS_COMBINING` gating.
+        let mut row_oob = Vec::new();
+        push_u32_le(&mut row_oob, TCG1_MAGIC);
+        push_u32_le(&mut row_oob, 1);
+        push_u32_le(&mut row_oob, 0);
+        push_u32_le(&mut row_oob, 0x10000); // row_index out of bounds
+        push_u32_le(&mut row_oob, 80 << 12);
+        assert!(decode_tcg1_batch(CELL_COMPRESSION_NONE, &row_oob).is_err());
+
+        let mut cols_oob = Vec::new();
+        push_u32_le(&mut cols_oob, TCG1_MAGIC);
+        push_u32_le(&mut cols_oob, 1);
+        push_u32_le(&mut cols_oob, 0);
+        push_u32_le(&mut cols_oob, 0);
+        push_u32_le(&mut cols_oob, 10 | (5 << 12)); // stored_cols (10) > logical_cols (5)
+        for _ in 0..(10 * CELL_WORDS) {
+            push_u32_le(&mut cols_oob, 0);
+        }
+        assert!(decode_tcg1_batch(CELL_COMPRESSION_NONE, &cols_oob).is_err());
+
+        let mut surrogate_raw = Vec::new();
+        push_u32_le(&mut surrogate_raw, TCG1_MAGIC);
+        push_u32_le(&mut surrogate_raw, 1);
+        push_u32_le(&mut surrogate_raw, 1);
+        push_u32_le(&mut surrogate_raw, 0);
+        push_u32_le(&mut surrogate_raw, 1 | (80 << 12)); // no LINE_FLAG_HAS_COMBINING
+        push_u32_le(&mut surrogate_raw, 0);
+        push_u32_le(&mut surrogate_raw, 0);
+        push_u32_le(&mut surrogate_raw, 0);
+        push_u32_le(&mut surrogate_raw, 0xD800 | (1 << CONTENT_WIDTH_SHIFT));
+        push_u32_le(&mut surrogate_raw, 0);
+        push_u32_le(&mut surrogate_raw, 0);
+        push_u32_le(&mut surrogate_raw, 0);
+        let decoded = decode_tcg1_batch(CELL_COMPRESSION_NONE, &surrogate_raw).expect("sanitized");
+        assert_eq!(decoded[0].cell_words[3] & CONTENT_CODEPOINT_MASK, 0xFFFD);
+        assert!(decoded[0].combining.is_empty());
+    }
+
+    #[test]
+    fn infer_initial_replay_modes_respects_primary_vs_alt_screen_defaults() {
+        let primary_end = HandoverTerminalModes {
+            in_alt_screen: false,
+            auto_wrap: true,
+            origin_mode: false,
+            ..Default::default()
+        };
+
+        // 1. Primary-screen tail with routine shell/CLI defensive `?7h` and `?6l`
+        // keeps primary defaults (`auto_wrap == true`, `origin_mode == false`).
+        let primary_defensive =
+            infer_initial_replay_modes(b"long wrapped line\r\n\x1b[?7h\x1b[?6l$ ", &primary_end);
+        assert!(!primary_defensive.in_alt_screen);
+        assert!(primary_defensive.auto_wrap);
+        assert!(!primary_defensive.origin_mode);
+
+        // 2. Alt-screen tail (`?1049l` seen first) with `?7h` and `?6l` infers
+        // TUI modes (`auto_wrap == false`, `origin_mode == true`), while
+        // `modes_for_screen(false)` resolves to `(true, false)` when external
+        // scrollback evidence overrides `initial_alt = false`.
+        let alt_tail =
+            infer_initial_replay_modes(b"status bar\x1b[?7h\x1b[?6l\x1b[?1049l$ ", &primary_end);
+        assert!(alt_tail.in_alt_screen);
+        assert!(!alt_tail.auto_wrap);
+        assert!(alt_tail.origin_mode);
+        assert_eq!(alt_tail.modes_for_screen(false), (true, false));
+
+        // 3. Explicit `?7l` and `?6h` as first transitions resolve to `(true, false)`
+        // regardless of initial screen.
+        let explicit_disable =
+            infer_initial_replay_modes(b"wrapped\r\n\x1b[?7l\x1b[?6h\x1b[?1049l", &primary_end);
+        assert!(explicit_disable.in_alt_screen);
+        assert!(explicit_disable.auto_wrap);
+        assert!(!explicit_disable.origin_mode);
+
+        // 4. Alt-screen tail exiting via `?1049l` or `?47l` without touching `?7`/`?6`,
+        // followed by wrapped primary-screen output and a later shell defensive
+        // `\x1b[?7h\x1b[?6l$ `, must NOT invert post-exit primary-screen modes onto
+        // the initial replay epoch.
+        let post_exit_1049_defensive = infer_initial_replay_modes(
+            b"tui frame\x1b[?1049lwrapped primary line\r\n\x1b[?7h\x1b[?6l$ ",
+            &primary_end,
+        );
+        assert!(post_exit_1049_defensive.in_alt_screen);
+        assert_eq!(
+            post_exit_1049_defensive.modes_for_screen(true),
+            (true, false)
+        );
+        assert_eq!(
+            post_exit_1049_defensive.modes_for_screen(false),
+            (true, false)
+        );
+
+        let post_exit_47_defensive = infer_initial_replay_modes(
+            b"tui frame\x1b[?47lwrapped primary line\r\n\x1b[?7h\x1b[?6l$ ",
+            &primary_end,
+        );
+        assert!(post_exit_47_defensive.in_alt_screen);
+        assert_eq!(post_exit_47_defensive.modes_for_screen(true), (true, false));
+
+        // 5. Alt-screen tail exiting via `?1049l`, printing wrapped primary output,
+        // and entering a second alt-screen (`?1049h\x1b[?7l`) keeps `auto_wrap == true`
+        // for the initial replay epoch even when `end_modes.auto_wrap == false`.
+        let second_alt_end = HandoverTerminalModes {
+            in_alt_screen: true,
+            auto_wrap: false,
+            origin_mode: false,
+            ..Default::default()
+        };
+        let multi_epoch = infer_initial_replay_modes(
+            b"tui1\x1b[?1049lwrapped primary\r\n\x1b[?1049h\x1b[?7l",
+            &second_alt_end,
+        );
+        assert!(multi_epoch.in_alt_screen);
+        assert_eq!(multi_epoch.modes_for_screen(true), (true, false));
+
+        // 6. Unmatched cursor restore (`ESC 8`, `CSI u`, `?1048l`, or `?1049l`) before
+        // any `?6` severs `end_modes.origin_mode` from t=0, whereas a matched in-tail
+        // save/restore (`ESC 7 ... ESC 8`) preserves `end_modes.origin_mode`.
+        let origin_end = HandoverTerminalModes {
+            in_alt_screen: false,
+            auto_wrap: true,
+            origin_mode: true,
+            ..Default::default()
+        };
+        let unmatched_decrc = infer_initial_replay_modes(b"body\x1b8tail", &origin_end);
+        assert_eq!(unmatched_decrc.modes_for_screen(false), (true, false));
+
+        let unmatched_1049l = infer_initial_replay_modes(b"tui\x1b[?1049ltail", &origin_end);
+        assert_eq!(unmatched_1049l.modes_for_screen(true), (true, false));
+        assert_eq!(unmatched_1049l.modes_for_screen(false), (true, true));
+
+        let matched_save_restore = infer_initial_replay_modes(b"\x1b7status\x1b8body", &origin_end);
+        assert_eq!(matched_save_restore.modes_for_screen(false), (true, true));
+
+        // 7. Soft reset (`CSI ! p`, DECSTR) resets tracked modes and severs backward
+        // inference just like `ESC c` (`RIS`).
+        let mut tracker = TerminalModeTracker::new();
+        let _ = tracker.observe_and_sanitize(b"\x1b[?1;6;66;1049h\x1b[?7l", 80);
+        assert!(tracker.in_alt_screen());
+        let _ = tracker.observe_and_sanitize(b"\x1b[!p", 80);
+        assert!(!tracker.in_alt_screen());
+        let decstr_inferred = infer_initial_replay_modes(
+            b"before\x1b[!p\x1b[?1049h\x1b[?7l\x1b[?6h",
+            &HandoverTerminalModes {
+                in_alt_screen: true,
+                auto_wrap: false,
+                origin_mode: true,
+                ..Default::default()
+            },
+        );
+        assert!(!decstr_inferred.in_alt_screen);
+        assert_eq!(decstr_inferred.modes_for_screen(false), (true, false));
+    }
+
+    #[test]
+    fn mode_tracker_handles_compound_decset_kitty_cap_screen_title_and_journal_graphemes() {
+        let mut term = make_terminal(80, 24);
+        let mut tracker = TerminalModeTracker::new();
+        // Compound DECSET up to vtparse's 16-param (31-token) window applies every mode,
+        // a 17th param beyond vtparse's window is ignored in lockstep with wezterm, and a
+        // colon subparam stops subsequent params just like wezterm_escape_parser.
+        let mut max_decset = String::from("\x1b[?");
+        for idx in 1..=14 {
+            max_decset.push_str(&format!("{};", 2000 + idx));
+        }
+        max_decset.push_str("1002;1006h");
+        feed(&mut term, &mut tracker, max_decset.as_bytes());
+        assert!(term.is_mouse_grabbed());
+        let modes1 = tracker.export_handover_modes(&term);
+        assert_eq!(modes1.mouse_mode, 3);
+        assert_eq!(modes1.mouse_report_mode, 2);
+
+        let mut overflow_decset = String::from("\x1b[?");
+        for idx in 1..=16 {
+            overflow_decset.push_str(&format!("{};", 2000 + idx));
+        }
+        overflow_decset.push_str("1049h");
+        feed(&mut term, &mut tracker, overflow_decset.as_bytes());
+        assert!(!term.is_alt_screen_active());
+        assert!(!tracker.in_alt_screen());
+
+        feed(&mut term, &mut tracker, b"\x1b[?1003:1;1005h");
+        let modes_colon = tracker.export_handover_modes(&term);
+        assert_eq!(modes_colon.mouse_mode, 4);
+        assert_eq!(modes_colon.mouse_report_mode, 2);
+
+        // Kitty keyboard push caps at 128 entries, masks flags to 5 bits, and preserves
+        // alt_kitty_stack across ?1049l alt-screen exit.
+        feed(&mut term, &mut tracker, b"\x1b[?1049h");
+        for _ in 0..140 {
+            feed(&mut term, &mut tracker, b"\x1b[>63u");
+        }
+        let modes_alt = tracker.export_handover_modes(&term);
+        assert_eq!(modes_alt.kitty_keyboard_flags, 0x1f);
+        assert_eq!(modes_alt.alt_kitty_stack.len(), 128);
+        feed(&mut term, &mut tracker, b"\x1b[?1049l");
+        let modes_after_exit = tracker.export_handover_modes(&term);
+        assert_eq!(modes_after_exit.alt_kitty_stack.len(), 128);
+        assert_eq!(modes_after_exit.kitty_keyboard_flags, 0);
+
+        // GNU screen / tmux `ESC k ... ST` records custom titles (including explicit empty `""`
+        // so handover clears `"wezterm"` default), and `ESC c` (`RIS`) resets `has_custom_title`.
+        feed(&mut term, &mut tracker, b"\x1bkmy-window\x1b\\");
+        let modes_titled = tracker.export_handover_modes(&term);
+        assert!(modes_titled.has_custom_title);
+        assert_eq!(modes_titled.title, "my-window");
+        feed(&mut term, &mut tracker, b"\x1bk\x1b\\");
+        let modes_cleared = tracker.export_handover_modes(&term);
+        assert!(modes_cleared.has_custom_title);
+        assert!(modes_cleared.title.is_empty());
+        feed(&mut term, &mut tracker, b"\x1bc");
+        let fresh_term = make_terminal(80, 24);
+        assert!(!tracker.export_handover_modes(&fresh_term).has_custom_title);
+
+        // `push_sgr_journal_record` keeps empty `b""` non-wrapping and promotes VS16,
+        // ZWJ sequences, and Regional Indicator pairs to width-2 lead + spacer cells.
+        let mut builder = Tcg1BatchBuilder::with_row_capacity(4, 16);
+        builder.push_sgr_journal_record(0, b"", 8);
+        builder.push_sgr_journal_record(
+            1,
+            "\u{2764}\u{FE0F}\u{1F468}\u{200D}\u{1F4BB}\u{1F1FA}\u{1F1F8}\r\n".as_bytes(),
+            8,
+        );
+        let batch = builder.finish_encoded();
+        let rows = decode_tcg1_batch(batch.compression, &batch.payload).expect("decode batch");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].flags & LINE_FLAG_WRAPS_NEXT, 0);
+        assert_eq!(rows[1].flags & LINE_FLAG_WRAPS_NEXT, 0);
+        assert_eq!(rows[1].stored_cols, 6);
+        let cell_cp =
+            |col: usize| rows[1].cell_words[col * CELL_WORDS + 3] & CONTENT_CODEPOINT_MASK;
+        let cell_w =
+            |col: usize| (rows[1].cell_words[col * CELL_WORDS + 3] >> CONTENT_WIDTH_SHIFT) & 0x3;
+        assert_eq!(cell_cp(0), 0x2764);
+        assert_eq!(cell_w(0), 2);
+        assert_eq!(cell_w(1), 0);
+        assert_eq!(cell_cp(2), 0x1F468);
+        assert_eq!(cell_w(2), 2);
+        assert_eq!(cell_w(3), 0);
+        assert_eq!(cell_cp(4), 0x1F1FA);
+        assert_eq!(cell_w(4), 2);
+        assert_eq!(cell_w(5), 0);
+        assert!(rows[1].combining.contains(&(0, 0xFE0F)));
+        assert!(rows[1].combining.contains(&(2, 0x200D)));
+        assert!(rows[1].combining.contains(&(2, 0x1F4BB)));
+        assert!(rows[1].combining.contains(&(4, 0x1F1F8)));
     }
 }

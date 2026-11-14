@@ -1,9 +1,10 @@
 // Headless TCG1 cell-batch decode and TerminalCellBuffer apply benchmark.
-// Run with `flutter test` or `dart run tool/parse_bench.dart` inside flutter/triage_client.
+// Run with `flutter test tool/parse_bench.dart` inside flutter/triage_client.
 // ignore_for_file: avoid_print
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 
@@ -56,9 +57,9 @@ void _benchBatch({
     const ZLibEncoder().encode(rawScrollback),
   );
   print(
-    '--- ${cols}x$viewportRows viewport (${rawViewport.length} B) + '
+    '=== ${cols}x$viewportRows viewport (${rawViewport.length} B) + '
     '$scrollbackRows scrollback rows (${rawScrollback.length} B raw, '
-    '${zlibScrollback.length} B zlib) ---',
+    '${zlibScrollback.length} B zlib) ===',
   );
 
   _runArm(
@@ -67,31 +68,35 @@ void _benchBatch({
     rounds: rounds,
     runOnce: () {
       final buf = TerminalCellBuffer(cols: cols, rows: viewportRows);
-      buf.applySyncFrame(
-        TerminalSyncFrameData(
-          frameSeq: 1,
-          rows: viewportRows,
-          cols: cols,
-          totalScrollbackRows: scrollbackRows,
-          trimmedTopRows: 0,
-          eraseScrollbackGen: 0,
-          cursorX: 0,
-          cursorY: viewportRows - 1,
-          cursorStyle: 0,
-          modeFlags: kModeFullViewport | kModeCursorVisible,
-          mouseMode: 0,
-          mouseReportMode: 0,
-          kittyKeyboardFlags: 0,
-          title: null,
-          viewportCompression: kCellCompressionNone,
-          viewportPayload: rawViewport,
-          pushedScrollbackStartRow: 0,
-          pushedScrollbackRowCount: scrollbackRows,
-          pushedScrollbackCompression: kCellCompressionNone,
-          pushedScrollbackPayload: rawScrollback,
-        ),
-      );
-      return buf.totalLines;
+      try {
+        buf.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: viewportRows,
+            cols: cols,
+            totalScrollbackRows: scrollbackRows,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: viewportRows - 1,
+            cursorStyle: 0,
+            modeFlags: kModeFullViewport | kModeCursorVisible,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: rawViewport,
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: scrollbackRows,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: rawScrollback,
+          ),
+        );
+        return buf.totalLines;
+      } finally {
+        buf.dispose();
+      }
     },
   );
 
@@ -101,48 +106,30 @@ void _benchBatch({
     rounds: rounds,
     runOnce: () {
       final buf = TerminalCellBuffer(cols: cols, rows: viewportRows);
-      buf.applySyncFrame(
-        TerminalSyncFrameData(
-          frameSeq: 1,
-          rows: viewportRows,
-          cols: cols,
-          totalScrollbackRows: scrollbackRows,
-          trimmedTopRows: 0,
-          eraseScrollbackGen: 0,
-          cursorX: 0,
-          cursorY: viewportRows - 1,
-          cursorStyle: 0,
-          modeFlags: kModeFullViewport | kModeCursorVisible,
-          mouseMode: 0,
-          mouseReportMode: 0,
-          kittyKeyboardFlags: 0,
-          title: null,
-          viewportCompression: kCellCompressionNone,
-          viewportPayload: rawViewport,
-          pushedScrollbackStartRow: 0,
-          pushedScrollbackRowCount: 0,
-          pushedScrollbackCompression: kCellCompressionNone,
-          pushedScrollbackPayload: Uint8List(0),
-        ),
-      );
-      buf.applyFetchedRows(
-        TerminalRowsPageData(
-          sessionId: 'bench',
-          startRow: 0,
-          rowCount: scrollbackRows,
-          totalScrollbackRows: scrollbackRows,
-          trimmedTopRows: 0,
-          eraseScrollbackGen: 0,
-          compression: kCellCompressionZlib,
-          payload: zlibScrollback,
-        ),
-      );
-      return buf.totalLines;
+      try {
+        buf.applyFetchedRows(
+          TerminalRowsPageData(
+            sessionId: 'bench',
+            startRow: 0,
+            rowCount: scrollbackRows,
+            totalScrollbackRows: scrollbackRows,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            compression: kCellCompressionZlib,
+            payload: zlibScrollback,
+          ),
+        );
+        return buf.totalLines;
+      } finally {
+        buf.dispose();
+      }
     },
   );
 }
 
 void main() {
-  _benchBatch(cols: 120, viewportRows: 40, scrollbackRows: 512, rounds: 7);
-  _benchBatch(cols: 120, viewportRows: 40, scrollbackRows: 2048, rounds: 5);
+  test('TCG1 cell-batch decode and TerminalCellBuffer apply benchmark', () {
+    _benchBatch(cols: 120, viewportRows: 40, scrollbackRows: 512, rounds: 7);
+    _benchBatch(cols: 120, viewportRows: 40, scrollbackRows: 2048, rounds: 5);
+  });
 }

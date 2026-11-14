@@ -73,10 +73,12 @@ void main() {
               kModeFullViewport |
               kModeTitleChanged,
           title: 'build-job',
-          viewportPayload: encodeTcg1PlainTextRows(
-            const <String>['row 0', 'row 1', 'row 2', 'row 3'],
-            cols: 40,
-          ),
+          viewportPayload: encodeTcg1PlainTextRows(const <String>[
+            'row 0',
+            'row 1',
+            'row 2',
+            'row 3',
+          ], cols: 40),
         ),
       );
 
@@ -123,14 +125,13 @@ void main() {
           totalScrollbackRows: 300,
           pushedScrollbackStartRow: 298,
           pushedScrollbackRowCount: 2,
-          pushedScrollbackPayload: encodeTcg1PlainTextRows(
-            const <String>['sb-298', 'sb-299'],
-            cols: 40,
-          ),
-          viewportPayload: encodeTcg1PlainTextRows(
-            const <String>['vp-0'],
-            cols: 40,
-          ),
+          pushedScrollbackPayload: encodeTcg1PlainTextRows(const <String>[
+            'sb-298',
+            'sb-299',
+          ], cols: 40),
+          viewportPayload: encodeTcg1PlainTextRows(const <String>[
+            'vp-0',
+          ], cols: 40),
         ),
       );
 
@@ -213,10 +214,7 @@ void main() {
               trimmedTopRows: 0,
               eraseScrollbackGen: 0,
               compression: kCellCompressionNone,
-              payload: encodeTcg1PlainTextRows(
-                <String>['page-$p'],
-                cols: 20,
-              ),
+              payload: encodeTcg1PlainTextRows(<String>['page-$p'], cols: 20),
             ),
             // Protect page 0 as the visible viewport while paging later blocks.
             protectFirstVirtualRow: 0,
@@ -230,7 +228,9 @@ void main() {
         // Unprotected oldest pages (1..6) were evicted; newest page is resident.
         expect(buf.lineAtVirtualRow(kScrollbackPageSize), isNull);
         expect(
-          buf.lineAtVirtualRow((totalPages - 1) * kScrollbackPageSize)?.toPlainText(),
+          buf
+              .lineAtVirtualRow((totalPages - 1) * kScrollbackPageSize)
+              ?.toPlainText(),
           'page-${totalPages - 1}',
         );
       },
@@ -262,10 +262,9 @@ void main() {
               trimmedTopRows: 0,
               eraseScrollbackGen: 0,
               compression: kCellCompressionNone,
-              payload: encodeTcg1PlainTextRows(
-                <String>['row-$start'],
-                cols: 80,
-              ),
+              payload: encodeTcg1PlainTextRows(<String>[
+                'row-$start',
+              ], cols: 80),
             ),
           );
         }
@@ -291,7 +290,11 @@ void main() {
       () {
         final buf = TerminalCellBuffer(cols: 40, rows: 4);
         buf.applySyncFrame(
-          _makeFrame(frameSeq: 1, totalScrollbackRows: 200, eraseScrollbackGen: 1),
+          _makeFrame(
+            frameSeq: 1,
+            totalScrollbackRows: 200,
+            eraseScrollbackGen: 1,
+          ),
         );
         expect(
           buf.applyFetchedRows(
@@ -303,7 +306,9 @@ void main() {
               trimmedTopRows: 0,
               eraseScrollbackGen: 1,
               compression: kCellCompressionNone,
-              payload: encodeTcg1PlainTextRows(const <String>['pre-clear'], cols: 40),
+              payload: encodeTcg1PlainTextRows(const <String>[
+                'pre-clear',
+              ], cols: 40),
             ),
           ),
           isTrue,
@@ -336,7 +341,9 @@ void main() {
               trimmedTopRows: 0,
               eraseScrollbackGen: 1,
               compression: kCellCompressionNone,
-              payload: encodeTcg1PlainTextRows(const <String>['stale'], cols: 40),
+              payload: encodeTcg1PlainTextRows(const <String>[
+                'stale',
+              ], cols: 40),
             ),
           ),
           isFalse,
@@ -345,33 +352,372 @@ void main() {
       },
     );
 
-    test('alt-screen hides primary scrollback while active and restores it on exit', () {
-      final buf = TerminalCellBuffer(cols: 40, rows: 4);
-      buf.applySyncFrame(
-        _makeFrame(frameSeq: 1, totalScrollbackRows: 120),
-      );
-      expect(buf.totalScrollbackRows, 120);
+    test(
+      'alt-screen hides primary scrollback while active and restores it on exit',
+      () {
+        final buf = TerminalCellBuffer(cols: 40, rows: 4);
+        buf.applySyncFrame(_makeFrame(frameSeq: 1, totalScrollbackRows: 120));
+        expect(buf.totalScrollbackRows, 120);
 
-      buf.applySyncFrame(
-        _makeFrame(
-          frameSeq: 2,
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 2,
+            totalScrollbackRows: 0,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+          ),
+        );
+        expect(buf.isUsingAltBuffer, isTrue);
+        expect(buf.totalScrollbackRows, 0);
+        expect(buf.missingScrollbackRanges(0, 50), isEmpty);
+
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 3,
+            totalScrollbackRows: 120,
+            modeFlags: kModeCursorVisible | kModeFullViewport,
+          ),
+        );
+        expect(buf.isUsingAltBuffer, isFalse);
+        expect(buf.totalScrollbackRows, 120);
+      },
+    );
+
+    test(
+      'applySyncFrame rejects corrupted totalScrollbackRows < pushedEnd',
+      () {
+        final buf = TerminalCellBuffer(cols: 40, rows: 4);
+        final pushedPayload = encodeTcg1PlainTextRows(const <String>[
+          'sb0',
+          'sb1',
+          'sb2',
+        ], cols: 40);
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 1,
+            totalScrollbackRows: 2, // less than 0 + 3
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 3,
+            pushedScrollbackPayload: pushedPayload,
+          ),
+        );
+        expect(buf.lastFrameSeq, 0);
+        expect(buf.totalScrollbackRows, 0);
+      },
+    );
+
+    test(
+      'expectedReflowGen rejects stale fetched pages across resize reflows',
+      () {
+        final buf = TerminalCellBuffer(cols: 80, rows: 4);
+        buf.applySyncFrame(
+          _makeFrame(frameSeq: 1, cols: 80, rows: 4, totalScrollbackRows: 200),
+        );
+        final genBeforeReflow = buf.reflowGen;
+
+        // Local resize clamps cursor without bumping reflowGen.
+        buf.resize(60, 4, 600, 80);
+        expect(buf.reflowGen, genBeforeReflow);
+
+        // Server-confirmed width changes 80 -> 120 -> 80 bump reflowGen twice.
+        buf.applySyncFrame(
+          _makeFrame(frameSeq: 2, cols: 120, rows: 4, totalScrollbackRows: 150),
+        );
+        buf.applySyncFrame(
+          _makeFrame(frameSeq: 3, cols: 80, rows: 4, totalScrollbackRows: 200),
+        );
+        expect(buf.reflowGen, greaterThan(genBeforeReflow));
+
+        final stalePage = TerminalRowsPageData(
+          sessionId: 's1',
+          startRow: 0,
+          rowCount: 1,
+          totalScrollbackRows: 200,
+          trimmedTopRows: 0,
+          eraseScrollbackGen: 0,
+          compression: kCellCompressionNone,
+          payload: encodeTcg1PlainTextRows(const <String>[
+            'stale-80',
+          ], cols: 80),
+        );
+        expect(
+          buf.applyFetchedRows(stalePage, expectedReflowGen: genBeforeReflow),
+          isFalse,
+        );
+        expect(buf.lineAtVirtualRow(0), isNull);
+
+        expect(
+          buf.applyFetchedRows(stalePage, expectedReflowGen: buf.reflowGen),
+          isTrue,
+        );
+        expect(buf.lineAtVirtualRow(0)?.toPlainText(), 'stale-80');
+      },
+    );
+
+    test(
+      'missingScrollbackRanges scans past row 0 in partially populated page',
+      () {
+        final buf = TerminalCellBuffer(cols: 40, rows: 4);
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 1,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 100,
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 1,
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(const <String>[
+              'only-row-zero',
+            ], cols: 40),
+          ),
+        );
+        expect(buf.lineAtVirtualRow(0)?.toPlainText(), 'only-row-zero');
+        expect(buf.lineAtVirtualRow(1), isNull);
+        final missing = buf.missingScrollbackRanges(0, 99);
+        expect(missing, isNotEmpty);
+        expect(missing.first, (0, 100));
+      },
+    );
+
+    test(
+      'preserves combining space, invalidates pages across height grow and alt resize, and accepts wide journal rows',
+      () {
+        // Space with combining acute accent must not be trimmed as trailing blank.
+        final spaceComb = encodeTcg1PlainTextRows(const <String>[
+          'a \u0301',
+        ], cols: 4);
+        final spaceLine = TerminalCellLine.fromDecoded(
+          decodeTcg1Batch(kCellCompressionNone, spaceComb).single,
+        );
+        expect(spaceLine.toPlainText(), 'a \u0301');
+
+        final buf = TerminalCellBuffer(cols: 80, rows: 10);
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 1,
+            cols: 80,
+            rows: 10,
+            totalScrollbackRows: 20,
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 20,
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(
+              List<String>.generate(20, (i) => 'sb-$i'),
+              cols: 80,
+            ),
+          ),
+        );
+        final gen0 = buf.reflowGen;
+
+        // Height growth pulls 10 scrollback rows back into viewport: bumps reflowGen.
+        buf.applySyncFrame(
+          _makeFrame(frameSeq: 2, cols: 80, rows: 20, totalScrollbackRows: 10),
+        );
+        expect(buf.reflowGen, greaterThan(gen0));
+        final genAfterHeightGrow = buf.reflowGen;
+
+        // Alt-screen column resize (80 -> 40 -> 80 while in alt) bumps reflowGen on return.
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 3,
+            cols: 40,
+            rows: 20,
+            totalScrollbackRows: 0,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+          ),
+        );
+        buf.applySyncFrame(
+          _makeFrame(frameSeq: 4, cols: 80, rows: 20, totalScrollbackRows: 10),
+        );
+        expect(buf.reflowGen, greaterThan(genAfterHeightGrow));
+
+        // Stale pre-narrow 80-col live-grid row (storedCols 28 < logicalCols 80) is rejected,
+        // while archived SGR journal row wider than current narrow width (storedCols == logicalCols == 55 > 40) is accepted.
+        buf.applySyncFrame(
+          _makeFrame(frameSeq: 5, cols: 40, rows: 20, totalScrollbackRows: 10),
+        );
+        final stalePreNarrowPage = TerminalRowsPageData(
+          sessionId: 's1',
+          startRow: 0,
+          rowCount: 1,
+          totalScrollbackRows: 10,
+          trimmedTopRows: 0,
+          eraseScrollbackGen: 0,
+          compression: kCellCompressionNone,
+          payload: encodeTcg1PlainTextRows(const <String>[
+            'stale-pre-narrow-live-row',
+          ], cols: 80),
+        );
+        expect(buf.applyFetchedRows(stalePreNarrowPage), isFalse);
+
+        const archivedWideLine =
+            'archived-journal-line-wider-than-forty-narrow-columns!!';
+        final wideJournalPage = TerminalRowsPageData(
+          sessionId: 's1',
+          startRow: 0,
+          rowCount: 1,
+          totalScrollbackRows: 10,
+          trimmedTopRows: 0,
+          eraseScrollbackGen: 0,
+          compression: kCellCompressionNone,
+          payload: encodeTcg1PlainTextRows(const <String>[
+            archivedWideLine,
+          ], cols: archivedWideLine.length),
+        );
+        expect(
+          buf.applyFetchedRows(
+            wideJournalPage,
+            expectedReflowGen: buf.reflowGen,
+          ),
+          isTrue,
+        );
+        expect(buf.lineAtVirtualRow(0)?.toPlainText(), archivedWideLine);
+
+        // Empty page with advanced trimmedTopRows adjusts totalScrollbackRows by trimDelta.
+        final emptyTrimmedPage = TerminalRowsPageData(
+          sessionId: 's1',
+          startRow: 0,
+          rowCount: 0,
           totalScrollbackRows: 0,
-          modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
-        ),
-      );
-      expect(buf.isUsingAltBuffer, isTrue);
-      expect(buf.totalScrollbackRows, 0);
-      expect(buf.missingScrollbackRanges(0, 50), isEmpty);
+          trimmedTopRows: 3,
+          eraseScrollbackGen: 0,
+          compression: kCellCompressionNone,
+          payload: Uint8List(0),
+        );
+        buf.applyFetchedRows(
+          emptyTrimmedPage,
+          expectedReflowGen: buf.reflowGen,
+        );
+        expect(buf.trimmedTopRows, 3);
+        expect(buf.totalScrollbackRows, 7);
 
-      buf.applySyncFrame(
-        _makeFrame(
-          frameSeq: 3,
-          totalScrollbackRows: 120,
-          modeFlags: kModeCursorVisible | kModeFullViewport,
-        ),
-      );
-      expect(buf.isUsingAltBuffer, isFalse);
-      expect(buf.totalScrollbackRows, 120);
-    });
+        // eraseScrollbackGen bump during alt-screen entry clears primary scrollback metadata.
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 6,
+            cols: 40,
+            rows: 20,
+            totalScrollbackRows: 0,
+            eraseScrollbackGen: 1,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+          ),
+        );
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 7,
+            cols: 40,
+            rows: 20,
+            totalScrollbackRows: 0,
+            eraseScrollbackGen: 1,
+          ),
+        );
+        expect(buf.trimmedTopRows, 0);
+        expect(buf.totalScrollbackRows, 0);
+      },
+    );
+
+    test(
+      'applies pushed scrollback across sawEraseDisplay, invalidates alt-screen col resize, and resets trimmedTopRows on erase gen change',
+      () {
+        final buf = TerminalCellBuffer(cols: 40, rows: 4);
+
+        // Seed 6 scrollback rows with trimmedTopRows = 4 and missing gaps at [0..2) and [4..6).
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 1,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 6,
+            trimmedTopRows: 4,
+            pushedScrollbackStartRow: 2,
+            pushedScrollbackRowCount: 2,
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(const <String>[
+              'sb-2',
+              'sb-3',
+            ], cols: 40),
+          ),
+        );
+        expect(buf.trimmedTopRows, 4);
+        final ranges = buf.missingScrollbackRanges(0, 5);
+        expect(ranges, const <(int, int)>[(0, 6)]);
+
+        // Boundary pushed scrollback on a `sawEraseDisplay` (`CSI 2J`) frame is retained.
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 2,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 7,
+            trimmedTopRows: 4,
+            modeFlags:
+                kModeCursorVisible |
+                kModeAutoWrap |
+                kModeFullViewport |
+                kModeSawEraseDisplay,
+            pushedScrollbackStartRow: 6,
+            pushedScrollbackRowCount: 1,
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(const <String>[
+              'fresh-6',
+            ], cols: 40),
+          ),
+        );
+        expect(buf.lineAtVirtualRow(6)?.toPlainText(), 'fresh-6');
+
+        // Enter alt screen at 40 cols, resize alt screen to 20 cols and back to 40 cols:
+        // `_sawAltColResize` invalidates stale primary scrollback cache pages on return.
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 3,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 0,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+          ),
+        );
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 4,
+            cols: 20,
+            rows: 4,
+            totalScrollbackRows: 0,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+          ),
+        );
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 5,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 7,
+            trimmedTopRows: 4,
+            modeFlags: kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+          ),
+        );
+        expect(buf.lineAtVirtualRow(6), isNull);
+
+        // Erase scrollback (`CSI 3J`) when `totalScrollbackRows == 0` still resets `trimmedTopRows` to 0.
+        final zeroScrollBuf = TerminalCellBuffer(cols: 40, rows: 4);
+        zeroScrollBuf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 1,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 9,
+            eraseScrollbackGen: 0,
+          ),
+        );
+        expect(zeroScrollBuf.trimmedTopRows, 9);
+        zeroScrollBuf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 2,
+            cols: 40,
+            rows: 4,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 1,
+          ),
+        );
+        expect(zeroScrollBuf.trimmedTopRows, 0);
+      },
+    );
   });
 }

@@ -19,6 +19,7 @@ bool shouldFinishBottomSnap({
   required bool hasAnchor,
 }) {
   if (isScrolling || pointerDown || hasAnchor) return false;
+  if (!pixels.isFinite || !maxScrollExtent.isFinite) return false;
   return pixels < maxScrollExtent;
 }
 
@@ -31,6 +32,12 @@ bool shouldReleaseScrollPin({
   required double lineHeight,
 }) {
   if (lastPixels == null || lineHeight <= 0) return false;
+  if (!lastPixels.isFinite ||
+      !pixels.isFinite ||
+      !maxScrollExtent.isFinite ||
+      !lineHeight.isFinite) {
+    return false;
+  }
   if (pixels <= lastPixels) return false;
   return pixels >= maxScrollExtent - kScrollPinReleaseGraceLines * lineHeight;
 }
@@ -47,10 +54,14 @@ class TerminalScrollAnchor {
   int? _anchoredAbsoluteRow;
   int _eraseScrollbackGen = 0;
   bool _isAltScreen = false;
+  bool _hadScrollback = false;
   double _withinLine = 0;
   int? _lastLineIndex;
 
-  bool get hasAnchor => _buffer != null && _anchoredAbsoluteRow != null;
+  bool get hasAnchor {
+    final idx = _currentVirtualRow;
+    return idx != null && idx > 0;
+  }
 
   int? get _currentVirtualRow {
     final buf = _buffer;
@@ -60,7 +71,14 @@ class TerminalScrollAnchor {
         buf.isUsingAltBuffer != _isAltScreen) {
       return null;
     }
-    return absRow - buf.trimmedTopRows;
+    if (_hadScrollback && buf.totalScrollbackRows <= 0) {
+      return null;
+    }
+    final idx = absRow - buf.trimmedTopRows;
+    if (idx <= 0 || idx >= buf.totalLines) {
+      return null;
+    }
+    return idx;
   }
 
   /// Whether the anchored line's virtual row index has shifted since the anchor
@@ -89,6 +107,7 @@ class TerminalScrollAnchor {
     copy._anchoredAbsoluteRow = _anchoredAbsoluteRow;
     copy._eraseScrollbackGen = _eraseScrollbackGen;
     copy._isAltScreen = _isAltScreen;
+    copy._hadScrollback = _hadScrollback;
     copy._withinLine = _withinLine;
     copy._lastLineIndex = _lastLineIndex;
     return copy;
@@ -99,6 +118,7 @@ class TerminalScrollAnchor {
     _anchoredAbsoluteRow = other._anchoredAbsoluteRow;
     _eraseScrollbackGen = other._eraseScrollbackGen;
     _isAltScreen = other._isAltScreen;
+    _hadScrollback = other._hadScrollback;
     _withinLine = other._withinLine;
     _lastLineIndex = other._lastLineIndex;
   }
@@ -112,7 +132,10 @@ class TerminalScrollAnchor {
     required double lineHeight,
   }) {
     final lineCount = buffer.totalLines;
-    if (lineHeight <= 0 ||
+    if (!pixels.isFinite ||
+        !maxScrollExtent.isFinite ||
+        !lineHeight.isFinite ||
+        lineHeight <= 0 ||
         lineCount <= 0 ||
         buffer.isUsingAltBuffer ||
         pixels <= 0.0 ||
@@ -129,6 +152,7 @@ class TerminalScrollAnchor {
     _anchoredAbsoluteRow = buffer.trimmedTopRows + topRow;
     _eraseScrollbackGen = buffer.eraseScrollbackGen;
     _isAltScreen = buffer.isUsingAltBuffer;
+    _hadScrollback = buffer.totalScrollbackRows > 0;
     _withinLine = pixels - topRow * lineHeight;
     _lastLineIndex = topRow;
   }
@@ -145,9 +169,14 @@ class TerminalScrollAnchor {
       clear();
       return null;
     }
-    if (lineHeight <= 0 || maxScrollExtent <= 0.0) return null;
+    if (!lineHeight.isFinite ||
+        !maxScrollExtent.isFinite ||
+        lineHeight <= 0 ||
+        maxScrollExtent <= 0.0) {
+      return null;
+    }
     final desired = idx * lineHeight + _withinLine;
-    if (desired <= 0.0) {
+    if (!desired.isFinite || desired <= 0.0) {
       clear();
       return null;
     }

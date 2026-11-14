@@ -2318,14 +2318,13 @@ void main() {
         expect(syncReq.subscribe, isTrue);
         expect(syncReq.knownFrameSeq, equals(7));
 
-        final viewportTcg1 = encodeTcg1PlainTextRows(
-          const <String>['prompt> hello', 'second row'],
-          cols: 120,
-        );
-        final pushedTcg1 = encodeTcg1PlainTextRows(
-          const <String>['scrolled line 0'],
-          cols: 120,
-        );
+        final viewportTcg1 = encodeTcg1PlainTextRows(const <String>[
+          'prompt> hello',
+          'second row',
+        ], cols: 120);
+        final pushedTcg1 = encodeTcg1PlainTextRows(const <String>[
+          'scrolled line 0',
+        ], cols: 120);
         final syncRespBytes = fbs.ServerMessageObjectBuilder(
           payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
           payload: fbs.ResponsePayloadObjectBuilder(
@@ -2415,15 +2414,16 @@ void main() {
           fetchReqMsg.payloadType,
           equals(fbs.ClientRequestPayloadTypeId.FetchTerminalRowsRequestTable),
         );
-        final fetchReq = fetchReqMsg.payload as fbs.FetchTerminalRowsRequestTable;
+        final fetchReq =
+            fetchReqMsg.payload as fbs.FetchTerminalRowsRequestTable;
         expect(fetchReq.sessionId, equals('sess-1'));
         expect(fetchReq.startRow, equals(128));
         expect(fetchReq.rowCount, equals(64));
 
-        final pageTcg1 = encodeTcg1PlainTextRows(
-          const <String>['archived row 128', 'archived row 129'],
-          cols: 120,
-        );
+        final pageTcg1 = encodeTcg1PlainTextRows(const <String>[
+          'archived row 128',
+          'archived row 129',
+        ], cols: 120);
         channel.addIncoming(
           fbs.ServerMessageObjectBuilder(
             payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
@@ -2548,7 +2548,9 @@ void main() {
         final reqJson =
             jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
         expect(reqJson['type'], equals('sync_terminal'));
-        final tcg1 = encodeTcg1PlainTextRows(const <String>['json row'], cols: 80);
+        final tcg1 = encodeTcg1PlainTextRows(const <String>[
+          'json row',
+        ], cols: 80);
         channel.addIncoming(
           jsonEncode({
             'type': 'response',
@@ -2648,6 +2650,27 @@ void main() {
         );
         await expectLater(
           fetchFuture,
+          throwsA(isA<TriageUnsupportedProtocolException>()),
+        );
+
+        // Older daemon rejecting binary FlatBuffers frame with id == null
+        // must immediately fail in-flight sync_terminal instead of hanging 30s.
+        final binaryNullIdFuture = client.syncTerminalSession(
+          sessionId: 'main',
+          clientId: 'c1',
+        );
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'error',
+            'id': null,
+            'error': {
+              'code': 'invalid_flatbuffer',
+              'message': 'unknown request payload union type',
+            },
+          }),
+        );
+        await expectLater(
+          binaryNullIdFuture,
           throwsA(isA<TriageUnsupportedProtocolException>()),
         );
 

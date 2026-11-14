@@ -633,21 +633,23 @@ class TriageWebSocketClient {
       } else if (type == 'error') {
         final id = message['id']?.toString();
         final error = message['error'] as Map<String, dynamic>?;
+        final code = error?['code']?.toString();
+        final errorMessage =
+            error?['message']?.toString() ?? code ?? 'Unknown error';
+        final lowerCode = (code ?? '').toLowerCase();
+        final lowerMsg = errorMessage.toLowerCase();
+        final looksLikeUnsupportedProtocol =
+            lowerCode == 'unsupported_payload' ||
+            lowerCode == 'invalid_flatbuffer' ||
+            lowerMsg.contains('unknown variant') ||
+            lowerMsg.contains('not recognized or supported');
         if (id != null && _pendingRequests.containsKey(id)) {
           _requestTimers.remove(id)?.cancel();
           final requestType = _pendingRequestTypes.remove(id);
-          final code = error?['code']?.toString();
-          final errorMessage =
-              error?['message']?.toString() ?? code ?? 'Unknown error';
-          final lowerCode = (code ?? '').toLowerCase();
-          final lowerMsg = errorMessage.toLowerCase();
           final isUnsupportedSync =
               (requestType == 'sync_terminal' ||
                   requestType == 'fetch_terminal_rows') &&
-              (lowerCode == 'unsupported_payload' ||
-                  lowerCode == 'invalid_flatbuffer' ||
-                  lowerMsg.contains('unknown variant') ||
-                  lowerMsg.contains('not recognized or supported'));
+              looksLikeUnsupportedProtocol;
           // Classify pairing failures here, at the one place that sees the
           // daemon's error code, so callers route to pairing on a type rather
           // than sniffing message text. Fall back to the message only when
@@ -661,6 +663,26 @@ class TriageWebSocketClient {
             failure = Exception(errorMessage);
           }
           _pendingRequests.remove(id)!.completeError(failure);
+        } else if (id == null && looksLikeUnsupportedProtocol) {
+          String? matchedId;
+          for (final entry in _pendingRequestTypes.entries) {
+            if (entry.value == 'sync_terminal' ||
+                entry.value == 'fetch_terminal_rows') {
+              matchedId = entry.key;
+              break;
+            }
+          }
+          if (matchedId != null && _pendingRequests.containsKey(matchedId)) {
+            _requestTimers.remove(matchedId)?.cancel();
+            _pendingRequestTypes.remove(matchedId);
+            _pendingRequests
+                .remove(matchedId)!
+                .completeError(
+                  TriageUnsupportedProtocolException(errorMessage),
+                );
+          } else {
+            _eventController.add(message);
+          }
         } else {
           _eventController.add(message);
         }

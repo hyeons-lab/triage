@@ -70,11 +70,15 @@ class TerminalGridView extends StatefulWidget {
 }
 
 class TerminalGridViewState extends State<TerminalGridView> {
+  final GlobalKey _scrollableKey = GlobalKey();
   final GlobalKey _renderKey = GlobalKey();
   bool _hasFocus = false;
 
   RenderTerminalGrid? get renderGrid =>
       _renderKey.currentContext?.findRenderObject() as RenderTerminalGrid?;
+
+  bool get _usesFocusWrapper =>
+      widget.focusNode != null || widget.autofocus || widget.onKeyEvent != null;
 
   @override
   void initState() {
@@ -88,8 +92,14 @@ class TerminalGridViewState extends State<TerminalGridView> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.focusNode != widget.focusNode) {
       oldWidget.focusNode?.removeListener(_onFocusChanged);
-      _hasFocus = widget.focusNode?.hasFocus ?? false;
-      widget.focusNode?.addListener(_onFocusChanged);
+      if (widget.focusNode != null) {
+        _hasFocus = widget.focusNode!.hasFocus;
+        widget.focusNode!.addListener(_onFocusChanged);
+      } else {
+        _hasFocus = false;
+      }
+    } else if (!_usesFocusWrapper && _hasFocus) {
+      _hasFocus = false;
     }
   }
 
@@ -108,9 +118,18 @@ class TerminalGridViewState extends State<TerminalGridView> {
     }
   }
 
+  void _handleFocusChange(bool focused) {
+    if (focused != _hasFocus && mounted) {
+      setState(() {
+        _hasFocus = focused;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     Widget content = Scrollable(
+      key: _scrollableKey,
       axisDirection: AxisDirection.down,
       controller: widget.scrollController,
       physics: widget.physics,
@@ -119,6 +138,7 @@ class TerminalGridViewState extends State<TerminalGridView> {
           key: _renderKey,
           buffer: widget.buffer,
           offset: offset,
+          scrollControllerIdentity: widget.scrollController,
           selection: widget.selection,
           hasFocus: _hasFocus,
           autoResize: widget.autoResize,
@@ -133,10 +153,11 @@ class TerminalGridViewState extends State<TerminalGridView> {
       },
     );
 
-    if (widget.focusNode != null) {
+    if (_usesFocusWrapper) {
       content = Focus(
         focusNode: widget.focusNode,
         autofocus: widget.autofocus,
+        onFocusChange: _handleFocusChange,
         onKeyEvent: widget.onKeyEvent,
         child: content,
       );
@@ -150,6 +171,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
     super.key,
     required this.buffer,
     required this.offset,
+    required this.scrollControllerIdentity,
     required this.selection,
     required this.hasFocus,
     required this.autoResize,
@@ -164,6 +186,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
 
   final TerminalCellBuffer buffer;
   final ViewportOffset offset;
+  final Object? scrollControllerIdentity;
   final TerminalSelectionRange? selection;
   final bool hasFocus;
   final bool autoResize;
@@ -180,6 +203,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
     return RenderTerminalGrid(
       buffer: buffer,
       offset: offset,
+      scrollControllerIdentity: scrollControllerIdentity,
       selection: selection,
       hasFocus: hasFocus,
       autoResize: autoResize,
@@ -199,6 +223,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
     RenderTerminalGrid renderObject,
   ) {
     renderObject
+      ..scrollControllerIdentity = scrollControllerIdentity
       ..buffer = buffer
       ..offset = offset
       ..selection = selection
@@ -240,6 +265,7 @@ class RenderTerminalGrid extends RenderBox {
   RenderTerminalGrid({
     required TerminalCellBuffer buffer,
     required ViewportOffset offset,
+    Object? scrollControllerIdentity,
     required TerminalSelectionRange? selection,
     required bool hasFocus,
     required bool autoResize,
@@ -248,10 +274,11 @@ class RenderTerminalGrid extends RenderBox {
     required double fontSize,
     required double lineHeightScale,
     required TextScaler textScaler,
-    required this.onGridMetricsChanged,
-    required this.onMissingRowsVisible,
+    required TerminalGridSizeCallback? onGridMetricsChanged,
+    required TerminalMissingRowsCallback? onMissingRowsVisible,
   }) : _buffer = buffer,
        _offset = offset,
+       _scrollControllerIdentity = scrollControllerIdentity,
        _selection = selection,
        _hasFocus = hasFocus,
        _autoResize = autoResize,
@@ -259,12 +286,18 @@ class RenderTerminalGrid extends RenderBox {
        _showCursor = showCursor,
        _fontSize = fontSize,
        _lineHeightScale = lineHeightScale,
-       _textScaler = textScaler;
+       _textScaler = textScaler,
+       _onGridMetricsChanged = onGridMetricsChanged,
+       _onMissingRowsVisible = onMissingRowsVisible,
+       _fittedCols = max(2, buffer.viewWidth),
+       _fittedRows = max(1, buffer.viewHeight);
 
   static const int _maxGlyphCacheEntries = 4096;
 
   TerminalCellBuffer _buffer;
   ViewportOffset _offset;
+  Object? _scrollControllerIdentity;
+  bool _scrollControllerSwapped = false;
   TerminalSelectionRange? _selection;
   bool _hasFocus;
   bool _autoResize;
@@ -274,19 +307,26 @@ class RenderTerminalGrid extends RenderBox {
   double _lineHeightScale;
   TextScaler _textScaler;
 
-  TerminalGridSizeCallback? onGridMetricsChanged;
-  TerminalMissingRowsCallback? onMissingRowsVisible;
+  TerminalGridSizeCallback? _onGridMetricsChanged;
+  TerminalMissingRowsCallback? _onMissingRowsVisible;
 
   double _cellWidth = 9.0;
   double _cellHeight = 18.0;
   double _glyphBaselineOffset = 0.0;
   bool _metricsDirty = true;
 
-  int _fittedCols = 80;
-  int _fittedRows = 24;
+  int _fittedCols;
+  int _fittedRows;
+  int _notifiedCols = -1;
+  int _notifiedRows = -1;
+  double _notifiedCellWidth = -1.0;
+  double _notifiedCellHeight = -1.0;
   int _knownTotalLines = -1;
   double _lastMaxScrollExtent = 0.0;
   bool _inPerformLayout = false;
+  bool _layoutInputsConsumed = false;
+  bool _deferredLayoutNeeded = false;
+  bool _deferredLayoutScheduled = false;
   bool _missingNotifyScheduled = false;
   int _pendingMissingFirst = -1;
   int _pendingMissingLast = -1;
@@ -300,6 +340,51 @@ class RenderTerminalGrid extends RenderBox {
   int get fittedCols => _fittedCols;
   int get fittedRows => _fittedRows;
 
+  TerminalGridSizeCallback? get onGridMetricsChanged => _onGridMetricsChanged;
+  set onGridMetricsChanged(TerminalGridSizeCallback? value) {
+    if (identical(_onGridMetricsChanged, value)) return;
+    final wasNull = _onGridMetricsChanged == null;
+    _onGridMetricsChanged = value;
+    if (value == null) {
+      _resetMetricsNotification();
+    } else if (wasNull && _autoResize) {
+      markNeedsLayout();
+    }
+  }
+
+  TerminalMissingRowsCallback? get onMissingRowsVisible =>
+      _onMissingRowsVisible;
+  set onMissingRowsVisible(TerminalMissingRowsCallback? value) {
+    if (identical(_onMissingRowsVisible, value)) return;
+    final wasNull = _onMissingRowsVisible == null;
+    _onMissingRowsVisible = value;
+    if (wasNull && value != null) {
+      markNeedsPaint();
+    }
+  }
+
+  void _resetMetricsNotification() {
+    _notifiedCols = -1;
+    _notifiedRows = -1;
+    _notifiedCellWidth = -1.0;
+    _notifiedCellHeight = -1.0;
+  }
+
+  bool get _hasPendingMetricsNotification =>
+      _autoResize &&
+      _onGridMetricsChanged != null &&
+      (_fittedCols != _notifiedCols ||
+          _fittedRows != _notifiedRows ||
+          _cellWidth != _notifiedCellWidth ||
+          _cellHeight != _notifiedCellHeight);
+
+  Object? get scrollControllerIdentity => _scrollControllerIdentity;
+  set scrollControllerIdentity(Object? value) {
+    if (identical(_scrollControllerIdentity, value)) return;
+    _scrollControllerIdentity = value;
+    _scrollControllerSwapped = true;
+  }
+
   TerminalCellBuffer get buffer => _buffer;
   set buffer(TerminalCellBuffer value) {
     if (identical(_buffer, value)) return;
@@ -307,9 +392,22 @@ class RenderTerminalGrid extends RenderBox {
       _buffer.removeListener(_onBufferChanged);
     }
     _buffer = value;
+    if (!hasSize || !constraints.hasBoundedWidth) {
+      _fittedCols = max(2, value.viewWidth);
+    }
+    if (!hasSize || !constraints.hasBoundedHeight) {
+      _fittedRows = max(1, value.viewHeight);
+    }
     _knownTotalLines = -1;
+    _lastMaxScrollExtent = 0.0;
+    _resetMetricsNotification();
+    _pendingMissingFirst = -1;
+    _pendingMissingLast = -1;
     if (attached) {
       _buffer.addListener(_onBufferChanged);
+    }
+    if (_inPerformLayout) {
+      _deferredLayoutNeeded = true;
     }
     markNeedsLayout();
     markNeedsPaint();
@@ -317,13 +415,28 @@ class RenderTerminalGrid extends RenderBox {
 
   ViewportOffset get offset => _offset;
   set offset(ViewportOffset value) {
-    if (identical(_offset, value)) return;
+    if (identical(_offset, value)) {
+      _scrollControllerSwapped = false;
+      return;
+    }
+    final preserveExtent =
+        !_scrollControllerSwapped &&
+        _offset.hasPixels &&
+        value.hasPixels &&
+        (value.pixels - _offset.pixels).abs() < 0.5;
+    _scrollControllerSwapped = false;
+    if (!preserveExtent) {
+      _lastMaxScrollExtent = 0.0;
+    }
     if (attached) {
       _offset.removeListener(_onScrollOffsetChanged);
     }
     _offset = value;
     if (attached) {
       _offset.addListener(_onScrollOffsetChanged);
+    }
+    if (_inPerformLayout) {
+      _deferredLayoutNeeded = true;
     }
     markNeedsLayout();
   }
@@ -369,14 +482,16 @@ class RenderTerminalGrid extends RenderBox {
 
   double get fontSize => _fontSize;
   set fontSize(double value) {
-    if (_fontSize == value) return;
+    if (_fontSize == value || (_fontSize.isNaN && value.isNaN)) return;
     _fontSize = value;
     _invalidateFontMetrics();
   }
 
   double get lineHeightScale => _lineHeightScale;
   set lineHeightScale(double value) {
-    if (_lineHeightScale == value) return;
+    if (_lineHeightScale == value || (_lineHeightScale.isNaN && value.isNaN)) {
+      return;
+    }
     _lineHeightScale = value;
     _invalidateFontMetrics();
   }
@@ -390,6 +505,7 @@ class RenderTerminalGrid extends RenderBox {
 
   void _invalidateFontMetrics() {
     _metricsDirty = true;
+    _resetMetricsNotification();
     for (final tp in _glyphCache.values) {
       tp.dispose();
     }
@@ -402,12 +518,22 @@ class RenderTerminalGrid extends RenderBox {
     super.attach(owner);
     _buffer.addListener(_onBufferChanged);
     _offset.addListener(_onScrollOffsetChanged);
+    if (_deferredLayoutNeeded ||
+        _metricsDirty ||
+        _hasPendingMetricsNotification ||
+        _buffer.totalLines != _knownTotalLines) {
+      _deferredLayoutNeeded = false;
+      markNeedsLayout();
+    }
+    markNeedsPaint();
   }
 
   @override
   void detach() {
     _buffer.removeListener(_onBufferChanged);
     _offset.removeListener(_onScrollOffsetChanged);
+    _pendingMissingFirst = -1;
+    _pendingMissingLast = -1;
     super.detach();
   }
 
@@ -426,9 +552,42 @@ class RenderTerminalGrid extends RenderBox {
   @override
   bool hitTestSelf(Offset position) => true;
 
+  void _scheduleDeferredLayout() {
+    _deferredLayoutNeeded = true;
+    if (!_deferredLayoutScheduled && attached) {
+      _deferredLayoutScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _deferredLayoutScheduled = false;
+        if (attached && _deferredLayoutNeeded) {
+          _deferredLayoutNeeded = false;
+          super.markNeedsLayout();
+        }
+      });
+    }
+  }
+
+  @override
+  void markNeedsLayout() {
+    if (_inPerformLayout) {
+      markNeedsPaint();
+      if (_deferredLayoutNeeded ||
+          _layoutInputsConsumed ||
+          _metricsDirty ||
+          _hasPendingMetricsNotification) {
+        _scheduleDeferredLayout();
+      }
+      return;
+    }
+    _deferredLayoutNeeded = false;
+    super.markNeedsLayout();
+  }
+
   void _onBufferChanged() {
     if (_inPerformLayout) {
       markNeedsPaint();
+      if (_layoutInputsConsumed && _buffer.totalLines != _knownTotalLines) {
+        _scheduleDeferredLayout();
+      }
       return;
     }
     if (_buffer.totalLines != _knownTotalLines) {
@@ -442,17 +601,27 @@ class RenderTerminalGrid extends RenderBox {
     markNeedsPaint();
   }
 
+  double get _safeFontSize =>
+      (_fontSize.isFinite && _fontSize > 0.0) ? _fontSize : 14.0;
+
+  double get _safeLineHeightScale =>
+      (_lineHeightScale.isFinite && _lineHeightScale > 0.0)
+      ? _lineHeightScale
+      : 1.2;
+
   void _ensureCellMetrics() {
     if (!_metricsDirty) return;
     _metricsDirty = false;
+    final fontSize = _safeFontSize;
+    final lineHeightScale = _safeLineHeightScale;
     final probe = TextPainter(
       text: TextSpan(
         text: 'MMMMMMMMMM',
         style: TextStyle(
           fontFamily: 'JetBrains Mono',
           fontFamilyFallback: kTerminalFontFallbacks,
-          fontSize: _fontSize,
-          height: _lineHeightScale,
+          fontSize: fontSize,
+          height: lineHeightScale,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -462,11 +631,17 @@ class RenderTerminalGrid extends RenderBox {
     final measuredH = probe.height;
     probe.dispose();
 
-    _cellWidth = measuredW > 1.0 ? measuredW : (_fontSize * 0.6);
-    _cellHeight = measuredH > 2.0
+    final rawW = (measuredW.isFinite && measuredW > 1.0)
+        ? measuredW
+        : (fontSize * 0.6);
+    final rawH = (measuredH.isFinite && measuredH > 2.0)
         ? measuredH.ceilToDouble()
-        : (_fontSize * _lineHeightScale).ceilToDouble();
-    _glyphBaselineOffset = max(0.0, (_cellHeight - measuredH) * 0.5);
+        : (fontSize * lineHeightScale).ceilToDouble();
+    _cellWidth = max(1.0, rawW);
+    _cellHeight = max(1.0, rawH);
+    _glyphBaselineOffset = measuredH.isFinite
+        ? max(0.0, (_cellHeight - measuredH) * 0.5)
+        : 0.0;
   }
 
   /// Maps a local pixel [position] inside this [RenderBox] to a virtual buffer
@@ -474,66 +649,89 @@ class RenderTerminalGrid extends RenderBox {
   CellOffset getCellOffset(Offset position) {
     final totalLines = max(1, _buffer.totalLines);
     final cols = max(1, _buffer.viewWidth);
-    final scrollY = _offset.hasPixels ? _offset.pixels : 0.0;
-    final col = (position.dx / _cellWidth).floor().clamp(0, cols - 1);
-    final row = ((position.dy + scrollY) / _cellHeight).floor().clamp(
-      0,
-      totalLines - 1,
-    );
+    final rawScrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final scrollY = rawScrollY.isFinite ? rawScrollY : 0.0;
+    final dx = position.dx.isFinite ? position.dx : 0.0;
+    final dy = position.dy.isFinite ? position.dy : 0.0;
+    final col = (dx / _cellWidth).floor().clamp(0, cols - 1);
+    final row = ((dy + scrollY) / _cellHeight).floor().clamp(0, totalLines - 1);
     return CellOffset(col, row);
   }
 
   /// Maps a local pixel [position] inside this [RenderBox] to a 0-based
   /// viewport `(col, row)` coordinate (`0 .. viewWidth - 1`, `0 .. viewHeight - 1`),
-  /// independent of scrollback offset.
+  /// aligned with [paint]'s row positions across scrollback slack.
   CellOffset getViewportCellOffset(Offset position) {
     final cols = max(1, _buffer.viewWidth);
     final rows = max(1, _buffer.viewHeight);
-    final col = (position.dx / _cellWidth).floor().clamp(0, cols - 1);
-    final row = (position.dy / _cellHeight).floor().clamp(0, rows - 1);
+    final rawScrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final scrollY = rawScrollY.isFinite ? rawScrollY : 0.0;
+    final dx = position.dx.isFinite ? position.dx : 0.0;
+    final dy = position.dy.isFinite ? position.dy : 0.0;
+    final col = (dx / _cellWidth).floor().clamp(0, cols - 1);
+    final virtualRow = ((dy + scrollY) / _cellHeight).floor();
+    final row = (virtualRow - _buffer.totalScrollbackRows).clamp(0, rows - 1);
     return CellOffset(col, row);
   }
 
   /// Maps a virtual buffer [cell] back to local pixel coordinates inside this
   /// [RenderBox] (taking the current scroll offset into account).
   Offset getOffset(CellOffset cell) {
-    final scrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final rawScrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final scrollY = rawScrollY.isFinite ? rawScrollY : 0.0;
     return Offset(cell.x * _cellWidth, cell.y * _cellHeight - scrollY);
   }
 
   @override
   void performLayout() {
     _inPerformLayout = true;
+    _layoutInputsConsumed = false;
+    _deferredLayoutNeeded = false;
     try {
       _ensureCellMetrics();
-      size = constraints.biggest;
+      final fallbackCols = max(2, _fittedCols);
+      final fallbackRows = max(1, _fittedRows);
+      final fallbackW = fallbackCols * _cellWidth;
+      final fallbackH = fallbackRows * _cellHeight;
+      size = constraints.constrain(
+        Size(
+          constraints.hasBoundedWidth ? constraints.maxWidth : fallbackW,
+          constraints.hasBoundedHeight ? constraints.maxHeight : fallbackH,
+        ),
+      );
 
-      final nextCols = max(2, (size.width / _cellWidth).floor());
-      final nextRows = max(1, (size.height / _cellHeight).floor());
-      final metricsChanged =
-          nextCols != _fittedCols || nextRows != _fittedRows;
-      if (_autoResize || _fittedCols <= 0 || _fittedRows <= 0) {
+      final hasValidViewport =
+          size.width >= _cellWidth && size.height >= _cellHeight;
+      if (hasValidViewport) {
+        final nextCols =
+            (!constraints.hasBoundedWidth && size.width == fallbackW)
+            ? fallbackCols
+            : max(2, (size.width / _cellWidth).floor());
+        final nextRows =
+            (!constraints.hasBoundedHeight && size.height == fallbackH)
+            ? fallbackRows
+            : max(1, (size.height / _cellHeight).floor());
         _fittedCols = nextCols;
         _fittedRows = nextRows;
-      }
 
-      final sizeDiffersFromBuffer =
-          _autoResize &&
-          (_fittedCols != _buffer.viewWidth ||
-              _fittedRows != _buffer.viewHeight);
-      if ((metricsChanged || sizeDiffersFromBuffer) &&
-          _autoResize &&
-          onGridMetricsChanged != null) {
-        onGridMetricsChanged!(
-          _fittedCols,
-          _fittedRows,
-          _cellWidth,
-          _cellHeight,
-        );
+        final callback = _onGridMetricsChanged;
+        final metricsDiffer =
+            _fittedCols != _notifiedCols ||
+            _fittedRows != _notifiedRows ||
+            _cellWidth != _notifiedCellWidth ||
+            _cellHeight != _notifiedCellHeight;
+        if (_autoResize && callback != null && metricsDiffer) {
+          _notifiedCols = _fittedCols;
+          _notifiedRows = _fittedRows;
+          _notifiedCellWidth = _cellWidth;
+          _notifiedCellHeight = _cellHeight;
+          callback(_fittedCols, _fittedRows, _cellWidth, _cellHeight);
+        }
       }
 
       final totalLines = _buffer.totalLines;
       _knownTotalLines = totalLines;
+      _layoutInputsConsumed = true;
       final contentHeight = max(size.height, totalLines * _cellHeight);
       final newMaxExtent = max(0.0, contentHeight - size.height);
 
@@ -543,13 +741,23 @@ class RenderTerminalGrid extends RenderBox {
       // ScrollPosition's `_lastMetrics.pixels` and `pixels` remain in lockstep
       // without launching zero-velocity ballistic scroll activities.
       if (_offset.hasPixels) {
-        final wasAtBottom = _offset.pixels >= _lastMaxScrollExtent - 0.5;
-        if (_stickToBottom && wasAtBottom && newMaxExtent != _offset.pixels) {
-          _offset.correctBy(newMaxExtent - _offset.pixels);
-        } else if (_offset.pixels > newMaxExtent) {
-          _offset.correctBy(newMaxExtent - _offset.pixels);
-        } else if (_offset.pixels < 0.0) {
-          _offset.correctBy(-_offset.pixels);
+        final currentPixels = _offset.pixels;
+        if (!currentPixels.isFinite) {
+          final targetPixels = currentPixels.isNaN
+              ? (_stickToBottom ? newMaxExtent : 0.0)
+              : (currentPixels > 0.0 ? newMaxExtent : 0.0);
+          if (_offset is ScrollPosition) {
+            (_offset as ScrollPosition).correctPixels(targetPixels);
+          }
+        } else {
+          final wasAtBottom = currentPixels >= _lastMaxScrollExtent - 0.5;
+          if (_stickToBottom && wasAtBottom && newMaxExtent != currentPixels) {
+            _offset.correctBy(newMaxExtent - currentPixels);
+          } else if (currentPixels > newMaxExtent) {
+            _offset.correctBy(newMaxExtent - currentPixels);
+          } else if (currentPixels < 0.0) {
+            _offset.correctBy(-currentPixels);
+          }
         }
       }
       _lastMaxScrollExtent = newMaxExtent;
@@ -578,7 +786,8 @@ class RenderTerminalGrid extends RenderBox {
     bgPaint.color = defaultBg;
     canvas.drawRect(offset & size, bgPaint);
 
-    final scrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final rawScrollY = _offset.hasPixels ? _offset.pixels : 0.0;
+    final scrollY = rawScrollY.isFinite ? rawScrollY : 0.0;
     final totalLines = _buffer.totalLines;
     if (totalLines <= 0) {
       canvas.restore();
@@ -602,13 +811,21 @@ class RenderTerminalGrid extends RenderBox {
       ..style = PaintingStyle.fill
       ..color = const Color(0x1874838a);
 
-    for (var virtualRow = firstRow; virtualRow < lastRowExclusive; virtualRow++) {
+    for (
+      var virtualRow = firstRow;
+      virtualRow < lastRowExclusive;
+      virtualRow++
+    ) {
       final rowTop = offset.dy + virtualRow * _cellHeight - scrollY;
       final line = _buffer.lineAtVirtualRow(virtualRow, touchCache: true);
 
       if (line == null) {
-        missingMin = missingMin == null ? virtualRow : min(missingMin, virtualRow);
-        missingMax = missingMax == null ? virtualRow : max(missingMax, virtualRow);
+        missingMin = missingMin == null
+            ? virtualRow
+            : min(missingMin, virtualRow);
+        missingMax = missingMax == null
+            ? virtualRow
+            : max(missingMax, virtualRow);
         // Subtle deterministic placeholder bar while FetchTerminalRows resolves.
         final pseudoCols = 14 + ((virtualRow * 17) % 34);
         final barW = min(size.width * 0.75, pseudoCols * _cellWidth);
@@ -632,7 +849,12 @@ class RenderTerminalGrid extends RenderBox {
       var runStart = -1;
       Color? runBg;
       for (var col = 0; col < maxStored; col++) {
-        final cellBg = _effectiveCellBackground(line, col, defaultFg, defaultBg);
+        final cellBg = _effectiveCellBackground(
+          line,
+          col,
+          defaultFg,
+          defaultBg,
+        );
         final nonDefault = cellBg != defaultBg;
         if (nonDefault) {
           if (runStart < 0) {
@@ -712,8 +934,8 @@ class RenderTerminalGrid extends RenderBox {
         final cellX = offset.dx + col * _cellWidth;
         final spanWidth = (width == 2 ? 2 : 1) * _cellWidth;
 
-        if (cp != 0 && cp != 0x20) {
-          final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
+        final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
+        if (cp != 0 && (cp != 0x20 || hasExtraCombining)) {
           final paintedVector =
               !hasExtraCombining &&
               cp >= 0x2500 &&
@@ -733,8 +955,7 @@ class RenderTerminalGrid extends RenderBox {
           }
         }
 
-        if ((attrs &
-                (kAttrUnderline | kAttrStrikethrough | kAttrOverline)) !=
+        if ((attrs & (kAttrUnderline | kAttrStrikethrough | kAttrOverline)) !=
             0) {
           _paintCellDecorations(
             canvas,
@@ -779,13 +1000,16 @@ class RenderTerminalGrid extends RenderBox {
     _missingNotifyScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _missingNotifyScheduled = false;
-      if (!attached) return;
       final f = _pendingMissingFirst;
       final l = _pendingMissingLast;
       _pendingMissingFirst = -1;
       _pendingMissingLast = -1;
-      if (f >= 0 && l >= f) {
-        onMissingRowsVisible?.call(f, l);
+      if (!attached) return;
+      final maxScrollback = _buffer.totalScrollbackRows;
+      if (maxScrollback <= 0) return;
+      final clampedLast = min(l, maxScrollback - 1);
+      if (f >= 0 && clampedLast >= f) {
+        onMissingRowsVisible?.call(f, clampedLast);
       }
     });
   }
@@ -859,8 +1083,8 @@ class RenderTerminalGrid extends RenderBox {
         style: TextStyle(
           fontFamily: 'JetBrains Mono',
           fontFamilyFallback: kTerminalFontFallbacks,
-          fontSize: _fontSize,
-          height: _lineHeightScale,
+          fontSize: _safeFontSize,
+          height: _safeLineHeightScale,
           color: fg,
           fontWeight: (attrs & kAttrBold) != 0
               ? FontWeight.bold
@@ -877,12 +1101,7 @@ class RenderTerminalGrid extends RenderBox {
     return tp;
   }
 
-  void _paintCellDecorations(
-    Canvas canvas,
-    Rect rect,
-    Color fg,
-    int attrs,
-  ) {
+  void _paintCellDecorations(Canvas canvas, Rect rect, Color fg, int attrs) {
     final paint = Paint()
       ..color = fg
       ..strokeWidth = 1.0
@@ -995,7 +1214,12 @@ class RenderTerminalGrid extends RenderBox {
       case TerminalCursorShape.blinkingBar:
       case TerminalCursorShape.steadyBar:
         canvas.drawRect(
-          Rect.fromLTWH(cursorRect.left, cursorRect.top, 2.0, cursorRect.height),
+          Rect.fromLTWH(
+            cursorRect.left,
+            cursorRect.top,
+            2.0,
+            cursorRect.height,
+          ),
           fillPaint,
         );
       case TerminalCursorShape.defaultShape:
@@ -1003,14 +1227,18 @@ class RenderTerminalGrid extends RenderBox {
       case TerminalCursorShape.steadyBlock:
         canvas.drawRect(cursorRect, fillPaint);
         if (line != null && col < line.storedCols) {
+          final cellAttrs = line.getAttrs(col);
           final cp = line.getCodePoint(col);
-          if (cp != 0 && cp != 0x20) {
+          final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
+          if ((cellAttrs & kAttrInvisible) == 0 &&
+              cp != 0 &&
+              (cp != 0x20 || hasExtraCombining)) {
             final glyph = line.cellGlyph(col);
             if (glyph.isNotEmpty) {
               final tp = _obtainGlyphPainter(
                 glyph,
                 TriageTerminalPalette.background,
-                line.getAttrs(col),
+                cellAttrs,
               );
               tp.paint(
                 canvas,

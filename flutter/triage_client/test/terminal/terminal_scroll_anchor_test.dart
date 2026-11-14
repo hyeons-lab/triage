@@ -1,14 +1,16 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 
 const _viewHeight = 5;
 
 TerminalCellLine _lineFromText(String text, {int width = 40}) {
-  return TerminalCellLine.fromSpec(
-    <String?>[for (final r in text.runes) String.fromCharCode(r)],
-    width: width,
-  );
+  return TerminalCellLine.fromSpec(<String?>[
+    for (final r in text.runes) String.fromCharCode(r),
+  ], width: width);
 }
 
 /// Fills a [TerminalCellBuffer] until its scrollback+viewport capacity reaches
@@ -141,6 +143,62 @@ void main() {
         pixels,
       );
     });
+
+    test(
+      'invalidates anchor on eraseScrollbackGen increment or alt-screen entry',
+      () {
+        final buffer = TerminalCellBuffer(cols: 40, rows: _viewHeight);
+        for (var i = 0; i < 20; i++) {
+          buffer.appendOutputLineForTest(
+            _lineFromText('row$i'),
+            maxTotalLines: 30,
+          );
+        }
+        final maxExtent = _maxExtent(buffer, lineHeight);
+        final anchor = TerminalScrollAnchor();
+        anchor.capture(
+          buffer: buffer,
+          pixels: 50.0,
+          maxScrollExtent: maxExtent,
+          lineHeight: lineHeight,
+        );
+        expect(anchor.hasAnchor, isTrue);
+
+        // Enter alt-screen: anchor must drop instead of resolving against alt rows.
+        buffer.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: _viewHeight,
+            cols: 40,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: Uint8List(0),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        expect(
+          anchor.desiredOffset(
+            maxScrollExtent: maxExtent,
+            lineHeight: lineHeight,
+          ),
+          isNull,
+        );
+        expect(anchor.hasAnchor, isFalse);
+      },
+    );
 
     test('desiredOffset returns null when maxScrollExtent is non-positive', () {
       final buffer = _fullBuffer(maxLines: 30);
@@ -368,6 +426,75 @@ void main() {
 
         anchor.markPinned();
         expect(anchor.hasLineShifted, isFalse);
+      },
+    );
+
+    test(
+      'viewport-only anchor tracks live viewport growth and upper-bound shrink invalidates',
+      () {
+        final buffer = TerminalCellBuffer(cols: 40, rows: 5);
+        for (var i = 0; i < 5; i++) {
+          buffer.setViewportLineForTest(i, _lineFromText('vp$i'));
+        }
+        final anchor = TerminalScrollAnchor();
+        // Capture when scrollbackRows == 0 (maxScrollExtent > 0 from sub-viewport layout).
+        anchor.capture(
+          buffer: buffer,
+          pixels: 10,
+          maxScrollExtent: 40,
+          lineHeight: lineHeight,
+        );
+        expect(anchor.hasAnchor, isTrue);
+
+        // Appending lines at the bottom keeps vp1 pinned at virtual row 1 (10.0 px),
+        // and once retention trims 2 rows at the top (maxTotalLines: 5), vp1 ages past row 0 and invalidates.
+        buffer.appendOutputLineForTest(_lineFromText('sb0'), maxTotalLines: 50);
+        buffer.appendOutputLineForTest(_lineFromText('sb1'), maxTotalLines: 50);
+        expect(
+          anchor.desiredOffset(maxScrollExtent: 60, lineHeight: lineHeight),
+          1 * lineHeight,
+        );
+        buffer.appendOutputLineForTest(_lineFromText('sb2'), maxTotalLines: 5);
+        expect(anchor.hasAnchor, isFalse);
+
+        // Shrinking totalLines below the anchored index invalidates the anchor cleanly.
+        final anchorHigh = TerminalScrollAnchor();
+        anchorHigh.capture(
+          buffer: buffer,
+          pixels: 3 * lineHeight,
+          maxScrollExtent: 40,
+          lineHeight: lineHeight,
+        );
+        expect(anchorHigh.hasAnchor, isTrue);
+        buffer.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: 2,
+            cols: 40,
+            totalScrollbackRows: 0,
+            trimmedTopRows: buffer.trimmedTopRows,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags: kModeCursorVisible | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: Uint8List(0),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        expect(anchorHigh.hasAnchor, isFalse);
+        expect(
+          anchorHigh.desiredOffset(maxScrollExtent: 20, lineHeight: lineHeight),
+          isNull,
+        );
       },
     );
   });

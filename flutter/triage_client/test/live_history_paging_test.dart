@@ -18,15 +18,19 @@ import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 
 String? get _liveWs {
-  const url = String.fromEnvironment('TRIAGE_LIVE_WS');
-  if (url.isNotEmpty) return url;
-  return Platform.environment['TRIAGE_LIVE_WS'];
+  const fromDefine = String.fromEnvironment('TRIAGE_LIVE_WS');
+  final trimmedDefine = fromDefine.trim();
+  if (trimmedDefine.isNotEmpty) return trimmedDefine;
+  final fromEnv = Platform.environment['TRIAGE_LIVE_WS']?.trim();
+  return (fromEnv != null && fromEnv.isNotEmpty) ? fromEnv : null;
 }
 
 String get _liveSession {
-  const session = String.fromEnvironment('TRIAGE_LIVE_SESSION');
-  if (session.isNotEmpty) return session;
-  return Platform.environment['TRIAGE_LIVE_SESSION'] ?? 'session-255';
+  const fromDefine = String.fromEnvironment('TRIAGE_LIVE_SESSION');
+  final trimmedDefine = fromDefine.trim();
+  if (trimmedDefine.isNotEmpty) return trimmedDefine;
+  final fromEnv = Platform.environment['TRIAGE_LIVE_SESSION']?.trim();
+  return (fromEnv != null && fromEnv.isNotEmpty) ? fromEnv : 'session-255';
 }
 
 void main() {

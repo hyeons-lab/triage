@@ -45,10 +45,7 @@ Widget _sizedView(TerminalCellBuffer buffer, ScrollController scroll) => Center(
   child: SizedBox(
     width: 800,
     height: 600,
-    child: TerminalGridView(
-      buffer: buffer,
-      scrollController: scroll,
-    ),
+    child: TerminalGridView(buffer: buffer, scrollController: scroll),
   ),
 );
 
@@ -97,14 +94,13 @@ void main() {
       cols: kBenchCols,
       rows: kBenchViewportRows,
     );
+    addTearDown(buffer.dispose);
     final scroll = ScrollController();
     addTearDown(scroll.dispose);
     await tester.pumpWidget(
       MaterialApp(home: Scaffold(body: _sizedView(buffer, scroll))),
     );
-    buffer.applySyncFrame(
-      _makeSyncFrame(viewportPayload, Uint8List(0), 0),
-    );
+    buffer.applySyncFrame(_makeSyncFrame(viewportPayload, Uint8List(0), 0));
     await tester.pumpAndSettle();
     await tester.pumpWidget(const MaterialApp(home: Scaffold()));
     await tester.pumpAndSettle();
@@ -115,15 +111,20 @@ void main() {
       cols: kBenchCols,
       rows: kBenchViewportRows,
     );
+    addTearDown(buffer.dispose);
     final scroll = ScrollController();
     addTearDown(scroll.dispose);
     await _benchArm(
       tester,
       binding,
-      'terminal_grid_sync_a',
+      kReplayBenchReportKeys[0],
       () => _sizedView(buffer, scroll),
       () => buffer.applySyncFrame(
-        _makeSyncFrame(viewportPayload, scrollbackPayload, kBenchScrollbackRows),
+        _makeSyncFrame(
+          viewportPayload,
+          scrollbackPayload,
+          kBenchScrollbackRows,
+        ),
       ),
     );
     expect(buffer.totalLines, kBenchViewportRows + kBenchScrollbackRows);
@@ -134,15 +135,20 @@ void main() {
       cols: kBenchCols,
       rows: kBenchViewportRows,
     );
+    addTearDown(buffer.dispose);
     final scroll = ScrollController();
     addTearDown(scroll.dispose);
     await _benchArm(
       tester,
       binding,
-      'terminal_grid_sync_b',
+      kReplayBenchReportKeys[1],
       () => _sizedView(buffer, scroll),
       () => buffer.applySyncFrame(
-        _makeSyncFrame(viewportPayload, scrollbackPayload, kBenchScrollbackRows),
+        _makeSyncFrame(
+          viewportPayload,
+          scrollbackPayload,
+          kBenchScrollbackRows,
+        ),
       ),
     );
     expect(buffer.totalLines, kBenchViewportRows + kBenchScrollbackRows);

@@ -76,13 +76,16 @@ class TerminalCellLine {
         words[base + 3] = 1 << kContentWidthShift;
         continue;
       }
-      final first = runes.first;
-      final w = _isWideCodePoint(first) ? 2 : 1;
+      final first = sanitizeTerminalCodePoint(runes.first);
+      final w = (_isWideCodePoint(first) && i + 1 < cells.length) ? 2 : 1;
       words[base + 3] =
           (first & kContentCodepointMask) | (w << kContentWidthShift);
       if (runes.length > 1) {
         combining ??= <int, List<int>>{};
-        combining[i] = runes.sublist(1);
+        combining[i] = <int>[
+          for (final r in runes.sublist(1))
+            sanitizeTerminalCodePoint(r == 0 ? 0xFFFD : r),
+        ];
       }
       storedCols = i + w;
     }
@@ -135,7 +138,9 @@ class TerminalCellLine {
 
   int getCodePoint(int col) {
     if (col < 0 || col >= storedCols) return 0;
-    return cellWords[col * kCellWords + 3] & kContentCodepointMask;
+    return sanitizeTerminalCodePoint(
+      cellWords[col * kCellWords + 3] & kContentCodepointMask,
+    );
   }
 
   int getWidth(int col) {
@@ -152,21 +157,27 @@ class TerminalCellLine {
     if (extra == null || extra.isEmpty) {
       return String.fromCharCode(cp);
     }
-    return String.fromCharCodes(<int>[cp, ...extra]);
+    return String.fromCharCodes(<int>[
+      cp,
+      for (final c in extra) sanitizeTerminalCodePoint(c == 0 ? 0xFFFD : c),
+    ]);
   }
 
   String toPlainText() {
     if (storedCols <= 0) return '';
-    var lastGlyph = -1;
-    for (var i = 0; i < storedCols; i++) {
-      final cp = getCodePoint(i);
-      if (cp != 0 && cp != 0x20) {
-        lastGlyph = i;
-      } else if (cp == 0x20 &&
-          (getFg(i) != kColorNormal ||
-              getBg(i) != kColorNormal ||
-              getAttrs(i) != 0)) {
-        lastGlyph = i;
+    var lastGlyph = wrapsNext ? storedCols - 1 : -1;
+    if (!wrapsNext) {
+      for (var i = 0; i < storedCols; i++) {
+        final cp = getCodePoint(i);
+        if (cp != 0 && cp != 0x20) {
+          lastGlyph = i;
+        } else if (cp == 0x20 &&
+            (getFg(i) != kColorNormal ||
+                getBg(i) != kColorNormal ||
+                getAttrs(i) != 0 ||
+                (combining?[i]?.isNotEmpty ?? false))) {
+          lastGlyph = i;
+        }
       }
     }
     if (lastGlyph < 0) return '';
@@ -178,7 +189,7 @@ class TerminalCellLine {
         final extra = combining?[i];
         if (extra != null) {
           for (final c in extra) {
-            out.writeCharCode(c);
+            out.writeCharCode(sanitizeTerminalCodePoint(c == 0 ? 0xFFFD : c));
           }
         }
       } else {
@@ -225,7 +236,7 @@ class TerminalCellLine {
         final extra = combining?[col];
         if (extra != null) {
           for (final c in extra) {
-            buf.writeCharCode(c);
+            buf.writeCharCode(sanitizeTerminalCodePoint(c == 0 ? 0xFFFD : c));
           }
         }
       }
@@ -315,11 +326,11 @@ class TerminalCellBuffer extends ChangeNotifier {
     this.onTitleChanged,
     this.onOutput,
     this.onResize,
-  }) : _viewWidth = max(1, cols),
-       _viewHeight = max(1, rows),
+  }) : _viewWidth = cols.clamp(1, kMaxEncodedCols),
+       _viewHeight = rows.clamp(1, kMaxViewportRows),
        _viewportLines = List<TerminalCellLine>.generate(
-         max(1, rows),
-         (_) => TerminalCellLine.blank(cols),
+         rows.clamp(1, kMaxViewportRows),
+         (_) => TerminalCellLine.blank(cols.clamp(1, kMaxEncodedCols)),
        );
 
   int _viewWidth;
@@ -329,7 +340,13 @@ class TerminalCellBuffer extends ChangeNotifier {
   int _primaryScrollbackRows = 0;
   int _primaryTrimmedTopRows = 0;
   int _primaryCols = 0;
+  int _lastSyncedCols = 0;
+  bool _sawAltColResize = false;
+  int? _expandedReflowFloorAbs;
+  int _reflowGen = 0;
   int _eraseScrollbackGen = 0;
+  int? _daemonEraseScrollbackGen;
+  bool _scrollbackClearedLocally = false;
   int _lastFrameSeq = 0;
 
   int _cursorX = 0;
@@ -369,6 +386,7 @@ class TerminalCellBuffer extends ChangeNotifier {
   int get totalScrollbackRows => _isAltScreen ? 0 : _primaryScrollbackRows;
   int get trimmedTopRows => _isAltScreen ? 0 : _primaryTrimmedTopRows;
   int get totalLines => totalScrollbackRows + _viewHeight;
+  int get reflowGen => _reflowGen;
   int get eraseScrollbackGen => _eraseScrollbackGen;
   int get lastFrameSeq => _lastFrameSeq;
 
@@ -411,6 +429,12 @@ class TerminalCellBuffer extends ChangeNotifier {
     );
     _primaryScrollbackRows = 0;
     _primaryTrimmedTopRows = 0;
+    _expandedReflowFloorAbs = null;
+    _sawAltColResize = false;
+    _eraseScrollbackGen += 1;
+    _reflowGen += 1;
+    _daemonEraseScrollbackGen = null;
+    _scrollbackClearedLocally = true;
     _absScrollbackPages.clear();
     _cursorX = 0;
     _cursorY = 0;
@@ -421,14 +445,9 @@ class TerminalCellBuffer extends ChangeNotifier {
   /// `TerminalSync` frame and notifies [onResize] (with [viewWidth] and
   /// [viewHeight] still holding their pre-resize values during the callback,
   /// matching the `TerminalPane` resize hook contract).
-  void resize(
-    int cols,
-    int rows, [
-    int pixelWidth = 0,
-    int pixelHeight = 0,
-  ]) {
-    final nextCols = max(1, cols);
-    final nextRows = max(1, rows);
+  void resize(int cols, int rows, [int pixelWidth = 0, int pixelHeight = 0]) {
+    final nextCols = cols.clamp(1, kMaxEncodedCols);
+    final nextRows = rows.clamp(1, kMaxViewportRows);
     onResize?.call(nextCols, nextRows, pixelWidth, pixelHeight);
     if (nextCols == _viewWidth && nextRows == _viewHeight) {
       return;
@@ -448,8 +467,8 @@ class TerminalCellBuffer extends ChangeNotifier {
 
   /// Resets all grid and scrollback state (e.g. before a fresh session load).
   void reset({int cols = 80, int rows = 24}) {
-    _viewWidth = max(1, cols);
-    _viewHeight = max(1, rows);
+    _viewWidth = cols.clamp(1, kMaxEncodedCols);
+    _viewHeight = rows.clamp(1, kMaxViewportRows);
     _viewportLines = List<TerminalCellLine>.generate(
       _viewHeight,
       (_) => TerminalCellLine.blank(_viewWidth),
@@ -457,7 +476,13 @@ class TerminalCellBuffer extends ChangeNotifier {
     _primaryScrollbackRows = 0;
     _primaryTrimmedTopRows = 0;
     _primaryCols = 0;
-    _eraseScrollbackGen = 0;
+    _lastSyncedCols = 0;
+    _sawAltColResize = false;
+    _expandedReflowFloorAbs = null;
+    _reflowGen += 1;
+    _eraseScrollbackGen += 1;
+    _daemonEraseScrollbackGen = null;
+    _scrollbackClearedLocally = true;
     _lastFrameSeq = 0;
     _cursorX = 0;
     _cursorY = 0;
@@ -482,56 +507,177 @@ class TerminalCellBuffer extends ChangeNotifier {
   /// Applies an authoritative `TerminalSyncFrame` from `SyncTerminal` or
   /// `SessionEvent::TerminalSync`.
   void applySyncFrame(TerminalSyncFrameData frame) {
-    final nextRows = max(1, frame.rows);
-    final nextCols = max(1, frame.cols);
+    final nextRows = frame.rows.clamp(1, kMaxViewportRows);
+    final nextCols = frame.cols.clamp(1, kMaxEncodedCols);
     final wasAlt = _isAltScreen;
     final nextAlt = frame.isAltScreen;
+    final clampedTotalSb = frame.totalScrollbackRows.clamp(
+      0,
+      kMaxScrollbackRows,
+    );
+    final clampedTrimmedTop = frame.trimmedTopRows.clamp(0, kMaxTrimmedTopRows);
 
-    if (frame.eraseScrollbackGen != _eraseScrollbackGen ||
-        frame.sawEraseScrollback) {
-      _eraseScrollbackGen = frame.eraseScrollbackGen;
+    if (!nextAlt && frame.pushedScrollbackRowCount > 0) {
+      if (frame.pushedScrollbackStartRow < 0 ||
+          frame.pushedScrollbackRowCount > clampedTotalSb ||
+          frame.pushedScrollbackStartRow >
+              clampedTotalSb - frame.pushedScrollbackRowCount) {
+        return;
+      }
+    } else if (!nextAlt && frame.pushedScrollbackRowCount < 0) {
+      return;
+    }
+
+    // Decode payloads before mutating state so malformed frames cannot leave
+    // the buffer partially updated or blanked.
+    final List<DecodedTcg1Row> pushed =
+        (!nextAlt &&
+            frame.pushedScrollbackPayload.isNotEmpty &&
+            frame.pushedScrollbackRowCount > 0)
+        ? decodeTcg1Batch(
+            frame.pushedScrollbackCompression,
+            frame.pushedScrollbackPayload,
+          )
+        : const <DecodedTcg1Row>[];
+    final List<DecodedTcg1Row> decodedRows = frame.viewportPayload.isNotEmpty
+        ? decodeTcg1Batch(frame.viewportCompression, frame.viewportPayload)
+        : const <DecodedTcg1Row>[];
+
+    final daemonGen = max(0, frame.eraseScrollbackGen);
+    final trimmedRegressedOnFull =
+        !nextAlt &&
+        frame.fullViewport &&
+        clampedTrimmedTop < _primaryTrimmedTopRows;
+    if (_scrollbackClearedLocally) {
+      _scrollbackClearedLocally = false;
+      _daemonEraseScrollbackGen = daemonGen;
+      if (frame.sawEraseScrollback) {
+        _eraseScrollbackGen = max(_eraseScrollbackGen + 1, daemonGen);
+        _reflowGen += 1;
+        _primaryScrollbackRows = 0;
+        _primaryTrimmedTopRows = 0;
+        _sawAltColResize = false;
+        _expandedReflowFloorAbs = null;
+        _absScrollbackPages.clear();
+      } else {
+        _eraseScrollbackGen = max(_eraseScrollbackGen, daemonGen);
+      }
+    } else if (_daemonEraseScrollbackGen == null) {
+      _daemonEraseScrollbackGen = daemonGen;
+      final hadResidentPrimary =
+          _primaryScrollbackRows > 0 ||
+          _primaryTrimmedTopRows > 0 ||
+          _absScrollbackPages.isNotEmpty;
+      if (frame.sawEraseScrollback ||
+          trimmedRegressedOnFull ||
+          (hadResidentPrimary && daemonGen != _eraseScrollbackGen)) {
+        _eraseScrollbackGen = max(_eraseScrollbackGen + 1, daemonGen);
+        _reflowGen += 1;
+        _primaryScrollbackRows = 0;
+        _primaryTrimmedTopRows = 0;
+        _sawAltColResize = false;
+        _expandedReflowFloorAbs = null;
+        _absScrollbackPages.clear();
+      } else {
+        _eraseScrollbackGen = max(_eraseScrollbackGen, daemonGen);
+      }
+    } else if (daemonGen != _daemonEraseScrollbackGen ||
+        frame.sawEraseScrollback ||
+        trimmedRegressedOnFull) {
+      _daemonEraseScrollbackGen = daemonGen;
+      _eraseScrollbackGen = max(_eraseScrollbackGen + 1, daemonGen);
+      _reflowGen += 1;
+      _primaryScrollbackRows = 0;
+      _primaryTrimmedTopRows = 0;
+      _sawAltColResize = false;
+      _expandedReflowFloorAbs = null;
       _absScrollbackPages.clear();
     }
 
-    if (!nextAlt) {
-      if (_primaryCols != 0 && _primaryCols != nextCols) {
-        // Column resize reflows the daemon's in-memory scrollback tail; drop
-        // cached pages in the reflowable window so demand-paging fetches
-        // freshly reflowed rows while keeping older archived journal pages.
-        final reflowStartVirtual = max(
-          0,
-          frame.totalScrollbackRows - kDaemonReflowWindowRows,
-        );
-        final reflowStartAbs = frame.trimmedTopRows + reflowStartVirtual;
-        final minPage = reflowStartAbs ~/ kScrollbackPageSize;
+    if (nextAlt) {
+      if (_primaryCols != 0 &&
+          (nextCols != _primaryCols ||
+              (_lastSyncedCols != 0 && nextCols != _lastSyncedCols))) {
+        _reflowGen += 1;
+        _sawAltColResize = true;
+        final preReflowStartAbs =
+            _primaryTrimmedTopRows +
+            max<int>(0, _primaryScrollbackRows - kDaemonReflowWindowRows);
+        _expandedReflowFloorAbs = _expandedReflowFloorAbs == null
+            ? preReflowStartAbs
+            : min<int>(_expandedReflowFloorAbs!, preReflowStartAbs);
+        final minPage = _expandedReflowFloorAbs! ~/ kScrollbackPageSize;
         _absScrollbackPages.removeWhere((pageIdx, _) => pageIdx >= minPage);
       }
+    } else {
+      final nextScrollbackRows = clampedTotalSb;
+      final nextTrimmedTopRows = frame.fullViewport
+          ? clampedTrimmedTop
+          : max(_primaryTrimmedTopRows, clampedTrimmedTop);
+      final prevAbsEnd = _primaryTrimmedTopRows + _primaryScrollbackRows;
+      final nextAbsEnd = nextTrimmedTopRows + nextScrollbackRows;
+      final colsChanged =
+          (_primaryCols != 0 && _primaryCols != nextCols) || _sawAltColResize;
+      if (colsChanged) {
+        _reflowGen += 1;
+        _sawAltColResize = false;
+        final preReflowStartAbs =
+            _primaryTrimmedTopRows +
+            max<int>(0, _primaryScrollbackRows - kDaemonReflowWindowRows);
+        final postReflowStartAbs =
+            nextTrimmedTopRows +
+            max<int>(0, nextScrollbackRows - kDaemonReflowWindowRows);
+        final candidateFloor = min<int>(preReflowStartAbs, postReflowStartAbs);
+        final effectiveFloor = _expandedReflowFloorAbs == null
+            ? candidateFloor
+            : min<int>(_expandedReflowFloorAbs!, candidateFloor);
+        if (_primaryCols != 0 && nextCols < _primaryCols ||
+            nextScrollbackRows > kDaemonReflowWindowRows) {
+          _expandedReflowFloorAbs = effectiveFloor;
+        } else if (nextScrollbackRows <= 3500) {
+          _expandedReflowFloorAbs = null;
+        }
+        final minPage = effectiveFloor ~/ kScrollbackPageSize;
+        _absScrollbackPages.removeWhere((pageIdx, _) => pageIdx >= minPage);
+      } else if (_expandedReflowFloorAbs != null &&
+          (nextScrollbackRows < _primaryScrollbackRows ||
+              nextAbsEnd < prevAbsEnd)) {
+        // Post-narrow primary scroll drained excess physical rows from the
+        // expanded in-memory reflow ring without changing columns.
+        _reflowGen += 1;
+        final minPage = _expandedReflowFloorAbs! ~/ kScrollbackPageSize;
+        _absScrollbackPages.removeWhere((pageIdx, _) => pageIdx >= minPage);
+        if (nextScrollbackRows <= 3500) {
+          _expandedReflowFloorAbs = null;
+        }
+      } else if (nextAbsEnd < prevAbsEnd) {
+        _reflowGen += 1;
+      }
       _primaryCols = nextCols;
-      _primaryScrollbackRows = max(0, frame.totalScrollbackRows);
-      _primaryTrimmedTopRows = max(0, frame.trimmedTopRows);
+      _primaryScrollbackRows = nextScrollbackRows;
+      _primaryTrimmedTopRows = nextTrimmedTopRows;
       _pruneTrimmedScrollbackPages(_primaryTrimmedTopRows);
+      if (nextAbsEnd < prevAbsEnd) {
+        _pruneTailScrollbackPages(nextAbsEnd);
+      }
 
-      if (frame.pushedScrollbackPayload.isNotEmpty &&
-          frame.pushedScrollbackRowCount > 0) {
-        final pushed = decodeTcg1Batch(
-          frame.pushedScrollbackCompression,
-          frame.pushedScrollbackPayload,
-        );
-        for (final row in pushed) {
-          final virtualRow = frame.pushedScrollbackStartRow + row.rowIndex;
-          if (virtualRow >= 0 && virtualRow < _primaryScrollbackRows) {
-            _putScrollbackRow(
-              _primaryTrimmedTopRows + virtualRow,
-              TerminalCellLine.fromDecoded(row, fallbackCols: nextCols),
-            );
-          }
+      for (final row in pushed) {
+        if (row.rowIndex < 0 ||
+            row.rowIndex >= frame.pushedScrollbackRowCount) {
+          continue;
+        }
+        final virtualRow = frame.pushedScrollbackStartRow + row.rowIndex;
+        if (virtualRow >= 0 && virtualRow < _primaryScrollbackRows) {
+          _putScrollbackRow(
+            _primaryTrimmedTopRows + virtualRow,
+            TerminalCellLine.fromDecoded(row, fallbackCols: nextCols),
+          );
         }
       }
     }
+    _lastSyncedCols = nextCols;
 
-    final sizeChanged = nextRows != _viewHeight || nextCols != _viewWidth;
-    final fullViewport =
-        frame.fullViewport || sizeChanged || (wasAlt != nextAlt);
+    final fullViewport = frame.fullViewport || (wasAlt != nextAlt);
     _viewWidth = nextCols;
     _viewHeight = nextRows;
     if (fullViewport) {
@@ -549,18 +695,12 @@ class TerminalCellBuffer extends ChangeNotifier {
       _viewportLines = resized;
     }
 
-    if (frame.viewportPayload.isNotEmpty) {
-      final decodedRows = decodeTcg1Batch(
-        frame.viewportCompression,
-        frame.viewportPayload,
-      );
-      for (final row in decodedRows) {
-        if (row.rowIndex >= 0 && row.rowIndex < _viewHeight) {
-          _viewportLines[row.rowIndex] = TerminalCellLine.fromDecoded(
-            row,
-            fallbackCols: _viewWidth,
-          );
-        }
+    for (final row in decodedRows) {
+      if (row.rowIndex >= 0 && row.rowIndex < _viewHeight) {
+        _viewportLines[row.rowIndex] = TerminalCellLine.fromDecoded(
+          row,
+          fallbackCols: _viewWidth,
+        );
       }
     }
 
@@ -583,9 +723,12 @@ class TerminalCellBuffer extends ChangeNotifier {
       _lastFrameSeq = frame.frameSeq;
     }
 
-    if (frame.titleChanged && frame.title != null && frame.title != _title) {
-      _title = frame.title!;
-      onTitleChanged?.call(_title);
+    if (frame.titleChanged) {
+      final nextTitle = frame.title ?? '';
+      if (nextTitle != _title) {
+        _title = nextTitle;
+        onTitleChanged?.call(_title);
+      }
     } else if (frame.title != null && _title.isEmpty) {
       _title = frame.title!;
     }
@@ -599,42 +742,104 @@ class TerminalCellBuffer extends ChangeNotifier {
   }
 
   /// Applies a demand-paged scrollback batch from `FetchTerminalRows`.
-  /// Discards stale responses from before a `CSI 3J` scrollback clear.
+  /// Discards stale responses from before a `CSI 3J` scrollback clear or
+  /// column reflow.
   bool applyFetchedRows(
     TerminalRowsPageData page, {
+    int? expectedReflowGen,
     int? protectFirstVirtualRow,
     int? protectLastVirtualRow,
   }) {
-    if (page.eraseScrollbackGen != _eraseScrollbackGen) {
+    if (_scrollbackClearedLocally) {
       return false;
     }
-    if (!_isAltScreen) {
-      if (page.trimmedTopRows > _primaryTrimmedTopRows) {
-        _primaryTrimmedTopRows = page.trimmedTopRows;
-        _pruneTrimmedScrollbackPages(_primaryTrimmedTopRows);
-      }
-      if (page.totalScrollbackRows > _primaryScrollbackRows) {
-        _primaryScrollbackRows = page.totalScrollbackRows;
-      }
+    final expectedEraseGen = _daemonEraseScrollbackGen ?? _eraseScrollbackGen;
+    if (page.eraseScrollbackGen != expectedEraseGen) {
+      return false;
+    }
+    if (expectedReflowGen != null && expectedReflowGen != _reflowGen) {
+      return false;
+    }
+    if (page.startRow < 0 ||
+        page.totalScrollbackRows < 0 ||
+        page.trimmedTopRows < _primaryTrimmedTopRows) {
+      return false;
     }
 
-    if (page.payload.isEmpty || page.rowCount == 0) {
+    final pageTotal = page.totalScrollbackRows.clamp(0, kMaxScrollbackRows);
+    final pageTrimmed = page.trimmedTopRows.clamp(0, kMaxTrimmedTopRows);
+
+    if (page.payload.isEmpty || page.rowCount <= 0) {
+      if (_advanceScrollbackMetadataFromPage(page) && !_isAltScreen) {
+        notifyListeners();
+      }
       return false;
     }
 
     final decoded = decodeTcg1Batch(page.compression, page.payload);
     if (decoded.isEmpty) {
+      if (_advanceScrollbackMetadataFromPage(page) && !_isAltScreen) {
+        notifyListeners();
+      }
       return false;
     }
 
+    if (_primaryCols > 0) {
+      final expectedCols = min(_primaryCols, kMaxEncodedCols);
+      final maxAbsEnd = max(
+        _primaryTrimmedTopRows + _primaryScrollbackRows,
+        pageTrimmed + pageTotal,
+      );
+      final baseFloor = max(0, maxAbsEnd - kDaemonReflowWindowRows);
+      final reflowFloorAbs = _expandedReflowFloorAbs == null
+          ? baseFloor
+          : min(_expandedReflowFloorAbs!, baseFloor);
+      for (final row in decoded) {
+        final absRow = pageTrimmed + page.startRow + row.rowIndex;
+        if (absRow >= reflowFloorAbs && row.logicalCols > 0) {
+          // Archived SGR journal records do not reflow on narrow and encode
+          // `logicalCols == max(expectedCols, storedCols)`, so `storedCols ==
+          // logicalCols > expectedCols` is valid for current-generation pages.
+          final widthMismatch =
+              row.logicalCols < expectedCols ||
+              (row.logicalCols > expectedCols &&
+                  row.storedCols < row.logicalCols);
+          if (widthMismatch) {
+            return false;
+          }
+        }
+      }
+    }
+
+    final metadataChanged = _advanceScrollbackMetadataFromPage(page);
+
+    var wroteAny = false;
+    final maxAbsExclusive = _primaryTrimmedTopRows + _primaryScrollbackRows;
     for (final row in decoded) {
-      final absRow = page.trimmedTopRows + page.startRow + row.rowIndex;
-      if (absRow >= _primaryTrimmedTopRows) {
+      if (row.rowIndex < 0 || row.rowIndex >= page.rowCount) {
+        continue;
+      }
+      final virtRow = page.startRow + row.rowIndex;
+      if (virtRow < 0 || virtRow >= pageTotal) {
+        continue;
+      }
+      final absRow = pageTrimmed + virtRow;
+      if (absRow >= _primaryTrimmedTopRows && absRow < maxAbsExclusive) {
         _putScrollbackRow(
           absRow,
-          TerminalCellLine.fromDecoded(row, fallbackCols: _viewWidth),
+          TerminalCellLine.fromDecoded(
+            row,
+            fallbackCols: _primaryCols > 0 ? _primaryCols : _viewWidth,
+          ),
         );
+        wroteAny = true;
       }
+    }
+    if (!wroteAny) {
+      if (metadataChanged && !_isAltScreen) {
+        notifyListeners();
+      }
+      return false;
     }
 
     _evictExcessScrollbackPages(
@@ -702,23 +907,25 @@ class TerminalCellBuffer extends ChangeNotifier {
       return const <(int, int)>[];
     }
 
-    final firstBucket =
-        (clampedFirst ~/ kScrollbackPageSize) * kScrollbackPageSize;
-    final lastBucket =
-        (clampedLast ~/ kScrollbackPageSize) * kScrollbackPageSize;
+    final trimmedTop = trimmedTopRows;
+    final firstAbsPage = (trimmedTop + clampedFirst) ~/ kScrollbackPageSize;
+    final lastAbsPage = (trimmedTop + clampedLast) ~/ kScrollbackPageSize;
 
     final ranges = <(int, int)>[];
     int? openStart;
     int openEnd = 0;
 
-    for (
-      var bucket = firstBucket;
-      bucket <= lastBucket;
-      bucket += kScrollbackPageSize
-    ) {
-      final bucketEnd = min(sbRows, bucket + kScrollbackPageSize);
+    for (var absPage = firstAbsPage; absPage <= lastAbsPage; absPage++) {
+      final bucket = max(0, absPage * kScrollbackPageSize - trimmedTop);
+      final bucketEnd = min(
+        sbRows,
+        (absPage + 1) * kScrollbackPageSize - trimmedTop,
+      );
+      if (bucketEnd <= bucket) continue;
+      final checkStart = max(bucket, clampedFirst);
+      final checkEnd = min(bucketEnd, clampedLast + 1);
       var hasMissing = false;
-      for (var r = bucket; r < bucketEnd; r++) {
+      for (var r = checkStart; r < checkEnd; r++) {
         if (!isScrollbackRowLoaded(r)) {
           hasMissing = true;
           break;
@@ -777,13 +984,18 @@ class TerminalCellBuffer extends ChangeNotifier {
     int cursorX = 0,
     int cursorY = 0,
   }) {
-    _viewWidth = max(1, cols);
-    _viewHeight = max(1, rows);
+    _viewWidth = cols.clamp(1, kMaxEncodedCols);
+    _viewHeight = rows.clamp(1, kMaxViewportRows);
     _primaryCols = _viewWidth;
+    _lastSyncedCols = _viewWidth;
+    _sawAltColResize = false;
+    _expandedReflowFloorAbs = null;
     _isAltScreen = altScreen;
     _bracketedPasteMode = bracketedPaste;
     _eraseScrollbackGen = eraseGen;
-    _primaryTrimmedTopRows = max(0, trimmedTop);
+    _daemonEraseScrollbackGen = eraseGen;
+    _scrollbackClearedLocally = false;
+    _primaryTrimmedTopRows = trimmedTop.clamp(0, kMaxTrimmedTopRows);
     _primaryScrollbackRows = altScreen ? 0 : scrollback.length;
     _absScrollbackPages.clear();
     if (!altScreen) {
@@ -806,10 +1018,7 @@ class TerminalCellBuffer extends ChangeNotifier {
   /// scrolling the top viewport line into scrollback and enforcing [maxLines]
   /// total buffer capacity by incrementing `trimmedTopRows`.
   @visibleForTesting
-  void appendOutputLineForTest(
-    TerminalCellLine line, {
-    int? maxTotalLines,
-  }) {
+  void appendOutputLineForTest(TerminalCellLine line, {int? maxTotalLines}) {
     if (!_isAltScreen) {
       final evictedTop = _viewportLines.first;
       final newVirtualIdx = _primaryScrollbackRows;
@@ -844,8 +1053,13 @@ class TerminalCellBuffer extends ChangeNotifier {
   @visibleForTesting
   void clearScrollbackForTest() {
     _eraseScrollbackGen += 1;
+    _reflowGen += 1;
+    _daemonEraseScrollbackGen = _eraseScrollbackGen;
+    _scrollbackClearedLocally = false;
     _primaryScrollbackRows = 0;
     _primaryTrimmedTopRows = 0;
+    _sawAltColResize = false;
+    _expandedReflowFloorAbs = null;
     _absScrollbackPages.clear();
     notifyListeners();
   }
@@ -903,6 +1117,24 @@ class TerminalCellBuffer extends ChangeNotifier {
     return existing;
   }
 
+  bool _advanceScrollbackMetadataFromPage(TerminalRowsPageData page) {
+    var changed = false;
+    final nextTrimmed = page.trimmedTopRows.clamp(0, kMaxTrimmedTopRows);
+    final nextTotal = page.totalScrollbackRows.clamp(0, kMaxScrollbackRows);
+    if (nextTrimmed > _primaryTrimmedTopRows) {
+      final trimDelta = nextTrimmed - _primaryTrimmedTopRows;
+      _primaryTrimmedTopRows = nextTrimmed;
+      _primaryScrollbackRows = max(0, _primaryScrollbackRows - trimDelta);
+      _pruneTrimmedScrollbackPages(_primaryTrimmedTopRows);
+      changed = true;
+    }
+    if (nextTotal > _primaryScrollbackRows) {
+      _primaryScrollbackRows = nextTotal;
+      changed = true;
+    }
+    return changed;
+  }
+
   void _pruneTrimmedScrollbackPages(int minAbsRow) {
     if (_absScrollbackPages.isEmpty || minAbsRow <= 0) return;
     final minKeepPage = minAbsRow ~/ kScrollbackPageSize;
@@ -911,6 +1143,24 @@ class TerminalCellBuffer extends ChangeNotifier {
     if (boundaryPage != null) {
       final minSlot = minAbsRow % kScrollbackPageSize;
       for (var s = 0; s < minSlot; s++) {
+        boundaryPage[s] = null;
+      }
+    }
+  }
+
+  void _pruneTailScrollbackPages(int maxAbsRowExclusive) {
+    if (_absScrollbackPages.isEmpty) return;
+    if (maxAbsRowExclusive <= 0) {
+      _absScrollbackPages.clear();
+      return;
+    }
+    final lastValidAbs = maxAbsRowExclusive - 1;
+    final maxKeepPage = lastValidAbs ~/ kScrollbackPageSize;
+    _absScrollbackPages.removeWhere((pageIdx, _) => pageIdx > maxKeepPage);
+    final boundaryPage = _absScrollbackPages[maxKeepPage];
+    if (boundaryPage != null) {
+      final clearFromSlot = (lastValidAbs % kScrollbackPageSize) + 1;
+      for (var s = clearFromSlot; s < kScrollbackPageSize; s++) {
         boundaryPage[s] = null;
       }
     }

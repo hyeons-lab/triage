@@ -8,6 +8,7 @@ import 'package:flutter/gestures.dart'
     show PointerDeviceKind, kSecondaryMouseButton;
 import 'package:flutter/material.dart'
     show
+        AlertDialog,
         CheckedPopupMenuItem,
         FilledButton,
         Icons,
@@ -15,7 +16,8 @@ import 'package:flutter/material.dart'
         MaterialApp,
         Scaffold,
         Switch,
-        TextField;
+        TextField,
+        showDialog;
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -642,6 +644,11 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
         : <String, dynamic>{};
     if (restoredAtEntry) {
       rawSnapshot['exited'] = false;
+    } else {
+      rawSnapshot.putIfAbsent(
+        'exited',
+        () => exitedSessionIds.contains(sessionId),
+      );
     }
     final subId = inner.containsKey('subscription_id')
         ? inner['subscription_id']
@@ -664,8 +671,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
         ...inner,
         'snapshot': rawSnapshot,
         'frame': frame,
-        'lease':
-            inner['lease'] ?? _attachLeaseFor(sessionId, clientId, mode),
+        'lease': inner['lease'] ?? _attachLeaseFor(sessionId, clientId, mode),
         'subscription_id': subId,
       },
     };
@@ -679,7 +685,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     int? cols,
     int? rows,
     bool resizePty = false,
-    bool restoreIfExited = true,
+    bool restoreIfExited = false,
     bool subscribe = true,
     int knownFrameSeq = 0,
   }) async {
@@ -871,7 +877,10 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     final safeStart = startRow < 0
         ? 0
         : (startRow > allLines.length ? allLines.length : startRow);
-    final safeEnd = min<int>(allLines.length, safeStart + max<int>(0, rowCount));
+    final safeEnd = min<int>(
+      allLines.length,
+      safeStart + max<int>(0, rowCount),
+    );
     final slice = allLines.sublist(safeStart, safeEnd);
     final cols = _sessionLastCols[sessionId] ?? 80;
     return {
@@ -992,6 +1001,8 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     return nextId;
   }
 
+  final List<({String sessionId, List<int> bytes})> writeInputPayloads = [];
+
   @override
   Future<void> writeInput({
     required String sessionId,
@@ -999,6 +1010,7 @@ class FakeTriageWebSocketClient extends TriageWebSocketClient {
     required List<int> bytes,
   }) async {
     writeInputCalls.add(sessionId);
+    writeInputPayloads.add((sessionId: sessionId, bytes: List<int>.of(bytes)));
   }
 
   final List<String> resizeSessionCalls = [];
@@ -1722,19 +1734,16 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('line 1 from main'), findsOneWidget);
 
-    client.emitTerminalSync(
-      'flutter-spike',
-      ['flutter-spike attached', 'live output during attach'],
-      frameSeq: 7,
-    );
+    client.emitTerminalSync('flutter-spike', [
+      'flutter-spike attached',
+      'live output during attach',
+    ], frameSeq: 7);
     await tester.pump();
 
     delayedAttach.complete(
-      client.attachSnapshotResponse(
-        'flutter-spike',
-        ['flutter-spike attached'],
-        frameSeq: 1,
-      ),
+      client.attachSnapshotResponse('flutter-spike', [
+        'flutter-spike attached',
+      ], frameSeq: 1),
     );
     await tester.pumpAndSettle();
 
@@ -1748,17 +1757,13 @@ void main() {
     // even before the post-select metadata refresh completes.
     expect(find.text('flutter-spike attached'), findsOneWidget);
     expect(find.text('live output during attach'), findsOneWidget);
-    expect(
-      client.ackTerminalSyncCalls.any((c) => c.frameSeq == 7),
-      isTrue,
-    );
+    expect(client.ackTerminalSyncCalls.any((c) => c.frameSeq == 7), isTrue);
 
     delayedRefresh.complete(
-      client.attachSnapshotResponse(
-        'flutter-spike',
-        ['flutter-spike attached', 'live output during attach'],
-        frameSeq: 8,
-      ),
+      client.attachSnapshotResponse('flutter-spike', [
+        'flutter-spike attached',
+        'live output during attach',
+      ], frameSeq: 8),
     );
     await tester.pumpAndSettle();
 
@@ -6988,17 +6993,15 @@ void main() {
             kittyKeyboardFlags: 0,
             title: null,
             viewportCompression: kCellCompressionNone,
-            viewportPayload: encodeTcg1PlainTextRows(
-              const <String>['row-0'],
-              cols: 120,
-            ),
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'row-0',
+            ], cols: 120),
             pushedScrollbackStartRow: 0,
             pushedScrollbackRowCount: 1,
             pushedScrollbackCompression: kCellCompressionNone,
-            pushedScrollbackPayload: encodeTcg1PlainTextRows(
-              <String>[wideHeader],
-              cols: 120,
-            ),
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(<String>[
+              wideHeader,
+            ], cols: 120),
           ),
         );
 
@@ -7162,24 +7165,19 @@ void main() {
         expect(client.syncTerminalCalls.last.subscribe, isTrue);
 
         parkedReconnect.complete(
-          client.attachSnapshotResponse(
-            'flutter-spike',
-            const <String>['initial prompt', 'missed-delta'],
-            frameSeq: 10,
-          ),
+          client.attachSnapshotResponse('flutter-spike', const <String>[
+            'initial prompt',
+            'missed-delta',
+          ], frameSeq: 10),
         );
         client.attachCompleters.remove('flutter-spike');
         await tester.pumpAndSettle();
 
-        client.emitTerminalSync(
-          'flutter-spike',
-          const <String>[
-            'initial prompt',
-            'missed-delta',
-            'live-after-reconnect',
-          ],
-          frameSeq: 11,
-        );
+        client.emitTerminalSync('flutter-spike', const <String>[
+          'initial prompt',
+          'missed-delta',
+          'live-after-reconnect',
+        ], frameSeq: 11);
         await tester.pumpAndSettle();
 
         final refreshedPane = tester.widget<TerminalPane>(
@@ -7221,6 +7219,517 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(client.attachSessionCalls, contains('flutter-spike'));
+      },
+    );
+
+    testWidgets(
+      'lease acquisition rejects non-granting sync responses and exited sessions without flushing input',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final client = FakeTriageWebSocketClient();
+        client.attachLeaseHolders['flutter-spike'] = 'other-client';
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Force syncTerminalSession to refuse granting the lease on InteractiveController.
+        client.syncResponseBuilder = (sid, knownSeq) {
+          if (sid == 'flutter-spike') {
+            return {
+              'snapshot': {'exited': false},
+              'lease': {'holder_client_id': 'other-client'},
+            };
+          }
+          return null;
+        };
+
+        pane.controller.sendInput('blocked-key');
+        await tester.pumpAndSettle();
+        expect(client.writeInputCalls, isEmpty);
+
+        // Now mark the session exited on the server without auto-restoring:
+        // lease acquisition must pass restoreIfExited: false and purge pending input.
+        client.exitedSessionIds.add('flutter-spike');
+        client.syncResponseBuilder = null;
+        pane.controller.sendInput('dead-session-key');
+        await tester.pumpAndSettle();
+
+        expect(client.syncTerminalCalls.last.restoreIfExited, isFalse);
+        expect(client.restoreSessionCalls, isEmpty);
+        expect(client.writeInputCalls, isEmpty);
+      },
+    );
+
+    testWidgets(
+      'mid-scrollback demand paging does not yank scroll offset or flash NoOlderScrollbackPill',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        final client = FakeTriageWebSocketClient();
+        client.snapshotVisibleRows['flutter-spike'] = List.generate(
+          120,
+          (i) => 'live $i',
+        );
+        client.fakeScrollbackLines['flutter-spike'] = List.generate(
+          600,
+          (i) => 'sb $i',
+        );
+        final fetchGate = Completer<Map<String, dynamic>>();
+        client.fetchRowsGate = (sid, startRow, rowCount) => fetchGate;
+
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Trigger mid-scrollback demand paging directly via onFetchScrollbackRows.
+        pane.onFetchScrollbackRows!(300, 320);
+        await tester.pump();
+        expect(client.fetchTerminalRowsCalls, isNotEmpty);
+
+        // User scrolls while the mid-scrollback RPC is in flight.
+        final scrollViewFinder = find.descendant(
+          of: find.byType(TerminalPane),
+          matching: find.byType(SingleChildScrollView),
+        );
+        final scrollController = tester
+            .widget<SingleChildScrollView>(scrollViewFinder)
+            .controller!;
+        scrollController.jumpTo(400.0);
+        await tester.pump();
+
+        fetchGate.complete({
+          'session_id': 'flutter-spike',
+          'start_row': 236,
+          'row_count': 128,
+          'total_scrollback_rows': 600,
+          'trimmed_top_rows': 0,
+          'erase_scrollback_gen': 0,
+          'compression': kCellCompressionNone,
+          'payload': encodeTcg1PlainTextRows(
+            List.generate(128, (i) => 'sb ${236 + i}'),
+            cols: 80,
+          ),
+        });
+        await tester.pumpAndSettle();
+
+        expect(scrollController.position.pixels, closeTo(400.0, 1.0));
+        expect(find.text('No older scrollback in reach'), findsNothing);
+      },
+    );
+
+    testWidgets(
+      'focus reporting (?1004) emits CSI I/O transitions and ?2004l clears seeded bracketed paste',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        TerminalPane.debugForceNativeTerminalView = true;
+        addTearDown(() {
+          TerminalPane.debugForceNativeTerminalView = false;
+        });
+        final client = FakeTriageWebSocketClient();
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // Enable ?1004 focus reporting while still a passive observer (no input lease).
+        pane.terminal.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 98,
+            rows: 24,
+            cols: 80,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags:
+                kModeCursorVisible | kModeFullViewport | kModeReportFocus,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: Uint8List(0),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        // Passive observer modal blur/refocus must not claim the input lease or send CSI I/O.
+        client.writeInputPayloads.clear();
+        final navContext = tester.element(find.byType(TerminalPane));
+        unawaited(
+          showDialog<void>(
+            context: navContext,
+            builder: (_) => const AlertDialog(title: Text('passive modal')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        Navigator.of(navContext).pop();
+        await tester.pumpAndSettle();
+        expect(client.writeInputPayloads, isEmpty);
+
+        // Acquire the input lease via a real keystroke.
+        pane.controller.sendInput('a');
+        await tester.pumpAndSettle();
+
+        // Enable ?1004 focus reporting + ?2004h bracketed paste via server sync frame.
+        pane.terminal.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 99,
+            rows: 24,
+            cols: 80,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags:
+                kModeCursorVisible |
+                kModeFullViewport |
+                kModeReportFocus |
+                kModeBracketedPaste,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: Uint8List(0),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(pane.terminal.bracketedPasteMode, isTrue);
+
+        // Clear ?2004l in next sync frame: terminal.bracketedPasteMode must clear.
+        pane.terminal.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 100,
+            rows: 24,
+            cols: 80,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags:
+                kModeCursorVisible | kModeFullViewport | kModeReportFocus,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: Uint8List(0),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(pane.terminal.bracketedPasteMode, isFalse);
+
+        // Push and pop a modal dialog while holding the lease: emits CSI O then CSI I without refit.
+        client.writeInputPayloads.clear();
+        final resizeCountBeforeBlur = client.resizeSessionCalls.length;
+        unawaited(
+          showDialog<void>(
+            context: navContext,
+            builder: (_) => const AlertDialog(title: Text('modal')),
+          ),
+        );
+        await tester.pumpAndSettle();
+        final sentAfterBlur = client.writeInputPayloads
+            .map((e) => String.fromCharCodes(e.bytes))
+            .join();
+        expect(sentAfterBlur, equals('\x1b[O'));
+        expect(client.resizeSessionCalls.length, equals(resizeCountBeforeBlur));
+
+        Navigator.of(navContext).pop();
+        await tester.pumpAndSettle();
+        final sentAfterRefocus = client.writeInputPayloads
+            .map((e) => String.fromCharCodes(e.bytes))
+            .join();
+        expect(sentAfterRefocus, equals('\x1b[O\x1b[I'));
+      },
+    );
+
+    testWidgets(
+      'gates passive ?1003 hover, resyncs on subscription_closed, retries reflowed fetchTerminalRows, and preserves cursor on revive',
+      (WidgetTester tester) async {
+        SharedPreferences.setMockInitialValues({});
+        TerminalPane.debugForceNativeTerminalView = true;
+        addTearDown(() {
+          TerminalPane.debugForceNativeTerminalView = false;
+        });
+
+        final client = FakeTriageWebSocketClient();
+        client.fakeScrollbackLines['flutter-spike'] = List<String>.generate(
+          64,
+          (i) => 'reflow-recovered-row-$i',
+        );
+        await tester.pumpWidget(TriageClientApp(client: client));
+        await tester.pumpAndSettle();
+
+        final pane = tester.widget<TerminalPane>(find.byType(TerminalPane));
+        pane.onViewFit!(80, 24);
+        await tester.pumpAndSettle();
+
+        // 1. Enable DEC ?1003 any-event mouse tracking + SGR ?1006 on passive observer.
+        pane.terminal.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 10,
+            rows: 24,
+            cols: 80,
+            totalScrollbackRows: 64,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags: kModeCursorVisible | kModeFullViewport,
+            mouseMode: 4, // ?1003 any-event
+            mouseReportMode: 2, // ?1006 SGR
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'mouse-tui',
+            ], cols: 80),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final syncCallsBeforeHover = client.syncTerminalCalls.length;
+        client.writeInputPayloads.clear();
+        // Unpressed SGR hover packet on passive observer must not claim lease or write bytes.
+        pane.controller.sendInput('\x1b[<35;6;6M');
+        await tester.pumpAndSettle();
+        expect(client.syncTerminalCalls.length, syncCallsBeforeHover);
+        expect(client.writeInputPayloads, isEmpty);
+
+        // 2. subscription_closed triggers non-restoring live resync (restoreIfExited: false, subscribe: true).
+        final syncBeforeClose = client.syncTerminalCalls.length;
+        client._testEventController.add(<String, dynamic>{
+          'type': 'subscription_closed',
+          'subscription_id': 'sub-flutter-spike',
+        });
+        await tester.pumpAndSettle();
+        expect(client.syncTerminalCalls.length, greaterThan(syncBeforeClose));
+        final closedResync = client.syncTerminalCalls.last;
+        expect(closedResync.sessionId, 'flutter-spike');
+        expect(closedResync.subscribe, isTrue);
+        expect(closedResync.restoreIfExited, isFalse);
+
+        // 3. Mid-flight reflowGen advance during fetchTerminalRows triggers automatic follow-up fetch.
+        var gateCall = 0;
+        final staleGate = Completer<Map<String, dynamic>>();
+        client.fetchRowsGate = (sessionId, startRow, rowCount) {
+          gateCall++;
+          return gateCall == 1 ? staleGate : null;
+        };
+        client.emitTerminalSync(
+          'flutter-spike',
+          const <String>['vp-90'],
+          cols: 90,
+          rows: 24,
+          totalScrollbackRows: 64,
+          frameSeq: 20,
+        );
+        await tester.pump();
+        expect(pane.onNearTop!(), isTrue);
+        await tester.pump();
+        expect(gateCall, 1);
+
+        // Width reflow arrives while first fetchTerminalRows is still in flight.
+        client.emitTerminalSync(
+          'flutter-spike',
+          const <String>['vp-100'],
+          cols: 100,
+          rows: 24,
+          totalScrollbackRows: 64,
+          frameSeq: 21,
+        );
+        await tester.pump();
+
+        // Stale pre-reflow page completes -> rejected, and finally schedules follow-up fetch (gateCall == 2).
+        staleGate.complete(<String, dynamic>{
+          'session_id': 'flutter-spike',
+          'start_row': 0,
+          'row_count': 64,
+          'total_scrollback_rows': 64,
+          'trimmed_top_rows': 0,
+          'erase_scrollback_gen': 0,
+          'compression': kCellCompressionNone,
+          'payload': encodeTcg1PlainTextRows(
+            List<String>.generate(64, (i) => 'stale-$i'),
+            cols: 90,
+          ),
+        });
+        await tester.pumpAndSettle();
+        client.fetchRowsGate = null;
+        expect(gateCall, 2);
+        expect(
+          readTerminalBufferText(pane.terminal),
+          contains('reflow-recovered-row-0'),
+        );
+
+        // 4. Mark session exited via Exited event, then revive via re-selection with bracketedPaste in frame
+        // and omitted bracketed_paste_enabled in snapshot: cursorVisible and bracketedPasteMode remain true.
+        client._testEventController.add(<String, dynamic>{
+          'type': 'event',
+          'subscription_id': 'sub-flutter-spike',
+          'envelope': <String, dynamic>{
+            'event_seq': 99,
+            'event': <String, dynamic>{
+              'Exited': <String, dynamic>{
+                'session_id': 'flutter-spike',
+                'completed': <String, dynamic>{
+                  'output_seq': 1,
+                  'bytes_logged': 0,
+                  'visible_rows': const <String>[],
+                },
+              },
+            },
+          },
+        });
+        await tester.pumpAndSettle();
+        expect(pane.terminal.cursorVisible, isFalse);
+
+        client.syncResponseBuilder = (sid, knownSeq) => <String, dynamic>{
+          'subscription_id': 'sub-$sid-revived',
+          'snapshot': <String, dynamic>{
+            'exited': false,
+            'size': <String, dynamic>{'rows': 24, 'cols': 100},
+          },
+          'frame': <String, dynamic>{
+            'frame_seq': 30,
+            'rows': 24,
+            'cols': 100,
+            'total_scrollback_rows': 0,
+            'trimmed_top_rows': 0,
+            'erase_scrollback_gen': 0,
+            'cursor_x': 2,
+            'cursor_y': 0,
+            'cursor_style': 2,
+            'mode_flags':
+                kModeCursorVisible | kModeFullViewport | kModeBracketedPaste,
+            'mouse_mode': 0,
+            'mouse_report_mode': 0,
+            'kitty_keyboard_flags': 0,
+            'viewport_compression': kCellCompressionNone,
+            'viewport_payload': encodeTcg1PlainTextRows(const <String>[
+              '\$ ',
+            ], cols: 100),
+            'pushed_scrollback_start_row': 0,
+            'pushed_scrollback_row_count': 0,
+            'pushed_scrollback_compression': kCellCompressionNone,
+            'pushed_scrollback_payload': Uint8List(0),
+          },
+        };
+        await tester.tap(find.text('experiment/flutter-spike').first);
+        await tester.pumpAndSettle();
+        client.syncResponseBuilder = null;
+
+        expect(pane.terminal.cursorVisible, isTrue);
+        expect(pane.terminal.bracketedPasteMode, isTrue);
+
+        // 5. Snapshot event carrying `exited: true` transitions the session to
+        // exited even without a separate Exited event.
+        client._testEventController.add(<String, dynamic>{
+          'type': 'event',
+          'subscription_id': 'sub-flutter-spike-revived',
+          'envelope': <String, dynamic>{
+            'event_seq': 100,
+            'event': <String, dynamic>{
+              'Snapshot': <String, dynamic>{
+                'session_id': 'flutter-spike',
+                'snapshot': <String, dynamic>{
+                  'exited': true,
+                  'size': <String, dynamic>{'rows': 24, 'cols': 100},
+                },
+              },
+            },
+          },
+        });
+        await tester.pumpAndSettle();
+        expect(pane.terminal.cursorVisible, isFalse);
+
+        // 6. `session_terminated` arriving while an on-demand session load is
+        // in flight cancels cleanly without post-load resizing or painting load failed.
+        final blockedAttach = Completer<Map<String, dynamic>>();
+        client.attachCompleters['main'] = blockedAttach;
+        await tester.tap(find.text('triage / main').first);
+        await tester.pump();
+        final mainResizesWhileLive = client.resizeSessionCalls
+            .where((c) => c.startsWith('main:'))
+            .length;
+        client._testEventController.add(<String, dynamic>{
+          'type': 'session_terminated',
+          'session_id': 'main',
+        });
+        await tester.pump();
+        blockedAttach.complete(<String, dynamic>{
+          'subscription_id': 'sub-main-late',
+          'snapshot': <String, dynamic>{
+            'exited': false,
+            'bracketed_paste_enabled': true,
+            'size': <String, dynamic>{'rows': 24, 'cols': 80},
+          },
+        });
+        await tester.pumpAndSettle();
+        client.attachCompleters.remove('main');
+        expect(find.text('triage / main'), findsNothing);
+        expect(
+          client.resizeSessionCalls.where((c) => c.startsWith('main:')).length,
+          equals(mainResizesWhileLive),
+        );
+
+        // 7. `session_terminated` arriving for an already-loaded selected session
+        // during reconnect must still advance `_connectionStatus` to Connected.
+        final blockedReconnect = Completer<Map<String, dynamic>>();
+        client.attachCompleters['websocket-session-api'] = blockedReconnect;
+        await client.emitSocketClosed();
+        await tester.pump(const Duration(seconds: 2));
+        await tester.pump();
+        expect(find.textContaining('Loading '), findsOneWidget);
+        client._testEventController.add(<String, dynamic>{
+          'type': 'session_terminated',
+          'session_id': 'websocket-session-api',
+        });
+        await tester.pump();
+        blockedReconnect.complete(<String, dynamic>{
+          'subscription_id': 'sub-ws-api-late',
+          'snapshot': <String, dynamic>{
+            'exited': false,
+            'bracketed_paste_enabled': true,
+            'size': <String, dynamic>{'rows': 24, 'cols': 80},
+          },
+        });
+        await tester.pumpAndSettle();
+        client.attachCompleters.remove('websocket-session-api');
+        expect(find.text('Connected to Daemon'), findsOneWidget);
+        expect(find.textContaining('Loading '), findsNothing);
       },
     );
   });

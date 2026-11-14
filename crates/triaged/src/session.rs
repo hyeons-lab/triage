@@ -3928,10 +3928,6 @@ fn spawn_adopted_pty_runtime(
     set_private_file_permissions(&target_log_path);
 
     let scrollback = crate::scrollback::open_journal_for_log(&target_log_path);
-    let mut mode_tracker = triage_term::TerminalModeTracker::new();
-    if let Some(modes) = h_sess.terminal_modes.as_ref() {
-        mode_tracker.restore_handover_modes(modes);
-    }
     let mut output = OutputState {
         log: log.try_clone().context("cloning restored session log")?,
         log_path: target_log_path,
@@ -3943,7 +3939,7 @@ fn spawn_adopted_pty_runtime(
         active_segment_bytes,
         compression_tx: None,
         terminal,
-        mode_tracker,
+        mode_tracker: triage_term::TerminalModeTracker::new(),
         cwd_sequence_buffer: Vec::new(),
         bytes_logged: h_sess.bytes_logged,
         output_seq: h_sess.output_seq,
@@ -3959,20 +3955,59 @@ fn spawn_adopted_pty_runtime(
         pending_escape_buffer: Vec::new(),
         scrollback: Some(scrollback),
         scroll_seq_baseline: None,
-        journal_clear_floor: 0,
+        journal_clear_floor: h_sess
+            .terminal_modes
+            .as_ref()
+            .map_or(0, |m| m.journal_clear_floor),
+        unjournaled_trimmed_top_rows: h_sess
+            .terminal_modes
+            .as_ref()
+            .map_or(0, |m| m.unjournaled_trimmed_top_rows),
         mirrored_journal_records: 0,
+        row_journal_counts: VecDeque::new(),
+        saved_alt_logical_journal_counts: None,
         prev_top_stable: None,
+        pending_alt_resize_reanchor: false,
     };
 
     let (replay_len, replay) = read_replay_tail(&h_sess.log_path)?;
+    if replay_len > replay.len() as u64
+        && let Some(modes) = h_sess.terminal_modes.as_ref()
+    {
+        let raw_start = replay_len.saturating_sub(replay.len() as u64);
+        let trimmed = trim_incomplete_replay_tail(&replay);
+        let inferred = triage_term::infer_initial_replay_modes(trimmed, modes);
+        let has_primary_scrolls_before_alt_exit =
+            inferred.first_alt_exit_offset.is_some_and(|off| {
+                output.scrollback.as_mut().is_some_and(|j| {
+                    j.is_enabled()
+                        && j.count_records_after_log_offset(raw_start)
+                            > j.count_records_after_log_offset(
+                                raw_start.saturating_add(off as u64).saturating_add(1),
+                            )
+                })
+            });
+        let initial_alt = if has_primary_scrolls_before_alt_exit {
+            false
+        } else {
+            inferred.in_alt_screen
+        };
+        let (initial_auto_wrap, initial_origin) = inferred.modes_for_screen(initial_alt);
+        if initial_alt {
+            output.mode_tracker.set_in_alt_screen(true);
+            output.terminal.advance_bytes(b"\x1b[?47h");
+        }
+        if !initial_auto_wrap {
+            output.terminal.advance_bytes(b"\x1b[?7l");
+        }
+        if initial_origin {
+            output.terminal.advance_bytes(b"\x1b[?6h");
+        }
+    }
     let replayed_working_directory = if replay_len == 0 {
         None
     } else {
         let cwd = output.replay_tail(replay_len, &replay)?;
-        let replay_writes = replay_gate.dropped_write_count();
-        let replay_flushes = replay_gate.dropped_flush_count();
-        output.terminal.advance_bytes(b"\x1b[c");
-        replay_gate.wait_for_dropped_activity_quiet_after(replay_writes, replay_flushes)?;
         output.output_seq = h_sess.output_seq;
         // The replay restored the sequences as if every byte were logged;
         // adoption must keep the outgoing daemon's persistence watermarks,
@@ -3981,6 +4016,27 @@ fn spawn_adopted_pty_runtime(
         output.logged_tail_bytes = h_sess.logged_tail_bytes().min(output.bytes_logged);
         cwd
     };
+    if let Some(modes) = h_sess.terminal_modes.as_ref() {
+        output.mode_tracker.restore_handover_modes(modes);
+        triage_term::apply_handover_modes_to_terminal(&mut output.terminal, modes);
+        if output.terminal.is_alt_screen_active() {
+            output.pending_alt_resize_reanchor = true;
+        } else if output.pending_alt_resize_reanchor {
+            let screen = output.terminal.screen();
+            let in_mem = screen.phys_row(0) as u64;
+            if screen.phys_to_stable_row_index(0) > 0 {
+                output.mirrored_journal_records = output.mirrored_journal_records.min(in_mem);
+            }
+            output.seed_row_journal_counts_from_mirrored();
+            output.pending_alt_resize_reanchor = false;
+        }
+    }
+    if replay_len > 0 || h_sess.terminal_modes.is_some() {
+        let replay_writes = replay_gate.dropped_write_count();
+        let replay_flushes = replay_gate.dropped_flush_count();
+        output.terminal.advance_bytes(b"\x1b[c");
+        replay_gate.wait_for_dropped_activity_quiet_after(replay_writes, replay_flushes)?;
+    }
     replay_gate.enable(master.take_writer().context("taking PTY writer")?)?;
     let foreground_pgid = pty_foreground_pgid(fd);
     let current_working_directory = adopted_session_cwd(
@@ -3991,7 +4047,7 @@ fn spawn_adopted_pty_runtime(
     );
     if is_interactive_shell_launch(&h_sess.command, &h_sess.args)
         && foreground_pgid == Some(h_sess.pid)
-        && output.terminal.is_mouse_grabbed()
+        && output.is_mouse_grabbed()
     {
         let _ = output.ingest(MOUSE_TRACKING_RESET_BYTES);
     }
@@ -5584,12 +5640,7 @@ impl SessionApi for SessionManager {
             .with_context(|| format!("session {} not found", request.session_id))?;
 
         match session {
-            ManagedSession::Live {
-                actor,
-                lease,
-                launch,
-                ..
-            } => {
+            ManagedSession::Live { actor, lease, .. } => {
                 if let Some(kind) = request.mode.controller_kind() {
                     self.grant_input_lease_and_flush(
                         &request.session_id,
@@ -5602,23 +5653,23 @@ impl SessionApi for SessionManager {
                 let lease_out = lease.clone();
                 let cmd_tx = actor.tx.clone();
                 let resize_to = if request.resize_pty {
-                    request.size.filter(|sz| *sz != launch.size)
+                    request.size
                 } else {
                     None
                 };
                 drop(sessions);
 
-                let cursor_in = std::mem::take(cursor);
+                let cursor_in = cursor.clone();
                 let (snapshot, updated_cursor, frame) =
                     request_sync_terminal(&cmd_tx, resize_to.clone(), cursor_in, force_full)?;
                 *cursor = updated_cursor;
 
-                if let Some(new_size) = resize_to
+                if resize_to.is_some()
                     && let Ok(mut sessions) = self.sessions()
                     && let Some(ManagedSession::Live { launch, .. }) =
                         sessions.get_mut(&request.session_id)
                 {
-                    launch.size = new_size;
+                    launch.size = snapshot.size.clone();
                 }
 
                 let snapshot = self.overlay_manager_fields(snapshot, &request.session_id);
@@ -5668,7 +5719,7 @@ impl SessionApi for SessionManager {
         match target {
             PollTarget::Ready(outcome) => Ok(outcome),
             PollTarget::Live(cmd_tx) => {
-                let cursor_in = std::mem::take(cursor);
+                let cursor_in = cursor.clone();
                 let (updated_cursor, outcome) =
                     request_poll_terminal_sync(&cmd_tx, cursor_in, force_full)?;
                 *cursor = updated_cursor;
@@ -5684,7 +5735,7 @@ impl SessionApi for SessionManager {
         let clamped_count = request.row_count.min(512);
         enum FetchTarget {
             Live(Sender<ActorCommand>),
-            Ready(FetchTerminalRowsResponse),
+            Historical(Box<PreparedHistoricalScrollbackFetch>),
         }
 
         let target = {
@@ -5694,13 +5745,13 @@ impl SessionApi for SessionManager {
                 .with_context(|| format!("session {} not found", request.session_id))?;
             match session {
                 ManagedSession::Live { actor, .. } => FetchTarget::Live(actor.tx.clone()),
-                ManagedSession::Historical { session, .. } => {
-                    FetchTarget::Ready(session.output.fetch_scrollback_rows(
+                ManagedSession::Historical { session, .. } => FetchTarget::Historical(Box::new(
+                    session.output.prepare_historical_scrollback_fetch(
                         request.session_id.clone(),
                         request.start_row,
                         clamped_count,
-                    ))
-                }
+                    ),
+                )),
                 ManagedSession::Restoring { .. } => {
                     bail!("session {} is being restored", request.session_id)
                 }
@@ -5708,7 +5759,7 @@ impl SessionApi for SessionManager {
         };
 
         match target {
-            FetchTarget::Ready(resp) => Ok(resp),
+            FetchTarget::Historical(prepared) => Ok(prepared.finish()),
             FetchTarget::Live(cmd_tx) => request_fetch_terminal_rows(
                 &cmd_tx,
                 request.session_id,
@@ -6586,7 +6637,7 @@ fn next_session_sequence<'a>(sessions: impl Iterator<Item = &'a SessionId>) -> u
 }
 
 const MOUSE_TRACKING_RESET_BYTES: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1005l\x1b[?1015l";
+    b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1005l\x1b[?1015l\x1b[?1016l";
 
 const WAKE_NUDGE_COOLDOWN: Duration = Duration::from_secs(5);
 const WAKE_ACTOR_TIMEOUT: Duration = Duration::from_secs(2);
@@ -6621,12 +6672,30 @@ fn is_interactive_shell_launch(command: &str, args: &[String]) -> bool {
 }
 
 fn contains_mouse_tracking_enable(bytes: &[u8]) -> bool {
-    find_bytes(bytes, b"\x1b[?1000h").is_some()
-        || find_bytes(bytes, b"\x1b[?1002h").is_some()
-        || find_bytes(bytes, b"\x1b[?1003h").is_some()
+    let mut tracker = triage_term::TerminalModeTracker::new();
+    let _ = tracker.observe_and_sanitize(bytes, 80);
+    tracker.mouse_mode() != 0
 }
 
-/// Parses one or more concatenated SGR (`ESC [ < Cb ; Cx ; Cy M/m`) or X10
+fn decode_one_utf8_scalar(slice: &[u8]) -> Option<(u32, usize)> {
+    let &lead = slice.first()?;
+    let len = match lead {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    if slice.len() < len {
+        return None;
+    }
+    let s = std::str::from_utf8(&slice[..len]).ok()?;
+    let ch = s.chars().next()?;
+    Some((ch as u32, len))
+}
+
+/// Parses one or more concatenated SGR (`ESC [ < Cb ; Cx ; Cy M/m`), urxvt
+/// (`ESC [ Cb ; Cx ; Cy M`), UTF-8 (`ESC [ M` + 3 UTF-8 codepoints), or X10
 /// (`ESC [ M Cb Cx Cy`) mouse report sequences. Returns `Some(true)` if the
 /// entire slice consists of hover-only motion reports (no button pressed and
 /// not a wheel event), `Some(false)` if it consists of mouse reports that
@@ -6671,15 +6740,80 @@ fn parse_mouse_reports(bytes: &[u8]) -> Option<bool> {
             if !is_hover {
                 all_hover_motion_only = false;
             }
-        } else if bytes[i..].starts_with(b"\x1b[M") && i + 6 <= bytes.len() {
-            let cb = bytes[i + 3];
-            let cx = bytes[i + 4];
-            let cy = bytes[i + 5];
-            if cb < 32 || cx < 32 || cy < 32 {
+        } else if bytes[i..].starts_with(b"\x1b[M") {
+            let mut utf8_parsed = None;
+            let mut cur = i + 3;
+            if let Some((cp0, n0)) = decode_one_utf8_scalar(&bytes[cur..]) {
+                cur += n0;
+                if let Some((cp1, n1)) = decode_one_utf8_scalar(&bytes[cur..]) {
+                    cur += n1;
+                    if let Some((cp2, n2)) = decode_one_utf8_scalar(&bytes[cur..]) {
+                        cur += n2;
+                        if (32..=287).contains(&cp0)
+                            && cp1 >= 32
+                            && cp2 >= 32
+                            && (cur == bytes.len() || bytes[cur..].starts_with(b"\x1b["))
+                        {
+                            utf8_parsed = Some((cp0 - 32, cur));
+                        }
+                    }
+                }
+            }
+            if let Some((button, next_i)) = utf8_parsed {
+                i = next_i;
+                let is_hover = (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
+                if !is_hover {
+                    all_hover_motion_only = false;
+                }
+            } else if i + 6 <= bytes.len() {
+                let cb = bytes[i + 3];
+                let cx = bytes[i + 4];
+                let cy = bytes[i + 5];
+                if cb < 32 || cx < 32 || cy < 32 {
+                    return None;
+                }
+                i += 6;
+                let button = (cb - 32) as u32;
+                let is_hover = (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
+                if !is_hover {
+                    all_hover_motion_only = false;
+                }
+            } else {
                 return None;
             }
-            i += 6;
-            let button = (cb - 32) as u32;
+        } else if bytes[i..].starts_with(b"\x1b[")
+            && bytes.get(i + 2).is_some_and(|b| b.is_ascii_digit())
+        {
+            i += 2;
+            let mut params = [0u32; 3];
+            for (param_idx, slot) in params.iter_mut().enumerate() {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    *slot = slot
+                        .checked_mul(10)?
+                        .checked_add((bytes[i] - b'0') as u32)?;
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                if param_idx < 2 {
+                    if i >= bytes.len() || bytes[i] != b';' {
+                        return None;
+                    }
+                    i += 1;
+                }
+            }
+            if i >= bytes.len()
+                || bytes[i] != b'M'
+                || params[0] < 32
+                || params[1] < 1
+                || params[2] < 1
+            {
+                return None;
+            }
+            i += 1;
+            let button = params[0] - 32;
             let is_hover = (button & 32) != 0 && (button & 3) == 3 && (button & 64) == 0;
             if !is_hover {
                 all_hover_motion_only = false;
@@ -7027,7 +7161,7 @@ impl HistoricalSession {
 
     fn history_coordinates(&self) -> SessionHistoryCoordinates {
         let is_alt_screen_active = self.output.terminal.is_alt_screen_active();
-        let is_mouse_grabbed = self.output.terminal.is_mouse_grabbed();
+        let is_mouse_grabbed = self.output.is_mouse_grabbed();
         let total_rows = self.output.terminal.screen().scrollback_rows();
         let styled_rows_start = total_rows.saturating_sub(self.size.rows);
         let styled_rows =
@@ -7536,12 +7670,26 @@ struct OutputState {
     /// Monotonic `ScrollbackJournal` floor set on live `CSI 3J` so client
     /// scrollback clears cleanly while preserving raw journal segments on disk.
     journal_clear_floor: u64,
+    /// Cumulative count of unjournaled scrollback rows evicted from the top of
+    /// `terminal`'s ring buffer since open or the most recent `CSI 3J`/`ESC c`.
+    unjournaled_trimmed_top_rows: u64,
     /// Number of active `ScrollbackJournal` records currently mirrored inside
-    /// `terminal`'s in-memory scrollback (`0..phys_row(0)`).
+    /// `terminal`'s primary screen (`0..scrollback_rows()`).
     mirrored_journal_records: u64,
+    /// Per-physical-row count of active `ScrollbackJournal` records represented
+    /// in `terminal`'s primary screen so height growth, column reflow, and ring
+    /// eviction keep `mirrored_journal_records` exact without double-journaling.
+    row_journal_counts: VecDeque<u32>,
+    /// Logical-line journal counts captured immediately before entering the
+    /// alternate screen so resizes during alt-screen map back onto primary rows.
+    saved_alt_logical_journal_counts: Option<Vec<u32>>,
     /// Previous `screen.phys_to_stable_row_index(0)` used to count top-of-ring
     /// scrollback evictions inside `terminal`.
     prev_top_stable: Option<StableRowIndex>,
+    /// Set when the primary screen must re-anchor `mirrored_journal_records`,
+    /// `prev_top_stable`, and `scroll_seq_baseline` on the next exit from the
+    /// alternate screen (after an alt-screen resize or tail replay ending in alt).
+    pending_alt_resize_reanchor: bool,
 }
 
 /// Visible rows + output sequence + git context + cwd, returned by the actor's
@@ -7778,12 +7926,19 @@ impl ActorState {
             .or_else(|| self.child.process_id())
             .ok_or_else(|| anyhow!("Child process has no process ID"))?;
 
-        let current_title = self.output.terminal.get_title().to_owned();
-        let terminal_modes = Some(
-            self.output
-                .mode_tracker
-                .export_handover_modes(&current_title),
-        );
+        const MAX_HANDOVER_TITLE_BYTES: usize = 4096;
+        let mut modes = self
+            .output
+            .mode_tracker
+            .export_handover_modes(&self.output.terminal);
+        modes.journal_clear_floor = self.output.journal_clear_floor;
+        modes.unjournaled_trimmed_top_rows = self.output.unjournaled_trimmed_top_rows;
+        if modes.title.len() > MAX_HANDOVER_TITLE_BYTES {
+            modes
+                .title
+                .truncate(modes.title.floor_char_boundary(MAX_HANDOVER_TITLE_BYTES));
+        }
+        let terminal_modes = Some(modes);
 
         Ok(ExtractedHandover {
             // Safety: `dup_cloexec` just produced this descriptor and no other owner
@@ -7975,7 +8130,7 @@ impl ActorState {
         if self.exited || self.output_closed {
             return;
         }
-        if self.output.terminal.is_mouse_grabbed() && self.is_root_shell_in_foreground() {
+        if self.output.is_mouse_grabbed() && self.is_root_shell_in_foreground() {
             self.emit_mouse_tracking_reset();
         }
         if let Some(cwd) = self.poll_child_cwd() {
@@ -8034,7 +8189,7 @@ impl ActorState {
     }
 
     fn emit_mouse_tracking_reset(&mut self) {
-        if !self.output.terminal.is_mouse_grabbed() {
+        if !self.output.is_mouse_grabbed() {
             return;
         }
         if let Err(error) = self.output.ingest(MOUSE_TRACKING_RESET_BYTES) {
@@ -8051,7 +8206,7 @@ impl ActorState {
     }
 
     fn reset_stale_mouse_tracking_after_output(&mut self, bytes: &[u8]) {
-        if !self.output.terminal.is_mouse_grabbed() {
+        if !self.output.is_mouse_grabbed() {
             return;
         }
         let root_shell_foreground = self.is_root_shell_in_foreground();
@@ -8281,7 +8436,10 @@ impl ActorState {
                     TerminalSyncFrame,
                 )> {
                     if let Some(size) = resize {
-                        let _ = self.resize(size)?;
+                        size.validate()?;
+                        if !self.exited && size != self.size {
+                            self.resize_for_sync_terminal(size);
+                        }
                     }
                     let snapshot = self.metadata_snapshot();
                     let frame = self.output.build_sync_frame(&mut cursor, force_full);
@@ -8331,7 +8489,7 @@ impl ActorState {
         let mut is_hover_motion = false;
         if is_mouse_report_sequence(&bytes) {
             if self.is_root_shell_in_foreground() {
-                if self.output.terminal.is_mouse_grabbed() {
+                if self.output.is_mouse_grabbed() {
                     self.emit_mouse_tracking_reset();
                 }
                 return;
@@ -8402,19 +8560,37 @@ impl ActorState {
                 .resize(pty_size(&size))
                 .context("resizing PTY")?;
         }
+        Ok(self.apply_terminal_resize_and_broadcast(size))
+    }
+
+    fn resize_for_sync_terminal(&mut self, size: SessionSize) {
+        if let Err(error) = self.master.resize(pty_size(&size)) {
+            tracing::debug!(
+                session_id = ?self.event_session_id,
+                error = ?error,
+                "ignoring PTY resize failure during SyncTerminal; child PTY may have closed"
+            );
+        }
+        let _ = self.apply_terminal_resize_and_broadcast(size);
+    }
+
+    fn apply_terminal_resize_and_broadcast(&mut self, size: SessionSize) -> SessionSnapshot {
         // `wezterm_term::Terminal::resize` rewraps soft-wrapped lines in place on
         // the primary screen (`Screen::rewrap_lines`) and resizes the alternate
         // screen in memory without reading or re-emulating the 16 MiB session log.
+        let resized = size.cols != self.size.cols || size.rows != self.size.rows;
+        let pre_logical = (resized && !self.output.terminal.is_alt_screen_active())
+            .then(|| self.output.snapshot_logical_journal_counts());
         triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut self.output.terminal);
         self.output.terminal.resize(terminal_size(&size));
-        if size.cols != self.size.cols || size.rows != self.size.rows {
+        if resized {
             self.output.scroll_seq_baseline = None;
-            if !self.output.terminal.is_alt_screen_active() {
-                let screen = self.output.terminal.screen();
-                self.output.prev_top_stable = Some(screen.phys_to_stable_row_index(0));
-                if screen.phys_row(0) == 0 {
-                    self.output.mirrored_journal_records = 0;
-                }
+            if let Some(logical_counts) = pre_logical {
+                self.output
+                    .reanchor_journal_counts_from_logical(&logical_counts);
+                self.output.pending_alt_resize_reanchor = false;
+            } else {
+                self.output.pending_alt_resize_reanchor = true;
             }
         }
         self.size = size;
@@ -8425,7 +8601,7 @@ impl ActorState {
                 snapshot: snapshot.clone(),
             });
         }
-        Ok(snapshot)
+        snapshot
     }
 
     fn snapshot(&self) -> SessionSnapshot {
@@ -8450,7 +8626,7 @@ impl ActorState {
 
     fn history_coordinates(&self) -> SessionHistoryCoordinates {
         let is_alt_screen_active = self.output.terminal.is_alt_screen_active();
-        let is_mouse_grabbed = self.output.terminal.is_mouse_grabbed();
+        let is_mouse_grabbed = self.output.is_mouse_grabbed();
         let total_rows = self.output.terminal.screen().scrollback_rows();
         let styled_rows_start = total_rows.saturating_sub(self.size.rows);
         let styled_rows =
@@ -8957,23 +9133,87 @@ fn trim_incomplete_replay_tail(bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+const ROW_ALREADY_JOURNALED_BIT: u32 = 1 << 31;
+const ROW_JOURNAL_COUNT_MASK: u32 = !(1 << 31);
+
 impl OutputState {
+    fn is_mouse_grabbed(&self) -> bool {
+        self.terminal.is_mouse_grabbed() || self.mode_tracker.mouse_mode() != 0
+    }
+
     fn feed_terminal_bytes(&mut self, bytes: &[u8], live_ingest: bool) {
         if bytes.is_empty() {
             return;
         }
         let cols = self.terminal.screen().physical_cols;
-        let prev_erase_gen = self.mode_tracker.erase_scrollback_gen();
-        let sanitized = self.mode_tracker.observe_and_sanitize(bytes, cols);
-        self.terminal.advance_bytes(sanitized);
-        if live_ingest && self.mode_tracker.erase_scrollback_gen() != prev_erase_gen {
-            let journal_next = self
-                .scrollback
-                .as_ref()
-                .map_or(0, crate::scrollback::ScrollbackJournal::next_seq);
-            self.journal_clear_floor = journal_next;
-            self.mirrored_journal_records = 0;
-            self.prev_top_stable = Some(self.terminal.screen().phys_to_stable_row_index(0));
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let was_alt = self.terminal.is_alt_screen_active();
+            let (sanitized, consumed, cleared) = self
+                .mode_tracker
+                .observe_and_sanitize_until_scrollback_clear(&bytes[pos..], cols);
+            if !sanitized.is_empty() {
+                if live_ingest && !was_alt {
+                    let split = sanitized.len() - 1;
+                    let tail_byte = [sanitized[split]];
+                    if split > 0 {
+                        self.terminal.advance_bytes(&sanitized[..split]);
+                    }
+                    if self.mode_tracker.in_alt_screen() {
+                        self.journal_scrolled_lines();
+                        self.saved_alt_logical_journal_counts =
+                            Some(self.snapshot_logical_journal_counts());
+                        triage_term::prevent_trailing_wrapped_line_drop_on_resize(
+                            &mut self.terminal,
+                        );
+                    }
+                    self.terminal.advance_bytes(tail_byte);
+                } else {
+                    self.terminal.advance_bytes(sanitized);
+                }
+            }
+            if consumed == 0 {
+                break;
+            }
+            pos += consumed;
+
+            if live_ingest && cleared {
+                let journal_next = self
+                    .scrollback
+                    .as_ref()
+                    .map_or(0, crate::scrollback::ScrollbackJournal::next_seq);
+                self.journal_clear_floor = journal_next;
+                self.unjournaled_trimmed_top_rows = 0;
+                self.mirrored_journal_records = 0;
+                self.row_journal_counts.clear();
+                self.saved_alt_logical_journal_counts = None;
+                self.pending_alt_resize_reanchor = false;
+                let screen = self.terminal.screen();
+                self.prev_top_stable = Some(screen.phys_to_stable_row_index(0));
+                self.scroll_seq_baseline = Some(screen.visible_row_to_stable_row(0));
+            } else if !self.terminal.is_alt_screen_active() {
+                if self.pending_alt_resize_reanchor {
+                    if let Some(logical_counts) = self.saved_alt_logical_journal_counts.take() {
+                        self.reanchor_journal_counts_from_logical(&logical_counts);
+                    } else {
+                        let screen = self.terminal.screen();
+                        let in_mem = screen.phys_row(0) as u64;
+                        if screen.phys_to_stable_row_index(0) > 0 {
+                            self.mirrored_journal_records =
+                                self.mirrored_journal_records.min(in_mem);
+                        }
+                        self.seed_row_journal_counts_from_mirrored();
+                    }
+                    if live_ingest {
+                        self.scroll_seq_baseline =
+                            Some(self.terminal.screen().visible_row_to_stable_row(0));
+                    }
+                    self.pending_alt_resize_reanchor = false;
+                } else if live_ingest && was_alt {
+                    self.saved_alt_logical_journal_counts = None;
+                    self.init_scroll_baseline();
+                }
+            }
         }
     }
 
@@ -9338,21 +9578,22 @@ impl OutputState {
     /// never calls this, so the first *live* chunk anchors onto the
     /// rebuilt window instead of re-journaling persisted lines.
     fn init_scroll_baseline(&mut self) {
+        if self.terminal.is_alt_screen_active() {
+            return;
+        }
+        if self.prev_top_stable.is_none() {
+            self.prev_top_stable = Some(self.terminal.screen().phys_to_stable_row_index(0));
+        }
         if self.scroll_seq_baseline.is_some()
             || self
                 .scrollback
                 .as_ref()
                 .is_none_or(crate::scrollback::ScrollbackJournal::is_disabled)
-            || self.terminal.is_alt_screen_active()
         {
             return;
         }
-        let screen = self.terminal.screen();
-        let first_visible = screen.visible_row_to_stable_row(0);
+        let first_visible = self.terminal.screen().visible_row_to_stable_row(0);
         self.scroll_seq_baseline = Some(first_visible);
-        if self.prev_top_stable.is_none() {
-            self.prev_top_stable = Some(screen.phys_to_stable_row_index(0));
-        }
     }
 
     /// Journal lines that scrolled into scrollback during this chunk.
@@ -9371,12 +9612,210 @@ impl OutputState {
     /// their records: history is a record, not a mirror. Restore and
     /// reflow replay through `advance_replayed_bytes`, which never calls
     /// this, so rebuilt terminals cannot double-journal persisted lines.
+    fn sync_row_journal_evictions(&mut self) {
+        if self.terminal.is_alt_screen_active() {
+            return;
+        }
+        let journal_active = self
+            .scrollback
+            .as_ref()
+            .is_some_and(crate::scrollback::ScrollbackJournal::is_enabled);
+        let screen = self.terminal.screen();
+        let top = screen.phys_to_stable_row_index(0);
+        if let Some(prev) = self.prev_top_stable {
+            let delta_evicted = (top - prev).max(0) as usize;
+            for _ in 0..delta_evicted {
+                if let Some(raw_c) = self.row_journal_counts.pop_front() {
+                    let count = raw_c & ROW_JOURNAL_COUNT_MASK;
+                    let was_journaled = (raw_c & ROW_ALREADY_JOURNALED_BIT) != 0 || count > 0;
+                    if count > 0 {
+                        self.mirrored_journal_records = self
+                            .mirrored_journal_records
+                            .saturating_sub(u64::from(count));
+                    }
+                    if !was_journaled || !journal_active {
+                        self.unjournaled_trimmed_top_rows =
+                            self.unjournaled_trimmed_top_rows.saturating_add(1);
+                    }
+                } else {
+                    self.unjournaled_trimmed_top_rows =
+                        self.unjournaled_trimmed_top_rows.saturating_add(1);
+                }
+            }
+        }
+        self.prev_top_stable = Some(top);
+        let total_rows = screen.scrollback_rows();
+        if self.row_journal_counts.len() < total_rows {
+            self.row_journal_counts.resize(total_rows, 0);
+        } else if self.row_journal_counts.len() > total_rows {
+            let mut tail_carry = 0u64;
+            let mut tail_journaled = false;
+            while self.row_journal_counts.len() > total_rows {
+                let raw_c = self.row_journal_counts.pop_back().unwrap_or(0);
+                let c = raw_c & ROW_JOURNAL_COUNT_MASK;
+                tail_carry += u64::from(c);
+                tail_journaled |= (raw_c & ROW_ALREADY_JOURNALED_BIT) != 0 || c > 0;
+            }
+            if (tail_carry > 0 || tail_journaled)
+                && let Some(back) = self.row_journal_counts.back_mut()
+            {
+                let prev_c = u64::from(*back & ROW_JOURNAL_COUNT_MASK);
+                let new_c = (prev_c + tail_carry).min(u64::from(ROW_JOURNAL_COUNT_MASK)) as u32;
+                let bit = if (*back & ROW_ALREADY_JOURNALED_BIT) != 0 || tail_journaled || new_c > 0
+                {
+                    ROW_ALREADY_JOURNALED_BIT
+                } else {
+                    0
+                };
+                *back = new_c | bit;
+            }
+        }
+    }
+
+    fn snapshot_logical_journal_counts(&mut self) -> Vec<u32> {
+        self.sync_row_journal_evictions();
+        let total_rows = self.terminal.screen().scrollback_rows();
+        let mut logical = Vec::new();
+        let mut acc = 0u64;
+        let mut any_journaled = false;
+        self.terminal.screen().for_each_phys_line(|phys_idx, line| {
+            let raw_c = self.row_journal_counts.get(phys_idx).copied().unwrap_or(0);
+            let count = raw_c & ROW_JOURNAL_COUNT_MASK;
+            acc += u64::from(count);
+            any_journaled |= (raw_c & ROW_ALREADY_JOURNALED_BIT) != 0 || count > 0;
+            if !line.last_cell_was_wrapped() || phys_idx + 1 == total_rows {
+                let clamped = acc.min(u64::from(ROW_JOURNAL_COUNT_MASK)) as u32;
+                let bit = if any_journaled || clamped > 0 {
+                    ROW_ALREADY_JOURNALED_BIT
+                } else {
+                    0
+                };
+                logical.push(clamped | bit);
+                acc = 0;
+                any_journaled = false;
+            }
+        });
+        logical
+    }
+
+    fn reanchor_journal_counts_from_logical(&mut self, pre_logical: &[u32]) {
+        if self.terminal.is_alt_screen_active() {
+            return;
+        }
+        let total_rows = self.terminal.screen().scrollback_rows();
+        let mut post_spans: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut span_start = 0usize;
+        self.terminal.screen().for_each_phys_line(|phys_idx, line| {
+            if !line.last_cell_was_wrapped() || phys_idx + 1 == total_rows {
+                post_spans.push(span_start..phys_idx + 1);
+                span_start = phys_idx + 1;
+            }
+        });
+
+        self.row_journal_counts.clear();
+        self.row_journal_counts.resize(total_rows, 0);
+        for (idx, span) in post_spans.iter().enumerate() {
+            let raw_entry = pre_logical.get(idx).copied().unwrap_or(0);
+            let count = u64::from(raw_entry & ROW_JOURNAL_COUNT_MASK);
+            let was_journaled = (raw_entry & ROW_ALREADY_JOURNALED_BIT) != 0 || count > 0;
+            if was_journaled && !span.is_empty() {
+                let m = span.len() as u64;
+                let base = count / m;
+                let rem = (count % m) as usize;
+                for (offset, phys_idx) in span.clone().enumerate() {
+                    let v = (base + u64::from(offset < rem)).min(u64::from(ROW_JOURNAL_COUNT_MASK))
+                        as u32;
+                    self.row_journal_counts[phys_idx] = v | ROW_ALREADY_JOURNALED_BIT;
+                }
+            }
+        }
+        if pre_logical.len() > post_spans.len() {
+            let mut carry = 0u64;
+            let mut carry_journaled = false;
+            for &raw_c in &pre_logical[post_spans.len()..] {
+                let c = raw_c & ROW_JOURNAL_COUNT_MASK;
+                carry += u64::from(c);
+                carry_journaled |= (raw_c & ROW_ALREADY_JOURNALED_BIT) != 0 || c > 0;
+            }
+            if (carry > 0 || carry_journaled)
+                && let Some(back) = self.row_journal_counts.back_mut()
+            {
+                let prev_c = u64::from(*back & ROW_JOURNAL_COUNT_MASK);
+                let new_c = (prev_c + carry).min(u64::from(ROW_JOURNAL_COUNT_MASK)) as u32;
+                let bit =
+                    if (*back & ROW_ALREADY_JOURNALED_BIT) != 0 || carry_journaled || new_c > 0 {
+                        ROW_ALREADY_JOURNALED_BIT
+                    } else {
+                        0
+                    };
+                *back = new_c | bit;
+            }
+        }
+        self.mirrored_journal_records = self
+            .row_journal_counts
+            .iter()
+            .map(|&c| u64::from(c & ROW_JOURNAL_COUNT_MASK))
+            .sum();
+        self.prev_top_stable = Some(self.terminal.screen().phys_to_stable_row_index(0));
+    }
+
+    fn seed_row_journal_counts_from_mirrored(&mut self) {
+        if self.terminal.is_alt_screen_active() {
+            return;
+        }
+        let mirrored = self.mirrored_journal_records;
+        let (total_rows, in_mem, top) = {
+            let screen = self.terminal.screen();
+            (
+                screen.scrollback_rows(),
+                screen.phys_row(0),
+                screen.phys_to_stable_row_index(0),
+            )
+        };
+        if top == 0
+            && mirrored > 0
+            && total_rows > 0
+            && let Some(logical) = self
+                .scrollback
+                .as_mut()
+                .and_then(|j| j.tail_logical_line_counts(mirrored))
+        {
+            self.reanchor_journal_counts_from_logical(&logical);
+            return;
+        }
+        self.row_journal_counts.clear();
+        self.row_journal_counts.resize(total_rows, 0);
+        if mirrored > 0 && total_rows > 0 {
+            if mirrored <= in_mem as u64 {
+                let m = mirrored as usize;
+                let start = in_mem - m;
+                for idx in start..in_mem {
+                    self.row_journal_counts[idx] = 1 | ROW_ALREADY_JOURNALED_BIT;
+                }
+            } else {
+                let span_len = (mirrored as usize).max(in_mem).max(1).min(total_rows);
+                let m = span_len as u64;
+                let base = mirrored / m;
+                let rem = (mirrored % m) as usize;
+                for idx in 0..span_len {
+                    let v =
+                        (base + u64::from(idx < rem)).min(u64::from(ROW_JOURNAL_COUNT_MASK)) as u32;
+                    self.row_journal_counts[idx] = v | ROW_ALREADY_JOURNALED_BIT;
+                }
+            }
+        }
+        self.prev_top_stable = Some(top);
+    }
+
     fn journal_scrolled_lines(&mut self) {
+        if self.terminal.is_alt_screen_active() {
+            return;
+        }
+        self.sync_row_journal_evictions();
         if self
             .scrollback
             .as_ref()
             .is_none_or(crate::scrollback::ScrollbackJournal::is_disabled)
-            || self.terminal.is_alt_screen_active()
         {
             return;
         }
@@ -9414,32 +9853,23 @@ impl OutputState {
             .terminal
             .screen()
             .lines_in_phys_range(phys_start..phys_end);
-        let appended_count = lines.len() as u64;
         let offset = self.bytes_logged;
-        if let Some(journal) = self.scrollback.as_mut() {
-            for mut line in lines {
+        for (idx, mut line) in lines.into_iter().enumerate() {
+            let phys_idx = phys_start + idx;
+            if self.row_journal_counts.get(phys_idx).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            if let Some(journal) = self.scrollback.as_mut() {
                 let bytes = crate::scrollback::encode_line(&mut line, &palette);
                 journal.append(offset, &bytes);
+                if journal.is_enabled() {
+                    if phys_idx < self.row_journal_counts.len() {
+                        self.row_journal_counts[phys_idx] = 1 | ROW_ALREADY_JOURNALED_BIT;
+                    }
+                    self.mirrored_journal_records = self.mirrored_journal_records.saturating_add(1);
+                }
             }
         }
-        if self
-            .scrollback
-            .as_ref()
-            .is_some_and(crate::scrollback::ScrollbackJournal::is_enabled)
-        {
-            if top > baseline {
-                self.mirrored_journal_records = appended_count;
-            } else {
-                let delta_evicted = self
-                    .prev_top_stable
-                    .map_or(0, |prev| (top - prev).max(0) as u64);
-                self.mirrored_journal_records = self
-                    .mirrored_journal_records
-                    .saturating_sub(delta_evicted)
-                    .saturating_add(appended_count);
-            }
-        }
-        self.prev_top_stable = Some(top);
         self.scroll_seq_baseline = Some(first_visible);
     }
 
@@ -9640,6 +10070,10 @@ impl OutputState {
     /// size, and [`read_raw_output_tail`] would then seek to the wrong offset and
     /// hand clients a misaligned history.
     fn replay_tail(&mut self, total_len: u64, tail: &[u8]) -> Result<Option<PathBuf>> {
+        let trimmed_tail = trim_incomplete_replay_tail(tail);
+        let last_clear_end = self
+            .mode_tracker
+            .last_scrollback_clear_end_in_raw_stream(trimmed_tail);
         let original_output_seq = self.output_seq;
         let current_working_directory = self.replay(tail)?;
         if total_len != tail.len() as u64 {
@@ -9655,20 +10089,43 @@ impl OutputState {
         self.mark_fully_persisted();
 
         let raw_start = total_len.saturating_sub(tail.len() as u64);
-        let in_mem = self.terminal.screen().phys_row(0) as u64;
-        self.prev_top_stable = Some(self.terminal.screen().phys_to_stable_row_index(0));
+        let ended_in_alt = self.terminal.is_alt_screen_active();
+        let ring_evicted_in_mem = if ended_in_alt {
+            None
+        } else {
+            let screen = self.terminal.screen();
+            let top = screen.phys_to_stable_row_index(0);
+            self.prev_top_stable = Some(top);
+            (top > 0).then(|| screen.phys_row(0) as u64)
+        };
+        if ended_in_alt {
+            self.pending_alt_resize_reanchor = true;
+        }
         if let Some(journal) = self.scrollback.as_mut()
             && journal.is_enabled()
         {
-            if let Some(last_clear_end) = find_last_csi_3j_end(tail) {
+            if let Some(last_clear_end) = last_clear_end {
                 let clear_offset = raw_start.saturating_add(last_clear_end as u64);
                 let after_clear = journal.count_records_after_log_offset(clear_offset);
-                self.journal_clear_floor = journal.next_seq().saturating_sub(after_clear);
-                self.mirrored_journal_records = after_clear.min(in_mem);
+                let tail_floor = journal.next_seq().saturating_sub(after_clear);
+                self.journal_clear_floor = self.journal_clear_floor.max(tail_floor);
+                let active_after_floor =
+                    journal.next_seq().saturating_sub(self.journal_clear_floor);
+                let capped = after_clear.min(active_after_floor);
+                self.mirrored_journal_records =
+                    ring_evicted_in_mem.map_or(capped, |rows| capped.min(rows));
             } else {
-                let tail_records = journal.count_records_after_log_offset(raw_start);
-                self.mirrored_journal_records = tail_records.min(in_mem);
+                let active_after_floor =
+                    journal.next_seq().saturating_sub(self.journal_clear_floor);
+                let tail_records = journal
+                    .count_records_after_log_offset(raw_start)
+                    .min(active_after_floor);
+                self.mirrored_journal_records =
+                    ring_evicted_in_mem.map_or(tail_records, |rows| tail_records.min(rows));
             }
+        }
+        if !ended_in_alt {
+            self.seed_row_journal_counts_from_mirrored();
         }
         Ok(current_working_directory)
     }
@@ -9679,7 +10136,11 @@ impl OutputState {
         self.terminal = terminal_with_writer(size, replay_writer);
         self.mode_tracker = triage_term::TerminalModeTracker::new();
         self.scroll_seq_baseline = None;
+        self.unjournaled_trimmed_top_rows = 0;
+        self.row_journal_counts.clear();
+        self.saved_alt_logical_journal_counts = None;
         self.prev_top_stable = None;
+        self.pending_alt_resize_reanchor = false;
         self.cwd_sequence_buffer.clear();
         self.pending_carriage_return = false;
         self.pending_escape_buffer.clear();
@@ -9730,7 +10191,8 @@ impl OutputState {
             _ => (0, 0),
         };
         let effective_floor = self.journal_clear_floor.max(first_retained);
-        let trimmed_top_rows = effective_floor.saturating_sub(self.journal_clear_floor);
+        let journal_trimmed = effective_floor.saturating_sub(self.journal_clear_floor);
+        let trimmed_top_rows = journal_trimmed.saturating_add(self.unjournaled_trimmed_top_rows);
         let active_journal_records = next_seq.saturating_sub(effective_floor);
         let clamped_mirrored = self.mirrored_journal_records.min(active_journal_records);
         let archived_prefix_count = active_journal_records.saturating_sub(clamped_mirrored);
@@ -9812,12 +10274,83 @@ impl OutputState {
         }
     }
 
+    fn prepare_historical_scrollback_fetch(
+        &mut self,
+        session_id: SessionId,
+        start_row: u64,
+        row_count: u32,
+    ) -> PreparedHistoricalScrollbackFetch {
+        if let Some(journal) = self.scrollback.as_mut() {
+            journal.flush_buffer();
+        }
+        let layout = self.scrollback_layout();
+        let erase_scrollback_gen = self.mode_tracker.erase_scrollback_gen();
+        if row_count == 0 || start_row >= layout.total_scrollback_rows {
+            return PreparedHistoricalScrollbackFetch::Empty(FetchTerminalRowsResponse {
+                session_id,
+                start_row: start_row.min(layout.total_scrollback_rows),
+                row_count: 0,
+                total_scrollback_rows: layout.total_scrollback_rows,
+                trimmed_top_rows: layout.trimmed_top_rows,
+                erase_scrollback_gen,
+                compression: triage_term::CELL_COMPRESSION_NONE,
+                payload: Vec::new(),
+            });
+        }
+
+        let clamped_count = u64::from(row_count)
+            .min(layout.total_scrollback_rows - start_row)
+            .min(512) as usize;
+        let end_row = start_row + clamped_count as u64;
+        let physical_cols = self.terminal.screen().physical_cols.max(1);
+        let journal_reader = if start_row < layout.archived_prefix_count {
+            self.scrollback
+                .as_ref()
+                .map(crate::scrollback::ScrollbackJournal::reader_clone)
+        } else {
+            None
+        };
+        let (in_mem_rel_base, in_mem_lines) = if end_row > layout.archived_prefix_count {
+            let mem_virt_start = start_row.max(layout.archived_prefix_count);
+            let phys_start = (mem_virt_start - layout.archived_prefix_count) as usize;
+            let phys_end = ((end_row - layout.archived_prefix_count) as usize)
+                .min(layout.in_mem_rows as usize);
+            let rel_base = (mem_virt_start - start_row) as u32;
+            let lines = if phys_start < phys_end {
+                self.terminal
+                    .screen()
+                    .lines_in_phys_range(phys_start..phys_end)
+            } else {
+                Vec::new()
+            };
+            (rel_base, lines)
+        } else {
+            (0, Vec::new())
+        };
+
+        PreparedHistoricalScrollbackFetch::Work(Box::new(PreparedHistoricalScrollbackWork {
+            session_id,
+            start_row,
+            clamped_count,
+            end_row,
+            layout,
+            erase_scrollback_gen,
+            physical_cols,
+            journal_reader,
+            in_mem_rel_base,
+            in_mem_lines,
+        }))
+    }
+
     fn fetch_scrollback_rows(
         &mut self,
         session_id: SessionId,
         start_row: u64,
         row_count: u32,
     ) -> FetchTerminalRowsResponse {
+        if let Some(journal) = self.scrollback.as_mut() {
+            journal.flush_buffer();
+        }
         let layout = self.scrollback_layout();
         let erase_scrollback_gen = self.mode_tracker.erase_scrollback_gen();
         if row_count == 0 || start_row >= layout.total_scrollback_rows {
@@ -9942,22 +10475,74 @@ struct ScrollbackLayout {
     total_scrollback_rows: u64,
 }
 
-fn find_last_csi_3j_end(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    let mut i = bytes.len() - 4;
-    loop {
-        if bytes[i] == 0x1b && bytes[i + 1] == b'[' && bytes[i + 2] == b'3' && bytes[i + 3] == b'J'
-        {
-            return Some(i + 4);
+struct PreparedHistoricalScrollbackWork {
+    session_id: SessionId,
+    start_row: u64,
+    clamped_count: usize,
+    end_row: u64,
+    layout: ScrollbackLayout,
+    erase_scrollback_gen: u64,
+    physical_cols: usize,
+    journal_reader: Option<crate::scrollback::ScrollbackJournal>,
+    in_mem_rel_base: u32,
+    in_mem_lines: Vec<tattoy_wezterm_surface::Line>,
+}
+
+enum PreparedHistoricalScrollbackFetch {
+    Empty(FetchTerminalRowsResponse),
+    Work(Box<PreparedHistoricalScrollbackWork>),
+}
+
+impl PreparedHistoricalScrollbackFetch {
+    fn finish(self) -> FetchTerminalRowsResponse {
+        match self {
+            Self::Empty(resp) => resp,
+            Self::Work(work) => {
+                let PreparedHistoricalScrollbackWork {
+                    session_id,
+                    start_row,
+                    clamped_count,
+                    end_row,
+                    layout,
+                    erase_scrollback_gen,
+                    physical_cols,
+                    mut journal_reader,
+                    in_mem_rel_base,
+                    in_mem_lines,
+                } = *work;
+                let mut builder =
+                    triage_term::Tcg1BatchBuilder::with_row_capacity(clamped_count, physical_cols);
+                if start_row < layout.archived_prefix_count {
+                    let arch_end = end_row.min(layout.archived_prefix_count);
+                    let arch_count = (arch_end - start_row) as usize;
+                    let start_seq = layout.effective_floor + start_row;
+                    if let Some(journal) = journal_reader.as_mut() {
+                        journal.pack_record_range(
+                            start_seq,
+                            arch_count,
+                            start_seq,
+                            physical_cols,
+                            &mut builder,
+                        );
+                    }
+                }
+                for (idx, line) in in_mem_lines.iter().enumerate() {
+                    builder.push_wezterm_line(in_mem_rel_base + idx as u32, line, physical_cols);
+                }
+                let encoded = builder.finish_encoded();
+                FetchTerminalRowsResponse {
+                    session_id,
+                    start_row,
+                    row_count: encoded.row_count,
+                    total_scrollback_rows: layout.total_scrollback_rows,
+                    trimmed_top_rows: layout.trimmed_top_rows,
+                    erase_scrollback_gen,
+                    compression: encoded.compression,
+                    payload: encoded.payload,
+                }
+            }
         }
-        if i == 0 {
-            break;
-        }
-        i -= 1;
     }
-    None
 }
 
 fn screen_cursor_to_baseline(c: TerminalScreenCursor) -> triage_term::ScreenBaseline {
@@ -10218,8 +10803,12 @@ fn spawn_pty_runtime(
                     scrollback: Some(scrollback),
                     scroll_seq_baseline: None,
                     journal_clear_floor: 0,
+                    unjournaled_trimmed_top_rows: 0,
                     mirrored_journal_records: 0,
+                    row_journal_counts: VecDeque::new(),
+                    saved_alt_logical_journal_counts: None,
                     prev_top_stable: None,
+                    pending_alt_resize_reanchor: false,
                 },
                 size: config.size,
                 current_working_directory: None,
@@ -10275,8 +10864,12 @@ fn spawn_pty_runtime(
                 scrollback: Some(scrollback),
                 scroll_seq_baseline: None,
                 journal_clear_floor: 0,
+                unjournaled_trimmed_top_rows: 0,
                 mirrored_journal_records: 0,
+                row_journal_counts: VecDeque::new(),
+                saved_alt_logical_journal_counts: None,
                 prev_top_stable: None,
+                pending_alt_resize_reanchor: false,
             };
             let (replay_len, replay) = read_replay_tail(&config.log_path)?;
             let replayed_working_directory = if replay_len == 0 {
@@ -10285,7 +10878,7 @@ fn spawn_pty_runtime(
                 output.replay_tail(replay_len, &replay)?
             };
             if is_interactive_shell_launch(&config.command, &config.args)
-                && output.terminal.is_mouse_grabbed()
+                && output.is_mouse_grabbed()
             {
                 let _ = output.ingest(MOUSE_TRACKING_RESET_BYTES);
             }
@@ -10412,8 +11005,12 @@ fn output_state_for_log(log_path: &PathBuf, size: SessionSize) -> Result<OutputS
         scrollback: Some(scrollback),
         scroll_seq_baseline: None,
         journal_clear_floor: 0,
+        unjournaled_trimmed_top_rows: 0,
         mirrored_journal_records: 0,
+        row_journal_counts: VecDeque::new(),
+        saved_alt_logical_journal_counts: None,
         prev_top_stable: None,
+        pending_alt_resize_reanchor: false,
     })
 }
 
@@ -10744,7 +11341,7 @@ fn output_snapshot_with_history(
     history_cap: u64,
 ) -> SessionSnapshot {
     let is_alt = output.terminal.is_alt_screen_active();
-    let is_mouse = output.terminal.is_mouse_grabbed();
+    let is_mouse = output.is_mouse_grabbed();
     let scrollback = (!is_alt).then_some(output.scrollback.as_ref()).flatten();
     let mut snapshot = overlay_raw_output_history(
         snapshot,
@@ -17692,8 +18289,12 @@ mod tests {
             scrollback: None,
             scroll_seq_baseline: None,
             journal_clear_floor: 0,
+            unjournaled_trimmed_top_rows: 0,
             mirrored_journal_records: 0,
+            row_journal_counts: VecDeque::new(),
+            saved_alt_logical_journal_counts: None,
             prev_top_stable: None,
+            pending_alt_resize_reanchor: false,
         };
 
         output
@@ -19916,8 +20517,12 @@ mod tests {
             scrollback: None,
             scroll_seq_baseline: None,
             journal_clear_floor: 0,
+            unjournaled_trimmed_top_rows: 0,
             mirrored_journal_records: 0,
+            row_journal_counts: VecDeque::new(),
+            saved_alt_logical_journal_counts: None,
             prev_top_stable: None,
+            pending_alt_resize_reanchor: false,
         }
     }
 
@@ -23042,7 +23647,7 @@ mod tests {
         let session_dir = temp.join("sessions").join("session-handover-modes");
         fs::create_dir_all(&session_dir).expect("create session dir");
         let log_path = session_dir.join("segment-000001.tlog");
-        fs::write(&log_path, b"prompt> ").expect("write tail log");
+        fs::write(&log_path, b"\x1b[>5uprompt> ").expect("write tail log");
 
         let h_sess = crate::handover::HandoverSession {
             id: SessionId::new("session-handover-modes").unwrap(),
@@ -23056,9 +23661,9 @@ mod tests {
             },
             log_path,
             output_seq: 1,
-            bytes_logged: 8,
+            bytes_logged: 13,
             logged_output_seq: Some(1),
-            logged_tail_bytes: Some(8),
+            logged_tail_bytes: Some(13),
             last_activity_ms: 0,
             last_input_ms: 0,
             pid: std::process::id(),
@@ -23076,7 +23681,11 @@ mod tests {
                 mouse_mode: 3,
                 mouse_report_mode: 2,
                 kitty_keyboard_flags: 5,
+                primary_kitty_stack: vec![5],
+                bracketed_paste: true,
+                reverse_video: true,
                 title: "Adopted TUI".into(),
+                ..Default::default()
             }),
         };
 
@@ -23104,16 +23713,443 @@ mod tests {
             libc::close(slave);
         }
 
+        assert!(runtime.output.is_mouse_grabbed());
+        assert!(runtime.output.terminal.is_mouse_grabbed());
+        assert!(runtime.output.terminal.bracketed_paste_enabled());
+
         let mut cursor = TerminalSyncCursor::default();
         let frame = runtime.output.build_sync_frame(&mut cursor, true);
         assert_ne!(frame.mode_flags & triage_term::MODE_APP_CURSOR_KEYS, 0);
         assert_ne!(frame.mode_flags & triage_term::MODE_APP_KEYPAD, 0);
         assert_ne!(frame.mode_flags & triage_term::MODE_REPORT_FOCUS, 0);
+        assert_ne!(frame.mode_flags & triage_term::MODE_BRACKETED_PASTE, 0);
+        assert_ne!(frame.mode_flags & triage_term::MODE_REVERSE_VIDEO, 0);
         assert_eq!(frame.mouse_mode, 3);
         assert_eq!(frame.mouse_report_mode, 2);
         assert_eq!(frame.kitty_keyboard_flags, 5);
         assert_eq!(frame.title.as_deref(), Some("Adopted TUI"));
 
+        // A single Kitty pop (`\x1b[<u`) must return flags to 0 rather than 5
+        // (proving tail replay did not push a duplicate stack entry).
+        runtime.output.ingest(b"\x1b[<u").expect("pop kitty stack");
+        let PollTerminalSyncOutcome::Frame(after_pop) =
+            runtime.output.poll_sync_frame(&mut cursor, false)
+        else {
+            panic!("expected sync frame after kitty pop");
+        };
+        assert_eq!(after_pop.kitty_keyboard_flags, 0);
+
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn same_chunk_csi_3j_journals_post_clear_scrollback_and_ignores_alt_screen_csi_3j() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("segment-000001.tlog");
+        let size = SessionSize {
+            rows: 4,
+            cols: 24,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size.clone());
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        for idx in 0..20 {
+            output
+                .ingest(format!("pre-{idx:02}\r\n").as_bytes())
+                .expect("ingest pre-clear line");
+        }
+        // Multi-param `\x1b[2;3J` is ignored by wezterm-term and must not clear scrollback.
+        output
+            .ingest(b"\x1b[2;3J")
+            .expect("ingest ignored multi-param J");
+
+        // Single chunk: home cursor + clear display + clear scrollback, then immediately
+        // scroll 6 post-clear lines so 3 lines enter post-clear scrollback.
+        let mut chunk = b"\x1b[H\x1b[2J\x1b[3J".to_vec();
+        for idx in 0..6 {
+            chunk.extend_from_slice(format!("post-{idx:02}\r\n").as_bytes());
+        }
+        output.ingest(&chunk).expect("ingest clear + post lines");
+
+        // Alt-screen `CSI 3J` must NOT clear primary-screen scrollback.
+        output
+            .ingest(b"\x1b[?1049h\x1b[3J\x1b]2;3J\x07\x1b[?1049l")
+            .expect("ingest alt-screen CSI 3J");
+
+        let mut cursor = TerminalSyncCursor::default();
+        let frame = output.build_sync_frame(&mut cursor, true);
+        assert_eq!(frame.total_scrollback_rows, 3);
+        let sid = SessionId::new("same-chunk-clear").expect("valid session id");
+        let page = output.fetch_scrollback_rows(sid.clone(), 0, 10);
+        assert_eq!(page.row_count, 3);
+        let decoded = triage_term::decode_tcg1_batch(page.compression, &page.payload)
+            .expect("decode post-clear rows");
+        assert_eq!(decoded_row_ascii(&decoded[0]), "post-00");
+        assert_eq!(decoded_row_ascii(&decoded[1]), "post-01");
+        assert_eq!(decoded_row_ascii(&decoded[2]), "post-02");
+
+        // Replaying the persisted log tail must agree with live state and ignore
+        // both the alt-screen `CSI 3J` and OSC title containing `3J`.
+        let raw_bytes = fs::read(&path).expect("read log");
+        let mut restored = test_output_state(&path, size);
+        restored.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+        restored
+            .replay_tail(raw_bytes.len() as u64, &raw_bytes)
+            .expect("replay tail");
+        let mut restored_cursor = TerminalSyncCursor::default();
+        let restored_frame = restored.build_sync_frame(&mut restored_cursor, true);
+        assert_eq!(restored_frame.total_scrollback_rows, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alt_screen_resize_reanchors_primary_scrollback_on_exit() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("segment-000001.tlog");
+        let narrow = SessionSize {
+            rows: 4,
+            cols: 10,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, narrow);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Each 18-char soft-wrapped line takes 2 physical rows at 10 cols.
+        for idx in 0..10 {
+            output
+                .ingest(format!("wrapped-line-{idx:02}!!\r\n").as_bytes())
+                .expect("ingest wrapped line");
+        }
+        let before_alt = output.scrollback_layout().total_scrollback_rows;
+        assert!(before_alt >= 16);
+
+        output.ingest(b"\x1b[?1049h").expect("enter alt screen");
+        assert!(output.terminal.is_alt_screen_active());
+
+        // Resize wider while in alt-screen so primary-screen wrapped rows unwrap in memory.
+        let wide = SessionSize {
+            rows: 4,
+            cols: 40,
+            ..SessionSize::default()
+        };
+        triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut output.terminal);
+        output.terminal.resize(terminal_size(&wide));
+        output.scroll_seq_baseline = None;
+        output.pending_alt_resize_reanchor = true;
+
+        // Exit alt-screen and scroll one new line in the same chunk.
+        output
+            .ingest(b"\x1b[?1049lpost-resize-line\r\n")
+            .expect("exit alt screen after resize");
+        assert!(!output.terminal.is_alt_screen_active());
+        assert!(!output.pending_alt_resize_reanchor);
+        let in_mem_after = output.terminal.screen().phys_row(0) as u64;
+        let layout_after = output.scrollback_layout();
+        assert_eq!(layout_after.archived_prefix_count, 0);
+        assert_eq!(layout_after.total_scrollback_rows, in_mem_after);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scrollback_seam_stays_exact_across_height_grow_narrow_eviction_and_replay_tail() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("segment-000001.tlog");
+        let short_size = SessionSize {
+            rows: 20,
+            cols: 80,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, short_size.clone());
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        for idx in 0..50 {
+            output
+                .ingest(format!("line-{idx:04}\r\n").as_bytes())
+                .expect("ingest initial line");
+        }
+        // 50 lines with trailing \r\n leaves 31 rows in scrollback + 20 in viewport (51 rows total).
+        let layout_initial = output.scrollback_layout();
+        assert_eq!(layout_initial.archived_prefix_count, 0);
+        assert_eq!(layout_initial.in_mem_rows, 31);
+        let journal_count_before_grow = output.scrollback.as_ref().expect("journal").next_seq();
+        assert_eq!(journal_count_before_grow, 31);
+
+        // 1. Height increase (80x20 -> 80x40): 20 scrollback lines move into viewport.
+        let tall_size = SessionSize {
+            rows: 40,
+            cols: 80,
+            ..SessionSize::default()
+        };
+        let pre_logical = output.snapshot_logical_journal_counts();
+        triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut output.terminal);
+        output.terminal.resize(terminal_size(&tall_size));
+        output.scroll_seq_baseline = None;
+        output.reanchor_journal_counts_from_logical(&pre_logical);
+
+        let layout_tall = output.scrollback_layout();
+        assert_eq!(layout_tall.archived_prefix_count, 0);
+        assert_eq!(layout_tall.in_mem_rows, 11);
+        assert_eq!(layout_tall.total_scrollback_rows, 11);
+
+        // Scrolling 25 more lines must NOT re-append the 20 previously journaled lines.
+        for idx in 50..75 {
+            output
+                .ingest(format!("line-{idx:04}\r\n").as_bytes())
+                .expect("ingest post-grow line");
+        }
+        let journal_count_after_scroll = output.scrollback.as_ref().expect("journal").next_seq();
+        assert_eq!(journal_count_after_scroll, 36);
+        let layout_after_scroll = output.scrollback_layout();
+        assert_eq!(layout_after_scroll.archived_prefix_count, 0);
+        assert_eq!(layout_after_scroll.in_mem_rows, 36);
+        assert_eq!(layout_after_scroll.total_scrollback_rows, 36);
+
+        // 2. replay_tail into a taller/wider terminal with zero ring eviction keeps archived_prefix_count == 0
+        // AND preserves per-row journal counts across viewport-pulled rows (in_mem < mirrored) without double-journaling.
+        output.scrollback.as_mut().expect("journal").flush_buffer();
+        let (replay_len, replay) = read_replay_tail(&path).expect("read replay tail");
+        let mut restored = test_output_state(&path, tall_size.clone());
+        restored.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+        restored
+            .replay_tail(replay_len, &replay)
+            .expect("replay_tail");
+        assert_eq!(restored.scrollback_layout().archived_prefix_count, 0);
+
+        let dir_tall_restore = unique_log_dir();
+        fs::create_dir_all(&dir_tall_restore).expect("create dir_tall_restore");
+        let path_tall_restore = dir_tall_restore.join("segment-000001.tlog");
+        let mut pre_restore = test_output_state(&path_tall_restore, short_size.clone());
+        pre_restore.scrollback = Some(crate::scrollback::ScrollbackJournal::open(
+            &dir_tall_restore,
+        ));
+        for idx in 0..50 {
+            pre_restore
+                .ingest(format!("line-{idx:04}\r\n").as_bytes())
+                .expect("ingest pre-restore line");
+        }
+        pre_restore
+            .scrollback
+            .as_mut()
+            .expect("journal")
+            .flush_buffer();
+        assert_eq!(
+            pre_restore.scrollback.as_ref().expect("journal").next_seq(),
+            31
+        );
+        let (tall_replay_len, tall_replay) =
+            read_replay_tail(&path_tall_restore).expect("read tall replay tail");
+        let mut restored_tall = test_output_state(&path_tall_restore, tall_size);
+        restored_tall.scrollback = Some(crate::scrollback::ScrollbackJournal::open(
+            &dir_tall_restore,
+        ));
+        restored_tall
+            .replay_tail(tall_replay_len, &tall_replay)
+            .expect("replay_tail into taller viewport");
+        assert_eq!(restored_tall.scrollback_layout().in_mem_rows, 11);
+        assert_eq!(restored_tall.scrollback_layout().archived_prefix_count, 0);
+        for idx in 50..75 {
+            restored_tall
+                .ingest(format!("line-{idx:04}\r\n").as_bytes())
+                .expect("ingest post-restore line");
+        }
+        assert_eq!(
+            restored_tall
+                .scrollback
+                .as_ref()
+                .expect("journal")
+                .next_seq(),
+            36
+        );
+        let _ = fs::remove_dir_all(&dir_tall_restore);
+
+        // 3. Column narrowing past the 3,500-row ring limit + 1 scroll evicts exact logical counts.
+        let dir2 = unique_log_dir();
+        fs::create_dir_all(&dir2).expect("create dir2");
+        let path2 = dir2.join("segment-000001.tlog");
+        let mut out2 = test_output_state(&path2, short_size);
+        out2.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir2));
+        let sixty_chars = "X".repeat(60);
+        for idx in 0..4000 {
+            out2.ingest(format!("{idx:04}-{sixty_chars}\r\n").as_bytes())
+                .expect("ingest 65-char line");
+        }
+        assert_eq!(out2.scrollback_layout().in_mem_rows, 3500);
+        assert_eq!(out2.scrollback_layout().archived_prefix_count, 481);
+
+        let narrow_size = SessionSize {
+            rows: 20,
+            cols: 40,
+            ..SessionSize::default()
+        };
+        let pre_logical2 = out2.snapshot_logical_journal_counts();
+        triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut out2.terminal);
+        out2.terminal.resize(terminal_size(&narrow_size));
+        out2.scroll_seq_baseline = None;
+        out2.reanchor_journal_counts_from_logical(&pre_logical2);
+
+        // Trigger one scroll at 40x20 so Screen::scroll_up evicts ~3,500 physical half-rows (~1,750 logical lines).
+        out2.ingest(b"after-narrow\r\n")
+            .expect("ingest post-narrow line");
+        let layout_narrow = out2.scrollback_layout();
+        assert!(
+            layout_narrow.archived_prefix_count > 2200
+                && layout_narrow.archived_prefix_count < 2300,
+            "expected ~2,240 archived records after narrowing eviction, got {}",
+            layout_narrow.archived_prefix_count
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn same_chunk_alt_entry_persists_pre_alt_scrolled_lines_to_journal() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("segment-000001.tlog");
+        let size = SessionSize {
+            rows: 4,
+            cols: 40,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Seed baseline on primary screen, then batch 6 scrolling lines + ?1049h in a single ingest chunk.
+        output.ingest(b"seed-0\r\n").expect("seed");
+        output
+            .ingest(b"pre-1\r\npre-2\r\npre-3\r\npre-4\r\npre-5\r\npre-6\r\n\x1b[?1049halt-screen")
+            .expect("ingest batched primary + alt entry");
+        assert!(output.terminal.is_alt_screen_active());
+        let persisted = output.scrollback.as_ref().expect("journal").next_seq();
+        assert!(
+            persisted >= 4,
+            "expected pre-alt scrolled lines to be journaled before switching to alt screen, got {persisted}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_sync_terminal_error_leaves_caller_cursor_intact() {
+        let (tx, rx) = mpsc::channel::<ActorCommand>();
+        drop(rx);
+        let caller_cursor = TerminalSyncCursor {
+            next_frame_seq: 42,
+            last_erase_scrollback_gen: 7,
+            ..TerminalSyncCursor::default()
+        };
+        let cursor_in = caller_cursor.clone();
+        let err = request_sync_terminal(&tx, None, cursor_in, false);
+        assert!(err.is_err());
+        assert_eq!(caller_cursor.next_frame_seq, 42);
+        assert_eq!(caller_cursor.last_erase_scrollback_gen, 7);
+    }
+
+    #[test]
+    fn narrow_reflow_continuation_rows_do_not_double_journal_and_mouse_parsers_cover_all_modes() {
+        let dir = unique_log_dir();
+        fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("segment-000001.tlog");
+        let wide_size = SessionSize {
+            rows: 4,
+            cols: 40,
+            ..SessionSize::default()
+        };
+        let mut output = test_output_state(&path, wide_size);
+        output.scrollback = Some(crate::scrollback::ScrollbackJournal::open(&dir));
+
+        // Scroll two 36-col lines into scrollback so each is persisted once at width 40.
+        output
+            .ingest(b"111111111111111111111111111111111111\r\n")
+            .expect("line 1");
+        output
+            .ingest(b"222222222222222222222222222222222222\r\n")
+            .expect("line 2");
+        output
+            .ingest(b"v0\r\nv1\r\nv2\r\nv3")
+            .expect("fill viewport");
+        let seq_before_reflow = output.scrollback.as_ref().expect("journal").next_seq();
+        assert_eq!(seq_before_reflow, 2);
+
+        // Narrow to 20 cols (each 36-col line splits into 2 physical rows: count 1 + count 0
+        // stamped with ROW_ALREADY_JOURNALED_BIT), grow height to pull a continuation sub-row
+        // back into the viewport, then scroll again: already-journaled sub-rows must NOT be
+        // re-appended to the scrollback journal!
+        let narrow_short = SessionSize {
+            rows: 4,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let pre_logical = output.snapshot_logical_journal_counts();
+        triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut output.terminal);
+        output.terminal.resize(terminal_size(&narrow_short));
+        output.scroll_seq_baseline = None;
+        output.reanchor_journal_counts_from_logical(&pre_logical);
+
+        let narrow_tall = SessionSize {
+            rows: 8,
+            cols: 20,
+            ..SessionSize::default()
+        };
+        let pre_logical_tall = output.snapshot_logical_journal_counts();
+        triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut output.terminal);
+        output.terminal.resize(terminal_size(&narrow_tall));
+        output.scroll_seq_baseline = None;
+        output.reanchor_journal_counts_from_logical(&pre_logical_tall);
+
+        output
+            .ingest(b"\r\nafter-1\r\nafter-2\r\nafter-3\r\nafter-4\r\n")
+            .expect("scroll after height growth");
+        let seq_after = output.scrollback.as_ref().expect("journal").next_seq();
+        // Only genuinely unjournaled viewport lines (`v0..v3`, `after-1..`) may be journaled;
+        // the two 36-col lines must remain journaled once each.
+        let mut fetch_buf = triage_term::Tcg1BatchBuilder::with_row_capacity(8, 40);
+        let packed = output
+            .scrollback
+            .as_mut()
+            .expect("journal")
+            .pack_record_range(0, seq_after as usize, 0, 40, &mut fetch_buf);
+        let encoded = fetch_buf.finish_encoded();
+        let rows = triage_term::decode_tcg1_batch(encoded.compression, &encoded.payload)
+            .expect("decode journal rows");
+        assert_eq!(packed, rows.len());
+        let ones_count = rows
+            .iter()
+            .filter(|r| {
+                r.stored_cols >= 10
+                    && (0..10)
+                        .all(|col| (r.cell_words[col * 4 + 3] & 0x001F_FFFF) == u32::from(b'1'))
+            })
+            .count();
+        assert_eq!(
+            ones_count, 1,
+            "reflowed sub-row must not be double-journaled"
+        );
+
+        // Mouse enable detection covers ?9h and compound DECSETs; mouse report parser
+        // classifies urxvt (?1015) and UTF-8 (?1005) clicks (`Some(false)`) vs hover (`Some(true)`).
+        assert!(contains_mouse_tracking_enable(b"\x1b[?9h"));
+        assert!(contains_mouse_tracking_enable(b"\x1b[?2004;1002;1006h"));
+        assert!(!contains_mouse_tracking_enable(b"\x1b[?2004h"));
+
+        assert_eq!(parse_mouse_reports(b"\x1b[32;45;12M"), Some(false));
+        assert_eq!(parse_mouse_reports(b"\x1b[67;45;12M"), Some(true));
+        assert_eq!(
+            parse_mouse_reports("\x1b[M \u{0120}\u{0090}".as_bytes()),
+            Some(false)
+        );
+        assert_eq!(
+            parse_mouse_reports("\x1b[MC\u{0120}\u{0090}".as_bytes()),
+            Some(true)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -2,6 +2,11 @@
 // Importable from `tool/` and `integration_test/`.
 import 'dart:math';
 
+const List<String> kReplayBenchReportKeys = <String>[
+  'terminal_grid_sync_a',
+  'terminal_grid_sync_b',
+];
+
 List<String> buildBenchLines(int lineCount, {int cols = 120}) {
   final rng = Random(0xC0FFEE);
   const plain = <String>[
@@ -26,14 +31,15 @@ List<String> buildBenchLines(int lineCount, {int cols = 120}) {
       text =
           '+ ${paths[i % paths.length]} ${rng.nextInt(9000) + 1000} insertions';
     } else if (kind == 2) {
-      text = '- obsolete line with trailing detail | box -- 中文';
+      text = '- obsolete line with trailing detail | box -> 中文';
     } else if (kind == 3) {
       text = 'warning: unused symbol `foo` [${plain[i % plain.length]}]';
     } else {
       text = '${plain[i % plain.length]} #${rng.nextInt(1 << 30)}';
     }
-    if (text.length > cols) {
-      text = text.substring(0, cols);
+    final runes = text.runes.toList();
+    if (runes.length > cols) {
+      text = String.fromCharCodes(runes.sublist(0, cols));
     }
     lines.add(text);
   }

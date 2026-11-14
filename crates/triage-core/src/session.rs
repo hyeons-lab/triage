@@ -826,6 +826,14 @@ impl TerminalSyncCursor {
         *self = Self::default();
         self.next_frame_seq = next_seq;
     }
+
+    pub fn reset_viewport_keep_generations(&mut self) {
+        self.primary = TerminalScreenCursor::default();
+        self.alt = TerminalScreenCursor::default();
+        if self.last_alt_screen.is_some() {
+            self.last_title_gen = self.last_title_gen.wrapping_add(u64::MAX);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
