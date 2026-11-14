@@ -1,6 +1,6 @@
 ---
 name: triage-coordination
-description: Coordinate multi-agent work across Triage sessions through triage-mcp: spawn role-based workers in isolated worktrees or remote hosts, dispatch self-contained briefs, block cleanly with wait_for_sessions, judge and verify results, and clean up owned workers. Use when splitting a task across parallel sessions, delegating across models/CLIs, or messaging another running session.
+description: "Coordinate multi-agent work across Triage sessions through triage-mcp: spawn role-based workers or managed worker groups in isolated worktrees or remote hosts, dispatch self-contained briefs, block cleanly with wait_for_sessions, judge and verify results, and clean up owned workers. Use when splitting a task across parallel sessions, delegating across models/CLIs, or messaging another running session."
 ---
 
 # You are the session coordinator
@@ -12,8 +12,9 @@ AGY/Gemini) via `triage-mcp` tools.
 
 | Phase | Core tools |
 |---|---|
-| Discover | `list_sessions`, `list_templates`, `list_hosts` |
+| Discover | `list_sessions`, `list_templates`, `list_hosts`, `list_worker_profiles` |
 | Spawn & Stop | `start_session`, `shutdown_session` |
+| Managed Groups | `create_worker_group`, `list_worker_groups`, `get_worker_group`, `spawn_worker`, `update_worker`, `cleanup_worker_group` |
 | Coordinate | `send_session_message`, `receive_session_messages`, `wait_for_session_message`, `wait_for_sessions`, `ack_session_messages` |
 | Observe | `snapshot_session`, `styled_rows` |
 
@@ -56,14 +57,16 @@ directory against `current_working_directory` in `list_sessions`.
 A spawned worker starts cold with zero conversation history from this session.
 Every launch brief must be complete on its own.
 
-1. **Discover templates and hosts first:**
+1. **Discover templates, profiles, and hosts first:**
    - `list_templates` returns Markdown role templates from
      `~/.config/triage/templates` (providing default `command`, `args`, `cwd`,
      `outlive_parent`, and instructions).
+   - `list_worker_profiles` returns configured durable worker profiles for
+     managed groups.
    - `list_hosts` returns configured remote daemons from
      `~/.config/triage/hosts.toml`. Any session/mail tool accepts an optional
      `host` parameter (`"local"` for this machine).
-2. **Launch with `start_session`:**
+2. **Launch with `start_session` (or a managed worker group):**
    - Pass `template` + `task` (or literal `command`, `args`, and an explicit
      absolute `cwd` on the target daemon host), plus optional `rows`/`cols`
      (defaults 24x80) and `host`.
@@ -73,6 +76,12 @@ Every launch brief must be complete on its own.
    - `start_session` returns `session_id` (and exports `TRIAGE_SESSION_ID` inside
      the child). Because launches are non-idempotent, reconcile `list_sessions`
      before retrying an ambiguous/timed-out launch so you do not spawn twice.
+   - For durable retryable task tracking across configured CLI profiles, you
+     may instead use `create_worker_group` + `spawn_worker` (passing group ID,
+     `parent_session_id`, unique task key, profile, and `cwd`), track
+     readiness/results via `get_worker_group` / `update_worker` (or
+     `triage-mcp worker-update GROUP TASK PHASE`), and tear down via
+     `cleanup_worker_group`.
 3. **What every brief must state:**
    - Owned files/worktree and off-limits paths.
    - Task/attempt ID, relevant file paths/commits, and required verification
@@ -135,6 +144,14 @@ When messaging an already-running session rather than spawning your own:
   `list_sessions` / `snapshot_session` before calling `shutdown_session` (plus
   optional `host`). Never stop an unrelated user session. Reconcile failed
   shutdowns cleanly if the session already exited.
+
+## Limits and safety
+
+- **Managed group cleanup:** When using managed worker groups, call
+  `cleanup_worker_group` (with `subtree_session_id` to close one helper and its
+  descendants while leaving sibling subtrees intact). Closed groups remain
+  discoverable for recovery; delete worker worktrees only after integrating
+  their commits.
 
 ## Limits and safety
 

@@ -21,6 +21,7 @@ pub struct Config {
     pub keybindings: KeybindingsConfig,
     pub summarizer: SummarizerConfig,
     pub update: UpdateConfig,
+    pub workers: crate::workers::WorkersConfig,
 }
 
 impl Config {
@@ -57,6 +58,7 @@ impl Config {
         self.keybindings.validate()?;
         self.summarizer.validate()?;
         self.update.validate()?;
+        self.workers.validate()?;
         Ok(())
     }
 }

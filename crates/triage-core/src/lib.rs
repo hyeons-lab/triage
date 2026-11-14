@@ -7,6 +7,7 @@ pub mod judge;
 pub mod judge_rules;
 pub mod logging;
 pub mod session;
+pub mod workers;
 
 #[allow(
     unsafe_code,

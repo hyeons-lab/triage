@@ -480,6 +480,16 @@ impl<T: WireRpcTransport> WireRoundTrip for WireRpcClient<T> {
 
 macro_rules! impl_wire_session_api_methods {
     () => {
+        fn worker_operation(
+            &self,
+            request: triage_core::workers::WorkerRequest,
+        ) -> Result<triage_core::workers::WorkerResponse> {
+            match self.round_trip_wire(WireRequest::WorkerOperation(request), Duration::ZERO)? {
+                WireSuccess::WorkerResponse(response) => Ok(response),
+                other => bail!("unexpected managed worker response: {other:?}"),
+            }
+        }
+
         fn list_sessions(&self) -> Result<Vec<SessionId>> {
             match self.round_trip_wire(WireRequest::ListSessions, Duration::ZERO)? {
                 WireSuccess::SessionIds(session_ids) => Ok(session_ids),
@@ -768,6 +778,7 @@ impl SessionApi for IpcClient {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireRequest {
+    WorkerOperation(triage_core::workers::WorkerRequest),
     ListSessions,
     StartSession(StartSessionRequest),
     AttachSession(AttachSessionRequest),
@@ -865,6 +876,7 @@ impl WireResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireSuccess {
+    WorkerResponse(triage_core::workers::WorkerResponse),
     Unit,
     SessionIds(Vec<SessionId>),
     SessionId(SessionId),
@@ -2013,6 +2025,11 @@ fn handle_session_rpc_request(
 ) -> Result<WireSuccess> {
     match request {
         WireRequest::ListSessions => manager.list_sessions().map(WireSuccess::SessionIds),
+        WireRequest::WorkerOperation(request) => manager
+            .worker_operation(request)
+            .map(WireSuccess::WorkerResponse)
+            // WireResponse serializes Display, so preserve this route's full cause chain.
+            .map_err(|error| anyhow!("{error:#}")),
         WireRequest::StartSession(request) => {
             manager.start_session(request).map(WireSuccess::SessionId)
         }
