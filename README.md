@@ -71,6 +71,46 @@ with a reverse proxy, or keep it on a tailnet. See
 [Pairing](crates/triaged/README.md#pairing), and
 [Remote Access](docs/remote-access.md) for reaching your daemon from anywhere.
 
+## Agent teamwork
+
+The bundled `agent-teamwork` skill lets **Muse, Claude Code, Codex, or AGY/Gemini**
+coordinate workers in any of those runtimes. It uses native helpers when the
+requested runtime/model and workspace requirements fit; otherwise it launches
+configured CLI profiles through Triage MCP. Managed workers share a parent/topic
+group with durable task state/results and owned cleanup.
+
+Install both `agent-teamwork` and `triage-coordination` from this checkout:
+
+```bash
+./install.sh                    # all supported runtimes and canonical store
+./install.sh --claude --codex    # selected runtimes
+./install.sh --link             # runtime links to the canonical skill bundles
+```
+
+Use a plain install once to add the new skill; `--upgrade` refreshes existing
+skills and deliberately skips missing ones. The installer packages the backend
+references with each skill. It does not change agent MCP configuration, install
+binaries, choose model IDs, authenticate providers, or modify AGY's built-in skills.
+
+Connect [Triage MCP](crates/triage-mcp/README.md) to the coordinating runtime,
+configure matching worker profiles there, then load the new skill in a fresh
+agent conversation. Run inside Triage, or supply an explicitly owned parent
+session/group for an outside coordinator. For example:
+
+```text
+/agent-teamwork Use Codex CLI to implement the parser, Claude Code to review it,
+and Muse to investigate the failing fixture. Keep the requested runtimes/models,
+isolate concurrent writers, collect verified results, and clean up owned sessions.
+```
+
+The same request can be coordinated from any supported runtime. Worker profiles
+choose the actual CLI/model; a model available inside AGY is not automatically
+Codex CLI. Native AGY teamwork remains available, with a native relay when its
+board needs to track external workers. External sessions do not appear on that
+board automatically. See the [portable workflow](skills/agent-teamwork/SKILL.md).
+Cross-runtime runs require the managed-worker daemon/MCP APIs and authenticated
+profiles; installing the Markdown skill alone does not make those available.
+
 ## Key Features
 
 - **Resident Tool-Call Approval Judge**: Autonomous agent CLIs (Antigravity, Claude Code) ask Triage before running commands. A 3-layer security system (Layer 1 deterministic deny, Layer 2 deterministic allow, Layer 3 Liquid `d1` decision model) auto-approves safe commands like `git status` or `cargo test` while ensuring risky commands prompt for confirmation. See [Approval Judge](docs/approval-judge.md).
@@ -111,6 +151,10 @@ full roadmap, with honest per-item status, lives in
 [`devlog/triage-design-doc.md`](devlog/triage-design-doc.md#-implementation-roadmap).
 
 ## Testing
+
+Run `tests/verify-install.sh` to verify skill installation in an isolated fake
+home, including every runtime, copied/linked references, upgrades and symlink
+refusals.
 
 The workspace includes `triage-test-support`, a non-published crate for reusable acceptance-test helpers. It provides renderer snapshot normalization and VT byte-stream fixtures so terminal engine, daemon session, and TUI behavior can be tested with deterministic golden outputs.
 

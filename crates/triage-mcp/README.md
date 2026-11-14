@@ -76,7 +76,9 @@ manual user prompting.
 The daemon owns durable parent/topic groups and worker task records. The calling
 agent chooses native helpers when they support the requested provider/model and
 have capacity; otherwise it uses a configured Triage worker profile. This routing
-is documented in `skills/triage-coordination/SKILL.md` and in the tool metadata.
+is documented in the portable
+[`agent-teamwork`](../../skills/agent-teamwork/SKILL.md) coordinator workflow,
+[`triage-coordination`](../../skills/triage-coordination/SKILL.md), and tool metadata.
 
 Configure profiles in `~/.config/triage/config.toml`. Confirm each installed CLI's
 interactive startup syntax before enabling a profile; add only supported model

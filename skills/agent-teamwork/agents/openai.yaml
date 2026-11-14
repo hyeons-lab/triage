@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Teamwork"
+  short_description: "Coordinate workers across agent runtimes"
+  default_prompt: "Use $agent-teamwork to coordinate this task with workers in the requested agent runtimes and models."

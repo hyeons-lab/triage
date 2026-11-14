@@ -1,9 +1,14 @@
 ---
 name: triage-coordination
-description: Coordinate with agents running in other Triage sessions through the triage-mcp tools: create managed parent/topic worker groups, choose native helpers or CLI sessions, track durable task results, exchange mail, and clean up owned workers. Use when a task spans sessions or another session needs something from this one.
+description: >-
+  Coordinate with agents running in other Triage sessions through the triage-mcp tools: create managed parent/topic worker groups, choose native helpers or CLI sessions, track durable task results, exchange mail, and clean up owned workers. Use when a task spans sessions or another session needs something from this one.
 ---
 
 # Triage Session Coordination
+
+For planning and supervising a complete cross-runtime team, use `agent-teamwork`
+when available. This skill covers Triage session messaging and managed-worker
+operations.
 
 Triage sessions are isolated shells; the `triage-mcp` tools are the bridge
 between them. Mail is direct (one sender, one target), and its body is read from the
@@ -38,8 +43,9 @@ Report a missing capability instead of injecting commands into another terminal.
    is missing, prepare its configuration and report what is needed; do not invent
    model identifiers or change permission modes silently.
 2. Call `create_worker_group` with your `parent_session_id`, a stable retry `key`,
-   and the parent conversation's `topic`. Use `TRIAGE_SESSION_ID`; a directory
-   match alone cannot establish ownership for a managed group. A managed helper
+   and the parent conversation's `topic`. Use `TRIAGE_SESSION_ID` or the explicitly
+   owned parent/group context supplied for this run (see `agent-teamwork`). A
+   directory match alone cannot establish ownership for a managed group. A managed helper
    automatically inherits its group when it creates a group for nested work.
 3. Use `spawn_worker` with the group ID, your immediate parent session ID, a unique
    task key, profile, absolute `cwd`, and a self-contained task. Provide source
@@ -121,13 +127,23 @@ finished, a prompt is idle).
 
 ## 8. Clean up owned workers
 
-After collecting durable results and integration instructions, call
-`cleanup_worker_group` with the group ID. To close one helper and all of its
-descendants, also set `subtree_session_id` to that worker's session ID. Inspect
-`errors` and retry incomplete cleanup. Cleanup records cancellation before
-stopping unfinished workers, checks stable session ownership inside the daemon,
-and preserves the root session, sibling subtrees, recorded results, and every
-working directory. Closed groups remain discoverable for recovery.
+After collecting results and integration instructions, choose the authorized
+cleanup scope. Only the run's root coordinator or an explicitly authorized
+whole-group delegate may omit `subtree_session_id` to close the entire group.
+Managed helpers inherit a shared group: membership does not authorize closing
+their parent, siblings or themselves while completing a delegated task.
+
+A nested helper cleans each directly owned child by calling
+`cleanup_worker_group` with `group_id` and `subtree_session_id` set to that child's
+session ID. Keep your own session alive to report your terminal result; your
+parent closes it. Native relays assigned only part of a group follow the same
+child-subtree rule, even if they inherit the root's environment.
+
+Inspect `errors` and retry at the same scope. Cleanup records cancellation before
+stopping unfinished workers, checks stable incarnation ownership, and retains the
+root, results and directories. Child-subtree cleanup also preserves the parent
+and sibling subtrees; whole-group cleanup stops every group worker. Closed groups
+remain discoverable for recovery.
 
 Delete or remove worktrees only after integrating their work and applying the
 repository's cleanup rules. Group cleanup intentionally does not discard them.
