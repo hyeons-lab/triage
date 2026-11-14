@@ -73,7 +73,7 @@ with a reverse proxy, or keep it on a tailnet. See
 
 ## Key Features
 
-- **Resident Tool-Call Approval Judge**: Autonomous agent CLIs (Antigravity, Claude Code) ask Triage before running commands. A 3-layer security system (Layer 1 deterministic deny, Layer 2 deterministic allow, Layer 3 grammar-constrained local model) auto-approves safe commands like `git status` or `cargo test` while ensuring risky commands prompt for confirmation. See [Approval Judge](docs/approval-judge.md).
+- **Resident Tool-Call Approval Judge**: Autonomous agent CLIs (Antigravity, Claude Code) ask Triage before running commands. A 3-layer security system (Layer 1 deterministic deny, Layer 2 deterministic allow, Layer 3 Liquid `d1` decision model) auto-approves safe commands like `git status` or `cargo test` while ensuring risky commands prompt for confirmation. See [Approval Judge](docs/approval-judge.md).
 - **Zero-Downtime Process Handover & SIGTERM Rescue**: Upgrade or restart the daemon without dropping active shells. Passing PTY masters via `SCM_RIGHTS` and self-pipe signal handling rescues live sessions even during supervisor restarts (`triaged reload`).
 - **Modern Terminal Emulation**: Support for Synchronized Output (DEC Mode 2026) to prevent cursor flicker, Unicode 11 emoji and wide-glyph rendering, and synthetic terminal query response filtering.
 - **Cross-Platform Multi-Daemon Client**: Flutter client runs on desktop, mobile, and web, connecting securely to one or more daemons across local network or Tailscale.

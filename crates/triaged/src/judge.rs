@@ -71,6 +71,52 @@ data over the network, opens network listeners, deletes files, runs destructive 
 cleans, kills processes, modifies files or databases outside the working directory, changes \
 system services or containers, deploys or merges remotely, or carries any side-effect ambiguity.";
 
+/// Maximum serialized JSON byte length of `D1Request.state` accepted by
+/// `judge_with_d1`. Keeps `d1` / `d1-omni` `state` well inside `cera`'s
+/// context budget even when multi-byte UTF-8 or `\u00XX`-escaped control
+/// characters expand `MAX_COMMAND_CHARS` scalars up to 6x in JSON.
+const MAX_D1_STATE_JSON_BYTES: usize = MAX_COMMAND_CHARS + 256;
+
+fn bounded_char_len(s: &str, cap: usize) -> usize {
+    if s.len() <= cap {
+        s.chars().count()
+    } else {
+        s.chars().take(cap + 1).count()
+    }
+}
+
+/// Validates input character and serialized JSON byte caps and builds the
+/// [`D1Request`], returning `Err(reason)` when the command or serialized state
+/// exceeds the judge budget (avoiding silent `d1-omni` right-truncation).
+pub(crate) fn build_bounded_d1_request(request: &JudgeRequest) -> Result<D1Request, &'static str> {
+    let command_len = request
+        .command_line
+        .as_deref()
+        .map_or(0, |command| bounded_char_len(command, MAX_COMMAND_CHARS));
+    let cwd_len = request
+        .cwd
+        .as_deref()
+        .map_or(0, |cwd| bounded_char_len(cwd, MAX_COMMAND_CHARS));
+    if command_len.saturating_add(cwd_len) > MAX_COMMAND_CHARS {
+        return Err("command is too long to judge");
+    }
+
+    let d1_request = build_d1_request(request);
+    if d1_request.state.dumps().len() > MAX_D1_STATE_JSON_BYTES {
+        return Err("command is too long to judge");
+    }
+    Ok(d1_request)
+}
+
+pub(crate) fn judge_with_d1_request(
+    engine: &D1Engine,
+    d1_request: &D1Request,
+    min_allow_confidence_pct: u8,
+) -> anyhow::Result<JudgeVerdict> {
+    let response = engine.decide(d1_request)?;
+    interpret_d1_response(&response, min_allow_confidence_pct)
+}
+
 /// Asks the Liquid `d1` decision model to classify an ambiguous command.
 ///
 /// Runs one forward pass with zero output tokens (`D1Engine::decide`) and
@@ -82,21 +128,16 @@ pub fn judge_with_d1(
     request: &JudgeRequest,
     min_allow_confidence_pct: u8,
 ) -> anyhow::Result<JudgeVerdict> {
-    // Second line of defence on the length cap. `evaluate` rejects an over-long
-    // command before this is reached, but this function is `pub` and the state
-    // must never be unbounded. See [`MAX_COMMAND_CHARS`].
-    let command_len = request
-        .command_line
-        .as_deref()
-        .map_or(0, |command| command.chars().count());
-    let cwd_len = request.cwd.as_deref().map_or(0, |cwd| cwd.chars().count());
-    if command_len + cwd_len > MAX_COMMAND_CHARS {
-        return Ok(JudgeVerdict::fallback("command is too long to judge"));
-    }
+    // Second line of defence on the length cap. `evaluate` and
+    // `Summarizer::judge_with_confidence` reject over-budget inputs before
+    // this is reached, but this function is `pub` and the state must never be
+    // unbounded or silently right-truncated. See [`MAX_COMMAND_CHARS`].
+    let d1_request = match build_bounded_d1_request(request) {
+        Ok(req) => req,
+        Err(reason) => return Ok(JudgeVerdict::fallback(reason)),
+    };
 
-    let d1_request = build_d1_request(request);
-    let response = engine.decide(&d1_request)?;
-    interpret_d1_response(&response, min_allow_confidence_pct)
+    judge_with_d1_request(engine, &d1_request, min_allow_confidence_pct)
 }
 
 /// Builds the structured `d1` request for one tool-call judge query.
@@ -177,26 +218,1020 @@ pub fn interpret_d1_response(
     })
 }
 
-/// Expands a leading `~/` or `~\` against `$HOME` / `$USERPROFILE`.
-fn expand_home_prefix(raw: &str) -> PathBuf {
-    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"))
-        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+/// Expands a leading `~`, `~/`, or `~\` against `$HOME` / `$USERPROFILE` after
+/// trimming surrounding whitespace.
+pub(crate) fn expand_home_prefix(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    let home_dir = || {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+    };
+    if trimmed == "~"
+        && let Some(home) = home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home;
     }
-    PathBuf::from(raw)
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn is_http_url(spec: &str) -> bool {
+    let bytes = spec.as_bytes();
+    (bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://"))
+        || (bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://"))
+}
+
+const REDACTED_SECRET: &str = "<REDACTED_SECRET>";
+
+fn is_valid_url_host_port(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some((ipv6_and_zone, after_bracket)) = rest.split_once(']') else {
+            return false;
+        };
+        let (ipv6, zone) = match ipv6_and_zone.split_once('%') {
+            Some((addr, z)) => (addr, Some(z)),
+            None => (ipv6_and_zone, None),
+        };
+        if ipv6.is_empty()
+            || !ipv6.contains(':')
+            || !ipv6
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return false;
+        }
+        if zone.is_some_and(|z| {
+            z.is_empty()
+                || !z.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'%' | b'.' | b'-' | b'_' | b'~')
+                })
+        }) {
+            return false;
+        }
+        return after_bracket.is_empty()
+            || after_bracket.strip_prefix(':').is_some_and(|port| {
+                !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit())
+            });
+    }
+    let (host, port) = match s.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (s, None),
+    };
+    if port.is_some_and(|p| p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    !host.is_empty()
+        && !host.starts_with('.')
+        && !host.contains("..")
+        && host
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+}
+
+fn is_host_with_any_port_digits(s: &str) -> bool {
+    if is_valid_url_host_port(s) {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some((ipv6_and_zone, after_bracket)) = rest.split_once(']') else {
+            return false;
+        };
+        let bracket_host = format!("[{ipv6_and_zone}]");
+        if !is_valid_url_host_port(&bracket_host) {
+            return false;
+        }
+        return after_bracket
+            .strip_prefix(':')
+            .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()));
+    }
+    let Some((host, port)) = s.split_once(':') else {
+        return false;
+    };
+    is_valid_url_host_port(host) && port.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn host_has_domain_or_ip_shape(host_port: &str) -> bool {
+    if host_port.starts_with('[') {
+        return true;
+    }
+    let host = host_port.split_once(':').map_or(host_port, |(h, _)| h);
+    host.contains('.') || host.eq_ignore_ascii_case("localhost")
+}
+
+fn starts_with_query_key_eq(s: &str) -> bool {
+    let Some((key, _val)) = s.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn scan_host_port_prefix_len(s: &str) -> usize {
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some(close_rel) = rest.find(']') else {
+            return 0;
+        };
+        let after_bracket = 1 + close_rel + 1;
+        let port_len = s[after_bracket..]
+            .strip_prefix(':')
+            .map(|p| 1 + p.bytes().take_while(|b| b.is_ascii_digit()).count())
+            .unwrap_or(0);
+        return after_bracket + port_len;
+    }
+    let host_len = s
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_')))
+        .unwrap_or(s.len());
+    let port_len = s[host_len..]
+        .strip_prefix(':')
+        .map(|p| 1 + p.bytes().take_while(|b| b.is_ascii_digit()).count())
+        .unwrap_or(0);
+    host_len + port_len
+}
+
+fn is_xml_closing_tag(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("</") else {
+        return false;
+    };
+    let tag_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.'))
+        .count();
+    tag_len > 0 && rest[tag_len..].starts_with('>')
+}
+
+fn is_authority_complete_before_query(head: &str, from_delim: &str) -> bool {
+    let host_port = match head.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => head,
+    };
+    let head_ok = host_port.is_empty()
+        || host_port == REDACTED_SECRET
+        || is_host_with_any_port_digits(host_port);
+    if !head_ok {
+        return false;
+    }
+    let slash = from_delim.find('/').unwrap_or(from_delim.len());
+    let pre_slash = &from_delim[..slash];
+    let post_slash = &from_delim[slash..];
+    if !pre_slash.contains('@') {
+        return !host_port.is_empty() || !from_delim.is_empty();
+    }
+    let mut has_authority_at_candidate = false;
+    let mut any_at_has_amp_before = false;
+    let mut any_at_reaches_slash = false;
+    for (at_idx, _) in pre_slash.match_indices('@') {
+        let after_at = &pre_slash[at_idx + 1..];
+        let hp_len = if after_at.starts_with(REDACTED_SECRET) {
+            REDACTED_SECRET.len()
+        } else {
+            scan_host_port_prefix_len(after_at)
+        };
+        let cand_hp = &after_at[..hp_len];
+        let after_hp = &after_at[hp_len..];
+        let is_scheme_before_slashes = (cand_hp.eq_ignore_ascii_case("http:")
+            || cand_hp.eq_ignore_ascii_case("https:"))
+            && after_hp.is_empty()
+            && post_slash.starts_with("//");
+        if is_scheme_before_slashes {
+            continue;
+        }
+        let valid_after_hp = after_hp.is_empty()
+            || after_hp.starts_with(['?', '#', ',', ';', '"', '\'', '`', ')', ']', '}', '>', '\\'])
+            || is_xml_closing_tag(after_hp);
+        if !valid_after_hp {
+            continue;
+        }
+        let cand_ok = cand_hp.is_empty()
+            || cand_hp == REDACTED_SECRET
+            || is_host_with_any_port_digits(cand_hp);
+        if !cand_ok {
+            continue;
+        }
+        if cand_hp.is_empty()
+            || (cand_hp != REDACTED_SECRET && !is_valid_url_host_port(cand_hp))
+            || after_hp.starts_with(['?', '#'])
+        {
+            return false;
+        }
+        has_authority_at_candidate = true;
+        if pre_slash[1..at_idx].contains('&') {
+            any_at_has_amp_before = true;
+        }
+        if after_hp.is_empty() && !post_slash.is_empty() {
+            any_at_reaches_slash = true;
+        }
+    }
+    if !has_authority_at_candidate {
+        return !host_port.is_empty() || !from_delim.is_empty();
+    }
+    if !host_port.is_empty()
+        && !host_has_domain_or_ip_shape(host_port)
+        && host_port != REDACTED_SECRET
+    {
+        return false;
+    }
+    let body = &pre_slash[1..];
+    if !starts_with_query_key_eq(body) {
+        return false;
+    }
+    let next_qf = post_slash.find(['?', '#']).unwrap_or(post_slash.len());
+    any_at_has_amp_before || (any_at_reaches_slash && post_slash[..next_qf].contains('&'))
+}
+
+fn find_embedded_url_before_query(tail: &str) -> Option<usize> {
+    let limit = tail.find(['?', '#']).unwrap_or(tail.len());
+    let slice = &tail[..limit];
+    for (idx, _) in slice.char_indices() {
+        if idx > 0 && is_http_url(&slice[idx..]) {
+            let prev = slice[..idx].chars().next_back().unwrap_or('/');
+            if matches!(
+                prev,
+                '/' | ',' | ';' | '=' | ':' | '\'' | '"' | '`' | '<' | '(' | '[' | '{'
+            ) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_authority_host_port(host_port: &str) -> &str {
+    if host_port.is_empty() || host_port == REDACTED_SECRET || is_valid_url_host_port(host_port) {
+        host_port
+    } else {
+        REDACTED_SECRET
+    }
+}
+
+fn redact_authority_and_tail(after_scheme: &str) -> (String, &str) {
+    let slash_idx = after_scheme.find('/').unwrap_or(after_scheme.len());
+    let first_delim_idx = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let head = &after_scheme[..first_delim_idx];
+    let from_delim = &after_scheme[first_delim_idx..];
+
+    if first_delim_idx == slash_idx || is_authority_complete_before_query(head, from_delim) {
+        let safe_auth = match head.rsplit_once('@') {
+            Some((_userinfo, host_port)) => {
+                format!(
+                    "{REDACTED_SECRET}@{}",
+                    sanitize_authority_host_port(host_port)
+                )
+            }
+            None if head != REDACTED_SECRET
+                && (head.contains(':') || head.starts_with(REDACTED_SECRET))
+                && !is_valid_url_host_port(head) =>
+            {
+                REDACTED_SECRET.to_string()
+            }
+            None => head.to_string(),
+        };
+        (safe_auth, from_delim)
+    } else {
+        let pre_slash = &after_scheme[..slash_idx];
+        let matched = pre_slash.match_indices('@').find_map(|(at_idx, _)| {
+            let after_at = &pre_slash[at_idx + 1..];
+            let host_end = after_at.find(['?', '#']).unwrap_or(after_at.len());
+            let host_port = &after_at[..host_end];
+            let host_candidate = host_port.is_empty()
+                || host_port == REDACTED_SECRET
+                || is_host_with_any_port_digits(host_port);
+            if !host_candidate {
+                return None;
+            }
+            let rest_from_delim = &after_scheme[at_idx + 1 + host_end..];
+            if !rest_from_delim.is_empty()
+                && !rest_from_delim.starts_with('/')
+                && !is_authority_complete_before_query(
+                    if is_valid_url_host_port(host_port) {
+                        host_port
+                    } else {
+                        REDACTED_SECRET
+                    },
+                    rest_from_delim,
+                )
+            {
+                return None;
+            }
+            Some((
+                sanitize_authority_host_port(host_port),
+                at_idx + 1 + host_end,
+            ))
+        });
+        match matched {
+            Some((safe_hp, tail_start)) => (
+                format!("{REDACTED_SECRET}@{safe_hp}"),
+                &after_scheme[tail_start..],
+            ),
+            None => match head.rsplit_once('@') {
+                Some((_userinfo, host_port)) => (
+                    format!(
+                        "{REDACTED_SECRET}@{}",
+                        sanitize_authority_host_port(host_port)
+                    ),
+                    from_delim,
+                ),
+                None if head != REDACTED_SECRET
+                    && (head.contains(':') || head.starts_with(REDACTED_SECRET))
+                    && !is_valid_url_host_port(head) =>
+                {
+                    (REDACTED_SECRET.to_string(), from_delim)
+                }
+                None => (head.to_string(), from_delim),
+            },
+        }
+    }
+}
+
+fn redact_single_http_url_segment(url: &str) -> (&str, String, &str) {
+    let (scheme, after_scheme) = url.split_once("://").expect("checked http(s)://");
+    let (safe_authority, tail) = redact_authority_and_tail(after_scheme);
+    (scheme, safe_authority, tail)
+}
+
+fn redact_http_url(url: &str) -> String {
+    if url.split_once("://").is_none() {
+        return url.to_string();
+    }
+    let mut out = String::with_capacity(url.len());
+    let mut cur = url;
+    loop {
+        let Some((_s, after_scheme)) = cur.split_once("://") else {
+            out.push_str(cur);
+            break;
+        };
+        let pre_delim_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let pre_delim = &after_scheme[..pre_delim_end];
+        let concat_split = pre_delim.char_indices().find_map(|(i, ch)| {
+            if matches!(ch, ',' | ';') && is_http_url(&after_scheme[i + 1..]) {
+                let left_head = &after_scheme[..i];
+                let left_hp = left_head.rsplit_once('@').map_or(left_head, |(_, hp)| hp);
+                if left_hp == REDACTED_SECRET || is_host_with_any_port_digits(left_hp) {
+                    let scheme_prefix_len = cur.len() - after_scheme.len();
+                    return Some(scheme_prefix_len + i);
+                }
+            }
+            None
+        });
+        if let Some(split_at) = concat_split {
+            let (scheme, safe_auth, _) = redact_single_http_url_segment(&cur[..split_at]);
+            out.push_str(scheme);
+            out.push_str("://");
+            out.push_str(&safe_auth);
+            out.push(cur.as_bytes()[split_at] as char);
+            cur = &cur[split_at + 1..];
+            continue;
+        }
+
+        let (scheme, safe_authority, mut tail) = redact_single_http_url_segment(cur);
+        out.push_str(scheme);
+        out.push_str("://");
+        out.push_str(&safe_authority);
+        while let Some(after_double_slash) = tail.strip_prefix("//") {
+            let next_slash = after_double_slash
+                .find('/')
+                .unwrap_or(after_double_slash.len());
+            if !after_double_slash[..next_slash].contains(['@', ':']) {
+                break;
+            }
+            out.push_str("//");
+            let (sub_auth, sub_tail) = redact_authority_and_tail(after_double_slash);
+            out.push_str(&sub_auth);
+            tail = sub_tail;
+        }
+        if let Some(emb_idx) = find_embedded_url_before_query(tail) {
+            out.push_str(&tail[..emb_idx]);
+            cur = &tail[emb_idx..];
+            continue;
+        }
+        match tail.find(['?', '#']) {
+            Some(idx) => {
+                let delim = tail.as_bytes()[idx] as char;
+                out.push_str(&tail[..idx]);
+                out.push(delim);
+                out.push_str(REDACTED_SECRET);
+            }
+            None => out.push_str(tail),
+        }
+        break;
+    }
+    out
+}
+
+/// Formats a `judge.model` or `summarizer.bundle_id` value for structured logs
+/// and error messages, stripping `userinfo@` and `?query` / `#fragment` tokens
+/// from HTTP(S) URLs while leaving repository IDs and local paths unchanged.
+pub fn redact_model_spec_for_log(spec: &str) -> String {
+    let trimmed = spec.trim();
+    if is_http_url(trimmed) && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        redact_http_url(trimmed)
+    } else {
+        redact_urls_in_text(trimmed)
+    }
+}
+
+fn is_closing_url_boundary(after: &str) -> bool {
+    let rest =
+        after.trim_start_matches([')', ']', '}', '>', '"', '\'', '`', ',', '.', ';', ':', '!']);
+    rest.chars()
+        .next()
+        .is_none_or(|nc| nc.is_whitespace() || nc.is_control())
+}
+
+fn count_preceding_backslashes(s: &str, byte_idx: usize) -> usize {
+    s.as_bytes()[..byte_idx]
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'\\')
+        .count()
+}
+
+fn has_open_html_tag_attr(prefix: &str) -> bool {
+    let Some(eq_prefix) = prefix.strip_suffix('"') else {
+        return false;
+    };
+    let trimmed = eq_prefix.trim_end_matches([' ', '\t']);
+    if !trimmed.ends_with('=') {
+        return false;
+    }
+    match (trimmed.rfind('<'), trimmed.rfind('>')) {
+        (Some(lt), Some(gt)) => lt > gt,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn detect_structured_quote_level(
+    prefix: &str,
+    closing_wrapper: Option<char>,
+    wrapper_bs: usize,
+) -> Option<(char, usize)> {
+    if let Some(w @ ('"' | '\'')) = closing_wrapper {
+        let quote_len = 1 + wrapper_bs;
+        if prefix.len() >= quote_len {
+            let before_q = prefix[..prefix.len() - quote_len].trim_end_matches([' ', '\t']);
+            if before_q.ends_with([':', '[', ',', '(']) {
+                return Some((w, wrapper_bs));
+            }
+        }
+        return None;
+    }
+    let bytes = prefix.as_bytes();
+    let mut idx = bytes.len();
+    while idx > 0 {
+        idx -= 1;
+        if bytes[idx] == b'"' {
+            let bs = count_preceding_backslashes(prefix, idx);
+            let before_q = prefix[..idx - bs].trim_end_matches([' ', '\t']);
+            if before_q.ends_with([':', '[', ',']) {
+                return Some(('"', bs));
+            }
+            break;
+        }
+    }
+    None
+}
+
+fn quote_matches_level(quote_bs: usize, level_bs: usize) -> bool {
+    if level_bs == 0 {
+        quote_bs.is_multiple_of(2)
+    } else {
+        quote_bs == level_bs
+    }
+}
+
+fn count_matching_quotes_in_slice(s: &str, q: char, level_bs: usize) -> usize {
+    s.char_indices()
+        .filter(|&(i, ch)| {
+            if ch != q {
+                return false;
+            }
+            if q == '"' {
+                quote_matches_level(count_preceding_backslashes(s, i), level_bs)
+            } else {
+                true
+            }
+        })
+        .count()
+}
+
+fn is_after_closing_bracket_valid(after_bracket: &str) -> bool {
+    let trimmed = after_bracket.trim_start_matches([' ', '\t']);
+    is_closing_url_boundary(trimmed)
+        || trimmed.starts_with([',', ';', ')', ']', '}', '"', '\'', '\\'])
+        || is_xml_closing_tag(trimmed)
+}
+
+fn is_container_continuation_after_quote(
+    after: &str,
+    q: char,
+    level_bs: usize,
+    paren_depth: usize,
+    bracket_depth: usize,
+    brace_depth: usize,
+) -> bool {
+    let trimmed = after.trim_start_matches([' ', '\t']);
+    if level_bs > 0 {
+        let bs = trimmed.bytes().take_while(|&b| b == b'\\').count();
+        if bs == level_bs {
+            let after_bs = &trimmed[bs..];
+            if after_bs.starts_with('"') {
+                return true;
+            }
+            if (after_bs.starts_with(')') && paren_depth == 0
+                || after_bs.starts_with(']') && bracket_depth == 0
+                || after_bs.starts_with('}') && brace_depth == 0)
+                && is_after_closing_bracket_valid(&after_bs[1..])
+            {
+                return true;
+            }
+        }
+    }
+    if (trimmed.starts_with(')') && paren_depth == 0
+        || trimmed.starts_with(']') && bracket_depth == 0
+        || trimmed.starts_with('}') && brace_depth == 0)
+        && is_after_closing_bracket_valid(&trimmed[1..])
+    {
+        return true;
+    }
+    let Some(rest_raw) = trimmed.strip_prefix([',', ';']) else {
+        return false;
+    };
+    let rest = rest_raw.trim_start_matches([' ', '\t']);
+    if level_bs > 0 {
+        let bs = rest.bytes().take_while(|&b| b == b'\\').count();
+        if bs == level_bs && rest[bs..].starts_with('"') {
+            return true;
+        }
+    }
+    if rest.starts_with([q, '"', '\'', '{', '[']) || is_http_url(rest) {
+        return true;
+    }
+    if rest.contains('@') {
+        return false;
+    }
+    let end = rest
+        .find(|c: char| matches!(c, ',' | ']' | '}' | ')') || c.is_whitespace() || c.is_control())
+        .unwrap_or(0);
+    if end == 0 {
+        return false;
+    }
+    let tok = &rest[..end];
+    let is_prim = matches!(tok, "true" | "false" | "null")
+        || tok
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.'));
+    is_prim && rest[end..].starts_with([',', ']', '}', ')'])
+}
+
+fn is_adjacent_url_separator(after: &str, w: char) -> bool {
+    if is_xml_closing_tag(after) {
+        return true;
+    }
+    if w == '>' && after.strip_prefix('<').is_some_and(is_http_url) {
+        return true;
+    }
+    if let Some(rest) = after.strip_prefix([',', ';'])
+        && (is_http_url(rest)
+            || rest
+                .strip_prefix(['"', '\'', '`', '<'])
+                .is_some_and(is_http_url))
+    {
+        return true;
+    }
+    false
+}
+
+fn redact_urls_in_text_once(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next_url = rest
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| is_http_url(&rest[i..]));
+        let Some(start) = next_url else {
+            out.push_str(rest);
+            break;
+        };
+        let prefix = &rest[..start];
+        out.push_str(prefix);
+        let (closing_wrapper, wrapper_backslashes) = match prefix.chars().next_back() {
+            Some('"') => (
+                Some('"'),
+                count_preceding_backslashes(prefix, prefix.len() - 1),
+            ),
+            Some('\'') => (Some('\''), 0),
+            Some('`') => (Some('`'), 0),
+            Some('<') => (Some('>'), 0),
+            _ => (None, 0),
+        };
+        let html_attr_quote = closing_wrapper == Some('"')
+            && wrapper_backslashes == 0
+            && has_open_html_tag_attr(prefix);
+        let structured_quote =
+            detect_structured_quote_level(prefix, closing_wrapper, wrapper_backslashes);
+
+        let candidate = &rest[start..];
+        let token_ws_end = candidate
+            .find(|c: char| c.is_whitespace() || c.is_control())
+            .unwrap_or(candidate.len());
+        let after_scheme_start = if candidate.as_bytes()[4] == b':' {
+            7
+        } else {
+            8
+        };
+        let after_scheme_token = &candidate[after_scheme_start..token_ws_end];
+        let initial_head_end = after_scheme_token
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme_token.len());
+        let initial_head = &after_scheme_token[..initial_head_end];
+        let initial_from_delim = &after_scheme_token[initial_head_end..];
+        let mut authority_complete = initial_head_end == after_scheme_token.len()
+            || initial_from_delim.starts_with('/')
+            || is_authority_complete_before_query(initial_head, initial_from_delim);
+
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut brace_depth = 0usize;
+        let mut angle_depth = 0usize;
+        let mut inner_quote_open = false;
+        let mut skip_until = 0usize;
+        let mut seen_path_slash = false;
+        let mut seen_query_or_fragment = false;
+        let mut raw_end = candidate.len();
+
+        for (idx, ch) in candidate.char_indices() {
+            if idx < skip_until {
+                continue;
+            }
+            if ch == '<' && candidate[idx..].starts_with(REDACTED_SECRET) {
+                skip_until = idx + REDACTED_SECRET.len();
+                continue;
+            }
+            if ch.is_whitespace() || ch.is_control() {
+                raw_end = idx;
+                break;
+            }
+            if is_xml_closing_tag(&candidate[idx..]) {
+                raw_end = idx;
+                break;
+            }
+            if !seen_query_or_fragment && idx > 0 && is_http_url(&candidate[idx..]) {
+                let prev = candidate[..idx].chars().next_back().unwrap_or('/');
+                if closing_wrapper.is_none()
+                    && structured_quote.is_none()
+                    && matches!(prev, ',' | ';')
+                {
+                    raw_end = idx;
+                    break;
+                }
+                if matches!(prev, '/' | ',' | ';' | '=' | ':' | '(' | '[' | '{') {
+                    let sub_scheme_len = if candidate.as_bytes()[idx + 4] == b':' {
+                        7
+                    } else {
+                        8
+                    };
+                    let sub_token = &candidate[idx + sub_scheme_len..token_ws_end];
+                    let sub_head_end = sub_token.find(['/', '?', '#']).unwrap_or(sub_token.len());
+                    let sub_head = &sub_token[..sub_head_end];
+                    let sub_from_delim = &sub_token[sub_head_end..];
+                    seen_path_slash = false;
+                    authority_complete = sub_head_end == sub_token.len()
+                        || sub_from_delim.starts_with('/')
+                        || is_authority_complete_before_query(sub_head, sub_from_delim);
+                    skip_until = idx + sub_scheme_len;
+                    continue;
+                }
+            }
+            let after = &candidate[idx + ch.len_utf8()..];
+            if !seen_query_or_fragment
+                && !inner_quote_open
+                && matches!(ch, '<' | '"' | '\'' | '`')
+                && is_http_url(after)
+            {
+                raw_end = idx;
+                break;
+            }
+            if idx >= after_scheme_start {
+                if ch == '/' {
+                    seen_path_slash = true;
+                    authority_complete = true;
+                } else if ch == '@' && !seen_path_slash && !authority_complete {
+                    let after_token = &candidate[idx + 1..token_ws_end];
+                    let (hp, hp_len) = if after_token.starts_with(REDACTED_SECRET) {
+                        (REDACTED_SECRET, REDACTED_SECRET.len())
+                    } else {
+                        let len = scan_host_port_prefix_len(after_token);
+                        (&after_token[..len], len)
+                    };
+                    let after_hp = &after[hp_len..];
+                    let valid_boundary = after_hp.is_empty()
+                        || after_hp.starts_with(['/', '?', '#', ',', ';'])
+                        || is_xml_closing_tag(after_hp)
+                        || is_closing_url_boundary(after_hp)
+                        || closing_wrapper.is_some_and(|w| after_hp.starts_with(w));
+                    let host_ok =
+                        hp.is_empty() || hp == REDACTED_SECRET || is_host_with_any_port_digits(hp);
+                    if valid_boundary && host_ok {
+                        let rest_in_token = &after_token[hp_len..];
+                        let check_hp = if is_valid_url_host_port(hp) {
+                            hp
+                        } else {
+                            REDACTED_SECRET
+                        };
+                        if rest_in_token.is_empty()
+                            || rest_in_token.starts_with(['/', ',', ';'])
+                            || is_xml_closing_tag(rest_in_token)
+                            || is_authority_complete_before_query(check_hp, rest_in_token)
+                        {
+                            authority_complete = true;
+                            seen_query_or_fragment = false;
+                            paren_depth = 0;
+                            bracket_depth = 0;
+                            brace_depth = 0;
+                            angle_depth = 0;
+                            inner_quote_open = false;
+                        }
+                    }
+                } else if matches!(ch, '?' | '#') && !seen_query_or_fragment {
+                    seen_query_or_fragment = true;
+                    if authority_complete {
+                        paren_depth = 0;
+                        bracket_depth = 0;
+                        brace_depth = 0;
+                        angle_depth = 0;
+                        inner_quote_open = false;
+                    }
+                }
+            }
+
+            let quote_backslashes = if ch == '"' {
+                count_preceding_backslashes(candidate, idx)
+            } else {
+                0
+            };
+
+            let active_quote_spec = match (closing_wrapper, structured_quote) {
+                (Some(w @ ('"' | '\'' | '`')), _) => Some((w, wrapper_backslashes)),
+                (None, Some((q, q_bs))) => Some((q, q_bs)),
+                _ => None,
+            };
+
+            if let Some((q_char, q_bs)) = active_quote_spec {
+                let matches_q =
+                    ch == q_char && (ch != '"' || quote_matches_level(quote_backslashes, q_bs));
+                if matches_q {
+                    if inner_quote_open {
+                        inner_quote_open = false;
+                        continue;
+                    }
+                    let closes_outer = is_closing_url_boundary(after)
+                        || is_adjacent_url_separator(after, ch)
+                        || (html_attr_quote && angle_depth == 0 && after.starts_with('>'))
+                        || ((after.starts_with(')') && paren_depth == 0
+                            || after.starts_with(']') && bracket_depth == 0
+                            || after.starts_with('}') && brace_depth == 0)
+                            && is_after_closing_bracket_valid(&after[1..]))
+                        || structured_quote.is_some_and(|(_, s_bs)| {
+                            s_bs == q_bs
+                                && is_container_continuation_after_quote(
+                                    after,
+                                    ch,
+                                    q_bs,
+                                    paren_depth,
+                                    bracket_depth,
+                                    brace_depth,
+                                )
+                        });
+                    if closes_outer {
+                        raw_end = idx;
+                        break;
+                    }
+                    let prev_ch = candidate[..idx].chars().next_back().unwrap_or(' ');
+                    if matches!(
+                        prev_ch,
+                        '=' | ',' | ';' | ':' | '/' | '(' | '[' | '{' | '?' | '#' | '&'
+                    ) {
+                        let rem_token = &after[..token_ws_end - (idx + ch.len_utf8())];
+                        let phase_slice = if !authority_complete {
+                            let end_rel = rem_token.find('@').unwrap_or(0);
+                            &rem_token[..end_rel]
+                        } else if !seen_query_or_fragment {
+                            let end_rel = rem_token.find(['?', '#']).unwrap_or(rem_token.len());
+                            &rem_token[..end_rel]
+                        } else {
+                            rem_token
+                        };
+                        let min_needed = if seen_query_or_fragment { 2 } else { 1 };
+                        let total_in_token =
+                            count_matching_quotes_in_slice(rem_token, q_char, q_bs);
+                        if count_matching_quotes_in_slice(phase_slice, q_char, q_bs) >= min_needed
+                            && total_in_token >= 2
+                        {
+                            inner_quote_open = true;
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if closing_wrapper == Some('>') && ch == '>' && angle_depth == 0 {
+                let closes_angle = is_closing_url_boundary(after)
+                    || is_adjacent_url_separator(after, '>')
+                    || ((after.starts_with(')') && paren_depth == 0
+                        || after.starts_with(']') && bracket_depth == 0
+                        || after.starts_with('}') && brace_depth == 0)
+                        && is_closing_url_boundary(&after[1..]));
+                if closes_angle {
+                    raw_end = idx;
+                    break;
+                }
+            }
+
+            match ch {
+                '(' => paren_depth += 1,
+                ')' => {
+                    if paren_depth > 0 {
+                        paren_depth -= 1;
+                    } else if is_closing_url_boundary(after)
+                        || is_adjacent_url_separator(after, ')')
+                    {
+                        raw_end = idx;
+                        break;
+                    }
+                }
+                '[' => bracket_depth += 1,
+                ']' => {
+                    if bracket_depth > 0 {
+                        bracket_depth -= 1;
+                    } else if is_closing_url_boundary(after)
+                        || is_adjacent_url_separator(after, ']')
+                    {
+                        raw_end = idx;
+                        break;
+                    }
+                }
+                '{' => brace_depth += 1,
+                '}' => {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    } else if is_closing_url_boundary(after)
+                        || is_adjacent_url_separator(after, '}')
+                    {
+                        raw_end = idx;
+                        break;
+                    }
+                }
+                '<' => {
+                    if is_closing_url_boundary(after) {
+                        raw_end = idx;
+                        break;
+                    }
+                    angle_depth += 1;
+                }
+                '>' => {
+                    if angle_depth > 0 {
+                        angle_depth -= 1;
+                    } else if is_closing_url_boundary(after) {
+                        raw_end = idx;
+                        break;
+                    }
+                }
+                '"' if active_quote_spec.is_none() && is_closing_url_boundary(after) => {
+                    raw_end = idx;
+                    break;
+                }
+                '\'' | '`' if active_quote_spec.is_none() && is_closing_url_boundary(after) => {
+                    raw_end = idx;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let mut url_end = raw_end;
+        if candidate[raw_end..].starts_with('"') {
+            let quote_bs = count_preceding_backslashes(candidate, raw_end);
+            let strip_count = match (closing_wrapper, structured_quote) {
+                (Some('"'), _) => {
+                    if wrapper_backslashes == 0 {
+                        0
+                    } else {
+                        wrapper_backslashes.min(quote_bs)
+                    }
+                }
+                (None, Some(('"', s_bs))) => {
+                    if s_bs == 0 {
+                        0
+                    } else {
+                        s_bs.min(quote_bs)
+                    }
+                }
+                _ => {
+                    if !quote_bs.is_multiple_of(2) {
+                        quote_bs
+                    } else {
+                        0
+                    }
+                }
+            };
+            let mut stripped = 0usize;
+            while stripped < strip_count
+                && url_end > after_scheme_start
+                && candidate.as_bytes()[url_end - 1] == b'\\'
+            {
+                url_end -= 1;
+                stripped += 1;
+            }
+        }
+        let stopped_at_embedded_url = is_http_url(&candidate[raw_end..]);
+        while url_end > after_scheme_start
+            && if stopped_at_embedded_url {
+                matches!(candidate.as_bytes()[url_end - 1], b',' | b';')
+            } else {
+                matches!(
+                    candidate.as_bytes()[url_end - 1],
+                    b',' | b'.' | b';' | b':' | b'!'
+                )
+            }
+        {
+            url_end -= 1;
+        }
+        out.push_str(&redact_http_url(&candidate[..url_end]));
+        rest = &candidate[url_end..];
+    }
+    out
+}
+
+/// Redacts `userinfo@` and `?query` / `#fragment` components from every HTTP(S)
+/// URL embedded inside a formatted error message. Idempotent across repeated
+/// passes over error chains that already contain `<REDACTED_SECRET>`.
+pub(crate) fn redact_urls_in_text(text: &str) -> String {
+    let mut current = redact_urls_in_text_once(text);
+    for _ in 0..3 {
+        let next = redact_urls_in_text_once(&current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+fn has_gguf_extension(s: &str) -> bool {
+    let name = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    let bytes = name.as_bytes();
+    bytes.len() > 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".gguf")
+}
+
+fn is_valid_three_segment_hf_gguf(spec: &str) -> Option<(&str, &str, &str)> {
+    let parts: Vec<&str> = spec.split('/').collect();
+    let [owner, repo, filename] = parts.as_slice() else {
+        return None;
+    };
+    if owner.is_empty()
+        || repo.is_empty()
+        || filename.is_empty()
+        || matches!(*owner, "." | ".." | "~")
+        || has_gguf_extension(repo)
+        || !has_gguf_extension(filename)
+    {
+        return None;
+    }
+    cera::bundle::cache_key::validate_path_segment("owner", owner).ok()?;
+    cera::bundle::cache_key::validate_path_segment("repo", repo).ok()?;
+    cera::bundle::cache_key::validate_path_segment("filename", filename).ok()?;
+    Some((owner, repo, filename))
 }
 
 /// Whether `spec` looks like an explicit filesystem path rather than a remote
 /// URL or Hugging Face repository identifier (`owner/repo`).
 fn looks_like_local_path(spec: &str, expanded: &Path) -> bool {
-    if spec.starts_with("http://") || spec.starts_with("https://") {
+    if is_http_url(spec) {
         return false;
     }
-    if expanded.is_file() {
+    if std::fs::symlink_metadata(expanded).is_ok() {
         return true;
     }
-    if spec.starts_with('/')
+    if matches!(spec, "." | ".." | "~")
+        || spec.starts_with('/')
         || spec.starts_with("./")
         || spec.starts_with("../")
         || spec.starts_with("~/")
@@ -205,60 +1240,186 @@ fn looks_like_local_path(spec: &str, expanded: &Path) -> bool {
     {
         return true;
     }
-    // Windows drive prefix (`C:/...`)
-    if spec.len() >= 3
+    // Windows drive prefix (`C:/...` or `C:\...` or `C:foo`)
+    if spec.len() >= 2
         && spec.as_bytes()[0].is_ascii_alphabetic()
         && spec.as_bytes()[1] == b':'
-        && (spec.as_bytes()[2] == b'/' || spec.as_bytes()[2] == b'\\')
+        && (spec.len() == 2
+            || spec.as_bytes()[2] == b'/'
+            || spec.as_bytes()[2] == b'\\'
+            || has_gguf_extension(spec))
     {
         return true;
     }
-    // Bare `foo.gguf` with no repo slash.
-    spec.ends_with(".gguf") && !spec.contains('/')
+    // Any `.gguf` spec without an inline `:quant` delimiter that is not a valid
+    // 3-segment `owner/repo/file.gguf` identifier (for example `foo.gguf`,
+    // `models/foo.gguf`, or `a/b/c/foo.gguf`) is a local path and must fail
+    // closed without contacting Hugging Face.
+    if has_gguf_extension(spec) && !spec.contains(':') {
+        return is_valid_three_segment_hf_gguf(spec).is_none();
+    }
+    false
+}
+
+fn split_clean_url_segments(path: &str) -> Option<(&str, Vec<&str>)> {
+    let path_no_qs = path.split(['?', '#']).next().unwrap_or("");
+    if path_no_qs.starts_with('/') {
+        return None;
+    }
+    let trimmed_path = path_no_qs.strip_suffix('/').unwrap_or(path_no_qs);
+    if trimmed_path.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = trimmed_path.split('/').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    Some((path_no_qs, segments))
+}
+
+fn direct_http_gguf_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let (host, path) = after_scheme.split_once('/')?;
+    if host.is_empty() {
+        return None;
+    }
+    let (path_no_qs, segments) = split_clean_url_segments(path)?;
+    if !has_gguf_extension(path_no_qs) {
+        return None;
+    }
+    cera::bundle::cache_key::cache_relative_segments(url).ok()?;
+    let candidate = if cera::bundle::hf::is_hf_or_endpoint_host(host) {
+        if segments.len() < 5 || !matches!(segments[2], "resolve" | "blob" | "raw") {
+            return None;
+        }
+        let spec = cera::bundle::hf::HfSpec::parse(url).ok()?;
+        let subpath = spec.subpath.as_deref()?;
+        if !has_gguf_extension(subpath) {
+            return None;
+        }
+        // Rewrite HF `/blob/` or `/raw/` viewer URLs to `/resolve/` so HTML
+        // pages never get cached as binary model artifacts.
+        if segments[2] != "resolve" {
+            spec.file_download_url(subpath)
+        } else {
+            url.to_string()
+        }
+    } else {
+        url.to_string()
+    };
+    cera::bundle::cache_key::cache_relative_segments(&candidate).ok()?;
+    Some(candidate)
+}
+
+/// Parses a Hugging Face repository root (`/owner/repo`) or branch/tag tree
+/// (`/owner/repo/tree/<revision>`) URL, rejecting URLs with unrecognized or
+/// truncated trailing path segments that `HfSpec::parse_url` would silently
+/// drop (`subpath: None`).
+fn parse_hf_repo_or_tree_url(url: &str) -> Option<cera::bundle::hf::HfSpec> {
+    let after_scheme = url.split_once("://")?.1;
+    let (host, path) = after_scheme.split_once('/')?;
+    if host.is_empty() || !cera::bundle::hf::is_hf_or_endpoint_host(host) {
+        return None;
+    }
+    cera::bundle::cache_key::cache_relative_segments(&format!("https://{host}/probe")).ok()?;
+    let (path_no_qs, segments) = split_clean_url_segments(path)?;
+    if has_gguf_extension(path_no_qs) {
+        return None;
+    }
+    let valid_shape = match segments.as_slice() {
+        [owner, repo] => !has_gguf_extension(owner) && !has_gguf_extension(repo),
+        [owner, repo, "tree", rev] => {
+            !has_gguf_extension(owner) && !has_gguf_extension(repo) && !has_gguf_extension(rev)
+        }
+        _ => false,
+    };
+    if !valid_shape {
+        return None;
+    }
+    let spec = cera::bundle::hf::HfSpec::parse(url).ok()?;
+    if spec.subpath.is_some() {
+        return None;
+    }
+    Some(spec)
+}
+
+fn canonical_hf_gguf_url(spec: &cera::bundle::hf::HfSpec, quant: &str) -> Option<String> {
+    let quant = quant.trim();
+    if !quant.is_empty() {
+        triage_core::config::validate_quant_tag("judge.quant", quant).ok()?;
+    }
+    let effective_quant = spec
+        .quant
+        .as_deref()
+        .or_else(|| (!quant.is_empty()).then_some(quant))?;
+    triage_core::config::validate_quant_tag("judge.quant", effective_quant).ok()?;
+    let stem = spec
+        .repo
+        .strip_suffix("-GGUF")
+        .or_else(|| spec.repo.strip_suffix("-gguf"))
+        .unwrap_or(&spec.repo);
+    let url = spec.file_download_url(&format!("{stem}-{effective_quant}.gguf"));
+    cera::bundle::cache_key::cache_relative_segments(&url).ok()?;
+    Some(url)
+}
+
+fn resolve_hf_fallback_target(trimmed: &str, quant: &str) -> (String, Option<String>) {
+    let hf_repo = if is_http_url(trimmed) || trimmed.contains('/') {
+        trimmed.to_string()
+    } else {
+        format!("LiquidAI/{trimmed}")
+    };
+    let spec_quant = cera::bundle::hf::HfSpec::parse(&hf_repo)
+        .ok()
+        .and_then(|spec| spec.quant);
+    let effective_quant = spec_quant.or_else(|| {
+        let q = quant.trim();
+        (!q.is_empty()).then(|| q.to_string())
+    });
+    (hf_repo, effective_quant)
 }
 
 /// Derives the canonical Hugging Face `.gguf` resolve URL for a `d1` model
-/// specification when `model` is an HTTP(S) URL, `owner/repo`, `owner/repo/file.gguf`,
-/// or bare LiquidAI repo name (e.g. `"d1-2B-GGUF"`). Returns `None` for local paths.
+/// specification when `model` is a direct `.gguf` HTTP(S) URL, Hugging Face URL,
+/// `owner/repo`, `owner/repo/file.gguf`, or bare LiquidAI repo name
+/// (e.g. `"d1-2B-GGUF"`). Returns `None` for local paths or non-`.gguf` URLs
+/// that cannot determine a concrete `.gguf` filename.
 pub fn d1_model_download_url(model: &str, quant: &str) -> Option<String> {
     let trimmed = model.trim();
     let quant = quant.trim();
-    if trimmed.is_empty() || quant.is_empty() {
+    if trimmed.is_empty() {
         return None;
     }
-    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
-        return Some(trimmed.to_string());
+    if !quant.is_empty() {
+        triage_core::config::validate_quant_tag("judge.quant", quant).ok()?;
     }
+    if is_http_url(trimmed) {
+        if let Some(direct) = direct_http_gguf_url(trimmed) {
+            return Some(direct);
+        }
+        let spec = parse_hf_repo_or_tree_url(trimmed)?;
+        return canonical_hf_gguf_url(&spec, quant);
+    }
+
     let expanded = expand_home_prefix(trimmed);
     if looks_like_local_path(trimmed, &expanded) {
         return None;
     }
 
-    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
-    match segments.as_slice() {
-        [repo] => {
-            let stem = repo
-                .strip_suffix("-GGUF")
-                .or_else(|| repo.strip_suffix("-gguf"))
-                .unwrap_or(repo);
-            Some(format!(
-                "https://huggingface.co/LiquidAI/{repo}/resolve/main/{stem}-{quant}.gguf"
-            ))
-        }
-        [owner, repo] => {
-            let stem = repo
-                .strip_suffix("-GGUF")
-                .or_else(|| repo.strip_suffix("-gguf"))
-                .unwrap_or(repo);
-            Some(format!(
-                "https://huggingface.co/{owner}/{repo}/resolve/main/{stem}-{quant}.gguf"
-            ))
-        }
-        [owner, repo, filename] if filename.ends_with(".gguf") => Some(format!(
-            "https://huggingface.co/{owner}/{repo}/resolve/main/{filename}"
-        )),
-        _ => None,
+    if let Some((owner, repo, filename)) = is_valid_three_segment_hf_gguf(trimmed) {
+        let base = cera::bundle::hf::hf_base_endpoint();
+        let url = format!("{base}/{owner}/{repo}/resolve/main/{filename}");
+        cera::bundle::cache_key::cache_relative_segments(&url).ok()?;
+        return Some(url);
     }
+
+    let repo_input = if trimmed.contains('/') {
+        trimmed.to_string()
+    } else {
+        format!("LiquidAI/{trimmed}")
+    };
+    let spec = cera::bundle::hf::HfSpec::parse(&repo_input).ok()?;
+    canonical_hf_gguf_url(&spec, quant)
 }
 
 /// Resolves `JudgeConfig.model` + `quant` to an on-disk `.gguf` file path,
@@ -271,8 +1432,18 @@ pub fn resolve_d1_model_path(
 ) -> anyhow::Result<PathBuf> {
     let trimmed = model.trim();
     ensure!(!trimmed.is_empty(), "judge.model must not be empty");
+    let trimmed_quant = quant.trim();
+    if !trimmed_quant.is_empty() {
+        triage_core::config::validate_quant_tag("judge.quant", trimmed_quant)?;
+    }
     let expanded = expand_home_prefix(trimmed);
     if looks_like_local_path(trimmed, &expanded) {
+        if expanded.is_dir() {
+            bail!(
+                "judge model path is a directory, expected a .gguf file: {}",
+                expanded.display()
+            );
+        }
         ensure!(
             expanded.is_file(),
             "judge model file does not exist: {}",
@@ -281,40 +1452,86 @@ pub fn resolve_d1_model_path(
         return Ok(expanded);
     }
 
-    let store = BundleRepo::new(cache_dir);
-    if let Some(url) = d1_model_download_url(trimmed, quant) {
+    let expanded_cache_dir = match cache_dir.to_str() {
+        Some(raw) => expand_home_prefix(raw),
+        None => cache_dir.to_path_buf(),
+    };
+    let store = BundleRepo::new(&expanded_cache_dir);
+
+    if is_http_url(trimmed) {
+        if let Some(direct_url) = direct_http_gguf_url(trimmed) {
+            return store
+                .resolve_url(&direct_url, None)
+                .map_err(|e| anyhow::anyhow!("{}", redact_urls_in_text(&format!("{e:#}"))))
+                .with_context(|| format!("resolving {}", redact_model_spec_for_log(&direct_url)));
+        }
+        // Only Hugging Face repository root (`/owner/repo`) or branch/tag tree
+        // (`/owner/repo/tree/<rev>`) URLs may proceed to repository manifest
+        // inspection; all other non-direct-`.gguf` HTTP(S) URLs fail closed
+        // before `BundleRepo` or `HfSpec::parse_url` can drop path segments.
+        ensure!(
+            parse_hf_repo_or_tree_url(trimmed).is_some(),
+            "direct judge.model URL must end with `.gguf` or point to a Hugging Face repository (`/owner/repo` or `/owner/repo/tree/<rev>`): {}",
+            redact_model_spec_for_log(trimmed)
+        );
+    }
+
+    if let Some((owner, repo, filename)) = is_valid_three_segment_hf_gguf(trimmed) {
+        let base = cera::bundle::hf::hf_base_endpoint();
+        let url = format!("{base}/{owner}/{repo}/resolve/main/{filename}");
+        return store
+            .resolve_url(&url, None)
+            .map_err(|e| anyhow::anyhow!("{}", redact_urls_in_text(&format!("{e:#}"))))
+            .with_context(|| format!("resolving {}", redact_model_spec_for_log(&url)));
+    }
+
+    if let Some(url) = d1_model_download_url(trimmed, trimmed_quant) {
         match store.resolve_url(&url, None) {
             Ok(path) => return Ok(path),
             Err(primary_err) => {
-                // If `trimmed` is already a direct URL, do not try HF repo discovery.
-                if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
-                    return Err(primary_err).with_context(|| format!("resolving {url}"));
-                }
                 tracing::debug!(
-                    %url,
-                    error = %primary_err,
+                    url = %redact_model_spec_for_log(&url),
+                    error = %redact_urls_in_text(&format!("{primary_err:#}")),
                     "canonical d1 GGUF URL failed; falling back to Hugging Face repo inspection"
                 );
             }
         }
     }
 
-    let hf_repo = if trimmed.contains('/') {
-        trimmed.to_string()
-    } else {
-        format!("LiquidAI/{trimmed}")
-    };
+    let (hf_repo, effective_quant) = resolve_hf_fallback_target(trimmed, trimmed_quant);
+    cera::bundle::hf::HfSpec::parse(&hf_repo)
+        .map_err(|e| anyhow::anyhow!("{}", redact_urls_in_text(&e.to_string())))?;
+    if let Some(eq) = effective_quant.as_deref() {
+        triage_core::config::validate_quant_tag("judge.quant", eq)?;
+    }
     let manifest = cera::bundle::inspect_and_resolve_manifest(
         &hf_repo,
-        Some(quant.trim()),
+        effective_quant.as_deref(),
         None,
-        Some(cache_dir),
+        Some(&expanded_cache_dir),
         None,
     )
-    .with_context(|| format!("inspecting Hugging Face repo `{hf_repo}` for quant `{quant}`"))?;
-    store
-        .resolve_url(&manifest.files.model, None)
-        .with_context(|| format!("downloading `{}`", manifest.files.model))
+    .map_err(|e| anyhow::anyhow!("{}", redact_urls_in_text(&format!("{e:#}"))))
+    .with_context(|| {
+        let quant_label = effective_quant.as_deref().unwrap_or("<default>");
+        format!(
+            "inspecting Hugging Face repo `{}` for quant `{quant_label}`",
+            redact_model_spec_for_log(&hf_repo)
+        )
+    })?;
+    if is_http_url(&manifest.files.model) {
+        store
+            .resolve_url(&manifest.files.model, None)
+            .map_err(|e| anyhow::anyhow!("{}", redact_urls_in_text(&format!("{e:#}"))))
+            .with_context(|| {
+                format!(
+                    "downloading `{}`",
+                    redact_model_spec_for_log(&manifest.files.model)
+                )
+            })
+    } else {
+        Ok(PathBuf::from(&manifest.files.model))
+    }
 }
 
 /// Inspects the status of the `.agents/hooks.json`, `.claude/settings.json`, or Muse `settings.json` file in the workspace or home directory.
@@ -1608,6 +2825,805 @@ mod tests {
         let err = resolve_d1_model_path(missing.to_str().unwrap(), "Q4_K_M", &temp_dir)
             .expect_err("missing local gguf must fail closed without hitting network");
         assert!(err.to_string().contains("judge model file does not exist"));
+
+        // Missing relative `dir/file.gguf` and uppercase `.GGUF` fail closed locally.
+        let rel_err = resolve_d1_model_path("nonexistent-subdir/model.GGUF", "", &temp_dir)
+            .expect_err("relative local .gguf path must fail closed without network");
+        assert!(
+            rel_err
+                .to_string()
+                .contains("judge model file does not exist")
+        );
+
+        // Existing directory fails closed with a clear directory diagnostic.
+        let dir_err = resolve_d1_model_path(temp_dir.to_str().unwrap(), "Q4_K_M", &temp_dir)
+            .expect_err("directory path must fail closed");
+        assert!(dir_err.to_string().contains("is a directory"));
+
+        // Non-GGUF non-HF HTTP URL fails closed before touching BundleRepo cache.
+        let bad_url_err =
+            resolve_d1_model_path("https://example.com/not-a-model-page", "Q4_K_M", &temp_dir)
+                .expect_err("HTML URL must be rejected before caching");
+        assert!(bad_url_err.to_string().contains(".gguf"));
+
+        // HF `/blob/` viewer URLs rewrite to `/resolve/`, repo URLs derive the GGUF
+        // file URL instead of caching HTML at `<owner>/<repo>`, and empty `quant`
+        // still works for explicit `.gguf` URLs and 3-segment HF file specs.
+        assert_eq!(
+            d1_model_download_url(
+                "https://huggingface.co/LiquidAI/d1-2B-GGUF/blob/main/d1-2B-Q4_K_M.gguf",
+                ""
+            )
+            .as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            d1_model_download_url("https://huggingface.co/LiquidAI/d1-2B-GGUF", "Q4_K_M")
+                .as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            d1_model_download_url(
+                "https://huggingface.co/LiquidAI/d1-2B-GGUF/tree/v1.0",
+                "Q4_K_M"
+            )
+            .as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/v1.0/d1-2B-Q4_K_M.gguf")
+        );
+        // Malformed or non-repo HF URLs whose trailing segments `HfSpec::parse_url`
+        // would silently drop (`subpath: None`) must fail closed rather than
+        // resolving to the default repository quantization.
+        for bad_hf_url in [
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/d1-2B-Q8_0.gguf",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/README.md",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/download/main/custom.gguf",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/d1-2B-Q8_0.gguf",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/blob/main",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/blob/main/README.md",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/tree/main/subdir",
+            "https://huggingface.co/LiquidAI/d1-2B.gguf",
+            "https://huggingface.co/LiquidAI//d1-2B-GGUF",
+            "https://huggingface.co//LiquidAI/d1-2B-GGUF",
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF//",
+            "https://huggingface.co:badport/LiquidAI/d1-2B-GGUF",
+            "https://huggingface.co:badport/LiquidAI/d1-2B-GGUF/blob/main/d1-2B-Q4_K_M.gguf",
+            "https://example.com/.gguf",
+            "https://example.com/../evil.gguf",
+            "https://example.com/./evil.gguf",
+            "https://example.com:badport/model.gguf",
+            "https://example.com/модель.gguf",
+            "https://example.com//models/custom-d1.gguf",
+        ] {
+            assert_eq!(
+                d1_model_download_url(bad_hf_url, "Q4_K_M"),
+                None,
+                "expected None for {bad_hf_url}"
+            );
+            assert!(
+                resolve_d1_model_path(bad_hf_url, "Q4_K_M", &temp_dir).is_err(),
+                "expected Err for {bad_hf_url}"
+            );
+        }
+        // Invalid `quant` values (traversal segments, path separators, query
+        // strings, or `.gguf` filenames) must fail closed locally in both
+        // `d1_model_download_url` and `resolve_d1_model_path` without falling
+        // through to live Hugging Face API calls.
+        for bad_quant in [
+            "../evil",
+            "sub/Q4_K_M",
+            "Q4_K_M.gguf?foo=bar",
+            "Q4_K_M.gguf",
+            ".gguf",
+            ".hidden",
+            "Q4_K_M.",
+        ] {
+            assert_eq!(
+                d1_model_download_url("LiquidAI/d1-2B-GGUF", bad_quant),
+                None,
+                "expected None for bad quant {bad_quant:?}"
+            );
+            assert_eq!(
+                d1_model_download_url("LiquidAI/d1-2B-GGUF:Q8_0@v1.0", bad_quant),
+                None,
+                "expected None when separate quant {bad_quant:?} is invalid"
+            );
+            assert_eq!(
+                d1_model_download_url("https://example.com/models/custom-d1.gguf", bad_quant),
+                None,
+                "expected None when direct .gguf URL carries invalid separate quant {bad_quant:?}"
+            );
+            assert_eq!(
+                d1_model_download_url("LiquidAI/d1-2B-GGUF/d1-2B-Q4_K_M.gguf", bad_quant),
+                None,
+                "expected None when 3-segment HF .gguf carries invalid separate quant {bad_quant:?}"
+            );
+            for early_return_model in [
+                "LiquidAI/d1-2B-GGUF",
+                existing_gguf.to_str().unwrap(),
+                "https://example.com/models/custom-d1.gguf",
+                "LiquidAI/d1-2B-GGUF/d1-2B-Q4_K_M.gguf",
+            ] {
+                let err = resolve_d1_model_path(early_return_model, bad_quant, &temp_dir)
+                    .expect_err("invalid quant must fail closed locally across all model shapes");
+                assert!(
+                    err.to_string().contains("judge.quant"),
+                    "expected local judge.quant validation error for ({early_return_model:?}, {bad_quant:?}), got: {err}"
+                );
+            }
+        }
+        for bad_inline_model in [
+            "LiquidAI/d1-2B-GGUF:../evil",
+            "LiquidAI/d1-2B-GGUF:Q4_K_M.gguf",
+            "LiquidAI/d1-2B-GGUF:.hidden",
+        ] {
+            assert_eq!(
+                d1_model_download_url(bad_inline_model, ""),
+                None,
+                "expected None for {bad_inline_model}"
+            );
+            assert!(
+                resolve_d1_model_path(bad_inline_model, "", &temp_dir).is_err(),
+                "expected Err for {bad_inline_model}"
+            );
+        }
+        assert_eq!(
+            d1_model_download_url("LiquidAI/d1-2B-GGUF:Q8_0@v1.0", "Q4_K_M").as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/v1.0/d1-2B-Q8_0.gguf")
+        );
+        assert_eq!(
+            d1_model_download_url("LiquidAI/d1-2B-GGUF/d1-2B-Q4_K_M.gguf", "").as_deref(),
+            Some("https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf")
+        );
+        assert_eq!(
+            d1_model_download_url("models/local-d1.gguf", "Q4_K_M"),
+            None
+        );
+
+        // Non-ASCII strings whose byte index `len - 5` lands inside a multi-byte
+        // UTF-8 scalar must never panic in `has_gguf_extension`, `d1_model_download_url`,
+        // or `resolve_d1_model_path`.
+        assert!(!has_gguf_extension("модель"));
+        assert!(!has_gguf_extension("a😀bc"));
+        assert!(has_gguf_extension("модель.GGUF"));
+        assert_eq!(
+            d1_model_download_url("https://example.com/модель", "Q4_K_M"),
+            None
+        );
+        assert!(resolve_d1_model_path("https://example.com/модель", "Q4_K_M", &temp_dir).is_err());
+        assert!(resolve_d1_model_path("./модель", "Q4_K_M", &temp_dir).is_err());
+
+        // Inline `:quant` in `model` takes precedence over `JudgeConfig.quant`
+        // during Hugging Face manifest fallback inspection as well as canonical URL
+        // derivation.
+        assert_eq!(
+            resolve_hf_fallback_target("org/custom-d1:Q8_0@v1.0", "Q4_K_M"),
+            (
+                "org/custom-d1:Q8_0@v1.0".to_string(),
+                Some("Q8_0".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_hf_fallback_target("d1-2B-GGUF:Q5_K_M", "Q4_K_M"),
+            (
+                "LiquidAI/d1-2B-GGUF:Q5_K_M".to_string(),
+                Some("Q5_K_M".to_string())
+            )
+        );
+        assert_eq!(
+            resolve_hf_fallback_target("org/custom-d1", " Q4_K_M "),
+            ("org/custom-d1".to_string(), Some("Q4_K_M".to_string()))
+        );
+        assert_eq!(
+            resolve_hf_fallback_target("org/custom-d1", "   "),
+            ("org/custom-d1".to_string(), None)
+        );
+
+        // `expand_home_prefix` trims whitespace and expands bare `~` and `~/...`.
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            assert_eq!(expand_home_prefix("  ~  "), PathBuf::from(&home));
+            assert_eq!(
+                expand_home_prefix(" ~/.cache/triage/models "),
+                PathBuf::from(&home).join(".cache/triage/models")
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn d1_bounded_request_rejects_oversized_char_count_and_escaped_json_state() {
+        let ok = build_bounded_d1_request(&request("cargo test --workspace"))
+            .expect("normal command fits budget");
+        assert_eq!(
+            ok.state.get("command"),
+            Some(&Json::Str("cargo test --workspace".to_string()))
+        );
+
+        let too_many_chars = "a".repeat(MAX_COMMAND_CHARS + 1);
+        assert_eq!(
+            build_bounded_d1_request(&request(&too_many_chars)).unwrap_err(),
+            "command is too long to judge"
+        );
+
+        // 2,000 ASCII control characters are well below `MAX_COMMAND_CHARS` (8,192)
+        // in scalar count, yet expand 6x to 12,000 `\u0001` JSON bytes and must
+        // fail closed instead of silently right-truncating `command`.
+        let escaped_expansion = "\x01".repeat(2_000);
+        assert!(escaped_expansion.chars().count() < MAX_COMMAND_CHARS);
+        assert_eq!(
+            build_bounded_d1_request(&request(&escaped_expansion)).unwrap_err(),
+            "command is too long to judge"
+        );
+    }
+
+    #[test]
+    fn model_url_redaction_strips_query_fragment_and_userinfo() {
+        assert_eq!(
+            redact_model_spec_for_log("LiquidAI/d1-2B-GGUF"),
+            "LiquidAI/d1-2B-GGUF"
+        );
+        assert_eq!(
+            redact_model_spec_for_log("/opt/models/d1.gguf"),
+            "/opt/models/d1.gguf"
+        );
+        assert_eq!(
+            redact_model_spec_for_log(
+                "https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf"
+            ),
+            "https://huggingface.co/LiquidAI/d1-2B-GGUF/resolve/main/d1-2B-Q4_K_M.gguf"
+        );
+        assert_eq!(
+            redact_model_spec_for_log(
+                "https://s3.example.com/models/d1.gguf?X-Amz-Signature=sig_placeholder&expires=99"
+            ),
+            "https://s3.example.com/models/d1.gguf?<REDACTED_SECRET>"
+        );
+        assert_eq!(
+            redact_model_spec_for_log(
+                "HTTPS://demo_user:p@ss_placeholder@models.example.com:8443/d1.gguf#frag_placeholder"
+            ),
+            "HTTPS://<REDACTED_SECRET>@models.example.com:8443/d1.gguf#<REDACTED_SECRET>"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "ошибка загрузки (https://demo_user:demo_pw@s3.example.com/d1.gguf?sig=sig_placeholder) failed"
+            ),
+            "ошибка загрузки (https://<REDACTED_SECRET>@s3.example.com/d1.gguf?<REDACTED_SECRET>) failed"
+        );
+        // Comma in query params + trailing `: HTTP 403`, IPv6 bracketed authority,
+        // balanced `(a)` in query params, and sub-delims `,` / `'` / `)` in userinfo.
+        assert_eq!(
+            redact_urls_in_text(
+                "GET https://models.example.com/d1.gguf?response-content-disposition=attachment,filename=d1.gguf&X-Amz-Signature=sig_placeholder: HTTP 403 Forbidden"
+            ),
+            "GET https://models.example.com/d1.gguf?<REDACTED_SECRET>: HTTP 403 Forbidden"
+        );
+        assert_eq!(
+            redact_urls_in_text("GET https://[::1]:8443/d1.gguf?token=sig_placeholder: HTTP 403"),
+            "GET https://[::1]:8443/d1.gguf?<REDACTED_SECRET>: HTTP 403"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "error sending request for url (https://models.example.com/d1.gguf?filter=(a)&sig=sig_placeholder)"
+            ),
+            "error sending request for url (https://models.example.com/d1.gguf?<REDACTED_SECRET>)"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "url 'https://demo_u,1:demo'p)2@models.example.com/d1.gguf?sig=sig_placeholder' failed"
+            ),
+            "url 'https://<REDACTED_SECRET>@models.example.com/d1.gguf?<REDACTED_SECRET>' failed"
+        );
+        // Internal `'` or unmatched `)` followed immediately by `,` / `.` / `:`
+        // inside query strings or userinfo must not truncate before `@` or `&sig=...`.
+        assert_eq!(
+            redact_urls_in_text(
+                "GET https://models.example.com/d1.gguf?tag='prod',&val=a).b&X-Amz-Signature=sig_placeholder: HTTP 403 Forbidden"
+            ),
+            "GET https://models.example.com/d1.gguf?<REDACTED_SECRET>: HTTP 403 Forbidden"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "bundle_id `https://demo_u':demo_p):x@models.example.com/m.gguf` contains forbidden character ':'"
+            ),
+            "bundle_id `https://<REDACTED_SECRET>@models.example.com/m.gguf` contains forbidden character ':'"
+        );
+        // Repeated redaction passes (for example `resolve_d1_model_path` followed by
+        // `run_worker` formatting `{error:#}`) must be idempotent and never duplicate
+        // `<REDACTED_SECRET>`.
+        let once = redact_urls_in_text(
+            "resolving https://s3.example.com/models/d1.gguf?sig=sig_placeholder: <https://demo_u:demo_pw@s3.example.com/models/d1.gguf#frag_placeholder>",
+        );
+        assert_eq!(
+            once,
+            "resolving https://s3.example.com/models/d1.gguf?<REDACTED_SECRET>: <https://<REDACTED_SECRET>@s3.example.com/models/d1.gguf#<REDACTED_SECRET>>"
+        );
+        assert_eq!(redact_urls_in_text(&once), once);
+
+        // Nested URLs inside `?query` or `#fragment` must keep trailing `&sig=...`
+        // inside the redacted query span, whereas unspaced pre-query URLs separated
+        // by `','`, `'='`, or `'/'` must split so the second URL's `userinfo@` is
+        // redacted.
+        let nested_query = redact_urls_in_text(
+            "GET https://models.example.com/d1.gguf?mirrors='https://m1.example.com/d1.gguf','https://m2.example.com/d1.gguf'&X-Amz-Signature=sig_placeholder: HTTP 403",
+        );
+        assert_eq!(
+            nested_query,
+            "GET https://models.example.com/d1.gguf?<REDACTED_SECRET>: HTTP 403"
+        );
+        assert_eq!(redact_urls_in_text(&nested_query), nested_query);
+
+        let adjacent_quoted = redact_urls_in_text(
+            "urls=['https://a.example.com/1.gguf','https://demo_u:demo_pw@b.example.com/2.gguf']",
+        );
+        assert_eq!(
+            adjacent_quoted,
+            "urls=['https://a.example.com/1.gguf','https://<REDACTED_SECRET>@b.example.com/2.gguf']"
+        );
+        assert_eq!(redact_urls_in_text(&adjacent_quoted), adjacent_quoted);
+
+        let path_embedded = redact_urls_in_text(
+            "GET https://cdn.example.com/fetch/https://demo_u:demo_pw@origin.example.com/d1.gguf: HTTP 502",
+        );
+        assert_eq!(
+            path_embedded,
+            "GET https://cdn.example.com/fetch/https://<REDACTED_SECRET>@origin.example.com/d1.gguf: HTTP 502"
+        );
+        assert_eq!(redact_urls_in_text(&path_embedded), path_embedded);
+
+        // Unencoded `?` or `#` inside `userinfo` must still redact `userinfo@`,
+        // without misparsing `@` inside slashless `?query` strings as `userinfo`.
+        assert_eq!(
+            redact_model_spec_for_log("https://demo_u:demo_pw#2@models.example.com/d1.gguf"),
+            "https://<REDACTED_SECRET>@models.example.com/d1.gguf"
+        );
+        assert_eq!(
+            redact_model_spec_for_log(
+                "https://demo_u@corp.example:demo_pw?2@models.example.com:8443/d1.gguf?sig=sig_placeholder"
+            ),
+            "https://<REDACTED_SECRET>@models.example.com:8443/d1.gguf?<REDACTED_SECRET>"
+        );
+        assert_eq!(
+            redact_model_spec_for_log(
+                "https://demo_u:demo_pw#2@models.example.com?notify=bob@corp.com&sig=sig_placeholder"
+            ),
+            "https://<REDACTED_SECRET>@models.example.com?<REDACTED_SECRET>"
+        );
+        assert_eq!(
+            redact_model_spec_for_log("https://models.example.com?u=a@b&sig=sig_placeholder"),
+            "https://models.example.com?<REDACTED_SECRET>"
+        );
+        assert_eq!(
+            redact_model_spec_for_log(
+                "https://demo_u:demo_pw?2@[::1]:8443/d1.gguf#frag_placeholder"
+            ),
+            "https://<REDACTED_SECRET>@[::1]:8443/d1.gguf#<REDACTED_SECRET>"
+        );
+
+        // Quotes, backticks, and angle brackets inside `userinfo` or `?query` must
+        // not truncate early, while enclosing quotes, escaped quotes, and compact
+        // JSON fields must still terminate cleanly at the URL boundary.
+        let inner_double_quotes = redact_urls_in_text(
+            "GET https://models.example.com/d1.gguf?tag=\"prod\"&X-Amz-Signature=sig_placeholder: HTTP 403",
+        );
+        assert_eq!(
+            inner_double_quotes,
+            "GET https://models.example.com/d1.gguf?<REDACTED_SECRET>: HTTP 403"
+        );
+        assert_eq!(
+            redact_urls_in_text(&inner_double_quotes),
+            inner_double_quotes
+        );
+
+        let outer_double_quotes = redact_urls_in_text(
+            "GET \"https://models.example.com/d1.gguf?sig=sig_placeholder\": HTTP 403",
+        );
+        assert_eq!(
+            outer_double_quotes,
+            "GET \"https://models.example.com/d1.gguf?<REDACTED_SECRET>\": HTTP 403"
+        );
+        assert_eq!(
+            redact_urls_in_text(&outer_double_quotes),
+            outer_double_quotes
+        );
+
+        let inner_backtick_and_angles = redact_urls_in_text(
+            "GET https://demo_u:p`w<2>3@models.example.com/d1.gguf?k=`v`&x=a>b&y=<c>&sig=sig_placeholder: HTTP 403",
+        );
+        assert_eq!(
+            inner_backtick_and_angles,
+            "GET https://<REDACTED_SECRET>@models.example.com/d1.gguf?<REDACTED_SECRET>: HTTP 403"
+        );
+        assert_eq!(
+            redact_urls_in_text(&inner_backtick_and_angles),
+            inner_backtick_and_angles
+        );
+
+        let compact_json = redact_urls_in_text(
+            "{\"url\":\"https://models.example.com/d1.gguf?tag=\\\"prod\\\",&sig=sig_placeholder\",\"status\":403}",
+        );
+        assert_eq!(
+            compact_json,
+            "{\"url\":\"https://models.example.com/d1.gguf?<REDACTED_SECRET>\",\"status\":403}"
+        );
+        assert_eq!(redact_urls_in_text(&compact_json), compact_json);
+
+        let rust_debug_escaped = redact_urls_in_text(
+            "failed to fetch \\\"https://demo_u:demo_pw@models.example.com/d1.gguf?sig=sig_placeholder\\\": status 403",
+        );
+        assert_eq!(
+            rust_debug_escaped,
+            "failed to fetch \\\"https://<REDACTED_SECRET>@models.example.com/d1.gguf?<REDACTED_SECRET>\\\": status 403"
+        );
+        assert_eq!(redact_urls_in_text(&rust_debug_escaped), rust_debug_escaped);
+
+        let multi_with_hash_userinfo = redact_urls_in_text(
+            "urls=https://demo_u1:demo_pw#2@a.example.com/1.gguf,https://demo_u2:demo_pw@b.example.com/2.gguf",
+        );
+        assert_eq!(
+            multi_with_hash_userinfo,
+            "urls=https://<REDACTED_SECRET>@a.example.com/1.gguf,https://<REDACTED_SECRET>@b.example.com/2.gguf"
+        );
+        assert_eq!(
+            redact_urls_in_text(&multi_with_hash_userinfo),
+            multi_with_hash_userinfo
+        );
+
+        // Slashless authorities with `@host/path` or embedded URLs inside `?query` or `#fragment`,
+        // malformed empty hosts, IPv6 zone IDs, inner wrapper-matching quotes + `,`, and nested
+        // escaped JSON strings must redact cleanly and remain idempotent on repeated passes.
+        for (spec, expected) in [
+            (
+                "https://models.example.com?redir=user@other.example.com/path&sig=sig_placeholder",
+                "https://models.example.com?<REDACTED_SECRET>",
+            ),
+            (
+                "https://models.example.com:8443?redir=user@other.example.com/d1.gguf&sig=sig_placeholder",
+                "https://models.example.com:8443?<REDACTED_SECRET>",
+            ),
+            (
+                "https://models.example.com#ref=user@other.example.com/d1.gguf&tok=sig_placeholder",
+                "https://models.example.com#<REDACTED_SECRET>",
+            ),
+            (
+                "https://models.example.com?tok=sig_placeholder&email=alice@corp.com",
+                "https://models.example.com?<REDACTED_SECRET>",
+            ),
+            (
+                "https://demo_u:demo_pw#2@models.example.com?tok=sig_placeholder&notify=bob@corp.com",
+                "https://<REDACTED_SECRET>@models.example.com?<REDACTED_SECRET>",
+            ),
+            (
+                "https://demo_u:12345#2@models.example.com/d1.gguf",
+                "https://<REDACTED_SECRET>@models.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_u:demo_pw#2@/d1.gguf",
+                "https://<REDACTED_SECRET>@/d1.gguf",
+            ),
+            (
+                "https://demo_u:demo_pw#2@[fe80::1%25eth0]/d1.gguf",
+                "https://<REDACTED_SECRET>@[fe80::1%25eth0]/d1.gguf",
+            ),
+            (
+                "https://cdn.example.com/fetch/https://demo_u:demo_pw@origin.example.com/d1.gguf",
+                "https://cdn.example.com/fetch/https://<REDACTED_SECRET>@origin.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_tok1.demo_tok2#2@models.example.com/d1.gguf",
+                "https://<REDACTED_SECRET>@models.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_first.demo_last:12345#demo_pw@models.example.com/d1.gguf",
+                "https://<REDACTED_SECRET>@models.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_u:12345#pw=demo_pw@models.example.com/d1.gguf",
+                "https://<REDACTED_SECRET>@models.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_first.demo_last:12345#pw=demo_pw@models.example.com/d1.gguf",
+                "https://<REDACTED_SECRET>@models.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_u.dot#pw=demo_pw@models.example.com/d1.gguf",
+                "https://<REDACTED_SECRET>@models.example.com/d1.gguf",
+            ),
+            (
+                "https://demo_u:demo_pw@?redir=alice@corp.com&sig=sig_placeholder",
+                "https://<REDACTED_SECRET>@?<REDACTED_SECRET>",
+            ),
+            (
+                "https://models.example.com:?redir=alice@corp.com&sig=sig_placeholder",
+                "https://<REDACTED_SECRET>?<REDACTED_SECRET>",
+            ),
+            (
+                "https://models.example.com:999999?redir=alice@corp.com&sig=sig_placeholder",
+                "https://<REDACTED_SECRET>?<REDACTED_SECRET>",
+            ),
+        ] {
+            let pass1 = redact_model_spec_for_log(spec);
+            assert_eq!(pass1, expected, "spec={spec}");
+            assert_eq!(
+                redact_model_spec_for_log(&pass1),
+                pass1,
+                "idempotent spec={spec}"
+            );
+        }
+
+        for (raw_text, expected) in [
+            (
+                "GET https://models.example.com?acct=user@corp.com&mirror='https://m1.example.com/d1.gguf'&sig=sig_placeholder: HTTP 403",
+                "GET https://models.example.com?<REDACTED_SECRET>: HTTP 403",
+            ),
+            (
+                "GET https://models.example.com?cb=u@https://m1.example.com/d1.gguf&sig=sig_placeholder: HTTP 403",
+                "GET https://models.example.com?<REDACTED_SECRET>: HTTP 403",
+            ),
+            (
+                "GET 'https://models.example.com/d1.gguf?tag='prod',&sig=sig_placeholder' failed",
+                "GET 'https://models.example.com/d1.gguf?<REDACTED_SECRET>' failed",
+            ),
+            (
+                "url 'https://demo_u',demo_pw@models.example.com/d1.gguf' failed",
+                "url 'https://<REDACTED_SECRET>@models.example.com/d1.gguf' failed",
+            ),
+            (
+                "\\\"GET https://demo_u:demo_pw#2@models.example.com\\\"",
+                "\\\"GET https://<REDACTED_SECRET>@models.example.com\\\"",
+            ),
+            (
+                "{\"body\":\"{\\\"u1\\\":\\\"https://a.example.com/1.gguf?x=1\\\",\\\"status\\\":403}\"}",
+                "{\"body\":\"{\\\"u1\\\":\\\"https://a.example.com/1.gguf?<REDACTED_SECRET>\\\",\\\"status\\\":403}\"}",
+            ),
+            (
+                "{\"url\":\"https://models.example.com/d1.gguf?tags=[\\\"a\\\",\\\"b\\\"]&sig=sig_placeholder\",\"status\":403}",
+                "{\"url\":\"https://models.example.com/d1.gguf?<REDACTED_SECRET>\",\"status\":403}",
+            ),
+            (
+                "GET 'https://models.example.com/d1.gguf?tags='prod','staging'&sig=sig_placeholder' failed",
+                "GET 'https://models.example.com/d1.gguf?<REDACTED_SECRET>' failed",
+            ),
+            (
+                "GET 'https://models.example.com/d1.gguf?mirrors='https://m1.example.com/d1.gguf','https://m2.example.com/d1.gguf'&sig=sig_placeholder' failed",
+                "GET 'https://models.example.com/d1.gguf?<REDACTED_SECRET>' failed",
+            ),
+            (
+                "GET \"https://models.example.com/d1.gguf?tags=\"prod\",\"staging\"&sig=sig_placeholder\": HTTP 403",
+                "GET \"https://models.example.com/d1.gguf?<REDACTED_SECRET>\": HTTP 403",
+            ),
+            (
+                "\\\"GET https://models.example.com/d1.gguf?tags=\\\"a\\\",\\\"b\\\"&sig=sig_placeholder\\\"",
+                "\\\"GET https://models.example.com/d1.gguf?<REDACTED_SECRET>\\\"",
+            ),
+            (
+                "url 'https://demo_u:'part1','demo_pw'@models.example.com/d1.gguf' failed",
+                "url 'https://<REDACTED_SECRET>@models.example.com/d1.gguf' failed",
+            ),
+            (
+                "GET 'https://models.example.com/d1.gguf?vals='a',1,2&sig=sig_placeholder' failed",
+                "GET 'https://models.example.com/d1.gguf?<REDACTED_SECRET>' failed",
+            ),
+            (
+                "url 'https://demo_u'):demo_pw@models.example.com/d1.gguf' failed",
+                "url 'https://<REDACTED_SECRET>@models.example.com/d1.gguf' failed",
+            ),
+            (
+                "GET \"https://models.example.com/d1.gguf?k=\"a\">b&sig=sig_placeholder\": HTTP 403",
+                "GET \"https://models.example.com/d1.gguf?<REDACTED_SECRET>\": HTTP 403",
+            ),
+            (
+                "resolving <https://models.example.com/d1.gguf?expr=a><b>&sig=sig_placeholder>",
+                "resolving <https://models.example.com/d1.gguf?<REDACTED_SECRET>>",
+            ),
+            (
+                "urls=https://demo_u1:demo_pw#2@a.example.com,https://demo_u2:demo_pw2@b.example.com/2.gguf",
+                "urls=https://<REDACTED_SECRET>@a.example.com,https://<REDACTED_SECRET>@b.example.com/2.gguf",
+            ),
+            (
+                "<Url>https://demo_u1:demo_pw#2@a.example.com</Url><Redirect>https://demo_u2:demo_pw2@b.example.com/2.gguf</Redirect>",
+                "<Url>https://<REDACTED_SECRET>@a.example.com</Url><Redirect>https://<REDACTED_SECRET>@b.example.com/2.gguf</Redirect>",
+            ),
+            (
+                "GET 'https://demo_u1:demo_pw1?2@/fetch/https://demo_u2:demo_pw2@origin.example.com/d1.gguf?sig=sig_placeholder' failed",
+                "GET 'https://<REDACTED_SECRET>@/fetch/https://<REDACTED_SECRET>@origin.example.com/d1.gguf?<REDACTED_SECRET>' failed",
+            ),
+            (
+                "GET 'https://demo_u1:demo_pw1?2@bad:999999/fetch/https://demo_u2:demo_pw2@origin.example.com/d1.gguf?sig=sig_placeholder' failed",
+                "GET 'https://<REDACTED_SECRET>@<REDACTED_SECRET>/fetch/https://<REDACTED_SECRET>@origin.example.com/d1.gguf?<REDACTED_SECRET>' failed",
+            ),
+            (
+                "error (https://models.example.com/d1_(v1?sig=sig_placeholder))",
+                "error (https://models.example.com/d1_(v1?<REDACTED_SECRET>))",
+            ),
+            (
+                "{\"url\":\"https://models.example.com/d1.gguf?dir=foo\\\\\",\"status\":403}",
+                "{\"url\":\"https://models.example.com/d1.gguf?<REDACTED_SECRET>\",\"status\":403}",
+            ),
+            (
+                "<a href=\"https://models.example.com/d1.gguf?sig=sig_placeholder\">download</a>",
+                "<a href=\"https://models.example.com/d1.gguf?<REDACTED_SECRET>\">download</a>",
+            ),
+        ] {
+            let pass1 = redact_urls_in_text(raw_text);
+            assert_eq!(pass1, expected, "raw_text={raw_text}");
+            assert_eq!(
+                redact_urls_in_text(&pass1),
+                pass1,
+                "idempotent raw_text={raw_text}"
+            );
+        }
+
+        // Deterministic property check across mixed authorities, dotted usernames,
+        // malformed ports, embedded URLs, inner quote lists, XML tags, JSON escapes,
+        // and arbitrary token soup: secrets must never survive and pass 2 must equal pass 1.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next_u64 = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let userinfos = [
+            "",
+            "sec_u:sec_pw@",
+            "sec_u.dot:sec_pw@",
+            "sec_u.tok1.tok2#2@",
+            "sec_u.dot#pw=sec_pw@",
+            "sec_u.dot?pw=sec_pw@",
+            "sec_u.dot:12345#pw=sec_pw@",
+            "sec_u@corp.example:sec_pw?2@",
+            "sec_u:'part1','sec_pw'@",
+            "sec_u'):sec_pw@",
+            "sec_u',1,2@",
+            "sec_u:https://sec_pw@",
+            "sec_u:p`w<2>3@",
+        ];
+        let hosts = [
+            "models.example.com",
+            "models.example.com:8443",
+            "localhost:8080",
+            "[::1]:8443",
+            "[fe80::1%25eth0]",
+            "",
+            "models.example.com:",
+            "models.example.com:999999",
+        ];
+        let paths = [
+            "",
+            "/d1.gguf",
+            "/λ/d1.gguf",
+            "/d1_(v1",
+            "/fetch/https://sec_u2:sec_pw2@origin.example.com/d1.gguf",
+        ];
+        let tails = [
+            "",
+            "?sig=sec_q",
+            "?redir=u@other.example.com/p&sig=sec_q",
+            "?tags='prod','staging'&sig=sec_q",
+            "?mirrors='https://m1.example.com/d1.gguf','https://m2.example.com/d1.gguf'&sig=sec_q",
+            "?vals='a',1,2&sig=sec_q",
+            "?k=\"a\">b&sig=sec_q",
+            "?expr=a><b>&sig=sec_q",
+            "?dir=foo\\\\&sig=sec_q",
+            "#frag=sec_q&ref=u@other.example.com/p",
+        ];
+        for _ in 0..4096 {
+            let u = userinfos[(next_u64() as usize) % userinfos.len()];
+            let h = hosts[(next_u64() as usize) % hosts.len()];
+            let p = paths[(next_u64() as usize) % paths.len()];
+            let t = tails[(next_u64() as usize) % tails.len()];
+            if u.is_empty() && h.is_empty() && p.is_empty() && t.is_empty() {
+                continue;
+            }
+            let raw_url = format!("https://{u}{h}{p}{t}");
+            let spec_pass1 = redact_model_spec_for_log(&raw_url);
+            assert!(
+                !spec_pass1.contains("sec_u")
+                    && !spec_pass1.contains("sec_pw")
+                    && !spec_pass1.contains("sec_tok")
+                    && !spec_pass1.contains("sec_q"),
+                "leaked secret in spec {raw_url} -> {spec_pass1}"
+            );
+            assert_eq!(
+                redact_model_spec_for_log(&spec_pass1),
+                spec_pass1,
+                "spec non-idempotent on {raw_url} -> {spec_pass1}"
+            );
+
+            let json_escaped = raw_url.replace('\\', "\\\\").replace('"', "\\\"");
+            let u2 = userinfos[(next_u64() as usize) % userinfos.len()];
+            let raw2 = format!("https://{u2}b.example.com/2.gguf?tok=sec_q");
+            let wrapped = match (next_u64() as usize) % 10 {
+                0 => format!("GET {raw_url}: HTTP 403"),
+                1 => format!("GET \"{raw_url}\": HTTP 403"),
+                2 => format!("GET '{raw_url}' failed"),
+                3 => format!("resolving <{raw_url}>"),
+                4 => format!("error ({raw_url})"),
+                5 => format!("{{\"url\":\"{json_escaped}\",\"status\":403}}"),
+                6 => format!("{{\"url\":\"{raw_url}\",\"status\":403}}"),
+                7 => format!("urls={raw_url},{raw2}"),
+                8 => format!("<Url>{raw_url}</Url><Redirect>{raw2}</Redirect>"),
+                _ => format!("['{raw_url}','{raw2}']"),
+            };
+            let pass1 = redact_urls_in_text(&wrapped);
+            assert!(
+                !pass1.contains("sec_u")
+                    && !pass1.contains("sec_pw")
+                    && !pass1.contains("sec_tok")
+                    && !pass1.contains("sec_q"),
+                "leaked secret in {wrapped} -> {pass1}"
+            );
+            assert_eq!(
+                redact_urls_in_text(&pass1),
+                pass1,
+                "non-idempotent on {wrapped} -> {pass1}"
+            );
+        }
+
+        let soup_tokens = [
+            "http://",
+            "https://",
+            "<REDACTED_SECRET>",
+            "@",
+            ":",
+            "/",
+            "?",
+            "#",
+            "&",
+            "=",
+            ".",
+            ",",
+            ";",
+            "'",
+            "\"",
+            "\\\"",
+            "\\\\",
+            "(",
+            ")",
+            "[",
+            "]",
+            "{",
+            "}",
+            "<",
+            ">",
+            "</Url>",
+            " ",
+            "a",
+            "1",
+            "999999",
+            "λ",
+        ];
+        for _ in 0..2048 {
+            let len = (next_u64() as usize) % 24;
+            let mut soup = String::new();
+            for _ in 0..len {
+                soup.push_str(soup_tokens[(next_u64() as usize) % soup_tokens.len()]);
+            }
+            let p1 = redact_urls_in_text(&soup);
+            assert_eq!(redact_urls_in_text(&p1), p1, "soup text non-idempotent");
+            let sp1 = redact_model_spec_for_log(&soup);
+            assert_eq!(
+                redact_model_spec_for_log(&sp1),
+                sp1,
+                "soup spec non-idempotent"
+            );
+        }
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("triage-d1-redact-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let err = resolve_d1_model_path(
+            "https://demo_user:demo_pw@example.com/not-a-gguf?sig=sig_placeholder",
+            "Q4_K_M",
+            &temp_dir,
+        )
+        .expect_err("non-gguf credentialed URL must fail closed");
+        let formatted = format!("{err:#}");
+        assert!(!formatted.contains("demo_user"));
+        assert!(!formatted.contains("demo_pw"));
+        assert!(!formatted.contains("sig_placeholder"));
+        assert!(formatted.contains("<REDACTED_SECRET>"));
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
