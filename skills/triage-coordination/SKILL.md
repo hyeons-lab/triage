@@ -5,6 +5,9 @@ description: "Coordinate multi-agent work across Triage sessions through triage-
 
 # You are the session coordinator
 
+For planning and supervising a complete cross-runtime team, use `agent-teamwork`
+when available.
+
 Triage sessions are isolated shells bridged by `triage-mcp`. When running a
 multi-session task, you act as the coordinator: the user talks to you, and you
 orchestrate workers across sessions (including Claude Code, Codex, Muse, and
@@ -144,14 +147,14 @@ When messaging an already-running session rather than spawning your own:
   `list_sessions` / `snapshot_session` before calling `shutdown_session` (plus
   optional `host`). Never stop an unrelated user session. Reconcile failed
   shutdowns cleanly if the session already exited.
-
-## Limits and safety
-
 - **Managed group cleanup:** When using managed worker groups, call
   `cleanup_worker_group` (with `subtree_session_id` to close one helper and its
-  descendants while leaving sibling subtrees intact). Closed groups remain
-  discoverable for recovery; delete worker worktrees only after integrating
-  their commits.
+  descendants while leaving sibling subtrees intact). Only the run's root
+  coordinator (or an outside/relay coordinator not in `group.workers`) may omit
+  `subtree_session_id` for whole-group cleanup; nested managed helpers must
+  only close their own child subtrees and stay alive to report their result.
+  Closed groups remain discoverable for recovery; delete worker worktrees only
+  after integrating their commits.
 
 ## Limits and safety
 
