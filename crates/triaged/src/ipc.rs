@@ -482,6 +482,15 @@ pub use crate::session::PairingPinInfo;
 pub use triage_core::ipc::default_socket_path;
 
 impl SessionApi for IpcClient {
+    fn worker_operation(
+        &self,
+        request: triage_core::workers::WorkerRequest,
+    ) -> Result<triage_core::workers::WorkerResponse> {
+        match self.round_trip(WireRequest::WorkerOperation(request))? {
+            WireSuccess::WorkerResponse(response) => Ok(response),
+            other => bail!("unexpected managed worker response: {other:?}"),
+        }
+    }
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
         match self.round_trip(WireRequest::ListSessions)? {
             WireSuccess::SessionIds(session_ids) => Ok(session_ids),
@@ -719,6 +728,7 @@ impl SessionApi for IpcClient {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireRequest {
+    WorkerOperation(triage_core::workers::WorkerRequest),
     ListSessions,
     StartSession(StartSessionRequest),
     AttachSession(AttachSessionRequest),
@@ -815,6 +825,7 @@ impl WireResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireSuccess {
+    WorkerResponse(triage_core::workers::WorkerResponse),
     Unit,
     SessionIds(Vec<SessionId>),
     SessionId(SessionId),
@@ -1903,6 +1914,11 @@ fn handle_request(
 ) -> Result<WireSuccess> {
     match request {
         WireRequest::ListSessions => manager.list_sessions().map(WireSuccess::SessionIds),
+        WireRequest::WorkerOperation(request) => manager
+            .worker_operation(request)
+            .map(WireSuccess::WorkerResponse)
+            // WireResponse serializes Display, so preserve this route's full cause chain.
+            .map_err(|error| anyhow!("{error:#}")),
         WireRequest::StartSession(request) => {
             manager.start_session(request).map(WireSuccess::SessionId)
         }

@@ -1,6 +1,6 @@
 ---
 name: triage-coordination
-description: Coordinate with agents running in other Triage sessions through the triage-mcp tools: start worker sessions, find sessions by label, send direct messages, wait for results, acknowledge mail, and stop owned workers. Use when a task spans sessions or another session needs something from this one.
+description: Coordinate with agents running in other Triage sessions through the triage-mcp tools: create managed parent/topic worker groups, choose native helpers or CLI sessions, track durable task results, exchange mail, and clean up owned workers. Use when a task spans sessions or another session needs something from this one.
 ---
 
 # Triage Session Coordination
@@ -23,32 +23,55 @@ Your session id is in the environment: `$TRIAGE_SESSION_ID`. Use it as
 inbox. If the variable is absent (an unmanaged shell), match your working
 directory against `current_working_directory` in `list_sessions` output.
 
-## 2. Start a worker when delegation is requested
+## 2. Delegate through native helpers or a managed group
 
-Discover available tools first: older MCP binaries may expose observation
-and messaging without `start_session` or `shutdown_session`. If a required
-lifecycle tool is absent, report the missing capability instead of
-injecting commands into another terminal.
+When delegation is authorized, use a native subagent if this runtime can launch
+the requested provider/model with sufficient capacity and workspace isolation.
+Otherwise use managed Triage sessions automatically. Do not substitute another
+provider or model to fit a native tool. Check the available tools: older MCP
+binaries expose observation/mail or basic session launch without managed groups.
+Report a missing capability instead of injecting commands into another terminal.
 
-Use `start_session` with an executable (`agy`, `claude`, `muse`, `codex`, or
-another configured runtime), its literal `args`, and an explicit absolute
-`cwd` on the daemon host. Optional `rows` and `cols` set PTY size (defaults
-24 and 80). An executable path is useful when the daemon's PATH differs.
-Keep runtime-specific model, effort, and permission options in its argv;
-do not invent or silently substitute unsupported flags. The child needs
-its own MCP configuration and an initial prompt that bootstraps inbox
-polling, or a worker-ready handshake before receiving work.
+1. Call `list_worker_profiles`. Choose a configured profile whose executable,
+   model, and permission arguments match the assignment. Profiles are literal
+   argv templates, with exactly one `{prompt}` placeholder. If a required profile
+   is missing, prepare its configuration and report what is needed; do not invent
+   model identifiers or change permission modes silently.
+2. Call `create_worker_group` with your `parent_session_id`, a stable retry `key`,
+   and the parent conversation's `topic`. Use `TRIAGE_SESSION_ID`; a directory
+   match alone cannot establish ownership for a managed group. A managed helper
+   automatically inherits its group when it creates a group for nested work.
+3. Use `spawn_worker` with the group ID, your immediate parent session ID, a unique
+   task key, profile, absolute `cwd`, and a self-contained task. Provide source
+   boundaries, acceptance criteria, and the required result. Give workers that
+   edit files separate worktrees or snapshots before launching them. The daemon
+   retains directories; it does not create or merge worktrees.
+4. After an ambiguous launch response, retry the identical group/key/request.
+   The daemon reconciles its durable launch intention. A changed task needs a new
+   key. `launched` confirms a process, not readiness. Poll `get_worker_group` with
+   bounded waits until the helper reports `ready`, `running`, and a terminal
+   result. A dead or absent session without a terminal result is interrupted work,
+   not success. Surface startup/authentication/permission prompts that require
+   human action. Do not disable safeguards to get past them.
+5. As a helper, use `update_worker` with the supplied group/task/session IDs:
+   report `ready` after understanding the task, `running` before work, then
+   `succeeded` or `failed` with a nonblank durable result (maximum 64 KiB). Terminal
+   results are immutable. Include findings, evidence, artifact paths, and worktree
+   integration instructions. Wait for follow-up mail if the session remains open.
+   Without connected MCP tools, run `triage-mcp worker-update GROUP TASK PHASE`
+   inside your session; terminal updates also take `--result-file PATH`. Add
+   `--socket PATH` when using a custom daemon socket. The CLI reads your session ID
+   from `TRIAGE_SESSION_ID` and leaves the result file in place.
 
-Persist the returned `session_id` together with the unique run/task and
-worktree identity. The child receives its ID as `TRIAGE_SESSION_ID`.
-Launch success confirms creation
-of a PTY child, not agent readiness or task completion. A launch is
-non-idempotent: after a lost response, inspect session state before
-retrying so a worker is not launched twice.
+Use `get_worker_group` as the source of task state and results. Direct mail is
+useful for coordination and notifications but is not durable. The MCP server is
+sequential per connection: avoid long mailbox waits while other calls are needed.
+The orchestrator remains responsible for supervising progress, requesting fixes,
+and integrating results. Triage does not run an independent model scheduler.
 
-Use a separate worktree or source snapshot for each worker that may edit
-or run mutating checks. Give each assignment a run/task/attempt ID and
-an output path. Persist results before acknowledging their messages.
+`start_session` remains available for unmanaged launches. It has no retry key or
+group ownership. Supply documented runtime argv and an explicit absolute `cwd`,
+persist the returned ID, and reconcile lost responses before trying again.
 
 ## 3. Find the other session
 
@@ -96,20 +119,21 @@ disturbing it. Prefer asking over watching when the question is quick;
 prefer watching over asking when you only need to confirm state (a build
 finished, a prompt is idle).
 
-## 8. Stop an owned worker
+## 8. Clean up owned workers
 
-Before using a saved ID with `shutdown_session`, re-establish ownership
-from a fresh roster/snapshot and the worker's unique run/task handshake.
-Numeric session IDs can be reused after a cold daemon restart; an old ID
-alone is not proof that the current session belongs to this run. If the
-worker's identity cannot be confirmed, leave it running and report the
-uncertainty. A current session explicitly selected by the user may also be
-stopped. The local API does not enforce ownership. Never stop an unrelated
-user session.
-The result includes completed terminal output, not a structured task
-report. Repeated shutdown may fail if the session is already gone;
-reconcile an ambiguous response before retrying. Closing the MCP
-connection does not stop launched sessions.
+After collecting durable results and integration instructions, call
+`cleanup_worker_group` with the group ID. To close one helper and all of its
+descendants, also set `subtree_session_id` to that worker's session ID. Inspect
+`errors` and retry incomplete cleanup. Cleanup records cancellation before
+stopping unfinished workers, checks stable session ownership inside the daemon,
+and preserves the root session, sibling subtrees, recorded results, and every
+working directory. Closed groups remain discoverable for recovery.
+
+Delete or remove worktrees only after integrating their work and applying the
+repository's cleanup rules. Group cleanup intentionally does not discard them.
+Closing the MCP connection does not stop workers. For an unmanaged session,
+`shutdown_session` still requires a fresh ownership check or an explicit user
+selection; never rely on an old numeric ID alone.
 
 ## Limits
 
