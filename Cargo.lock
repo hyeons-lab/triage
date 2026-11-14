@@ -3977,8 +3977,11 @@ dependencies = [
 name = "triage-term"
 version = "0.3.0"
 dependencies = [
+ "flate2",
+ "serde",
  "tattoy-wezterm-surface",
  "tattoy-wezterm-term",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -4035,6 +4038,7 @@ dependencies = [
  "toml",
  "tracing",
  "triage-core",
+ "triage-term",
  "triage-transport-ws",
  "unicode-width 0.2.0",
  "zstd",

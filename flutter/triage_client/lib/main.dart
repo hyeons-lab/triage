@@ -17,7 +17,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:triage_client/daemon_disk_stats.dart';
 import 'package:triage_client/daemon_host_stats.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
-import 'package:xterm2/xterm.dart' as xt;
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/models/daemon_server.dart';
 import 'package:triage_client/widgets/terminal_pane.dart';
@@ -29,12 +28,10 @@ import 'package:triage_client/session_rail_layout.dart';
 import 'package:triage_client/terminal/debug_log.dart';
 import 'package:triage_client/terminal/emulator_query_response.dart';
 import 'package:triage_client/terminal/size_drift.dart';
-import 'package:triage_client/terminal/terminal_intent.dart';
-import 'package:triage_client/terminal/terminal_store.dart';
-import 'package:triage_client/terminal/terminal_controller_sink.dart';
-import 'package:triage_client/terminal/triage_term_ffi.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 // Process-env access (home dir, marquee gating) behind a conditional import so
-// the web client — which has no `dart:io` — compiles against web stubs.
+// the web client (which has no `dart:io`) compiles against web stubs.
 import 'package:triage_client/platform_env_io.dart'
     if (dart.library.js_util) 'package:triage_client/platform_env_web.dart';
 
@@ -369,40 +366,19 @@ class SessionVm {
     this.isExited = false,
     this.loaded = false,
   }) : // The snapshot refresh reseeds rows in place (`..clear()..addAll()`),
-       // so the field must stay mutable no matter what a caller passes —
+       // so the field must stay mutable no matter what a caller passes:
        // a lazy placeholder seeds an immutable empty list.
        rows = List<StyledRow>.of(rows),
        terminalController = TerminalController() {
-    if (!kIsWeb) {
-      terminalController.addWriteListener((data) {
-        writeToXterm(terminal, data);
-      });
-      terminalController.addClearListener(() {
-        final t = _terminal;
-        if (t == null) return;
-        beginTerminalWriteBatch();
-        try {
-          t.clear();
-          t.useMainBuffer();
-          t.mainBuffer.clear();
-          t.altBuffer.clear();
-          t.write(
-            '\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l'
-            '\x1b[?2004l\x1b[?1l\x1b[?7h\x1b[?25h\x1b[H\x1b[2J\x1b[3J',
-          );
-        } catch (_) {
-        } finally {
-          endTerminalWriteBatch();
-        }
-      });
-      terminalController.addResizeListener((cols, rows) {
-        terminal.resize(cols, rows);
-      });
-      terminalController.addHistoryReplayedListener(
-        _finishTerminalHistoryBatch,
-      );
+    terminalController.addClearListener(() {
+      _terminal?.clear();
+    });
+    terminalController.addResizeListener((cols, rows) {
+      terminal.resize(cols, rows);
+    });
+    if (!isRemote && this.rows.isNotEmpty) {
+      seedLocalRows();
     }
-    store = TerminalStore(TerminalControllerSink(terminalController));
     // Seed the inferred worktree from the constructor's own context so an attach
     // straight into a worktree is remembered from the first frame.
     _recordInferredWorktree();
@@ -757,28 +733,24 @@ class SessionVm {
 
   final String? sessionId;
   final IconData icon;
-  // Plain visible rows kept for the test fallback view and demo seeding only;
-  // real rendering goes through [store]/[terminal] from raw bytes.
+  // Plain visible rows kept for the test fallback view and local demo seeding;
+  // production rendering uses [terminal] (`TerminalCellBuffer`) fed by `TCG1`
+  // cell-grid synchronization frames.
   final List<StyledRow> rows;
   final TerminalController terminalController;
   final bool isRemote;
   bool isExited;
-  // True once this remote session has been subscribed/attached (lazy-loaded).
+  // True once this remote session has been synchronized (lazy-loaded).
   // Non-selected sessions stay unloaded until the user opens them.
   bool loaded = false;
-  // History window currently held, in raw bytes requested from the daemon.
-  // Starts at the first-page window and doubles toward the platform replay
-  // budget as the user pages older scrollback (see `_pageHistoryUp`).
-  int historyWindowBytes = kHistoryFirstWindowBytes;
-  // Absolute log offset of the oldest byte held in the terminal (or staged for
-  // first view fit). Null until the first history lands; 0 means the log start
-  // is loaded and paging stops.
-  int? get historyStart =>
-      store.appliedHistoryStart ?? _pendingHistory?.effectiveStart;
-  int get historyPrefixBytes => store.appliedHistoryPrefixBytes;
-  // A scroll-up page re-attach is in flight; near-top triggers coalesce
-  // behind it instead of stacking replays.
-  bool pagingHistory = false;
+  // Active `SyncTerminal` subscription id on the current WebSocket connection.
+  String? syncSubscriptionId;
+  // Highest monotonic `frame_seq` applied on [syncSubscriptionId].
+  int lastSyncedServerFrameSeq = 0;
+  // Scrollback page claims (`(reflowGen, eraseScrollbackGen, absPage)`) in flight.
+  final Set<(int, int, int)> inFlightScrollbackPages = <(int, int, int)>{};
+  // True when the remote daemon predates `SyncTerminal` / `FetchTerminalRows`.
+  bool unsupportedSyncDaemon = false;
   int focusCursorRevision = 0;
   int? lastFittedCols;
   int? lastFittedRows;
@@ -822,60 +794,30 @@ class SessionVm {
   int? inFlightRows;
   int resizeRequestSeq = 0;
 
-  xt.Terminal? _terminal;
-  xt.Terminal get terminal => _terminal ??= _createTerminal();
+  TerminalCellBuffer? _terminal;
+  TerminalCellBuffer get terminal => _terminal ??= _createTerminal();
   bool get isUsingAltBuffer => _terminal?.isUsingAltBuffer ?? false;
 
-  xt.Terminal _createTerminal() {
-    final created = createTriageTerminal(
-      maxLines: 50000,
-      // Re-wrap the whole buffer on resize, like a real terminal; otherwise
-      // scrollback keeps its old wrap points and a full-screen TUI's in-place
-      // redraw after SIGWINCH collides with mis-sized cells. The scroll anchor
-      // tolerates reflow replacing line objects: it drops a detached anchor
-      // line (`BufferLine.attached`) and falls back to following the bottom.
-      reflowEnabled: true,
+  TerminalCellBuffer _createTerminal() {
+    final created = TerminalCellBuffer(
       onResize: (w, h, pw, ph) => onTerminalResize?.call(w, h, pw, ph),
     );
     if (bracketedPasteEnabled) {
-      try {
-        created.setBracketedPasteMode(true);
-      } catch (_) {}
+      created.setBracketedPasteMode(true);
+    }
+    if (isExited) {
+      created.setCursorVisible(false);
     }
     return created;
   }
 
-  // The single, ordered write path for all terminal output (live + history).
-  // The sink wraps the controller, so both platform views render through their
-  // existing listeners; decoding/buffering/CRLF/dedup all live in the store.
-  late final TerminalStore store;
   // Guards dispose against the second call: every teardown site disposes the
   // whole view model, and ChangeNotifier.dispose asserts on reuse.
   bool _disposed = false;
-  bool _replayingHistoryOnTerminal = false;
-  int _terminalBatchDepth = 0;
   void Function(int w, int h, int pw, int ph)? onTerminalResize;
+  List<String>? _localDemoLines;
+  int _pushedLocalScrollbackRows = 0;
 
-  void beginTerminalWriteBatch() {
-    if (kIsWeb || _disposed) return;
-    _terminalBatchDepth += 1;
-    if (_terminalBatchDepth == 1) {
-      terminal.setSynchronizedUpdateMode(true);
-    }
-  }
-
-  void endTerminalWriteBatch() {
-    if (kIsWeb || _terminalBatchDepth <= 0) return;
-    _terminalBatchDepth -= 1;
-    if (_terminalBatchDepth == 0 && !_disposed) {
-      _terminal?.setSynchronizedUpdateMode(false);
-    }
-  }
-
-  // Deferred history: replay must wait until the view is laid out and fitted, so
-  // it re-emulates at the real terminal size. Writing before the first fit
-  // renders at the default 80x24 and shows nothing until a resize refits.
-  _PendingHistory? _pendingHistory;
   bool _viewReady = false;
   int _viewCols = 80;
   int _viewRows = 24;
@@ -889,163 +831,239 @@ class SessionVm {
     return null;
   }
 
-  /// Begin the attach/resync lifecycle and stage the raw output-history tail.
-  /// [Attach] is dispatched if not already live so live chunks buffer in arrival
-  /// order; the actual [HistoryBytes] replay is deferred until the view reports
-  /// its fitted size (see [noteViewFit]) and replays at that size (the host
-  /// capture size is intentionally not used). Live chunks at or below
-  /// [throughOutputSeq] are dropped by the store as duplicates.
-  void applyHistory(
-    List<int> rawOutput, {
-    int? throughOutputSeq,
-    int? rawOutputStart,
-    int? windowBytes,
-    List<int> rawOutputPrefix = const [],
-    List<int> rawOutputViewport = const [],
-    bool isExited = false,
-    bool preservePendingLive = false,
+  /// Applies an authoritative `TerminalSyncFrame` from `SyncTerminal` or
+  /// `SessionEvent::TerminalSync`.
+  void applyTerminalSyncFrame(
+    TerminalSyncFrameData frame, {
+    bool notifyReplay = false,
+    Map<String, dynamic>? snapshot,
   }) {
-    if (rawOutput.isEmpty &&
-        rawOutputPrefix.isEmpty &&
-        !isExited &&
-        !this.isExited &&
-        (_pendingHistory != null &&
-            (_pendingHistory!.rawOutput.isNotEmpty ||
-                _pendingHistory!.rawOutputPrefix.isNotEmpty))) {
-      return;
+    if (_disposed) return;
+    unsupportedSyncDaemon = false;
+    terminal.applySyncFrame(frame);
+    final effectiveExited = snapshot != null
+        ? snapshot['exited'] == true
+        : isExited;
+    if (effectiveExited) {
+      terminal.setCursorVisible(false);
     }
-    _pendingHistory = _PendingHistory(
-      rawOutput,
-      throughOutputSeq,
-      rawOutputStart: rawOutputStart,
-      windowBytes: windowBytes,
-      rawOutputPrefix: rawOutputPrefix,
-      rawOutputViewport: rawOutputViewport,
-    );
-    tdbg(
-      'vm.applyHistory',
-      '$title ${rawOutput.length}B+${rawOutputPrefix.length}P '
-          'seq=$throughOutputSeq '
-          'phase=${store.state.phase} viewReady=$_viewReady',
-    );
-    if (preservePendingLive ||
-        !store.state.scrollbackReady ||
-        store.appliedLogBytes == null) {
-      store.dispatch(
-        Attach(
-          preservePendingLive:
-              preservePendingLive ||
-              store.isPagingHistory ||
-              store.isRefreshingHistory,
-        ),
+    final bp =
+        frame.bracketedPaste ||
+        (frame.modeFlags == 0 && snapshot?['bracketed_paste_enabled'] == true);
+    setBracketedPasteEnabled(bp);
+    if (runningUnderFlutterTest()) {
+      final viewportStyled = terminal.viewportStyledRows(
+        trimTrailingBlankRows: true,
       );
+      if (viewportStyled.isNotEmpty) {
+        rows
+          ..clear()
+          ..addAll(viewportStyled);
+      }
     }
-    this.isExited = isExited;
-    if (_viewReady) {
-      _flushPendingHistory();
-    } else if (isExited) {
-      markExited();
+    if (notifyReplay) {
+      terminalController.notifyHistoryReplayed();
     }
   }
 
-  /// The view fitted to a real grid size. Records it and replays any staged
-  /// history at that size. Idempotent on subsequent fits (no staged history).
-  void noteViewFit(int cols, int rows) {
-    tdbg(
-      'vm.noteViewFit',
-      '$title ${cols}x$rows '
-          'pendingHistory=${_pendingHistory != null}',
+  /// Marks this session as connected to an older daemon that does not support
+  /// `SyncTerminal` / `FetchTerminalRows`.
+  void markUnsupportedSyncDaemon() {
+    if (_disposed) return;
+    unsupportedSyncDaemon = true;
+    loaded = true;
+    hasInputLease = false;
+    status = 'upgrade daemon';
+    statusColor = const Color(0xffff6b6b);
+    final cols = max(80, _viewCols);
+    final rowsCount = max(24, _viewRows);
+    final payload = encodeTcg1PlainTextRows(const <String>[
+      kUnsupportedTerminalSyncMessage,
+    ], cols: cols);
+    terminal.applySyncFrame(
+      TerminalSyncFrameData(
+        frameSeq: 0,
+        rows: rowsCount,
+        cols: cols,
+        totalScrollbackRows: 0,
+        trimmedTopRows: 0,
+        eraseScrollbackGen: 0,
+        cursorX: 0,
+        cursorY: 0,
+        cursorStyle: 0,
+        modeFlags: kModeFullViewport,
+        mouseMode: 0,
+        mouseReportMode: 0,
+        kittyKeyboardFlags: 0,
+        title: null,
+        viewportCompression: kCellCompressionNone,
+        viewportPayload: payload,
+        pushedScrollbackStartRow: 0,
+        pushedScrollbackRowCount: 0,
+        pushedScrollbackCompression: kCellCompressionNone,
+        pushedScrollbackPayload: Uint8List(0),
+      ),
     );
+    rows
+      ..clear()
+      ..add(
+        const StyledRow(
+          spans: <StyledSpan>[
+            StyledSpan(
+              text: kUnsupportedTerminalSyncMessage,
+              style: TerminalStyle(),
+            ),
+          ],
+        ),
+      );
+  }
+
+  /// Records the view's fitted grid size.
+  void noteViewFit(int cols, int rows) {
+    tdbg('vm.noteViewFit', '$title ${cols}x$rows');
     _viewCols = cols;
     _viewRows = rows;
     _viewReady = true;
-    _flushPendingHistory();
   }
 
-  void _finishTerminalHistoryBatch() {
-    if (!_replayingHistoryOnTerminal) return;
-    _replayingHistoryOnTerminal = false;
-    endTerminalWriteBatch();
-    if (_terminalBatchDepth > 0 && !_disposed) {
-      _terminal?.setSynchronizedUpdateMode(false);
-      _terminal?.setSynchronizedUpdateMode(true);
+  /// Seeds local/demo placeholder [rows] into [terminal] without a VT parser.
+  void seedLocalRows() {
+    if (_disposed) return;
+    _pushedLocalScrollbackRows = 0;
+    _localDemoLines = rows
+        .map((r) => r.spans.map((s) => s.text).join())
+        .toList();
+    if (_localDemoLines!.isEmpty) {
+      _localDemoLines!.add('');
     }
-  }
-
-  void _flushPendingHistory() {
-    final pending = _pendingHistory;
-    if (pending == null) return;
-    _pendingHistory = null;
-    const batchTerminalWrites = !kIsWeb;
-    if (batchTerminalWrites) {
-      if (_viewCols >= kMinTerminalCols &&
-          _viewRows >= kMinTerminalRows &&
-          (terminal.viewWidth != _viewCols ||
-              terminal.viewHeight != _viewRows)) {
-        terminal.resize(_viewCols, _viewRows);
-      }
-      _replayingHistoryOnTerminal = true;
-      beginTerminalWriteBatch();
-    }
-    try {
-      store.dispatch(
-        HistoryBytes(
-          pending.rawOutput,
-          cols: _viewCols,
-          rows: _viewRows,
-          throughOutputSeq: pending.throughOutputSeq,
-          rawOutputStart: pending.rawOutputStart,
-          windowBytes: pending.windowBytes,
-          rawOutputPrefix: pending.rawOutputPrefix,
-          rawOutputViewport: pending.rawOutputViewport,
-        ),
-      );
-    } finally {
-      _finishTerminalHistoryBatch();
-    }
-    if (isExited) {
-      markExited();
-    }
-  }
-
-  /// Apply a live raw output chunk (remote PTY bytes) through the write path.
-  void applyLiveBytes(List<int> bytes, {int? outputSeq}) {
-    beginTerminalWriteBatch();
-    try {
-      if (!_viewReady) {
-        final cols =
-            ownFittedCols ??
-            (runningUnderFlutterTest() ? lastFittedCols : null);
-        final rows =
-            ownFittedRows ??
-            (runningUnderFlutterTest() ? lastFittedRows : null);
-        if (cols != null && rows != null) {
-          noteViewFit(cols, rows);
-        }
-      }
-      store.dispatch(LiveBytes(bytes, outputSeq: outputSeq));
-    } finally {
-      endTerminalWriteBatch();
-    }
+    final cols = max(80, _viewCols);
+    final height = max(24, max(_viewRows, rows.length));
+    final payload = encodeTcg1StyledRows(rows, cols: cols);
+    final lastIdx = max(0, rows.length - 1);
+    final lastLen = _localDemoLines!.last.runes.length.clamp(0, cols - 1);
+    terminal.applySyncFrame(
+      TerminalSyncFrameData(
+        frameSeq: 0,
+        rows: height,
+        cols: cols,
+        totalScrollbackRows: 0,
+        trimmedTopRows: 0,
+        eraseScrollbackGen: 0,
+        cursorX: lastLen,
+        cursorY: lastIdx,
+        cursorStyle: 0,
+        modeFlags: kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+        mouseMode: 0,
+        mouseReportMode: 0,
+        kittyKeyboardFlags: 0,
+        title: null,
+        viewportCompression: kCellCompressionNone,
+        viewportPayload: payload,
+        pushedScrollbackStartRow: 0,
+        pushedScrollbackRowCount: 0,
+        pushedScrollbackCompression: kCellCompressionNone,
+        pushedScrollbackPayload: Uint8List(0),
+      ),
+    );
   }
 
   /// Echo locally produced bytes for local/demo sessions (no remote PTY).
   void echoLocalBytes(List<int> bytes) {
-    beginTerminalWriteBatch();
-    try {
-      store.dispatch(LiveBytes(bytes));
-    } finally {
-      endTerminalWriteBatch();
+    if (_disposed || bytes.isEmpty) return;
+    final lines = _localDemoLines ??= rows
+        .map((r) => r.spans.map((s) => s.text).join())
+        .toList();
+    if (lines.isEmpty) {
+      lines.add('');
     }
+    if (bytes.length == 3 &&
+        bytes[0] == 0x08 &&
+        bytes[1] == 0x20 &&
+        bytes[2] == 0x08) {
+      final current = lines.last;
+      if (current.isNotEmpty) {
+        final runes = current.runes.toList();
+        runes.removeLast();
+        lines[lines.length - 1] = String.fromCharCodes(runes);
+      }
+    } else {
+      final text = utf8.decode(bytes, allowMalformed: true);
+      for (final rune in text.runes) {
+        if (rune == 0x0a) {
+          lines.add('');
+        } else if (rune == 0x0d) {
+          // Handled alongside LF in CRLF or ignored alone on the demo prompt.
+        } else if (rune == 0x08 || rune == 0x7f) {
+          final current = lines.last;
+          if (current.isNotEmpty) {
+            final runes = current.runes.toList();
+            runes.removeLast();
+            lines[lines.length - 1] = String.fromCharCodes(runes);
+          }
+        } else if (rune >= 0x20) {
+          lines[lines.length - 1] =
+              '${lines.last}${String.fromCharCodes(<int>[rune])}';
+        }
+      }
+    }
+    final cols = max(80, _viewCols);
+    final height = max(24, _viewRows);
+    final scrollbackCount = max(0, lines.length - height);
+    final viewportSlice = lines.sublist(scrollbackCount);
+    rows
+      ..clear()
+      ..addAll(
+        viewportSlice.map(
+          (t) => StyledRow(
+            spans: <StyledSpan>[
+              StyledSpan(text: t, style: const TerminalStyle()),
+            ],
+          ),
+        ),
+      );
+    final vpPayload = encodeTcg1PlainTextRows(viewportSlice, cols: cols);
+    final pushStart = min(_pushedLocalScrollbackRows, scrollbackCount);
+    final pushCount = scrollbackCount - pushStart;
+    final sbPayload = pushCount > 0
+        ? encodeTcg1PlainTextRows(
+            lines.sublist(pushStart, scrollbackCount),
+            cols: cols,
+          )
+        : Uint8List(0);
+    _pushedLocalScrollbackRows = scrollbackCount;
+    final cursorRow = max(0, viewportSlice.length - 1);
+    final cursorCol = viewportSlice.isEmpty
+        ? 0
+        : viewportSlice.last.runes.length.clamp(0, cols - 1);
+    terminal.applySyncFrame(
+      TerminalSyncFrameData(
+        frameSeq: 0,
+        rows: height,
+        cols: cols,
+        totalScrollbackRows: scrollbackCount,
+        trimmedTopRows: 0,
+        eraseScrollbackGen: 0,
+        cursorX: cursorCol,
+        cursorY: cursorRow,
+        cursorStyle: 0,
+        modeFlags: kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+        mouseMode: 0,
+        mouseReportMode: 0,
+        kittyKeyboardFlags: 0,
+        title: null,
+        viewportCompression: kCellCompressionNone,
+        viewportPayload: vpPayload,
+        pushedScrollbackStartRow: pushStart,
+        pushedScrollbackRowCount: pushCount,
+        pushedScrollbackCompression: kCellCompressionNone,
+        pushedScrollbackPayload: sbPayload,
+      ),
+    );
   }
 
   void markExited() {
-    beginTerminalWriteBatch();
-    try {
-      store.dispatch(const Exited());
-    } finally {
-      endTerminalWriteBatch();
-    }
+    isExited = true;
+    _terminal?.setCursorVisible(false);
   }
 
   void focusCursorOnNextDisplay() {
@@ -1055,50 +1073,16 @@ class SessionVm {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
-    _replayingHistoryOnTerminal = false;
-    _terminalBatchDepth = 0;
-    store.dispose();
+    inFlightScrollbackPages.clear();
     terminalController.dispose();
     _terminal?.dispose();
   }
 }
 
-/// Staged attach/resync history awaiting the view's first fit.
-class _PendingHistory {
-  _PendingHistory(
-    this.rawOutput,
-    this.throughOutputSeq, {
-    this.rawOutputStart,
-    this.windowBytes,
-    this.rawOutputPrefix = const [],
-    this.rawOutputViewport = const [],
-  });
-
-  final List<int> rawOutput;
-  final int? throughOutputSeq;
-  final int? rawOutputStart;
-  final int? windowBytes;
-  final List<int> rawOutputPrefix;
-  final List<int> rawOutputViewport;
-
-  bool _computedEffectiveStart = false;
-  int? _cachedEffectiveStart;
-
-  int? get effectiveStart {
-    if (_computedEffectiveStart) return _cachedEffectiveStart;
-    _computedEffectiveStart = true;
-    final start = rawOutputStart;
-    if (start == null) return null;
-    final budgets = historyTrimBudgetsForWindow(windowBytes, web: kIsWeb);
-    final trimmed = trimHistoryReplay(
-      rawOutputPrefix: rawOutputPrefix,
-      rawOutput: rawOutput,
-      maxLines: budgets.maxLines,
-      maxBytes: budgets.maxBytes,
-    );
-    return _cachedEffectiveStart = start + trimmed.droppedRawBytes;
-  }
-}
+/// Message surfaced when connecting to an older `triaged` daemon that does not
+/// implement `SyncTerminal` / `FetchTerminalRows`.
+const String kUnsupportedTerminalSyncMessage =
+    'Daemon upgrade required: update triaged to support terminal cell-grid sync.';
 
 /// Aborts a session load whose daemon changed mid-flight.
 ///
@@ -1110,10 +1094,6 @@ class _PendingHistory {
 final class _StaleLoad implements Exception {
   const _StaleLoad();
 }
-
-/// Steps of the resubscribe unit and the revive path. An enum, not strings:
-/// rollback decisions compare against these, and a typo must not compile.
-enum _ResubStep { restore, resubscribe, attach, refresh }
 
 class TriageHome extends StatefulWidget {
   const TriageHome({
@@ -1474,6 +1454,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // in-flight refresh lands, so the history baseline is never silently
   // skipped while the caller reports success.
   final Set<String> _refreshHistoryFollowUp = {};
+  final Map<String, Completer<void>> _inFlightRefreshDone = {};
   // Session ids with an in-flight resubscribe. Generation-tagged like the
   // load and lease claims above.
   final GenerationClaims _resubscribeClaims = GenerationClaims();
@@ -1557,15 +1538,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     return StyledRow(
       spans: [StyledSpan(text: text, style: const TerminalStyle())],
     );
-  }
-
-  /// Flattens demo/local placeholder rows into plain CRLF-terminated bytes for
-  /// seeding a session's store (styling is dropped — these are placeholders).
-  List<int> _seedBytesFromRows(List<StyledRow> rows) {
-    final text = rows
-        .map((row) => row.spans.map((span) => span.text).join())
-        .join('\r\n');
-    return utf8.encode(text);
   }
 
   StyledRow _promptRow(String command) {
@@ -1694,9 +1666,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     ];
     for (final s in _sessions) {
       _setupSessionInputListener(s);
-      // Seed the demo/local sessions into the store's live phase so their
-      // placeholder content renders and local echo works through one pipeline.
-      s.applyHistory(_seedBytesFromRows(s.rows));
     }
     final isMockMode = Uri.base.queryParameters['mock'] == 'true';
     if (!isMockMode && widget.client == null && kIsWeb) {
@@ -1874,6 +1843,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _pendingEvents.clear();
     _websocketEventQueue.clear();
     _subscriptionIds.clear();
+    for (final c in _inFlightRefreshDone.values) {
+      if (!c.isCompleted) c.complete();
+    }
+    _inFlightRefreshDone.clear();
     _refreshClaims.clear();
     _refreshHistoryFollowUp.clear();
     _resubscribeClaims.clear();
@@ -2130,7 +2103,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
-    if (!session.isRemote || session.isExited || session.status == 'exited') {
+    if (!session.isRemote ||
+        session.isExited ||
+        session.status == 'exited' ||
+        session.unsupportedSyncDaemon) {
       return;
     }
     if (session.hostSizeDriftedFromOwnFit ||
@@ -2146,21 +2122,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // header "refit" button, so a user switching between devices (each with its
   // own width) can reclaim the PTY for the device they are now on.
   //
-  // The re-fit is delegated to the pane via `controller.refit()` because only
-  // the pane knows the true render grid. On web that is the xterm.js FitAddon
-  // size; `session.terminal` is a Dart-side shadow that does not track it, so
-  // reading its `viewWidth` here (as this used to) re-asserted a stale, often
-  // too-narrow width on resume. The web pane re-fits from real pixels and
-  // force-sends the result to the host itself, so we stop here on web.
-  //
-  // On native `TerminalView` auto-fits `session.terminal`, so its `viewWidth`
-  // *is* authoritative; the pane registers no refit listener and this jiggles
-  // the host to it. `lastFittedCols` is deliberately not used — it is polluted
-  // by host-size broadcasts from other devices on a shared PTY. A same-size
-  // resize sends no SIGWINCH, so the jiggle (one row shorter, then back)
-  // guarantees a repaint over the live stream. History is deliberately not
-  // replayed: re-emulating the raw-output tail re-introduces the
-  // width-mismatched frame.
+  // `controller.refit()` reconciles `session.terminal` to the live
+  // `RenderTerminalGrid` dimensions first. Because a same-size resize sends no
+  // SIGWINCH on the host PTY, the jiggle below (one row shorter, then back)
+  // triggers a clean redraw and authoritative `TerminalSync` update.
   void _refitActiveSession() {
     // `_client` is `late` and only assigned by _connectWebSocket; in mock mode it
     // is never set, so guard on _clientInitialized before touching it.
@@ -2168,43 +2133,53 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     if (!_client.isConnected) return;
     if (_selectedIndex < 0 || _selectedIndex >= _sessions.length) return;
     final session = _selectedSession;
-    if (!session.isRemote || session.isExited || session.status == 'exited') {
+    if (!session.isRemote ||
+        !session.loaded ||
+        session.isExited ||
+        session.status == 'exited' ||
+        session.unsupportedSyncDaemon) {
       return;
     }
     final sessionId = _sessionIdFor(session);
     if (sessionId == null) return;
 
     final generation = _connectGeneration;
-    // The pane owns the re-fit. On web this is the whole operation; running the
-    // native jiggle below afterward would nudge the host straight back to the
-    // stale shadow width.
+    // Ask the unified pane to reconcile `session.terminal` to the live
+    // `RenderTerminalGrid` size before jiggling the daemon PTY.
     session.terminalController.refit();
-    if (kIsWeb) return;
     if (session.refitInFlight) return;
 
     final cols = session.terminal.viewWidth;
     final rows = session.terminal.viewHeight;
     if (cols < 2 || rows < 2) return;
-    session.hostSizeCols = cols;
-    session.hostSizeRows = rows;
+    final reqSeq = ++session.resizeRequestSeq;
     session.refitInFlight = true;
     unawaited(() async {
+      bool shouldAbortRefit() =>
+          _disposed ||
+          _isStale(generation) ||
+          !_sessions.contains(session) ||
+          session.isExited ||
+          session.status == 'exited' ||
+          reqSeq != session.resizeRequestSeq;
       try {
         await _client.resizeSession(
           sessionId: sessionId,
           cols: cols,
           rows: rows - 1,
         );
-        if (_disposed || _isStale(generation)) return;
+        if (shouldAbortRefit()) return;
         await Future<void>.delayed(const Duration(milliseconds: 60));
-        if (_disposed || _isStale(generation)) return;
+        if (shouldAbortRefit()) return;
         await _client.resizeSession(
           sessionId: sessionId,
           cols: cols,
           rows: rows,
         );
-        session.hostSizeCols = cols;
-        session.hostSizeRows = rows;
+        if (!shouldAbortRefit()) {
+          session.hostSizeCols = cols;
+          session.hostSizeRows = rows;
+        }
       } catch (_) {
       } finally {
         session.refitInFlight = false;
@@ -2386,29 +2361,31 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.inputListenerBound = true;
 
     session.terminalController.addInputListener((keys) {
-      // While the store replays history or when the emulator auto-answers terminal
-      // queries (DSR, DA, Kitty queries), those answers surface here as emulator
-      // output; they must not be forwarded to the host as fake user input.
-      if (session.store.isSuppressingHostInput ||
-          isEmulatorQueryResponse(keys)) {
-        return;
-      }
+      // Emulator query responses (DSR, DA, Kitty queries) are already filtered
+      // with hardware-key provenance in `TerminalController.sendInput`.
       if (_isRemoteSession(session)) {
-        if (!_client.isConnected) {
-          // Mark, but do not drop: the bytes buffer in
-          // `_sendRemoteSessionInput` and flush when the reconnect
-          // re-acquires the lease.
-          _markRemoteSessionDisconnected(session);
-        }
-
-        if (session.isExited || session.status == 'exited') {
+        if (session.isExited ||
+            session.status == 'exited' ||
+            session.unsupportedSyncDaemon) {
           return;
         }
 
         final sessionId = _sessionIdFor(session) ?? session.remoteSessionId;
         if (sessionId == null) return;
 
-        _sendRemoteSessionInput(session, sessionId, utf8.encode(keys));
+        final encoded = utf8.encode(keys);
+        if (!_client.isConnected) {
+          if (_isFocusReportBytes(encoded) ||
+              _isEncodedMouseReportBytes(encoded)) {
+            return;
+          }
+          // Mark, but do not drop user keystrokes: they buffer in
+          // `_sendRemoteSessionInput` and flush when reconnect re-acquires the
+          // lease.
+          _markRemoteSessionDisconnected(session);
+        }
+
+        _sendRemoteSessionInput(session, sessionId, encoded);
       } else {
         // Local/demo session: echo keystrokes through the same single write
         // path the remote stream uses, so there is one rendering pipeline.
@@ -2451,8 +2428,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (_clientInitialized &&
           _client.isConnected &&
           sessionId != null &&
+          session.loaded &&
           !session.isExited &&
-          session.status != 'exited') {
+          session.status != 'exited' &&
+          !session.unsupportedSyncDaemon) {
         final reqSeq = ++session.resizeRequestSeq;
         final generation = _connectGeneration;
         // Tell the host its new PTY size; the program repaints and the live
@@ -2464,7 +2443,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               cols: cols,
               rows: rows,
             );
-            if (!_isStale(generation) && reqSeq == session.resizeRequestSeq) {
+            if (!_isStale(generation) &&
+                _sessions.contains(session) &&
+                !session.isExited &&
+                session.status != 'exited' &&
+                reqSeq == session.resizeRequestSeq) {
               session.hostSizeCols = cols;
               session.hostSizeRows = rows;
             }
@@ -2475,7 +2458,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   Future<void> _ensureSessionInputLease(SessionVm session) async {
-    if (!_clientInitialized || !_client.isConnected || session.isExited) return;
+    if (!_clientInitialized ||
+        !_client.isConnected ||
+        !session.loaded ||
+        session.isExited ||
+        session.unsupportedSyncDaemon) {
+      return;
+    }
     final sessionId = _sessionIdFor(session) ?? session.remoteSessionId;
     if (sessionId == null) return;
     if (session.hasInputLease) return;
@@ -2486,7 +2475,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     SessionVm session,
     String sessionId,
   ) async {
-    if (!_clientInitialized || !_client.isConnected || session.isExited) return;
+    if (!_clientInitialized ||
+        !_client.isConnected ||
+        !session.loaded ||
+        session.isExited ||
+        session.unsupportedSyncDaemon) {
+      return;
+    }
     final acquireGeneration = _connectGeneration;
     final acquireAttempt = _leaseAcquisitionClaims.claim(
       sessionId,
@@ -2497,20 +2492,73 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       return;
     }
     try {
-      await _client.attachSession(
+      final keepSubscribed = _subscriptionIds.containsValue(sessionId);
+      final syncRes = await _client.syncTerminalSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'InteractiveController',
-        // Lease-only: the snapshot is discarded, so probe with the minimum
-        // window instead of shipping a megabyte tail to throw away.
-        historyBytes: kHistoryLeaseProbeBytes,
+        restoreIfExited: false,
+        subscribe: keepSubscribed,
+        knownFrameSeq: session.terminal.lastFrameSeq,
       );
       // A disconnect in between resets leases: a zombie `true` here would
       // bypass the buffer-and-acquire path and drop input.
-      if (_isStale(acquireGeneration)) return;
-      session.hasInputLease = true;
+      if (_isStale(acquireGeneration) || !_sessions.contains(session)) return;
+      final responseObj = _asMap(syncRes['response']) ?? syncRes;
+      final snapshot = _asMap(responseObj['snapshot']);
+      final exited = snapshot?['exited'] as bool? ?? false;
+      if (exited) {
+        _subscriptionIds.removeWhere((_, id) => id == sessionId);
+        session.syncSubscriptionId = null;
+        session.lastSyncedServerFrameSeq = 0;
+        session.hasInputLease = false;
+        _pendingInput.forget(sessionId);
+        session.markExited();
+        if (!_disposed && mounted) {
+          setState(() {
+            session.isExited = true;
+            session.status = 'exited';
+            session.statusColor = const Color(0xff7f8b8d);
+          });
+        } else {
+          session.isExited = true;
+          session.status = 'exited';
+          session.statusColor = const Color(0xff7f8b8d);
+        }
+        return;
+      }
+      final prevSubId = session.syncSubscriptionId;
+      final subId = responseObj['subscription_id']?.toString();
+      if (subId != null && subId.isNotEmpty) {
+        _subscriptionIds.removeWhere((_, id) => id == sessionId);
+        _subscriptionIds[subId] = sessionId;
+        session.syncSubscriptionId = subId;
+        if (subId != prevSubId) {
+          session.lastSyncedServerFrameSeq = 0;
+        }
+      }
+      final frameMap = _asMap(responseObj['frame']);
+      if (frameMap != null && frameMap.isNotEmpty) {
+        final frame = TerminalSyncFrameData.fromMap(frameMap);
+        final subChanged =
+            subId != null && subId.isNotEmpty && subId != prevSubId;
+        if (!keepSubscribed ||
+            subChanged ||
+            frame.frameSeq == 0 ||
+            frame.frameSeq > session.lastSyncedServerFrameSeq) {
+          session.applyTerminalSyncFrame(frame, snapshot: snapshot);
+          if (frame.frameSeq > 0 && session.syncSubscriptionId != null) {
+            session.lastSyncedServerFrameSeq = frame.frameSeq;
+          }
+        }
+      }
+      session.hasInputLease = _attachGrantsInputLease(syncRes);
+      final hasLiveSubscription =
+          (keepSubscribed && subId != null && subId.isNotEmpty) ||
+          _subscriptionIds.containsValue(sessionId);
       if (!_disposed &&
           mounted &&
+          hasLiveSubscription &&
           session.status != 'attached' &&
           session.status != 'loading') {
         setState(() {
@@ -2518,11 +2566,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.statusColor = const Color(0xff7fd1c7);
         });
       }
-      await _flushPendingInput(session, sessionId);
+      if (session.hasInputLease) {
+        await _flushPendingInput(session, sessionId);
+      }
     } on TriageAuthException {
       _routeStaleAuthFailure(acquireGeneration);
     } catch (e) {
-      debugPrint('Input lease attach failed for $sessionId: $e');
+      if (isUnsupportedTerminalSyncError(e) &&
+          !_isStale(acquireGeneration) &&
+          _sessions.contains(session)) {
+        if (!_disposed && mounted) {
+          setState(session.markUnsupportedSyncDaemon);
+        } else {
+          session.markUnsupportedSyncDaemon();
+        }
+        return;
+      }
+      debugPrint('Input lease sync failed for $sessionId: $e');
     } finally {
       _leaseAcquisitionClaims.release(sessionId, acquireAttempt);
     }
@@ -2578,17 +2638,54 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   String? _leaseErrorSessionId(String message) => leaseErrorSessionId(message);
 
+  bool _isEncodedMouseReportBytes(List<int> bytes) {
+    if (bytes.length < 6 || bytes[0] != 0x1b || bytes[1] != 0x5b) {
+      return false;
+    }
+    try {
+      return isTerminalMouseReport(utf8.decode(bytes));
+    } on FormatException {
+      return false;
+    }
+  }
+
+  bool _isFocusReportBytes(List<int> bytes) {
+    return bytes.length == 3 &&
+        bytes[0] == 0x1b &&
+        bytes[1] == 0x5b &&
+        (bytes[2] == 0x49 || bytes[2] == 0x4f);
+  }
+
+  bool _isUnpressedMouseHoverBytes(List<int> bytes) {
+    if (bytes.length < 6 || bytes[0] != 0x1b || bytes[1] != 0x5b) {
+      return false;
+    }
+    try {
+      return isUnpressedTerminalMouseHover(utf8.decode(bytes));
+    } on FormatException {
+      return false;
+    }
+  }
+
   void _sendRemoteSessionInput(
     SessionVm session,
     String sessionId,
     List<int> bytes,
   ) {
-    final isMouseReport =
-        bytes.length >= 6 &&
-        bytes[0] == 0x1b &&
-        bytes[1] == 0x5b &&
-        (bytes[2] == 0x3c || bytes[2] == 0x4d);
+    final isFocusReport = _isFocusReportBytes(bytes);
+    if (isFocusReport && (!session.hasInputLease || !_client.isConnected)) {
+      // Passive observers must not claim the input lease or replay stale
+      // focus transitions when local routes or windows focus and blur.
+      return;
+    }
+    final isMouseReport = _isEncodedMouseReportBytes(bytes);
+    if (isMouseReport &&
+        (!_client.isConnected ||
+            (!session.hasInputLease && _isUnpressedMouseHoverBytes(bytes)))) {
+      return;
+    }
     if (!isMouseReport &&
+        !isFocusReport &&
         !session.refitInFlight &&
         _clientForeground &&
         _selectedIndex >= 0 &&
@@ -2941,12 +3038,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       } catch (_) {}
     }
     _subscriptionIds.clear();
+    for (final c in _inFlightRefreshDone.values) {
+      if (!c.isCompleted) c.complete();
+    }
+    _inFlightRefreshDone.clear();
     // Leases are daemon-side: a reconnected daemon may have dropped them, and
     // a stale `true` bypasses the buffer-and-acquire path and drops input.
     // Re-acquired on the next keystroke; select and refresh only resync the
     // flag from the daemon's current holder.
     for (final s in _sessions) {
       s.hasInputLease = false;
+      s.syncSubscriptionId = null;
+      s.lastSyncedServerFrameSeq = 0;
     }
 
     // Disposed, or superseded by a newer generation — which then owns
@@ -3409,6 +3512,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             TerminalPane.destroySession(s.title);
             if (sid != null) {
               _pendingInput.forget(sid);
+              _pendingEvents.remove(sid);
+              _subscriptionIds.removeWhere((_, id) => id == sid);
             }
           }
         }
@@ -3418,6 +3523,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           TerminalPane.destroySession(s.title);
         }
         _pendingInput.clear();
+        _pendingEvents.clear();
+        _subscriptionIds.clear();
       }
       setState(() {
         _sessionsServerId = _activeServerId;
@@ -3494,41 +3601,38 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // A racing select owns the identical unit; skip on claim failure.
           final attempt = _resubscribeClaims.claim(selectedSid, generation);
           if (attempt != null) {
-            var step = _ResubStep.resubscribe;
             try {
               await _resubscribeAndRefreshHistory(
                 selectedSession,
                 selectedSid,
                 owningGeneration: generation,
-                onStep: (s) => step = s,
               );
               if (_isStale(generation)) return;
-              _drainPendingEvents(selectedSid);
+              if (_sessions.contains(selectedSession)) {
+                _drainPendingEvents(selectedSid);
+              }
             } on TriageAuthException {
               rethrow;
             } catch (e, stack) {
               debugPrint(
-                'Failed to reload session $selectedSid on reconnect '
-                '(${step.name}): $e\n$stack',
+                'Failed to reload session $selectedSid on reconnect: '
+                '$e\n$stack',
               );
               // As in _loadDaemonSessionInto: a failure that outlived its
               // daemon must not paint the session now sitting under that id.
               // Guarded, not returned: the status block and seed wait below
               // make their own generation checks.
-              if (!_isStale(generation)) {
-                // As in the select path: a refresh-step failure leaves a live
-                // subscription behind, and the next select would then run a
-                // metadata-only refresh over the hole instead of retrying the
-                // full unit. Drop it so the retry replays history; a
-                // resubscribe-step failure installed nothing and self-heals.
-                if (step != _ResubStep.resubscribe) {
-                  _subscriptionIds.removeWhere((_, id) => id == selectedSid);
-                }
+              if (!_isStale(generation) &&
+                  _sessions.contains(selectedSession)) {
                 failedSessionIds.add(selectedSid);
-                setState(() {
-                  selectedSession.status = 'load failed';
-                  selectedSession.statusColor = const Color(0xffff6b6b);
-                });
+                if (isUnsupportedTerminalSyncError(e)) {
+                  setState(selectedSession.markUnsupportedSyncDaemon);
+                } else {
+                  setState(() {
+                    selectedSession.status = 'load failed';
+                    selectedSession.statusColor = const Color(0xffff6b6b);
+                  });
+                }
               }
             } finally {
               _resubscribeClaims.release(selectedSid, attempt);
@@ -4280,6 +4384,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       // `cd`ed elsewhere since connect), and that moves the row to a different
       // group, which the swap alone does not recompute.
       var regrouped = false;
+      var swapped = false;
       setState(() {
         final existingIndex = _sessions.indexWhere(
           (s) => s.remoteSessionId == sid,
@@ -4316,6 +4421,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           TerminalPane.destroySession(oldSession.title);
         }
         _sessions[existingIndex] = session;
+        swapped = true;
         // Rebind the mounted pane to the replacement's TerminalController
         // BEFORE `noteViewFit` flushes staged history so the pane's
         // `_onHistoryReplayed` listener receives the notification, masks the
@@ -4362,6 +4468,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           }
         }
       });
+      if (!swapped) {
+        _subscriptionIds.removeWhere((_, id) => id == sid);
+        _pendingEvents.remove(sid);
+        TerminalPane.destroySession(session.title);
+        session.dispose();
+        return;
+      }
       if (regrouped) _regroupRail();
       _drainPendingEvents(sid);
       if (!session.isExited && _pendingInput.hasPending(sid)) {
@@ -4370,23 +4483,35 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final postLoadCols = session.ownFittedCols ?? session.lastFittedCols;
       final postLoadRows = session.ownFittedRows ?? session.lastFittedRows;
       if (_clientForeground &&
+          !session.isExited &&
           postLoadCols != null &&
           postLoadRows != null &&
           (session.hostSizeCols != postLoadCols ||
               session.hostSizeRows != postLoadRows)) {
         final targetCols = postLoadCols;
         final targetRows = postLoadRows;
+        final reqSeq = ++session.resizeRequestSeq;
         unawaited(() async {
           // The swap above settled the generation; a switch since must not
           // resize the new daemon's same-named session.
-          if (_isStale(generation)) return;
+          if (_isStale(generation) ||
+              !_sessions.contains(session) ||
+              session.isExited ||
+              session.status == 'exited' ||
+              reqSeq != session.resizeRequestSeq) {
+            return;
+          }
           try {
             await _client.resizeSession(
               sessionId: sid,
               cols: targetCols,
               rows: targetRows,
             );
-            if (!_isStale(generation)) {
+            if (!_isStale(generation) &&
+                _sessions.contains(session) &&
+                !session.isExited &&
+                session.status != 'exited' &&
+                reqSeq == session.resizeRequestSeq) {
               session.hostSizeCols = targetCols;
               session.hostSizeRows = targetRows;
             }
@@ -4394,6 +4519,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }());
         session.terminalController.fit();
       }
+    } on _StaleLoad {
+      return;
     } on TriageAuthException {
       // The daemon refused the attach: this client is no longer paired. Painting
       // the row "load failed" would be a dead end — the same token fails for
@@ -4404,7 +4531,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       rethrow;
     } catch (e, stack) {
       // A load that failed because we tore its daemon down is not a failure of
-      // the session now sitting under that id on the new daemon — painting that
+      // the session now sitting under that id on the new daemon: painting that
       // one "load failed" would be a lie about a healthy session.
       if (_disposed || generation != _connectGeneration) return;
       failedSessionIds.add(sid);
@@ -4413,6 +4540,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           (s) => s.remoteSessionId == sid,
         );
         if (existingIndex == -1) return;
+        if (isUnsupportedTerminalSyncError(e)) {
+          _sessions[existingIndex].markUnsupportedSyncDaemon();
+          return;
+        }
         _sessions[existingIndex].status = 'load failed';
         _sessions[existingIndex].statusColor = const Color(0xffff6b6b);
         if (runningUnderFlutterTest()) {
@@ -4421,9 +4552,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             ..add(_plainRow('Failed to load session $sid'));
         }
       });
-      // With the stack: this catch spans the whole load — attach, the swap
-      // setState, regroup, drain, resize — so the message alone does not say
-      // which step threw, and a load failure is not reproducible on demand.
       debugPrint('Failed to load session $sid: $e\n$stack');
     } finally {
       _loadingClaims.release(sid, loadAttempt);
@@ -4436,6 +4564,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     required int owningGeneration,
   }) async {
     String? subId;
+    bool stillPresent() => _sessions.any((s) => s.remoteSessionId == sid);
     try {
       final existing = _sessions.cast<SessionVm?>().firstWhere(
         (s) => s?.remoteSessionId == sid,
@@ -4451,24 +4580,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           mounted &&
           TerminalPane.getLastFittedWorkspaceSize() == null &&
           TerminalPane.getCachedTerminalSize(sessionTitle) == null) {
-        // Wait for the frame scheduled by `_loadDaemonSessions` / `_loadDaemonSessionInto`
-        // to lay out `TerminalPane` so `RenderTerminal` measures the real font and
-        // viewport cell grid before we resize the daemon PTY or fetch history.
-        // Bound the wait so a minimized or occluded window (where the OS
-        // compositor suspends vsync callbacks) cannot block session attach.
+        // Wait for the frame scheduled by `_loadDaemonSessions` /
+        // `_loadDaemonSessionInto` to lay out `TerminalPane` so
+        // `RenderTerminalGrid` measures the real font and viewport cell grid
+        // before we synchronize the daemon PTY. Bound the wait so an occluded
+        // window cannot block session attach.
         await initialAttachFrameFuture.timeout(
           const Duration(milliseconds: 500),
           onTimeout: () {},
         );
-        if (_isStale(owningGeneration)) throw const _StaleLoad();
+        if (_isStale(owningGeneration) || !stillPresent()) {
+          throw const _StaleLoad();
+        }
       }
-
-      var preAttachSnapshot = <String, dynamic>{};
-      try {
-        final snapshotRes = await _client.snapshotSession(sessionId: sid);
-        preAttachSnapshot =
-            snapshotRes['snapshot'] as Map<String, dynamic>? ?? {};
-      } catch (_) {}
 
       final cachedSize =
           TerminalPane.getLastFittedWorkspaceSize() ??
@@ -4481,126 +4605,82 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           (knownFittedRows != null && knownFittedCols != null)
           ? (knownFittedRows, knownFittedCols)
           : null;
-
-      final replayTargetSize =
+      final (int, int)? syncSize =
           knownTargetSize ??
-          (includeHistory &&
-                  (preAttachSnapshot['exited'] == true ||
-                      (!kIsWeb && runningUnderFlutterTest()))
-              ? _estimatedTerminalRestoreSize(
-                  preAttachSnapshot['size'] as Map<String, dynamic>?,
-                )
-              : null);
-      Map<String, dynamic>? preparedSnapshot;
-      (int, int)? drivenSize;
-      if (preAttachSnapshot['exited'] == true) {
-        // Drop any keystrokes buffered for the dead incarnation so the
-        // post-restore attach cannot flush them into the freshly spawned shell.
-        _pendingInput.forget(sid);
-        existing?.hasInputLease = false;
-        final sizeObj = preAttachSnapshot['size'] as Map<String, dynamic>?;
-        final restoreSize =
-            replayTargetSize ?? _savedOrEstimatedTerminalRestoreSize(sizeObj);
-        // Every daemon write below is guarded the same way: a switch
-        // mid-load must not restore, resize, subscribe, or attach on the
-        // new daemon under this colliding id.
-        if (_isStale(owningGeneration)) throw const _StaleLoad();
-        try {
-          preparedSnapshot = _snapshotFromResponse(
-            await _client.restoreSession(
-              sessionId: sid,
-              rows: restoreSize.$1,
-              cols: restoreSize.$2,
-            ),
-          );
-          drivenSize = restoreSize;
-          if (preparedSnapshot != null) {
-            preAttachSnapshot = preparedSnapshot;
-          }
-        } catch (_) {}
-      }
-
-      // Subscribe to events before resizing a live session so we do not miss
-      // any SIGWINCH redraw emitted by the child process during attach.
-      if (_isStale(owningGeneration)) throw const _StaleLoad();
-      subId = await _checkedSubscribeSessionEvents(sid);
-      // Above the install, not just the attach: a response landing after a
-      // switch must not plant the old daemon's id under a `sub-{n}` key the
-      // new connection reissues. The attach below is covered by this same
-      // guard; only synchronous work sits between it and the issuance.
-      if (_isStale(owningGeneration)) throw const _StaleLoad();
-      _subscriptionIds[subId] = sid;
-
-      if (preAttachSnapshot['exited'] != true &&
-          replayTargetSize != null &&
+          (includeHistory ? _estimatedTerminalRestoreSize(null) : null);
+      final shouldResizeLivePty =
           _clientForeground &&
-          !_snapshotSizeMatches(preAttachSnapshot, replayTargetSize)) {
-        // Gated like the other resize-out paths. When a known fitted size is
-        // available, use it; otherwise fall back to estimated restore size.
-        if (_isStale(owningGeneration)) throw const _StaleLoad();
-        try {
-          preparedSnapshot = _snapshotFromResponse(
-            await _client.resizeSession(
-              sessionId: sid,
-              rows: replayTargetSize.$1,
-              cols: replayTargetSize.$2,
-            ),
-          );
-          drivenSize = replayTargetSize;
-          if (preparedSnapshot != null) {
-            preAttachSnapshot = preparedSnapshot;
-          }
-        } catch (_) {}
+          (knownTargetSize != null ||
+              (runningUnderFlutterTest() && syncSize != null));
+
+      if (existing?.isExited == true) {
+        _pendingInput.forget(sid);
       }
 
-      // Observer: loading a session to look at it must not steal the input
-      // lease from another client (or agent) typing there. The first
-      // keystroke acquires it through the buffer-and-flush path instead.
-      // First-page window: first paint waits on the viewport, and
-      // scrolling near the top re-attaches with a doubling window.
-      final useHttpHistory = _client.hasHttpHistoryTransport;
-      final attachRes = await _client.attachSession(
+      if (_isStale(owningGeneration) || !stillPresent()) {
+        throw const _StaleLoad();
+      }
+      final probeExitedFirst =
+          existing?.isExited != true && _pendingInput.hasPending(sid);
+      var syncRes = await _client.syncTerminalSession(
         sessionId: sid,
         clientId: _clientId,
         mode: 'Observer',
-        historyBytes: useHttpHistory
-            ? kHistoryLeaseProbeBytes
-            : kHistoryFirstWindowBytes,
+        cols: syncSize?.$2,
+        rows: syncSize?.$1,
+        resizePty: shouldResizeLivePty,
+        restoreIfExited: !probeExitedFirst,
+        subscribe: true,
+        knownFrameSeq: 0,
       );
-      if (_isStale(owningGeneration)) throw const _StaleLoad();
-      final responseObj = attachRes['response'] as Map<String, dynamic>?;
-      var snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-      if (useHttpHistory) {
-        final historySnapshot = await _client.fetchSessionHistory(
-          sessionId: sid,
-          clientId: _clientId,
-          windowBytes: kHistoryFirstWindowBytes,
-        );
-        if (_isStale(owningGeneration)) throw const _StaleLoad();
-        snapshot = _mergeHistoryIntoSnapshot(snapshot, historySnapshot);
-      } else if (replayTargetSize != null &&
-          preparedSnapshot != null &&
-          snapshotCarriesHistory(preparedSnapshot) &&
-          snapshot?['exited'] != true &&
-          !_snapshotSizeMatches(snapshot, replayTargetSize)) {
-        // Fall back to the prepared snapshot only when it carries history: the
-        // restore path's snapshot does, but a resize snapshot never does, and
-        // replaying its empty history would clear the terminal to a blank screen.
-        snapshot = preparedSnapshot;
+      if (_isStale(owningGeneration) || !stillPresent()) {
+        throw const _StaleLoad();
       }
 
-      final contextObj = snapshot?['context'] as Map<String, dynamic>?;
+      var responseObj = _asMap(syncRes['response']) ?? syncRes;
+      var snapshot = _asMap(responseObj['snapshot']);
+      if (probeExitedFirst && (snapshot?['exited'] as bool? ?? false)) {
+        _pendingInput.forget(sid);
+        final restoreSize = syncSize ?? _estimatedTerminalRestoreSize(null);
+        syncRes = await _client.syncTerminalSession(
+          sessionId: sid,
+          clientId: _clientId,
+          mode: 'Observer',
+          cols: restoreSize.$2,
+          rows: restoreSize.$1,
+          resizePty: shouldResizeLivePty,
+          restoreIfExited: true,
+          subscribe: true,
+          knownFrameSeq: 0,
+        );
+        if (_isStale(owningGeneration) || !stillPresent()) {
+          throw const _StaleLoad();
+        }
+        responseObj = _asMap(syncRes['response']) ?? syncRes;
+        snapshot = _asMap(responseObj['snapshot']);
+      }
+      final frameMap = _asMap(responseObj['frame']);
+      final exited = snapshot?['exited'] as bool? ?? false;
+      final rawSubId = responseObj['subscription_id']?.toString() ?? '';
+      if (!exited && rawSubId.isEmpty) {
+        throw Exception('sync_terminal returned no subscription id for $sid');
+      }
+      _subscriptionIds.removeWhere((_, id) => id == sid);
+      if (rawSubId.isNotEmpty) {
+        subId = rawSubId;
+        _subscriptionIds[rawSubId] = sid;
+      }
+
+      if (exited) {
+        _pendingInput.forget(sid);
+      }
+
+      final contextObj = _asMap(snapshot?['context']);
       final branch = contextObj?['branch']?.toString();
       final repoRoot = contextObj?['repository_root']?.toString();
       final worktreeRoot = contextObj?['worktree_root']?.toString();
       final cwd = snapshot?['current_working_directory']?.toString();
-
       final plainRows = _plainRowsFromSnapshot(snapshot);
-      final exited = snapshot?['exited'] as bool? ?? false;
-      if (exited) {
-        _pendingInput.forget(sid);
-      }
-      final outputSeq = snapshot?['output_seq'] as int?;
 
       final customLabel = _lookupCustomLabel(sid);
       final session = SessionVm(
@@ -4622,10 +4702,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         isRemote: true,
         isExited: exited,
       );
-      session.hasInputLease = !exited && _attachGrantsInputLease(attachRes);
-      final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
-      final reportedRows = sizeObj?['rows'] as int?;
-      final reportedCols = sizeObj?['cols'] as int?;
+      session.syncSubscriptionId = subId;
+      session.hasInputLease = !exited && _attachGrantsInputLease(syncRes);
+
+      final sizeObj = _asMap(snapshot?['size']);
+      final reportedRows = (sizeObj?['rows'] as num?)?.toInt();
+      final reportedCols = (sizeObj?['cols'] as num?)?.toInt();
+      final drivenSize = (shouldResizeLivePty && !exited) ? syncSize : null;
       final hostSize =
           drivenSize ??
           (reportedCols == null || reportedRows == null
@@ -4635,47 +4718,40 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.hostSizeCols = hostSize.$2;
         session.hostSizeRows = hostSize.$1;
       }
-      // Snapshot carries the current snippet for the attached session (the list
-      // seed + push events cover the rest).
       session.snippet = snapshot?['snippet'] as String?;
       session.snippetDetail = snapshot?['snippet_detail'] as String?;
-      session.agent = snapshot?['agent'] as Map<String, dynamic>?;
+      session.agent = _asMap(snapshot?['agent']);
       final bracketedPaste =
           snapshot?['bracketed_paste_enabled'] as bool? ?? false;
       session.setBracketedPasteEnabled(bracketedPaste);
-      // Replay the raw output-history tail through the single write path. Live
-      // chunks already covered by this snapshot are dropped by output_seq.
-      final rawOutputStart = snapshot?['raw_output_start'] as int?;
-      final snapMap = snapshot ?? const <String, dynamic>{};
-      final rawOutput = _rawOutputFromSnapshot(snapMap);
-      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapMap);
-      final rawOutputViewport = _rawOutputViewportFromSnapshot(
-        snapMap,
-        decodedPrefix: rawOutputPrefix,
-        decodedRawOutput: rawOutput,
-      );
-      session.applyHistory(
-        rawOutput,
-        throughOutputSeq: outputSeq,
-        rawOutputStart: rawOutputStart,
-        windowBytes: kHistoryFirstWindowBytes,
-        rawOutputPrefix: rawOutputPrefix,
-        rawOutputViewport: rawOutputViewport,
-        isExited: exited,
-      );
+
+      if (frameMap != null && frameMap.isNotEmpty) {
+        final frame = TerminalSyncFrameData.fromMap(frameMap);
+        session.applyTerminalSyncFrame(
+          frame,
+          notifyReplay: true,
+          snapshot: snapshot,
+        );
+        if (frame.frameSeq > 0 && subId != null) {
+          session.lastSyncedServerFrameSeq = frame.frameSeq;
+        }
+        if (session.hostSizeCols == null && frame.cols > 0 && frame.rows > 0) {
+          session.hostSizeCols = frame.cols;
+          session.hostSizeRows = frame.rows;
+        }
+      }
+      if (runningUnderFlutterTest() && session.rows.isEmpty) {
+        final fallback = _plainRowsFromSnapshot(snapshot);
+        session.rows.addAll(
+          fallback.isNotEmpty
+              ? fallback
+              : <StyledRow>[_plainRow('Attached to session $sid')],
+        );
+      }
+
       _setupSessionInputListener(session);
       return session;
     } catch (_) {
-      // Roll back the subscription bookkeeping and drop any events buffered
-      // for a session we will never expose, so they don't accumulate forever.
-      // A superseded attempt touches neither map, whatever its error: the
-      // purge already dropped the pre-switch entries, the pending events
-      // arrived after the switch and belong to the new daemon's session
-      // under this id, and a subscription id is `sub-{n}` per connection, so
-      // removing by this key could delete the new generation's live mapping.
-      // (A late RPC error on a stale attempt takes this path too, not just
-      // the `_StaleLoad` bails above, which is why the predicate is
-      // staleness, not the exception type.)
       if (!_isStale(owningGeneration)) {
         if (subId != null && subId.isNotEmpty) {
           _subscriptionIds.remove(subId);
@@ -4688,10 +4764,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
   void _drainPendingEvents(String sid) {
     final pending = _pendingEvents.remove(sid);
-    if (pending != null) {
-      for (final msg in pending) {
-        _onWebSocketEvent(msg);
+    if (pending != null && pending.isNotEmpty) {
+      for (final msg in pending.reversed) {
+        _websocketEventQueue.addFirst(msg);
       }
+      unawaited(_processWebsocketEventQueue());
     }
   }
 
@@ -4716,52 +4793,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     return (rows, cols);
   }
 
-  (int, int) _savedOrEstimatedTerminalRestoreSize(
-    Map<String, dynamic>? fallbackSize,
-  ) {
-    final cols = fallbackSize?['cols'] as int?;
-    final rows = fallbackSize?['rows'] as int?;
-    if (cols != null && rows != null) {
-      return (rows, cols);
-    }
-    return _estimatedTerminalRestoreSize(fallbackSize);
-  }
-
-  (int, int) _currentReplayTerminalSize(
-    SessionVm session,
-    Map<String, dynamic>? fallbackSize,
-  ) {
-    final cachedSize =
-        TerminalPane.getLastFittedWorkspaceSize() ??
-        TerminalPane.getCachedTerminalSize(session.title);
-    final cols =
-        cachedSize?.$2 ?? session.ownFittedCols ?? session.lastFittedCols;
-    final rows =
-        cachedSize?.$1 ?? session.ownFittedRows ?? session.lastFittedRows;
-    if (cols != null && rows != null) {
-      return (rows, cols);
-    }
-    return _estimatedTerminalRestoreSize(fallbackSize);
-  }
-
   Map<String, dynamic>? _asMap(Object? value) {
     if (value is Map<String, dynamic>) return value;
     if (value is Map) return Map<String, dynamic>.from(value);
     return null;
-  }
-
-  Map<String, dynamic>? _snapshotFromResponse(Map<String, dynamic> response) {
-    return _asMap(response['snapshot']) ??
-        _asMap(_asMap(response['response'])?['snapshot']);
-  }
-
-  bool _snapshotSizeMatches(
-    Map<String, dynamic>? snapshot,
-    (int, int) targetSize,
-  ) {
-    final sizeObj = snapshot?['size'] as Map<String, dynamic>?;
-    return sizeObj?['rows'] == targetSize.$1 &&
-        sizeObj?['cols'] == targetSize.$2;
   }
 
   void _onWebSocketEvent(Map<String, dynamic> message) {
@@ -4773,35 +4808,21 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   Future<void> _processWebsocketEventQueue() async {
     if (_websocketProcessingEvent || _websocketEventQueue.isEmpty) return;
     _websocketProcessingEvent = true;
-    final batchedSessions = <SessionVm>{};
-    void flushBatchedSessions() {
-      if (batchedSessions.isEmpty) return;
-      for (final s in batchedSessions) {
-        s.endTerminalWriteBatch();
-      }
-      batchedSessions.clear();
-    }
-
     final sliceWatch = Stopwatch()..start();
     try {
       while (_websocketEventQueue.isNotEmpty && !_disposed) {
         final message = _websocketEventQueue.removeFirst();
         try {
-          await _processWebSocketEvent(
-            message,
-            batchedSessions: batchedSessions,
-          );
+          await _processWebSocketEvent(message);
         } catch (_) {}
         if (!runningUnderFlutterTest() &&
             _websocketEventQueue.isNotEmpty &&
             sliceWatch.elapsedMilliseconds >= 8) {
-          flushBatchedSessions();
           await Future<void>.delayed(Duration.zero);
           sliceWatch.reset();
         }
       }
     } finally {
-      flushBatchedSessions();
       _websocketProcessingEvent = false;
     }
   }
@@ -4889,6 +4910,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.dispose();
     TerminalPane.destroySession(session.title);
     _pendingInput.forget(sessionId);
+    _pendingEvents.remove(sessionId);
+    _subscriptionIds.removeWhere((_, id) => id == sessionId);
 
     final wasSelected = index == _selectedIndex;
     if (index < _selectedIndex) {
@@ -4928,13 +4951,109 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _processWebSocketEvent(
-    Map<String, dynamic> message, {
-    Set<SessionVm>? batchedSessions,
-  }) async {
+  Future<void> _processWebSocketEvent(Map<String, dynamic> message) async {
     final type = message['type'] as String?;
     if (type == 'connection_closed') {
       _onWebSocketClosed(_connectGeneration);
+      return;
+    }
+
+    if (type == 'subscription_closed') {
+      final subId = message['subscription_id']?.toString();
+      if (subId == null || subId.isEmpty) return;
+      final closedSid = _subscriptionIds.remove(subId);
+      SessionVm? target;
+      for (final s in _sessions) {
+        if (s.syncSubscriptionId == subId ||
+            (closedSid != null && s.remoteSessionId == closedSid)) {
+          if (s.syncSubscriptionId == subId) {
+            s.syncSubscriptionId = null;
+            s.lastSyncedServerFrameSeq = 0;
+          }
+          target ??= s;
+        }
+      }
+      final sid = closedSid ?? target?.remoteSessionId;
+      void markClosedSubscriptionStatus(
+        SessionVm session, {
+        required bool resyncFailed,
+      }) {
+        if (session.isExited ||
+            (sid != null && _subscriptionIds.containsValue(sid))) {
+          return;
+        }
+        session.hasInputLease = false;
+        if (resyncFailed) {
+          void applyFailed() {
+            session.status = 'load failed';
+            session.statusColor = const Color(0xffff6b6b);
+          }
+
+          if (!_disposed && mounted) {
+            setState(applyFailed);
+          } else {
+            applyFailed();
+          }
+        } else if (session.status == 'attached') {
+          void applyDetached() {
+            session.status = 'idle';
+            session.statusColor = const Color(0xff7f8b8d);
+          }
+
+          if (!_disposed && mounted) {
+            setState(applyDetached);
+          } else {
+            applyDetached();
+          }
+        }
+      }
+
+      if (target != null &&
+          sid != null &&
+          target.loaded &&
+          !target.isExited &&
+          !target.unsupportedSyncDaemon &&
+          _clientInitialized &&
+          _client.isConnected &&
+          _selectedIndex >= 0 &&
+          _selectedIndex < _sessions.length &&
+          identical(_sessions[_selectedIndex], target)) {
+        final generation = _connectGeneration;
+        try {
+          await _refreshSessionSnapshot(
+            target,
+            includeHistory: true,
+            forceSubscribe: true,
+            allowRestore: false,
+            owningGeneration: generation,
+          );
+          if (!_isStale(generation) &&
+              _sessions.contains(target) &&
+              !_subscriptionIds.containsValue(sid) &&
+              !target.isExited) {
+            markClosedSubscriptionStatus(target, resyncFailed: false);
+          }
+        } on TriageAuthException {
+          if (!_isStale(generation) && _sessions.contains(target)) {
+            markClosedSubscriptionStatus(target, resyncFailed: false);
+          }
+          _routeStaleAuthFailure(generation);
+        } catch (e) {
+          if (!_isStale(generation) && _sessions.contains(target)) {
+            final stillSelected =
+                _selectedIndex >= 0 &&
+                _selectedIndex < _sessions.length &&
+                identical(_sessions[_selectedIndex], target);
+            markClosedSubscriptionStatus(target, resyncFailed: stillSelected);
+          }
+          tdbg(
+            'sync.closed',
+            'resync after subscription_closed failed for $sid: $e',
+          );
+        }
+      } else if (target != null) {
+        markClosedSubscriptionStatus(target, resyncFailed: false);
+      }
       return;
     }
 
@@ -5124,16 +5243,18 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       if (event == null) return;
 
       String? sessionId;
-      if (event.containsKey('Output')) {
-        sessionId = event['Output']['session_id'] as String?;
+      if (event.containsKey('TerminalSync')) {
+        sessionId = _asMap(event['TerminalSync'])?['session_id'] as String?;
+      } else if (event.containsKey('Output')) {
+        sessionId = _asMap(event['Output'])?['session_id'] as String?;
       } else if (event.containsKey('Exited')) {
-        sessionId = event['Exited']['session_id'] as String?;
+        sessionId = _asMap(event['Exited'])?['session_id'] as String?;
       } else if (event.containsKey('Snapshot')) {
-        sessionId = event['Snapshot']['session_id'] as String?;
+        sessionId = _asMap(event['Snapshot'])?['session_id'] as String?;
       } else if (event.containsKey('ResyncRequired')) {
-        sessionId = event['ResyncRequired']['session_id'] as String?;
+        sessionId = _asMap(event['ResyncRequired'])?['session_id'] as String?;
       } else if (event.containsKey('LeaseChanged')) {
-        sessionId = event['LeaseChanged']['session_id'] as String?;
+        sessionId = _asMap(event['LeaseChanged'])?['session_id'] as String?;
       }
 
       if (sessionId == null) return;
@@ -5161,110 +5282,127 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final pending = _pendingEvents.remove(sessionId);
       if (pending != null && pending.isNotEmpty) {
         for (final msg in pending) {
-          await _processWebSocketEvent(msg, batchedSessions: batchedSessions);
+          await _processWebSocketEvent(msg);
         }
       }
 
-      if (event.containsKey('Output')) {
-        final output = event['Output'] as Map<String, dynamic>;
-        final outputSeq = output['output_seq'] as int?;
-        final bytes = (output['bytes'] as List<dynamic>).cast<int>();
-
-        if (batchedSessions != null &&
-            !kIsWeb &&
-            batchedSessions.add(session)) {
-          session.beginTerminalWriteBatch();
+      if (event.containsKey('TerminalSync')) {
+        final eventSubId =
+            message['subscription_id']?.toString() ??
+            envelope?['subscription_id']?.toString();
+        if (eventSubId != null &&
+            eventSubId.isNotEmpty &&
+            session.syncSubscriptionId != null &&
+            session.syncSubscriptionId!.isNotEmpty &&
+            eventSubId != session.syncSubscriptionId) {
+          return;
         }
-        // Single write path: raw bytes flow through the store, which owns UTF-8
-        // carry, CRLF normalization, buffering, and all output_seq
-        // de-duplication (against both the history high-water and re-deliveries).
-        session.applyLiveBytes(bytes, outputSeq: outputSeq);
+        final payload = _asMap(event['TerminalSync']);
+        final frameMap = _asMap(payload?['frame']) ?? payload;
+        if (frameMap != null) {
+          final frame = TerminalSyncFrameData.fromMap(frameMap);
+          final shouldApply =
+              frame.frameSeq == 0 ||
+              frame.frameSeq > session.lastSyncedServerFrameSeq;
+          if (shouldApply) {
+            session.applyTerminalSyncFrame(frame);
+            if (frame.frameSeq > 0) {
+              session.lastSyncedServerFrameSeq = frame.frameSeq;
+            }
+            if (frame.cols > 0 && frame.rows > 0 && !session.refitInFlight) {
+              session.lastFittedCols = frame.cols;
+              session.lastFittedRows = frame.rows;
+              session.hostSizeCols = frame.cols;
+              session.hostSizeRows = frame.rows;
+              if (session.ownFittedCols != frame.cols ||
+                  session.ownFittedRows != frame.rows) {
+                TerminalPane.invalidateCachedResizeOut(session.title);
+              }
+            }
+          }
+          final subId = eventSubId ?? session.syncSubscriptionId ?? '';
+          if (subId.isNotEmpty &&
+              frame.frameSeq > 0 &&
+              _clientInitialized &&
+              _client.isConnected) {
+            _client.ackTerminalSync(
+              subscriptionId: subId,
+              frameSeq: frame.frameSeq,
+            );
+          }
+          if (shouldApply && runningUnderFlutterTest() && mounted) {
+            setState(() {});
+          }
+        }
       } else if (event.containsKey('Exited')) {
-        if (batchedSessions != null && batchedSessions.remove(session)) {
-          session.endTerminalWriteBatch();
-        }
+        _subscriptionIds.removeWhere((_, id) => id == sessionId);
+        session.syncSubscriptionId = null;
+        session.lastSyncedServerFrameSeq = 0;
         _pendingInput.forget(sessionId);
         session.hasInputLease = false;
         session.markExited();
+        void applyExited() {
+          session.status = 'exited';
+          session.statusColor = const Color(0xff7f8b8d);
+          session.isExited = true;
+        }
+
         if (mounted) {
-          setState(() {
-            session.status = 'exited';
-            session.statusColor = const Color(0xff7f8b8d);
-            session.isExited = true;
-          });
+          setState(applyExited);
+        } else {
+          applyExited();
         }
       } else if (event.containsKey('Snapshot')) {
-        // Resize-driven snapshot broadcast. Raw clients re-emulate from the live
-        // byte stream (the program repaints on resize), so there is no history
-        // to replay here — ignore it. Track the settled size for resize bookkeeping.
-        final snapshot = event['Snapshot']['snapshot'] as Map<String, dynamic>?;
-        final size = snapshot?['size'] as Map<String, dynamic>?;
-        final cols = size?['cols'] as int?;
-        final rows = size?['rows'] as int?;
+        // Track the settled PTY size for cross-device resize drift bookkeeping.
+        final snapshot = _asMap(_asMap(event['Snapshot'])?['snapshot']);
+        final size = _asMap(snapshot?['size']);
+        final cols = (size?['cols'] as num?)?.toInt();
+        final rows = (size?['rows'] as num?)?.toInt();
         if (cols != null && rows != null && !session.refitInFlight) {
           session.lastFittedCols = cols;
           session.lastFittedRows = rows;
-          // The host's own account of the PTY's settled size. Recorded
-          // separately because this is the only place another device's resize
-          // is observable, and it is what a reclaim has to compare against.
           session.hostSizeCols = cols;
           session.hostSizeRows = rows;
           if (session.ownFittedCols != cols || session.ownFittedRows != rows) {
             TerminalPane.invalidateCachedResizeOut(session.title);
           }
         }
-      } else if (event.containsKey('ResyncRequired')) {
-        if (batchedSessions != null && batchedSessions.remove(session)) {
-          session.endTerminalWriteBatch();
-        }
-        final snapshot =
-            event['ResyncRequired']['snapshot'] as Map<String, dynamic>?;
-        if (snapshot != null) {
-          final generation = _connectGeneration;
-          var effectiveSnapshot = snapshot;
-          final snapshotHasHistory = snapshotCarriesHistory(snapshot);
-          session.store.beginHistoryRefresh();
-          try {
-            if (!snapshotHasHistory && _client.hasHttpHistoryTransport) {
-              try {
-                final mergedSnapshot = await _fetchAndMergeSessionHistory(
-                  session,
-                  sessionId,
-                  snapshot,
-                );
-                if (_isStale(generation) ||
-                    _disposed ||
-                    !_sessions.contains(session)) {
-                  return;
-                }
-                effectiveSnapshot = mergedSnapshot;
-              } on TriageAuthException {
-                _routeStaleAuthFailure(generation);
-                return;
-              } catch (e) {
-                tdbg(
-                  'history.resync',
-                  'HTTP resync fetch failed for $sessionId: $e',
-                );
-                return;
-              }
-            }
-            // Pushed snapshots carrying inline history are served unwindowed at
-            // the full history cap: replay them at the platform budgets, not the
-            // held window, or the trim over-shrinks them.
-            await _applySnapshotToSession(
-              session,
-              sessionId,
-              effectiveSnapshot,
-              unwindowed: snapshotHasHistory,
-            );
-          } finally {
-            session.store.endHistoryRefresh();
+        if ((snapshot?['exited'] as bool? ?? false) && !session.isExited) {
+          _subscriptionIds.removeWhere((_, id) => id == sessionId);
+          session.syncSubscriptionId = null;
+          session.lastSyncedServerFrameSeq = 0;
+          _pendingInput.forget(sessionId);
+          session.hasInputLease = false;
+          session.markExited();
+          void applySnapshotExited() {
+            session.status = 'exited';
+            session.statusColor = const Color(0xff7f8b8d);
+            session.isExited = true;
+          }
+
+          if (mounted) {
+            setState(applySnapshotExited);
+          } else {
+            applySnapshotExited();
           }
         }
+      } else if (event.containsKey('ResyncRequired')) {
+        final generation = _connectGeneration;
+        try {
+          await _refreshSessionSnapshot(
+            session,
+            includeHistory: true,
+            allowRestore: false,
+            owningGeneration: generation,
+          );
+        } on TriageAuthException {
+          _routeStaleAuthFailure(generation);
+        } catch (e) {
+          tdbg('sync.resync', 'terminal sync resync failed for $sessionId: $e');
+        }
       } else if (event.containsKey('LeaseChanged')) {
-        final change = event['LeaseChanged']['change'] as Map<String, dynamic>?;
-        final currentHolder = change?['current'] as Map<String, dynamic>?;
+        final change = _asMap(_asMap(event['LeaseChanged'])?['change']);
+        final currentHolder = _asMap(change?['current']);
         final holderClientId = currentHolder?['client_id'] as String?;
         session.hasInputLease = holderClientId?.trim() == _clientId;
         if (session.hasInputLease) {
@@ -5274,268 +5412,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  Future<Map<String, dynamic>> _fetchAndMergeSessionHistory(
-    SessionVm session,
-    String sessionId,
-    Map<String, dynamic> snapshot, {
-    bool forceFullWindow = false,
-  }) async {
-    final canUseDelta =
-        !forceFullWindow &&
-        session.loaded &&
-        !session.isExited &&
-        !session.store.state.exited &&
-        snapshot['exited'] != true;
-    final historySnapshot = await _client.fetchSessionHistory(
-      sessionId: sessionId,
-      clientId: _clientId,
-      windowBytes: session.historyWindowBytes,
-      afterByte: canUseDelta ? session.store.appliedLogBytes : null,
-      afterSeq: canUseDelta
-          ? (session.store.appliedLiveSeq ??
-                session.store.state.historyHighWaterSeq)
-          : null,
-    );
-    return _mergeHistoryIntoSnapshot(snapshot, historySnapshot);
-  }
-
-  Map<String, dynamic> _mergeHistoryIntoSnapshot(
-    Map<String, dynamic>? base,
-    Map<String, dynamic> history,
-  ) {
-    final merged = <String, dynamic>{...?base};
-    for (final entry in history.entries) {
-      if (entry.value != null) {
-        merged[entry.key] = entry.value;
-      }
-    }
-    return merged;
-  }
-
-  Future<void> _applySnapshotToSession(
-    SessionVm session,
-    String sessionId,
-    Map<String, dynamic> snapshot, {
-    (int, int)? renderSize,
-    bool replayHistory = true,
-    bool forceFullReplay = false,
-    // True when the snapshot was served unwindowed at the full history
-    // cap (server-pushed ResyncRequired): the replay must keep the
-    // platform budgets instead of the session's narrower held window,
-    // which would over-trim the payload. A plain null windowBytes
-    // parameter cannot express this (its null would have to mean both
-    // "use held" and "use platform budgets"), so the tri-state rides a
-    // bool.
-    bool unwindowed = false,
-    // True only for manager-served snapshots (attach/resume responses),
-    // whose agent field carries the live attachment or its absence.
-    // Actor-built snapshots (resync) always carry null here, which must
-    // preserve the last known agent rather than clear it.
-    bool agentAuthoritative = false,
-  }) async {
-    // Bail if this SessionVm was disposed/replaced (e.g. a reconnect ran
-    // _loadDaemonSessions) while the refresh was in flight — applying to a
-    // disposed store is a use-after-dispose, and the live same-id object is
-    // refreshed by its own load path.
-    if (_disposed || !_sessions.contains(session)) return;
-    final prevAgent = session.agent;
-    final snapshotAgent = snapshot['agent'] as Map<String, dynamic>?;
-    if (agentAuthoritative || snapshotAgent != null) {
-      session.agent = snapshotAgent;
-    }
-    final agentChanged = !mapEquals(prevAgent, session.agent);
-    final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-    // Kept separate from the rendering fallbacks below: the FlatBuffers decoder
-    // turns an absent size into an empty map rather than null, so the container
-    // being present says nothing about whether the host reported a size.
-    final reportedCols = sizeObj?['cols'] as int?;
-    final reportedRows = sizeObj?['rows'] as int?;
-    final cols = reportedCols ?? 80;
-    final rowsVal = reportedRows ?? 24;
-    // `renderSize` is the size the caller actually drove the host to, or null
-    // when it drove nothing (the foreground gate declined, or the resize
-    // failed). It serves two readers below: the grid the content is rendered
-    // at, and the host's own account of its size.
-    //
-    // The grid the content is actually rendered at, falling back to the
-    // snapshot's own size. Using the snapshot size when it carries the *host*
-    // width (the resize branch keeps the host-sized attach snapshot) would
-    // poison lastFittedCols and drive the next refresh to resize the host back
-    // and forth.
-    final fittedCols = renderSize?.$2 ?? cols;
-    final fittedRows = renderSize?.$1 ?? rowsVal;
-    final snapshotOutputSeq = snapshot['output_seq'] as int?;
-    final snapshotRawOutputStart = snapshot['raw_output_start'] as int?;
-    final exited = snapshot['exited'] as bool? ?? false;
-    if (exited) {
-      _pendingInput.forget(sessionId);
-      session.hasInputLease = false;
-    }
-    // Reused view models skip the fresh-VM seeding and the bulk seed carries
-    // no cwd, so seed it from every snapshot that has one.
-    final wasLoaded = session.loaded;
-    final prevExited = session.isExited;
-    final prevCwd = session.cwd;
-    final snapshotCwd = snapshot['current_working_directory']?.toString();
-    if (snapshotCwd != null) session.cwd = snapshotCwd;
-
-    // Replay history through the single write path: raw PTY bytes, not the
-    // lossy styled-row reconstruction. When re-selecting an already-loaded live
-    // session, avoid clearing and re-emulating the buffer so scroll position and
-    // existing scrollback are preserved.
-    if (replayHistory || !session.loaded) {
-      final rawOutput = _rawOutputFromSnapshot(snapshot);
-      final rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      final rawOutputViewport = _rawOutputViewportFromSnapshot(
-        snapshot,
-        decodedPrefix: rawOutputPrefix,
-        decodedRawOutput: rawOutput,
-      );
-      session.applyHistory(
-        rawOutput,
-        throughOutputSeq: snapshotOutputSeq,
-        rawOutputStart: snapshotRawOutputStart,
-        windowBytes: unwindowed ? null : session.historyWindowBytes,
-        rawOutputPrefix: rawOutputPrefix,
-        rawOutputViewport: rawOutputViewport,
-        isExited: exited,
-        preservePendingLive: forceFullReplay,
-      );
-      session.loaded = true;
-    } else if (exited != session.isExited) {
-      session.isExited = exited;
-      if (exited) {
-        session.markExited();
-      } else {
-        // Unreachable via the current callers: refresh forces a replay on
-        // revive and resync always replays. A bare Attach with no history
-        // strands the store in awaitingHistory, so any future
-        // replayHistory:false path that can revive must replay instead.
-        session.store.dispatch(const Attach());
-      }
-    }
-    final prevBracketedPaste = session.bracketedPasteEnabled;
-    final bracketedPaste =
-        snapshot['bracketed_paste_enabled'] as bool? ?? false;
-    session.setBracketedPasteEnabled(bracketedPaste);
-
-    // The host's account of its own size, seeded here so a client that
-    // attaches while backgrounded and never sees a resize broadcast can still
-    // tell on refocus that the PTY is not at its size.
-    //
-    // `renderSize` when the caller has one, because that is a size it
-    // actually drove the host to; the snapshot it hands us is deliberately
-    // the pre-resize, history-bearing one, so reading `size` from it would
-    // record a value already known to be stale and manufacture drift that
-    // fires a pointless refit on the next focus regain. Never `fittedCols`,
-    // which prefers our render size and so is not the host's account at all.
-    //
-    // Left alone entirely when neither is available: `cols`/`rowsVal` fall
-    // back to 80x24 for rendering, and writing that guess here would either
-    // invent drift or hide it. Guarded on the reported values rather than on
-    // the size container, which the resize broadcast also does, because an
-    // absent size reaches us as an empty map over FlatBuffers.
-    final hostSize =
-        renderSize ??
-        (reportedCols == null || reportedRows == null
-            ? null
-            : (reportedRows, reportedCols));
-    if (hostSize != null) {
-      session.hostSizeCols = hostSize.$2;
-      session.hostSizeRows = hostSize.$1;
-      if (session.ownFittedCols != hostSize.$2 ||
-          session.ownFittedRows != hostSize.$1) {
-        TerminalPane.invalidateCachedResizeOut(session.title);
-      }
-    }
-    session.lastFittedCols = fittedCols;
-    session.lastFittedRows = fittedRows;
-    session.inFlightCols = null;
-    session.inFlightRows = null;
-
-    final nextRows = _plainRowsFromSnapshot(snapshot);
-    final rowsChanged =
-        nextRows.isNotEmpty && !_styledRowsEqual(session.rows, nextRows);
-    final nextStatus = exited ? 'exited' : 'attached';
-    final nextStatusColor = exited
-        ? const Color(0xff7f8b8d)
-        : const Color(0xff7fd1c7);
-    final uiChanged =
-        !wasLoaded ||
-        replayHistory ||
-        rowsChanged ||
-        agentChanged ||
-        session.cwd != prevCwd ||
-        session.bracketedPasteEnabled != prevBracketedPaste ||
-        prevExited != exited ||
-        session.status != nextStatus ||
-        session.statusColor != nextStatusColor;
-
-    void applyUiFields() {
-      // Plain mirror for the test fallback view only; not used for real render.
-      if (rowsChanged) {
-        session.rows
-          ..clear()
-          ..addAll(nextRows);
-      }
-      session.isExited = exited;
-      session.status = nextStatus;
-      session.statusColor = nextStatusColor;
-    }
-
-    if (uiChanged && mounted) {
-      setState(applyUiFields);
-    } else {
-      applyUiFields();
-    }
-  }
-
-  bool _styledRowsEqual(List<StyledRow> a, List<StyledRow> b) {
-    if (identical(a, b)) return true;
-    if (a.length != b.length) return false;
-    for (var i = 0; i < a.length; i++) {
-      final spansA = a[i].spans;
-      final spansB = b[i].spans;
-      if (spansA.length != spansB.length) return false;
-      for (var j = 0; j < spansA.length; j++) {
-        final sA = spansA[j];
-        final sB = spansB[j];
-        if (sA.text != sB.text ||
-            sA.style.foreground != sB.style.foreground ||
-            sA.style.background != sB.style.background ||
-            sA.style.bold != sB.style.bold ||
-            sA.style.dim != sB.style.dim ||
-            sA.style.italic != sB.style.italic ||
-            sA.style.underline != sB.style.underline ||
-            sA.style.reverse != sB.style.reverse) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  /// Extracts the raw output-history tail from a parsed snapshot map. Empty when
-  /// the host did not carry history (old host, or a resize broadcast).
-  Uint8List _rawOutputFromSnapshot(Map<String, dynamic> snapshot) =>
-      rawOutputFromSnapshot(snapshot);
-
-  Uint8List _rawOutputPrefixFromSnapshot(Map<String, dynamic> snapshot) =>
-      rawOutputPrefixFromSnapshot(snapshot);
-
-  Uint8List _rawOutputViewportFromSnapshot(
-    Map<String, dynamic> snapshot, {
-    Uint8List? decodedPrefix,
-    Uint8List? decodedRawOutput,
-  }) => rawOutputViewportFromSnapshot(
-    snapshot,
-    decodedPrefix: decodedPrefix,
-    decodedRawOutput: decodedRawOutput,
-  );
-
   /// Builds a plain-row mirror of a snapshot, used only by the FLUTTER_TEST
-  /// fallback view; production rendering is driven by the store from raw bytes.
-  /// Prefers visible_rows, falling back to the flattened text of styled_rows.
+  /// fallback view when a test supplies snapshot rows without a TCG1 frame.
   List<StyledRow> _plainRowsFromSnapshot(Map<String, dynamic>? snapshot) {
     if (snapshot == null || !runningUnderFlutterTest()) {
       return const <StyledRow>[];
@@ -5609,6 +5487,10 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     _reconnectTimer?.cancel();
     _credentialStorageTimer?.cancel();
     _activityResortTimer?.cancel();
+    for (final c in _inFlightRefreshDone.values) {
+      if (!c.isCompleted) c.complete();
+    }
+    _inFlightRefreshDone.clear();
     if (_clientInitialized) {
       _client.disconnect();
       _websocketSubscription?.cancel();
@@ -5620,14 +5502,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  /// The terminal view reported its fitted grid size. Always replay any staged
-  /// history at that size; on the *first* fit after a fresh attach, also re-sync
-  /// the host to it. The attach snapshot's raw output was authored at the host
-  /// PTY width, which may differ from ours — replaying it at our width
-  /// wrap-fragments the frame. Resizing the host to our real width (the same
-  /// thing the select path does) makes the program redraw at our width and the
-  /// live stream paint a clean frame. One-shot per attach so ordinary window
-  /// resizes still self-heal through the live stream, not a re-snapshot.
+  /// The terminal view reported its fitted grid size. On the first fit after a
+  /// fresh attach, synchronize the host PTY to our measured grid so the daemon
+  /// reflows and pushes an authoritative `TerminalSync` frame at our real width.
+  /// Subsequent window resizes flow through `resizeSession` without a full
+  /// snapshot refresh.
   void _onSessionViewFit(SessionVm session, int cols, int rows) {
     session.lastFittedCols = cols;
     session.lastFittedRows = rows;
@@ -5640,7 +5519,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     session.noteViewFit(cols, rows);
     if (!session.hasFitted) {
       session.hasFitted = true;
-      if (session.loaded && session.isRemote && _client.isConnected) {
+      if (_clientInitialized &&
+          session.loaded &&
+          session.isRemote &&
+          !session.unsupportedSyncDaemon &&
+          _client.isConnected) {
         unawaited(
           _refreshSessionSnapshot(
             session,
@@ -5648,27 +5531,6 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             owningGeneration: _connectGeneration,
           ),
         );
-      }
-    } else if (kIsWeb &&
-        session.loaded &&
-        session.isRemote &&
-        !session.isExited &&
-        _clientForeground &&
-        _client.isConnected &&
-        (session.hostSizeCols != cols || session.hostSizeRows != rows)) {
-      final sid = session.remoteSessionId;
-      if (sid != null) {
-        final generation = _connectGeneration;
-        unawaited(() async {
-          if (_isStale(generation)) return;
-          try {
-            await _client.resizeSession(sessionId: sid, cols: cols, rows: rows);
-            if (!_isStale(generation)) {
-              session.hostSizeCols = cols;
-              session.hostSizeRows = rows;
-            }
-          } catch (_) {}
-        }());
       }
     }
   }
@@ -5687,6 +5549,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     setState(() {
       if (_client.isConnected &&
           session.isRemote &&
+          !session.unsupportedSyncDaemon &&
           session.status != 'exited') {
         session.status = 'attached';
         session.statusColor = const Color(0xff7fd1c7);
@@ -5698,7 +5561,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     // (This is the rail tap path only; programmatic selection goes through
     // the load and reselect paths, which must not disturb daemon order.)
     _noteLocalInteraction(session);
-    if (!canRefresh) return;
+    if (!canRefresh || session.unsupportedSyncDaemon) return;
     // Lazy-load: an unopened session has no live subscription yet (the connect
     // path only attached the initially-selected one), so attach it now instead
     // of refreshing a snapshot it never subscribed to.
@@ -5722,16 +5585,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         debugPrint('Skipping resubscribe for $sid: claim denied');
       } else {
         unawaited(() async {
-          var step = _ResubStep.resubscribe;
           try {
             await _resubscribeAndRefreshHistory(
               session,
               sid,
               owningGeneration: selectGeneration,
-              onStep: (s) => step = s,
             );
-            if (_isStale(selectGeneration)) return;
+            if (_isStale(selectGeneration) || !_sessions.contains(session)) {
+              return;
+            }
             _drainPendingEvents(sid);
+            if (!session.isExited && _pendingInput.hasPending(sid)) {
+              await _acquireInputLeaseAndFlush(session, sid);
+            }
           } on TriageAuthException {
             // As in the generic catch below: a stale daemon's 401 must not
             // clear the new daemon's good token or steal its pairing.
@@ -5742,25 +5608,19 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             // reused view model would pass the identity check below.
             if (_isStale(selectGeneration)) return;
             debugPrint(
-              'Session $sid ${step.name} failed on selection: $e\n$stack',
+              'Session $sid resubscribe failed on selection: $e\n$stack',
             );
-            // Drop the subscription so the next selection does a full
-            // resubscribe plus history refresh; keep pending events, since the
-            // retry's drain replays them and control-plane events (Exited,
-            // LeaseChanged) are not recoverable from history. Only when the
-            // resubscribe itself succeeded: on a resubscribe-step failure this
-            // attempt installed nothing, so removing here would destroy a
-            // concurrent installer's (the claim-less revive resubscribe's) id.
-            if (step != _ResubStep.resubscribe) {
-              _subscriptionIds.removeWhere((_, id) => id == sid);
-            }
             if (_selectedIndex >= 0 &&
                 _selectedIndex < _sessions.length &&
                 identical(_sessions[_selectedIndex], session)) {
-              setState(() {
-                session.status = 'load failed';
-                session.statusColor = const Color(0xffff6b6b);
-              });
+              if (isUnsupportedTerminalSyncError(e)) {
+                setState(session.markUnsupportedSyncDaemon);
+              } else {
+                setState(() {
+                  session.status = 'load failed';
+                  session.statusColor = const Color(0xffff6b6b);
+                });
+              }
             }
           } finally {
             _resubscribeClaims.release(sid, resubAttempt);
@@ -5768,48 +5628,15 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         }());
       }
     }
-    if (sid != null && !session.isExited) {
-      if (_pendingInput.hasPending(sid)) {
-        // Pending input buffered while unselected: flush immediately on select.
-        unawaited(_acquireInputLeaseAndFlush(session, sid));
-      } else if (subscribed && !session.hasFitted) {
-        // When `session.hasFitted` is true, `_refreshSessionSnapshot` below
-        // already performs an `Observer` attach with `kHistoryLeaseProbeBytes`
-        // and updates `session.hasInputLease`, so issuing a separate lease
-        // probe here would send two identical `attachSession` RPCs back-to-back.
-        // A success arriving after a purge must not resurrect the lease the
-        // disconnect just reset; the catch below already fails safe to false.
-        final leaseGeneration = _connectGeneration;
-        // Observer: selecting resyncs the flag from whoever holds the lease
-        // without stealing it; typing claims it on demand.
-        unawaited(
-          _client
-              .attachSession(
-                sessionId: sid,
-                clientId: _clientId,
-                mode: 'Observer',
-                // Lease-only resync: the snapshot is discarded.
-                historyBytes: kHistoryLeaseProbeBytes,
-              )
-              .then((attachRes) {
-                if (_isStale(leaseGeneration)) return;
-                session.hasInputLease = _attachGrantsInputLease(attachRes);
-              })
-              .catchError((Object e) {
-                if (e is TriageAuthException) {
-                  session.hasInputLease = false;
-                  _routeStaleAuthFailure(leaseGeneration);
-                  return;
-                }
-                if (_isStale(leaseGeneration)) return;
-                debugPrint('Select lease attach failed for $sid: $e');
-                session.hasInputLease = false;
-              }),
-        );
-      }
+    if (sid != null &&
+        subscribed &&
+        !session.isExited &&
+        _pendingInput.hasPending(sid)) {
+      // Pending input buffered while unselected: flush immediately on select.
+      unawaited(_acquireInputLeaseAndFlush(session, sid));
     }
     if (session.hasFitted && (sid == null || subscribed)) {
-      // Already fitted and subscribed: refresh metadata without clearing and replaying history.
+      // Already fitted and subscribed: refresh metadata and any missed dirty rows.
       unawaited(
         _refreshSessionSnapshot(
           session,
@@ -5817,27 +5644,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           owningGeneration: _connectGeneration,
         ),
       );
-      // Reconcile the terminal grid after the selection-driven remount. On web,
-      // the xterm.js canvas fit on remount can land before layout settles (and
-      // skip on the zero-size guard), so fit at the current size when the host
-      // already matches this device's fit or reclaim with the rows-1 jiggle
-      // when the host size has drifted. On native platforms, call fit() so
-      // RenderTerminal and session.terminal stay synchronized across session
-      // switches even when the viewport pixel dimensions did not change.
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!_disposed &&
             _selectedIndex >= 0 &&
             _selectedIndex < _sessions.length &&
             identical(_sessions[_selectedIndex], session) &&
             _client.isConnected) {
-          if (kIsWeb) {
-            _fitOrReclaimActiveSessionOnWeb();
-          } else {
-            session.terminalController.fit();
-          }
+          session.terminalController.fit();
         }
       });
-    } else {
+    } else if (sid == null || subscribed) {
       // Not yet fitted: the first view-fit issues the initial refresh at the
       // real size; refreshing here too would race it with an estimated size.
       // Guard against a pane that never reports a fit (zero-size or a reused
@@ -5862,469 +5678,497 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }
   }
 
-  /// Computes the next scroll-up history page for [session], or `null` when
-  /// paging is gated (disconnected, local/unloaded session, page already in
-  /// flight, log start already reached, or platform replay budget exhausted).
-  ({String sessionId, int nextWindow})? _nextHistoryPage(SessionVm session) {
-    if (!_client.isConnected || !session.isRemote || !session.loaded) {
-      return null;
+  /// Invoked when the viewport scrolls near virtual row `0` (top of scrollback).
+  /// Returns `true` when top scrollback pages are still being fetched, or
+  /// `false` once virtual row `0` is present (or scrollback is empty) so
+  /// [TerminalPane] surfaces [NoOlderScrollbackPill].
+  bool _onSessionNearTop(SessionVm session) {
+    if (!_clientInitialized ||
+        !_client.isConnected ||
+        !session.isRemote ||
+        !session.loaded ||
+        session.isUsingAltBuffer ||
+        session.unsupportedSyncDaemon) {
+      return false;
     }
-    if (session.pagingHistory || session.isUsingAltBuffer) {
-      return null;
+    final totalScrollback = session.terminal.totalScrollbackRows;
+    if (totalScrollback <= 0) {
+      return false;
     }
-    final start = session.historyStart;
-    if (start == null || start <= 0) return null;
-    final maxWindow = kIsWeb
-        ? kHistoryReplayWebMaxBytes
-        : kHistoryReplayMaxBytes;
-    final appliedBytes = session.store.appliedLogBytes;
-    final heldSpan = (appliedBytes != null && appliedBytes > start)
-        ? appliedBytes - start
-        : session.historyWindowBytes;
-    final currentWindow = max(session.historyWindowBytes, heldSpan);
-    final nextWindow = nextHistoryWindowBytes(
-      current: currentWindow,
-      max: maxWindow,
+    final topEnd = min(totalScrollback - 1, kScrollbackPageSize - 1);
+    final missingTop = session.terminal.missingScrollbackRanges(0, topEnd);
+    final topKey = (
+      session.terminal.reflowGen,
+      session.terminal.eraseScrollbackGen,
+      session.terminal.trimmedTopRows ~/ kScrollbackPageSize,
     );
-    if (nextWindow <= currentWindow) return null;
-    final sessionId = _sessionIdFor(session);
-    if (sessionId == null) return null;
-    return (sessionId: sessionId, nextWindow: nextWindow);
+    if (missingTop.isEmpty &&
+        !session.inFlightScrollbackPages.contains(topKey)) {
+      return false;
+    }
+    if (missingTop.isNotEmpty) {
+      _fetchScrollbackRowsForSession(session, 0, topEnd);
+    }
+    return true;
   }
 
-  /// Whether a scroll-up page would launch for [session] right now: all of
-  /// [_pageHistoryUp]'s gates, synchronously answerable so the `onNearTop`
-  /// callback can report back whether it launched a page (the pane
-  /// auto-continues through barren pages on `true`, and reports exhausted
-  /// scrollback on `false`).
-  bool _canPageHistory(SessionVm session) => _nextHistoryPage(session) != null;
+  /// Demand-pages missing 128-row scrollback pages covering
+  /// `[firstVirtualRow - 64 .. lastVirtualRow + 64]` from the daemon via
+  /// `FetchTerminalRows`.
+  void _fetchScrollbackRowsForSession(
+    SessionVm session,
+    int firstVirtualRow,
+    int lastVirtualRow,
+  ) {
+    if (!_clientInitialized ||
+        !_client.isConnected ||
+        !session.isRemote ||
+        !session.loaded ||
+        session.isUsingAltBuffer ||
+        session.unsupportedSyncDaemon) {
+      return;
+    }
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    final totalScrollback = session.terminal.totalScrollbackRows;
+    if (totalScrollback <= 0) return;
 
-  /// Page older scrollback after a near-top scroll: fetch the older byte
-  /// slice (or re-attach with a doubling history window on transports without
-  /// HTTP) and replay the wider tail. Stops at the log start (`historyStart == 0`)
-  /// and coalesces triggers behind one in-flight page.
-  Future<void> _pageHistoryUp(SessionVm session) async {
-    final target = _nextHistoryPage(session);
-    if (target == null) return;
-    final (:sessionId, :nextWindow) = target;
+    final prefetchStart = max(0, firstVirtualRow - 64);
+    final prefetchEnd = min(totalScrollback - 1, lastVirtualRow + 64);
+    if (prefetchStart > prefetchEnd) return;
+
+    final missingRanges = session.terminal.missingScrollbackRanges(
+      prefetchStart,
+      prefetchEnd,
+    );
+    if (missingRanges.isEmpty) return;
+
     final generation = _connectGeneration;
-    session.pagingHistory = true;
-    session.store.beginHistoryPaging();
-    try {
-      final useHttpHistory = _client.hasHttpHistoryTransport;
-      final requestBeforeByte =
-          session.store.retainedRawStart ?? session.historyStart;
-      Map<String, dynamic>? snapshot;
-      if (useHttpHistory) {
-        snapshot = await _client.fetchSessionHistory(
-          sessionId: sessionId,
-          clientId: _clientId,
-          windowBytes: nextWindow,
-          beforeByte: requestBeforeByte,
-          afterByte: session.store.appliedLogBytes,
-          afterSeq:
-              session.store.appliedLiveSeq ??
-              session.store.state.historyHighWaterSeq,
-        );
-      } else {
-        // Observer: paging must not steal the lease from whoever is typing.
-        final attachRes = await _client.attachSession(
-          sessionId: sessionId,
-          clientId: _clientId,
-          mode: 'Observer',
-          historyBytes: nextWindow,
-        );
-        if (_isStale(generation) ||
-            _disposed ||
-            !_sessions.contains(session) ||
-            !session.store.isPagingHistory) {
-          return;
+    final trimmedBase = session.terminal.trimmedTopRows;
+    final expectedReflowGen = session.terminal.reflowGen;
+    final expectedEraseGen = session.terminal.eraseScrollbackGen;
+
+    final batchesToFetch = <(int, int, List<(int, int, int)>)>[];
+    for (final (startRow, rowCount) in missingRanges) {
+      if (rowCount <= 0) continue;
+      final firstAbsPage = (trimmedBase + startRow) ~/ kScrollbackPageSize;
+      final lastAbsPage =
+          (trimmedBase + startRow + rowCount - 1) ~/ kScrollbackPageSize;
+      int? runStart;
+      var runEnd = 0;
+      var runClaims = <(int, int, int)>[];
+      void flushRun() {
+        if (runStart != null && runEnd > runStart! && runClaims.isNotEmpty) {
+          batchesToFetch.add((runStart!, runEnd - runStart!, runClaims));
         }
-        session.hasInputLease =
-            !session.isExited &&
-            !session.store.state.exited &&
-            _attachGrantsInputLease(attachRes);
-        final responseObj = attachRes['response'] as Map<String, dynamic>?;
-        snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
+        runStart = null;
+        runClaims = <(int, int, int)>[];
       }
-      if (_isStale(generation) ||
-          _disposed ||
-          !_sessions.contains(session) ||
-          !session.store.isPagingHistory) {
-        return;
+
+      for (var p = firstAbsPage; p <= lastAbsPage; p++) {
+        final key = (expectedReflowGen, expectedEraseGen, p);
+        if (session.inFlightScrollbackPages.add(key)) {
+          final pageStart = max(
+            startRow,
+            p * kScrollbackPageSize - trimmedBase,
+          );
+          final pageEnd = min(
+            startRow + rowCount,
+            (p + 1) * kScrollbackPageSize - trimmedBase,
+          );
+          if (pageEnd > pageStart) {
+            runStart ??= pageStart;
+            runEnd = pageEnd;
+            runClaims.add(key);
+          } else {
+            session.inFlightScrollbackPages.remove(key);
+          }
+        } else {
+          flushRun();
+        }
       }
-      final currentStart = session.historyStart;
-      if (currentStart == null || currentStart <= 0) {
-        return;
-      }
-      if (snapshot == null) return;
-      var rawOutput = _rawOutputFromSnapshot(snapshot);
-      var rawOutputPrefix = _rawOutputPrefixFromSnapshot(snapshot);
-      if (rawOutput.isEmpty && rawOutputPrefix.isEmpty) return;
-      var rawOutputViewport = _rawOutputViewportFromSnapshot(
-        snapshot,
-        decodedPrefix: rawOutputPrefix,
-        decodedRawOutput: rawOutput,
-      );
-      if (rawOutputViewport.isEmpty &&
-          session.store.retainedRawViewport.isNotEmpty) {
-        rawOutputViewport = session.store.retainedRawViewport;
-      }
-      var rawOutputStart = snapshot['raw_output_start'] as int?;
-      if (rawOutputStart == null) return;
-      var throughOutputSeq = snapshot['output_seq'] as int?;
-      if (snapshot['raw_output_truncated'] == true) {
-        final rawOutputEnd =
-            (snapshot['raw_output_end'] as int?) ??
-            (rawOutputStart + rawOutput.length);
-        final spliced = session.store.spliceBackwardHistoryPage(
-          rawOutput,
-          rawOutputStart: rawOutputStart,
-          rawOutputEnd: rawOutputEnd,
-        );
-        if (spliced == null) {
-          final fallback = await _client.fetchSessionHistory(
+      flushRun();
+    }
+
+    for (final (batchStart, batchCount, claimedKeys) in batchesToFetch) {
+      unawaited(() async {
+        var needsFollowUp = false;
+        try {
+          final res = await _client.fetchTerminalRows(
             sessionId: sessionId,
-            clientId: _clientId,
-            windowBytes: nextWindow,
+            startRow: batchStart,
+            rowCount: batchCount,
           );
           if (_isStale(generation) ||
               _disposed ||
-              !_sessions.contains(session) ||
-              !session.store.isPagingHistory) {
+              !_sessions.contains(session)) {
             return;
           }
-          final fallbackRawOutput = _rawOutputFromSnapshot(fallback);
-          final fallbackRawOutputPrefix = _rawOutputPrefixFromSnapshot(
-            fallback,
+          final page = TerminalRowsPageData.fromMap(res);
+          final applied = session.terminal.applyFetchedRows(
+            page,
+            expectedReflowGen: expectedReflowGen,
+            protectFirstVirtualRow: firstVirtualRow,
+            protectLastVirtualRow: lastVirtualRow,
           );
-          if (fallbackRawOutput.isEmpty && fallbackRawOutputPrefix.isEmpty) {
+          if (!applied &&
+              (session.terminal.reflowGen != expectedReflowGen ||
+                  session.terminal.eraseScrollbackGen != expectedEraseGen ||
+                  session.terminal.trimmedTopRows != trimmedBase)) {
+            needsFollowUp = true;
+          }
+          if (runningUnderFlutterTest() && mounted) {
+            setState(() {});
+          }
+        } on TriageAuthException {
+          _routeStaleAuthFailure(generation);
+        } catch (e) {
+          if (isUnsupportedTerminalSyncError(e) &&
+              !_isStale(generation) &&
+              !_disposed &&
+              _sessions.contains(session)) {
+            if (mounted) {
+              setState(session.markUnsupportedSyncDaemon);
+            } else {
+              session.markUnsupportedSyncDaemon();
+            }
             return;
           }
-          final fallbackStart = fallback['raw_output_start'] as int?;
-          if (fallbackStart == null) return;
-          snapshot = fallback;
-          rawOutput = fallbackRawOutput;
-          rawOutputPrefix = fallbackRawOutputPrefix;
-          rawOutputViewport = _rawOutputViewportFromSnapshot(
-            fallback,
-            decodedPrefix: rawOutputPrefix,
-            decodedRawOutput: rawOutput,
+          tdbg(
+            'scrollback.fetch',
+            'fetchTerminalRows failed for $sessionId: $e',
           );
-          if (rawOutputViewport.isEmpty &&
-              session.store.retainedRawViewport.isNotEmpty) {
-            rawOutputViewport = session.store.retainedRawViewport;
+        } finally {
+          for (final k in claimedKeys) {
+            session.inFlightScrollbackPages.remove(k);
           }
-          rawOutputStart = fallbackStart;
-          throughOutputSeq = fallback['output_seq'] as int?;
-        } else {
-          rawOutput = spliced.bytes;
-          throughOutputSeq = spliced.throughOutputSeq;
+          if (needsFollowUp &&
+              !_isStale(generation) &&
+              !_disposed &&
+              _sessions.contains(session)) {
+            _fetchScrollbackRowsForSession(
+              session,
+              firstVirtualRow,
+              lastVirtualRow,
+            );
+          }
         }
-      }
-      final budgets = historyTrimBudgetsForWindow(nextWindow, web: kIsWeb);
-      final trimmed = trimHistoryReplay(
-        rawOutputPrefix: rawOutputPrefix,
-        rawOutput: rawOutput,
-        maxLines: budgets.maxLines,
-        maxBytes: budgets.maxBytes,
-      );
-      final retainedPrefixBytes = trimmed.retainedPrefixBytes;
-      final effectiveStart = rawOutputStart + trimmed.droppedRawBytes;
-      final isSplitHistory =
-          rawOutputPrefix.isNotEmpty && rawOutputViewport.isNotEmpty;
-      if ((rawOutput.isEmpty && rawOutputPrefix.isEmpty) ||
-          (isSplitHistory
-              ? retainedPrefixBytes <= session.historyPrefixBytes
-              : (effectiveStart >= currentStart &&
-                    retainedPrefixBytes <= session.historyPrefixBytes))) {
-        session.historyWindowBytes = max(
-          session.historyWindowBytes,
-          nextWindow,
-        );
-        session.terminalController.notifyHistoryPageStarted();
-        session.terminalController.notifyHistoryReplayed();
-        return;
-      }
-      session.terminalController.notifyHistoryPageStarted();
-      // Full replay, not a delta merge: the wider window extends backward,
-      // which the store's same-end branch would no-op. Reset the lifecycle
-      // inside applyHistory with preservePendingLive so the wider tail replays
-      // from its older start while live chunks buffered during the page RPC
-      // stay in _pendingLive (covered chunks drop as duplicates and newer
-      // chunks flush afterward).
-      session.historyWindowBytes = max(session.historyWindowBytes, nextWindow);
-      session.applyHistory(
-        rawOutput,
-        throughOutputSeq: throughOutputSeq,
-        rawOutputStart: rawOutputStart,
-        windowBytes: nextWindow,
-        rawOutputPrefix: rawOutputPrefix,
-        rawOutputViewport: rawOutputViewport,
-        isExited:
-            (snapshot['exited'] == true) ||
-            session.isExited ||
-            session.store.state.exited,
-        preservePendingLive: true,
-      );
-    } on TriageAuthException {
-      _routeStaleAuthFailure(generation);
-    } catch (e) {
-      tdbg('history.page', 'page up failed for $sessionId: $e');
-    } finally {
-      session.store.endHistoryPaging();
-      session.pagingHistory = false;
+      }());
     }
   }
 
   Future<void> _refreshSessionSnapshot(
     SessionVm session, {
     bool includeHistory = false,
+    bool forceSubscribe = false,
+    bool allowRestore = true,
     required int owningGeneration,
   }) async {
-    if (!_client.isConnected || !session.isRemote) return;
-    final sessionId = _sessionIdFor(session);
-    if (sessionId == null) return;
-    // A refresh superseded mid-flight must not claim the in-flight slot (it
-    // would make the current generation's refresh coalesce-drop behind a
-    // stale one) or issue daemon writes under a colliding id below.
-    if (_isStale(owningGeneration)) return;
-    // Coalesce concurrent refreshes for the same session: a second one would
-    // clear the terminal and replay history underneath the first, blanking it.
-    final refreshAttempt = _refreshClaims.claim(sessionId, owningGeneration);
-    if (refreshAttempt == null) {
-      if (includeHistory) _refreshHistoryFollowUp.add(sessionId);
-      debugPrint(
-        'Skipping ${includeHistory ? 'history' : 'metadata'} refresh for '
-        '$sessionId: refresh already in flight',
-      );
+    if (!_clientInitialized ||
+        !_client.isConnected ||
+        !session.isRemote ||
+        session.unsupportedSyncDaemon) {
       return;
     }
-    final needsHistory =
-        includeHistory ||
-        !session.loaded ||
-        session.isExited ||
-        session.store.state.exited;
-    if (needsHistory) {
-      session.store.beginHistoryRefresh();
+    final sessionId = _sessionIdFor(session);
+    if (sessionId == null) return;
+    int? refreshAttempt;
+    while (true) {
+      if (!_clientInitialized ||
+          !_client.isConnected ||
+          !session.isRemote ||
+          session.unsupportedSyncDaemon ||
+          _isStale(owningGeneration) ||
+          _disposed ||
+          !_sessions.contains(session)) {
+        return;
+      }
+      refreshAttempt = _refreshClaims.claim(sessionId, owningGeneration);
+      if (refreshAttempt != null) break;
+      if (!includeHistory && !forceSubscribe) {
+        debugPrint(
+          'Skipping delta terminal sync for $sessionId: sync already in flight',
+        );
+        return;
+      }
+      final inflight = _inFlightRefreshDone[sessionId];
+      if (inflight == null) {
+        _refreshHistoryFollowUp.add(sessionId);
+        return;
+      }
+      await inflight.future;
     }
+    final doneCompleter = Completer<void>();
+    _inFlightRefreshDone[sessionId] = doneCompleter;
     try {
-      // Observer: a refresh must not steal the lease from whoever is typing.
-      // Only fetch the held history window when the snapshot will actually be
-      // replayed; metadata-only refreshes (initial view-fit and rail switches
-      // onto an already-loaded live session) use the 1 KiB probe so they do
-      // not ship or gunzip discarded scrollback.
-      final useHttpHistory = _client.hasHttpHistoryTransport;
-      final attachRes = await _client.attachSession(
+      final cachedSize = TerminalPane.getCachedTerminalSize(session.title);
+      final targetRows =
+          session.ownFittedRows ?? cachedSize?.$1 ?? session.lastFittedRows;
+      final targetCols =
+          session.ownFittedCols ?? cachedSize?.$2 ?? session.lastFittedCols;
+      final (int, int)? knownTargetSize =
+          (targetRows != null && targetCols != null)
+          ? (targetRows, targetCols)
+          : null;
+      final (int, int)? syncSize =
+          knownTargetSize ??
+          (session.isExited ? _estimatedTerminalRestoreSize(null) : null);
+      final shouldResizeHost =
+          _clientForeground &&
+          knownTargetSize != null &&
+          (session.hostSizeCols != knownTargetSize.$2 ||
+              session.hostSizeRows != knownTargetSize.$1);
+      final forceFull =
+          includeHistory ||
+          forceSubscribe ||
+          !session.loaded ||
+          session.isExited ||
+          session.terminal.lastFrameSeq == 0;
+      final wantSubscribe =
+          forceSubscribe ||
+          _subscriptionIds.containsValue(sessionId) ||
+          includeHistory ||
+          !session.loaded;
+
+      if (session.isExited) {
+        _pendingInput.forget(sessionId);
+      }
+
+      final probeExitedFirst =
+          allowRestore &&
+          !session.isExited &&
+          _pendingInput.hasPending(sessionId);
+      var syncRes = await _client.syncTerminalSession(
         sessionId: sessionId,
         clientId: _clientId,
         mode: 'Observer',
-        historyBytes: (needsHistory && !useHttpHistory)
-            ? session.historyWindowBytes
-            : kHistoryLeaseProbeBytes,
+        cols: syncSize?.$2,
+        rows: syncSize?.$1,
+        resizePty: shouldResizeHost,
+        restoreIfExited: allowRestore && !probeExitedFirst,
+        subscribe: wantSubscribe,
+        knownFrameSeq: forceFull ? 0 : session.terminal.lastFrameSeq,
       );
-      // The purge or reconnect may have landed during the attach: returning
-      // before the restore/resize branches keeps those writes off the new
-      // daemon, and skips a lease mark the disconnect just reset.
-      if (_isStale(owningGeneration)) return;
-      session.hasInputLease = _attachGrantsInputLease(attachRes);
-      final responseObj = attachRes['response'] as Map<String, dynamic>?;
-      final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-      if (snapshot != null && !_disposed) {
-        var finalSnapshot = snapshot;
-        final sizeObj = snapshot['size'] as Map<String, dynamic>?;
-        final replayTargetSize = _currentReplayTerminalSize(session, sizeObj);
-        // The size the host actually ends this call at, which is not the same
-        // as `replayTargetSize`: that is only the size we would like. When the
-        // foreground gate below declines to resize, nothing drove the host, and
-        // passing our wanted size on as `renderSize` would record "the host is
-        // at my size" immediately after deciding not to put it there, which is
-        // exactly the evidence the refocus reclaim looks for. Left null in that
-        // case so the snapshot's own size is used instead.
-        (int, int)? drivenSize;
-        var resizedHost = false;
-        if (snapshot['exited'] == true) {
-          // Drop any keystrokes buffered for the dead incarnation before
-          // reviving the session id with a fresh shell.
-          _pendingInput.forget(sessionId);
-          session.hasInputLease = false;
-          debugPrint(
-            'Session $sessionId is exited/historical during snapshot refresh; calling restoreSession',
-          );
-          final restoreSize = replayTargetSize;
-          var reviveStep = _ResubStep.restore;
-          try {
-            final restoredSnapshot = _snapshotFromResponse(
-              await _client.restoreSession(
-                sessionId: sessionId,
-                rows: restoreSize.$1,
-                cols: restoreSize.$2,
-              ),
-            );
-            // A restore re-spawns the process at this size, so the host is
-            // genuinely here now whatever the snapshot says.
-            drivenSize = restoreSize;
-            if (restoredSnapshot != null) {
-              finalSnapshot = restoredSnapshot;
-            }
-            // A restore re-spawns the daemon actor, orphaning our subscription;
-            // re-subscribe before the fresh attach. The actor replacement
-            // requires it even when another path holds the resubscribe claim;
-            // a racing holder at worst orphans one dead-actor id.
-            reviveStep = _ResubStep.resubscribe;
-            await _resubscribeSessionEvents(
-              sessionId,
-              owningGeneration: owningGeneration,
-            );
-            // The resubscribe above bails silently when stale; without this
-            // recheck the fresh attach would fire at the new daemon under a
-            // colliding id.
-            if (_isStale(owningGeneration)) return;
-            reviveStep = _ResubStep.attach;
-            final freshAttachRes = await _client.attachSession(
-              sessionId: sessionId,
-              clientId: _clientId,
-              mode: 'Observer',
-              historyBytes: useHttpHistory
-                  ? kHistoryLeaseProbeBytes
-                  : session.historyWindowBytes,
-            );
-            if (_isStale(owningGeneration)) return;
-            session.hasInputLease = _attachGrantsInputLease(freshAttachRes);
-            final freshResponseObj =
-                freshAttachRes['response'] as Map<String, dynamic>?;
-            final freshSnapshot =
-                freshResponseObj?['snapshot'] as Map<String, dynamic>?;
-            if (freshSnapshot != null) {
-              if (freshSnapshot['exited'] == true ||
-                  _snapshotSizeMatches(freshSnapshot, replayTargetSize)) {
-                finalSnapshot = freshSnapshot;
-              }
-            }
-          } on TriageAuthException {
-            rethrow;
-          } catch (e) {
-            // Any resubscribe-step failure rolls back like every other
-            // checked-subscribe caller: without a subscription the revive
-            // cannot hear live events, so logging-and-continuing would strand
-            // an unsubscribed session behind an 'attached' status.
-            // Restore/attach-step failures instead log and render the
-            // pre-revive snapshot; the session still reads exited, so the
-            // next refresh retries the revive.
-            if (reviveStep == _ResubStep.resubscribe) rethrow;
-            debugPrint(
-              'Failed to revive session $sessionId during refresh '
-              '(${reviveStep.name}): ${e.toString()}',
-            );
-          }
-        } else if (_clientForeground &&
-            !_snapshotSizeMatches(snapshot, replayTargetSize)) {
-          // Resize the host so its program repaints at our width, but keep the
-          // history-bearing attach snapshot for rendering. The resize response
-          // carries no raw_output (resize snapshots never do), so using it would
-          // make applyHistory clear the terminal and blank it; history replays
-          // at the fitted size client-side anyway.
-          //
-          // Gated on foreground for the same reason the resize-out listener is:
-          // a reconnect on a blurred client would otherwise re-take the shared
-          // PTY from whichever device the user is actually looking at. The
-          // reclaim on refocus covers the size this skips, which is why
-          // `drivenSize` is set only once the resize has actually landed.
-          try {
-            final resizedSnapshot = _snapshotFromResponse(
-              await _client.resizeSession(
-                sessionId: sessionId,
-                rows: replayTargetSize.$1,
-                cols: replayTargetSize.$2,
-              ),
-            );
-            drivenSize = replayTargetSize;
-            resizedHost = true;
-            if (resizedSnapshot != null) {
-              finalSnapshot = <String, dynamic>{
-                ...finalSnapshot,
-                if (resizedSnapshot['size'] != null)
-                  'size': resizedSnapshot['size'],
-                if (resizedSnapshot['styled_rows'] != null)
-                  'styled_rows': resizedSnapshot['styled_rows'],
-                if (resizedSnapshot['styled_rows_start'] != null)
-                  'styled_rows_start': resizedSnapshot['styled_rows_start'],
-                if (resizedSnapshot['visible_rows'] != null)
-                  'visible_rows': resizedSnapshot['visible_rows'],
-                if (resizedSnapshot['cursor'] != null)
-                  'cursor': resizedSnapshot['cursor'],
-              };
-            }
-          } on TriageAuthException {
-            rethrow;
-          } catch (_) {}
-        }
-        // A restore inside this refresh may have revived an exited session.
-        // Without a replay the exited-to-live transition in the apply below
-        // dispatches a bare Attach and strands the store in awaitingHistory.
-        // Either side can record the exit (the push skips the VM flag when
-        // unmounted), and replaying when only the store says exited is safe
-        // since the delta paths refuse anyway.
-        final revivedNeedsReplay =
-            (session.isExited || session.store.state.exited) &&
-            finalSnapshot['exited'] != true;
-        final shouldReplayHistory =
-            includeHistory || !session.loaded || revivedNeedsReplay;
-        if (useHttpHistory && shouldReplayHistory) {
-          if (_isStale(owningGeneration)) return;
-          final mergedSnapshot = await _fetchAndMergeSessionHistory(
-            session,
-            sessionId,
-            finalSnapshot,
-            forceFullWindow: resizedHost,
-          );
-          if (_isStale(owningGeneration)) return;
-          finalSnapshot = mergedSnapshot;
-        }
-        // The restore/resize awaits above span a purge window: applying a
-        // superseded snapshot onto the reused VM would blank the new
-        // generation's load with old-daemon bytes.
-        if (_isStale(owningGeneration)) return;
-        await _applySnapshotToSession(
-          session,
-          sessionId,
-          finalSnapshot,
-          renderSize: drivenSize,
-          replayHistory:
-              includeHistory ||
-              (!session.loaded && snapshot['exited'] == true) ||
-              revivedNeedsReplay,
-          forceFullReplay:
-              (resizedHost || revivedNeedsReplay) && shouldReplayHistory,
-          // finalSnapshot comes from attach/resume responses, whose agent
-          // field is manager-overlaid and authoritative.
-          agentAuthoritative: true,
+      if (_isStale(owningGeneration) ||
+          _disposed ||
+          !_sessions.contains(session)) {
+        return;
+      }
+
+      var responseObj = _asMap(syncRes['response']) ?? syncRes;
+      var snapshot = _asMap(responseObj['snapshot']);
+      var revivedFromProbe = false;
+      if (probeExitedFirst && (snapshot?['exited'] as bool? ?? false)) {
+        _pendingInput.forget(sessionId);
+        revivedFromProbe = true;
+        final restoreSize = syncSize ?? _estimatedTerminalRestoreSize(null);
+        syncRes = await _client.syncTerminalSession(
+          sessionId: sessionId,
+          clientId: _clientId,
+          mode: 'Observer',
+          cols: restoreSize.$2,
+          rows: restoreSize.$1,
+          resizePty: shouldResizeHost,
+          restoreIfExited: true,
+          subscribe: wantSubscribe,
+          knownFrameSeq: 0,
         );
+        if (_isStale(owningGeneration) ||
+            _disposed ||
+            !_sessions.contains(session)) {
+          return;
+        }
+        responseObj = _asMap(syncRes['response']) ?? syncRes;
+        snapshot = _asMap(responseObj['snapshot']);
+      }
+      final frameMap = _asMap(responseObj['frame']);
+      final exited = snapshot?['exited'] as bool? ?? false;
+      final rawSubId = responseObj['subscription_id']?.toString() ?? '';
+      if (wantSubscribe && !exited && rawSubId.isEmpty) {
+        throw Exception(
+          'sync_terminal returned no subscription id for $sessionId',
+        );
+      }
+
+      final wasLoaded = session.loaded;
+      final prevExited = session.isExited || revivedFromProbe;
+      final prevCwd = session.cwd;
+      final prevAgent = session.agent;
+      final prevBracketedPaste = session.bracketedPasteEnabled;
+
+      final prevSubId = session.syncSubscriptionId;
+      if (exited || wantSubscribe) {
+        _subscriptionIds.removeWhere((_, id) => id == sessionId);
+        if (!exited && rawSubId.isNotEmpty) {
+          session.syncSubscriptionId = rawSubId;
+          _subscriptionIds[rawSubId] = sessionId;
+        } else {
+          session.syncSubscriptionId = null;
+        }
+        if (session.syncSubscriptionId != prevSubId) {
+          session.lastSyncedServerFrameSeq = 0;
+        }
+      }
+
+      var frameApplied = false;
+      if (frameMap != null && frameMap.isNotEmpty) {
+        final frame = TerminalSyncFrameData.fromMap(frameMap);
+        final shouldApplyFrame =
+            forceFull ||
+            revivedFromProbe ||
+            session.syncSubscriptionId != prevSubId ||
+            frame.frameSeq == 0 ||
+            frame.frameSeq > session.lastSyncedServerFrameSeq;
+        if (shouldApplyFrame) {
+          session.applyTerminalSyncFrame(
+            frame,
+            notifyReplay: forceFull || revivedFromProbe,
+            snapshot: snapshot,
+          );
+          if (frame.frameSeq > 0 && session.syncSubscriptionId != null) {
+            session.lastSyncedServerFrameSeq = frame.frameSeq;
+          }
+          frameApplied = true;
+        }
+      } else if (snapshot != null && runningUnderFlutterTest()) {
+        final fallbackRows = _plainRowsFromSnapshot(snapshot);
+        if (fallbackRows.isNotEmpty) {
+          session.rows
+            ..clear()
+            ..addAll(fallbackRows);
+          frameApplied = true;
+        }
+      }
+
+      session.unsupportedSyncDaemon = false;
+      session.hasInputLease = !exited && _attachGrantsInputLease(syncRes);
+      if (exited) {
+        _pendingInput.forget(sessionId);
+      }
+
+      if (snapshot != null) {
+        session.agent = _asMap(snapshot['agent']);
+        final snapshotCwd = snapshot['current_working_directory']?.toString();
+        if (snapshotCwd != null) {
+          session.cwd = snapshotCwd;
+        }
+        final contextObj = _asMap(snapshot['context']);
+        if (contextObj != null) {
+          session.applyContext(
+            repoRoot:
+                contextObj['repository_root']?.toString() ?? session.repoRoot,
+            worktreeRoot:
+                contextObj['worktree_root']?.toString() ?? session.worktreeRoot,
+            branch: contextObj['branch']?.toString() ?? session.branch,
+            cwd: snapshotCwd ?? session.cwd,
+          );
+        }
+        if (!frameApplied) {
+          final bracketedPaste =
+              snapshot['bracketed_paste_enabled'] as bool? ?? false;
+          session.setBracketedPasteEnabled(bracketedPaste);
+        }
+      }
+
+      final sizeObj = _asMap(snapshot?['size']);
+      final reportedCols = (sizeObj?['cols'] as num?)?.toInt();
+      final reportedRows = (sizeObj?['rows'] as num?)?.toInt();
+      final effectiveSyncSize =
+          syncSize ??
+          (revivedFromProbe ? _estimatedTerminalRestoreSize(null) : null);
+      final drivenSize =
+          (!exited &&
+              (shouldResizeHost || (prevExited && effectiveSyncSize != null)))
+          ? (shouldResizeHost ? knownTargetSize : effectiveSyncSize)
+          : null;
+      final hostSize =
+          drivenSize ??
+          (reportedCols == null || reportedRows == null
+              ? null
+              : (reportedRows, reportedCols));
+      if (hostSize != null) {
+        session.hostSizeCols = hostSize.$2;
+        session.hostSizeRows = hostSize.$1;
+        if (session.ownFittedCols != hostSize.$2 ||
+            session.ownFittedRows != hostSize.$1) {
+          TerminalPane.invalidateCachedResizeOut(session.title);
+        }
+      }
+      final fittedCols =
+          drivenSize?.$2 ?? knownTargetSize?.$2 ?? reportedCols ?? 80;
+      final fittedRows =
+          drivenSize?.$1 ?? knownTargetSize?.$1 ?? reportedRows ?? 24;
+      session.lastFittedCols = fittedCols;
+      session.lastFittedRows = fittedRows;
+      session.inFlightCols = null;
+      session.inFlightRows = null;
+
+      session.loaded = true;
+      if (exited) {
+        session.markExited();
+      }
+
+      final hasLiveSubscription =
+          (!exited && wantSubscribe && rawSubId.isNotEmpty) ||
+          _subscriptionIds.containsValue(sessionId);
+      final agentChanged = !mapEquals(prevAgent, session.agent);
+      final nextStatus = exited
+          ? 'exited'
+          : (hasLiveSubscription ? 'attached' : session.status);
+      final nextStatusColor = exited
+          ? const Color(0xff7f8b8d)
+          : (hasLiveSubscription
+                ? const Color(0xff7fd1c7)
+                : session.statusColor);
+      final uiChanged =
+          !wasLoaded ||
+          forceFull ||
+          frameApplied ||
+          agentChanged ||
+          session.cwd != prevCwd ||
+          session.bracketedPasteEnabled != prevBracketedPaste ||
+          prevExited != exited ||
+          session.status != nextStatus ||
+          session.statusColor != nextStatusColor;
+
+      void applyUiFields() {
+        session.isExited = exited;
+        session.status = nextStatus;
+        session.statusColor = nextStatusColor;
+      }
+
+      if (uiChanged && mounted) {
+        setState(applyUiFields);
+      } else {
+        applyUiFields();
       }
     } on TriageAuthException {
       if (!_isStale(owningGeneration)) {
         session.hasInputLease = false;
       }
-      // Awaited callers own routing (the connect path re-pairs in
-      // _connectWebSocket, the selection path in _selectSession); handling
-      // here too would fire a second pairing challenge. The detached
-      // follow-up below is the exception: it routes its own errors at the
-      // scheduling site.
-      if (includeHistory) rethrow;
-      // A stale daemon's 401 must not clear the new daemon's good token:
-      // pairing clears the stored credential before its own check runs.
+      if (includeHistory || forceSubscribe) rethrow;
       _routeStaleAuthFailure(owningGeneration);
     } catch (e) {
       if (!_isStale(owningGeneration)) {
         session.hasInputLease = false;
+        if (isUnsupportedTerminalSyncError(e) && _sessions.contains(session)) {
+          if (mounted) {
+            setState(session.markUnsupportedSyncDaemon);
+          } else {
+            session.markUnsupportedSyncDaemon();
+          }
+        }
       }
-      if (includeHistory) rethrow;
-      debugPrint('Snapshot refresh failed for $sessionId: $e');
+      if (includeHistory || forceSubscribe) rethrow;
+      debugPrint('Terminal sync refresh failed for $sessionId: $e');
     } finally {
-      if (needsHistory) {
-        session.store.endHistoryRefresh();
-      }
       _refreshClaims.release(sessionId, refreshAttempt);
+      if (identical(_inFlightRefreshDone[sessionId], doneCompleter)) {
+        _inFlightRefreshDone.remove(sessionId);
+      }
+      if (!doneCompleter.isCompleted) {
+        doneCompleter.complete();
+      }
       _scheduleHistoryFollowUp(session, sessionId);
     }
   }
@@ -6385,64 +6229,23 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   }
 
   /// The resubscribe unit both the select and reconnect paths perform:
-  /// re-subscribe, then refresh with history. Callers hold a resubscribe
-  /// claim across it, drain afterwards once they have confirmed the attempt
-  /// is still current, and own error routing.
+  /// atomically subscribe and synchronize full viewport + mode state. Callers
+  /// hold a resubscribe claim across it, drain afterwards once they have
+  /// confirmed the attempt is still current, and own error routing.
   /// [owningGeneration] bails the unit as soon as a switch or reconnect
   /// supersedes it, so a stale attempt never mutates the new daemon's maps.
   Future<void> _resubscribeAndRefreshHistory(
     SessionVm session,
     String sessionId, {
     required int owningGeneration,
-    void Function(_ResubStep step)? onStep,
   }) async {
     if (_isStale(owningGeneration)) return;
-    session.store.beginHistoryRefresh();
-    try {
-      onStep?.call(_ResubStep.resubscribe);
-      await _resubscribeSessionEvents(
-        sessionId,
-        owningGeneration: owningGeneration,
-      );
-      if (_isStale(owningGeneration)) return;
-      onStep?.call(_ResubStep.refresh);
-      await _refreshSessionSnapshot(
-        session,
-        includeHistory: true,
-        owningGeneration: owningGeneration,
-      );
-    } finally {
-      session.store.endHistoryRefresh();
-    }
-  }
-
-  /// Subscribes to a session's events, throwing when the daemon answers
-  /// without an id: proceeding unsubscribed would leave a silently frozen
-  /// session. Load, select, reconnect, and history-refresh callers roll back
-  /// to load failed, creation rolls back to its error status, and detached
-  /// and metadata-only refreshes log the failure.
-  Future<String> _checkedSubscribeSessionEvents(String sessionId) async {
-    final subId = await _client.subscribeSessionEvents(sessionId: sessionId);
-    if (subId.isEmpty) {
-      throw Exception(
-        'subscribe_session_events returned no subscription id for $sessionId',
-      );
-    }
-    return subId;
-  }
-
-  /// Re-subscribes to a session's events, dropping any stale subscription ids
-  /// for it. The previous id is unusable: a restore strands it on a shut-down
-  /// actor, and a purge clears it before we get here.
-  Future<void> _resubscribeSessionEvents(
-    String sessionId, {
-    required int owningGeneration,
-  }) async {
-    if (_isStale(owningGeneration)) return;
-    _subscriptionIds.removeWhere((_, sid) => sid == sessionId);
-    final subId = await _checkedSubscribeSessionEvents(sessionId);
-    if (_isStale(owningGeneration)) return;
-    _subscriptionIds[subId] = sessionId;
+    await _refreshSessionSnapshot(
+      session,
+      includeHistory: true,
+      forceSubscribe: true,
+      owningGeneration: owningGeneration,
+    );
   }
 
   String? _sessionIdFor(SessionVm session) {
@@ -6500,37 +6303,43 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // A switch during the spawn above leaves a session id belonging
           // to the daemon we left: bail before subscribing under it.
           if (_isStale(createGeneration)) return;
-          // Subscribe to events first so we don't miss welcome messages
-          subId = await _checkedSubscribeSessionEvents(sessionId);
-          // Above the install, as in the load path: a response landing
-          // after a switch must not plant the old daemon's id under a
-          // `sub-{n}` key the new connection reissues. The attach below is
-          // covered by this same guard; only synchronous work sits between
-          // it and the issuance.
-          if (_isStale(createGeneration)) return;
-          _subscriptionIds[subId] = sessionId;
-
-          final attachRes = await _client.attachSession(
+          final cachedSize = TerminalPane.getLastFittedWorkspaceSize();
+          final syncRes = await _client.syncTerminalSession(
             sessionId: sessionId,
             clientId: _clientId,
             mode: 'InteractiveController',
-            // Freshly spawned: no history yet, first-page window suffices.
-            historyBytes: kHistoryFirstWindowBytes,
+            cols: cachedSize?.$2,
+            rows: cachedSize?.$1,
+            resizePty: _clientForeground && cachedSize != null,
+            restoreIfExited: false,
+            subscribe: true,
+            knownFrameSeq: 0,
           );
           // The daemon changed under us: this snapshot belongs to the one
           // we left, and the tile below must not land on the new rail.
           if (_isStale(createGeneration)) return;
-          final responseObj = attachRes['response'] as Map<String, dynamic>?;
-          final snapshot = responseObj?['snapshot'] as Map<String, dynamic>?;
-          final contextObj = snapshot?['context'] as Map<String, dynamic>?;
+          final responseObj = _asMap(syncRes['response']) ?? syncRes;
+          final snapshot = _asMap(responseObj['snapshot']);
+          final frameMap = _asMap(responseObj['frame']);
+          final exited = snapshot?['exited'] as bool? ?? false;
+          final rawSubId = responseObj['subscription_id']?.toString() ?? '';
+          if (!exited && rawSubId.isEmpty) {
+            throw Exception(
+              'sync_terminal returned no subscription id for $sessionId',
+            );
+          }
+          _subscriptionIds.removeWhere((_, id) => id == sessionId);
+          if (rawSubId.isNotEmpty) {
+            subId = rawSubId;
+            _subscriptionIds[rawSubId] = sessionId;
+          }
+
+          final contextObj = _asMap(snapshot?['context']);
           final branch = contextObj?['branch']?.toString();
           final repoRoot = contextObj?['repository_root']?.toString();
           final worktreeRoot = contextObj?['worktree_root']?.toString();
           final cwd = snapshot?['current_working_directory']?.toString();
-
           final plainRows = _plainRowsFromSnapshot(snapshot);
-          final exited = snapshot?['exited'] as bool? ?? false;
-          final outputSeq = snapshot?['output_seq'] as int?;
 
           final session = SessionVm(
             title: 'triage / $sessionId',
@@ -6551,26 +6360,36 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
             isExited: exited,
             loaded: true,
           );
-          session.hasInputLease = _attachGrantsInputLease(attachRes);
+          session.syncSubscriptionId = subId;
+          session.hasInputLease = !exited && _attachGrantsInputLease(syncRes);
+          final sizeObj = _asMap(snapshot?['size']);
+          final reportedRows = (sizeObj?['rows'] as num?)?.toInt();
+          final reportedCols = (sizeObj?['cols'] as num?)?.toInt();
+          final drivenSize = (_clientForeground && !exited) ? cachedSize : null;
+          final hostSize =
+              drivenSize ??
+              (reportedCols == null || reportedRows == null
+                  ? null
+                  : (reportedRows, reportedCols));
+          if (hostSize != null) {
+            session.hostSizeCols = hostSize.$2;
+            session.hostSizeRows = hostSize.$1;
+          }
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
-          session.agent = snapshot?['agent'] as Map<String, dynamic>?;
+          session.agent = _asMap(snapshot?['agent']);
           final bracketedPaste =
               snapshot?['bracketed_paste_enabled'] as bool? ?? false;
           session.setBracketedPasteEnabled(bracketedPaste);
           _setupSessionInputListener(session);
-          final rawOutputStart = snapshot?['raw_output_start'] as int?;
-          session.applyHistory(
-            _rawOutputFromSnapshot(snapshot ?? const {}),
-            throughOutputSeq: outputSeq,
-            rawOutputStart: rawOutputStart,
-            windowBytes: kHistoryFirstWindowBytes,
-            rawOutputPrefix: _rawOutputPrefixFromSnapshot(snapshot ?? const {}),
-            rawOutputViewport: _rawOutputViewportFromSnapshot(
-              snapshot ?? const {},
-            ),
-            isExited: exited,
-          );
+          if (frameMap != null && frameMap.isNotEmpty) {
+            final frame = TerminalSyncFrameData.fromMap(frameMap);
+            session.applyTerminalSyncFrame(
+              frame,
+              notifyReplay: true,
+              snapshot: snapshot,
+            );
+          }
 
           // Rank it above everything already on the rail. The daemon has no
           // output for a session it just spawned, so it reports activity 0, and
@@ -6645,6 +6464,22 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // nothing to act on. The trace distinguishes a spawn failure from a
         // later subscribe/attach one, which the message alone does not.
         debugPrint('Failed to create session: $e\n$stackTrace');
+        if (isUnsupportedTerminalSyncError(e)) {
+          setState(() {
+            if (sessionId.isNotEmpty) {
+              final existingIndex = _sessions.indexWhere(
+                (s) => s.remoteSessionId == sessionId,
+              );
+              if (existingIndex != -1) {
+                _sessions[existingIndex].markUnsupportedSyncDaemon();
+                _selectedIndex = existingIndex;
+              }
+            }
+            _connectionStatus = kUnsupportedTerminalSyncMessage;
+            _connectionStatusColor = const Color(0xffff6b6b);
+          });
+          return;
+        }
         setState(() {
           _connectionStatus = 'Error creating session';
           _connectionStatusColor = const Color(0xffff6b6b);
@@ -6706,7 +6541,11 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         session.dispose();
         TerminalPane.destroySession(session.title);
         final removedId = _sessionIdFor(session) ?? session.remoteSessionId;
-        if (removedId != null) _pendingInput.forget(removedId);
+        if (removedId != null) {
+          _pendingInput.forget(removedId);
+          _pendingEvents.remove(removedId);
+          _subscriptionIds.removeWhere((_, id) => id == removedId);
+        }
         if (_selectedIndex >= _sessions.length) {
           _selectedIndex = _sessions.isEmpty ? 0 : _sessions.length - 1;
         }
@@ -7205,12 +7044,13 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
               onCloseSession: () => _closeSession(currentSession),
               onViewFit: (cols, rows) =>
                   _onSessionViewFit(currentSession, cols, rows),
-              onNearTop: () {
-                final session = currentSession;
-                if (!_canPageHistory(session)) return false;
-                unawaited(_pageHistoryUp(session));
-                return true;
-              },
+              onNearTop: () => _onSessionNearTop(currentSession),
+              onFetchScrollbackRows: (firstRow, lastRow) =>
+                  _fetchScrollbackRowsForSession(
+                    currentSession,
+                    firstRow,
+                    lastRow,
+                  ),
               onToggleJudge: () => _toggleSessionJudgePolicy(currentSession),
               onOpenRail: isMobile ? openRail : null,
               onRefit: _refitAndFocusActiveSession,
@@ -11841,6 +11681,7 @@ class SessionWorkspace extends StatelessWidget {
     this.onCloseSession,
     this.onViewFit,
     this.onNearTop,
+    this.onFetchScrollbackRows,
     this.onOpenRail,
     this.onRefit,
     this.onToggleJudge,
@@ -11854,11 +11695,12 @@ class SessionWorkspace extends StatelessWidget {
   final bool interactionEnabled;
   final VoidCallback? onCloseSession;
   final void Function(int cols, int rows)? onViewFit;
-  // The terminal scrolled near the top of its scrollback: page older
-  // history by re-attaching with a wider window. Returns whether a page
-  // was launched, so the pane can auto-continue through barren pages or
-  // report exhausted scrollback when no deeper window is available.
+  // Invoked when the viewport scrolls near virtual row 0. Returns whether
+  // top scrollback pages are still being fetched (`false` once row 0 is loaded).
   final bool Function()? onNearTop;
+  // Invoked by RenderTerminalGrid to demand-page missing virtual scrollback rows.
+  final void Function(int firstVirtualRow, int lastVirtualRow)?
+  onFetchScrollbackRows;
   // Mobile only: opens the session rail overlay from the workspace header.
   final VoidCallback? onOpenRail;
   // Re-asserts this device's terminal size on the shared PTY.
@@ -11886,6 +11728,35 @@ class SessionWorkspace extends StatelessWidget {
           softKeyboardEnabled: softKeyboardEnabled,
           onToggleSoftKeyboard: onToggleSoftKeyboard,
         ),
+        if (session.unsupportedSyncDaemon)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+            decoration: const BoxDecoration(
+              color: Color(0xff2c1719),
+              border: Border(bottom: BorderSide(color: Color(0xff6b2c32))),
+            ),
+            child: const Row(
+              children: [
+                Icon(
+                  Icons.warning_amber_rounded,
+                  size: 16,
+                  color: Color(0xffff8a80),
+                ),
+                SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Daemon upgrade required for terminal cell sync',
+                    style: TextStyle(
+                      color: Color(0xffffb4ab),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         Expanded(
           child: TerminalPane(
             key: ValueKey(session.title),
@@ -11901,6 +11772,7 @@ class SessionWorkspace extends StatelessWidget {
               onViewFit?.call(cols, rows);
             },
             onNearTop: onNearTop,
+            onFetchScrollbackRows: onFetchScrollbackRows,
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
             isExited: session.status == 'exited',

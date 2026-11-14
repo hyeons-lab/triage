@@ -1,26 +1,37 @@
-import 'package:flutter_test/flutter_test.dart';
-import 'package:triage_client/terminal/terminal_selection.dart';
-import 'package:xterm2/xterm.dart' as xt;
+import 'dart:typed_data';
 
-// Builds a single buffer line of [width] cells from a compact spec: each entry
-// is either a single-character glyph or `null` for a blank (codePoint 0) cell —
-// the same state a program leaves behind when it moves the cursor over a gap
-// instead of writing a literal space.
-xt.BufferLine _line(List<String?> cells, {int? width, bool isWrapped = false}) {
-  final line = xt.BufferLine(width ?? cells.length, isWrapped: isWrapped);
-  for (var i = 0; i < cells.length; i++) {
-    final cell = cells[i];
-    if (cell != null) {
-      line.setCodePoint(i, cell.runes.first);
-    }
-  }
-  return line;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
+import 'package:triage_client/terminal/terminal_selection.dart';
+
+// Builds a single cell line of [width] cells from a compact spec: each entry
+// is either a single-character glyph or `null` for an unwritten blank
+// (codePoint 0) cell, matching the state a TUI leaves behind when moving the
+// cursor across a gap instead of writing literal spaces.
+TerminalCellLine _line(
+  List<String?> cells, {
+  int? width,
+  bool isWrapped = false,
+}) {
+  return TerminalCellLine.fromSpec(cells, width: width, wrapsNext: isWrapped);
+}
+
+TerminalCellLine _textLine(
+  String text, {
+  int width = 20,
+  bool wrapsNext = false,
+}) {
+  return TerminalCellLine.fromSpec(
+    <String?>[for (final r in text.runes) String.fromCharCode(r)],
+    width: width,
+    wrapsNext: wrapsNext,
+  );
 }
 
 void main() {
   group('bufferLineSelectedText', () {
     test('turns interior blank cells into spaces', () {
-      // "AB" then a 3-cell cursor-move gap then "CD".
       final line = _line(['A', 'B', null, null, null, 'C', 'D']);
       expect(bufferLineSelectedText(line, 0, line.length), 'AB   CD');
     });
@@ -31,14 +42,11 @@ void main() {
     });
 
     test('preserves literal spaces, including trailing ones', () {
-      // A literal space is codePoint 0x20, not a blank cell, so it survives.
       final line = _line(['A', ' ', 'B', ' ', ' '], width: 8);
       expect(bufferLineSelectedText(line, 0, line.length), 'A B  ');
     });
 
     test('does not add a stray space after a wide (CJK) glyph', () {
-      // '世' occupies two cells; its trailing half is a codePoint-0 cell that
-      // must not be mistaken for a gap.
       final line = _line(['A', '世', null, 'B']);
       expect(bufferLineSelectedText(line, 0, line.length), 'A世B');
     });
@@ -50,47 +58,82 @@ void main() {
 
     test('honors a half-open sub-range', () {
       final line = _line(['A', 'B', null, 'C', 'D']);
-      // Columns [1, 4): 'B', a gap, 'C'.
       expect(bufferLineSelectedText(line, 1, 4), 'B C');
     });
 
     test('drops a wide glyph whose trailing half is outside the range', () {
-      // Mirrors Buffer.getText: a wide glyph straddling `to` is not emitted.
       final line = _line(['A', '世', null, 'B']);
       expect(bufferLineSelectedText(line, 0, 2), 'A');
     });
   });
 
   group('terminalSelectionText', () {
-    // The visible top row maps to this absolute buffer line.
-    int topRow(xt.Terminal t) => t.buffer.height - t.viewHeight;
-
     test('restores spaces a cursor-move gap left behind', () {
-      final terminal = xt.Terminal(maxLines: 100);
-      terminal.resize(20, 5);
-      // "AB", move the cursor 3 columns right, then "CD" — the gap cells stay
-      // blank, exactly how a TUI lays out columns.
-      terminal.write('AB\x1b[3CCD');
-
-      final row = topRow(terminal);
-      final range = xt.BufferRangeLine(
-        xt.CellOffset(0, row),
-        xt.CellOffset(terminal.viewWidth, row),
+      final buffer = TerminalCellBuffer(cols: 20, rows: 5);
+      buffer.seedLinesForTest(
+        cols: 20,
+        rows: 5,
+        viewport: <TerminalCellLine>[
+          _line(['A', 'B', null, null, null, 'C', 'D'], width: 20),
+        ],
       );
-      expect(terminalSelectionText(terminal.buffer, range), 'AB   CD');
+
+      final range = TerminalSelectionRange(
+        const CellOffset(0, 0),
+        CellOffset(buffer.viewWidth, 0),
+      );
+      expect(terminalSelectionText(buffer, range), 'AB   CD');
     });
 
-    test('joins selected rows with newlines', () {
-      final terminal = xt.Terminal(maxLines: 100);
-      terminal.resize(20, 5);
-      terminal.write('A\x1b[2CB\r\nC\x1b[2CD');
+    test(
+      'joins hard-broken rows with newlines and suppresses soft-wrap newlines',
+      () {
+        final buffer = TerminalCellBuffer(cols: 20, rows: 5);
+        buffer.seedLinesForTest(
+          cols: 20,
+          rows: 5,
+          viewport: <TerminalCellLine>[
+            _line(['A', null, null, 'B'], width: 20),
+            _line(['C', null, null, 'D'], width: 20, isWrapped: true),
+            _line(['E', 'F'], width: 20),
+          ],
+        );
 
-      final row = topRow(terminal);
-      final range = xt.BufferRangeLine(
-        xt.CellOffset(0, row),
-        xt.CellOffset(terminal.viewWidth, row + 1),
+        final range = TerminalSelectionRange(
+          const CellOffset(0, 0),
+          CellOffset(buffer.viewWidth, 2),
+        );
+        expect(terminalSelectionText(buffer, range), 'A  B\nC  DEF');
+      },
+    );
+
+    test('compensates for top retention trims via trimmedTopRows', () {
+      final buffer = TerminalCellBuffer(cols: 20, rows: 2);
+      buffer.seedLinesForTest(
+        cols: 20,
+        rows: 2,
+        scrollback: <TerminalCellLine>[
+          _textLine('row 0'),
+          _textLine('row 1'),
+          _textLine('row 2'),
+        ],
+        viewport: <TerminalCellLine>[_textLine('row 3'), _textLine('row 4')],
       );
-      expect(terminalSelectionText(terminal.buffer, range), 'A  B\nC  D');
+
+      final range = TerminalSelectionRange(
+        const CellOffset(0, 2),
+        const CellOffset(5, 2),
+        trimmedTopRows: buffer.trimmedTopRows,
+        eraseScrollbackGen: buffer.eraseScrollbackGen,
+      );
+      expect(terminalSelectionText(buffer, range), 'row 2');
+
+      // Append a new line with maxTotalLines=5 so 1 top line is trimmed and
+      // 'row 2' shifts from virtual row 2 to virtual row 1.
+      buffer.appendOutputLineForTest(_textLine('row 5'), maxTotalLines: 5);
+      expect(buffer.trimmedTopRows, 1);
+      expect(terminalSelectionIsLive(buffer, range), isTrue);
+      expect(terminalSelectionText(buffer, range), 'row 2');
     });
   });
 
@@ -98,31 +141,36 @@ void main() {
     test(
       'forward and backward selections over the same cells produce identical text',
       () {
-        final terminal = xt.Terminal(maxLines: 100);
-        terminal.resize(20, 5);
-        terminal.write('hello world\r\nsecond line');
-        final top = terminal.buffer.height - terminal.viewHeight;
+        final buffer = TerminalCellBuffer(cols: 20, rows: 5);
+        buffer.seedLinesForTest(
+          cols: 20,
+          rows: 5,
+          viewport: <TerminalCellLine>[
+            _textLine('hello world'),
+            _textLine('second line'),
+          ],
+        );
 
         final forward = resolveSelectionEndpoints(
-          anchorCell: xt.CellOffset(2, top),
-          targetCell: xt.CellOffset(8, top + 1),
-          viewWidth: terminal.viewWidth,
-          lineCount: terminal.buffer.lines.length,
+          anchorCell: const CellOffset(2, 0),
+          targetCell: const CellOffset(8, 1),
+          viewWidth: buffer.viewWidth,
+          lineCount: buffer.totalLines,
         )!;
         final backward = resolveSelectionEndpoints(
-          anchorCell: xt.CellOffset(8, top + 1),
-          targetCell: xt.CellOffset(2, top),
-          viewWidth: terminal.viewWidth,
-          lineCount: terminal.buffer.lines.length,
+          anchorCell: const CellOffset(8, 1),
+          targetCell: const CellOffset(2, 0),
+          viewWidth: buffer.viewWidth,
+          lineCount: buffer.totalLines,
         )!;
 
         final forwardText = terminalSelectionText(
-          terminal.buffer,
-          xt.BufferRangeLine(forward.$1, forward.$2),
+          buffer,
+          TerminalSelectionRange(forward.$1, forward.$2),
         );
         final backwardText = terminalSelectionText(
-          terminal.buffer,
-          xt.BufferRangeLine(backward.$1, backward.$2),
+          buffer,
+          TerminalSelectionRange(backward.$1, backward.$2),
         );
 
         expect(forwardText, 'llo world\nsecond li');
@@ -131,82 +179,115 @@ void main() {
     );
 
     test('backward single-line selection includes the anchor cell', () {
-      final terminal = xt.Terminal(maxLines: 100);
-      terminal.resize(20, 5);
-      terminal.write('abcdef');
-      final top = terminal.buffer.height - terminal.viewHeight;
+      final buffer = TerminalCellBuffer(cols: 20, rows: 5);
+      buffer.seedLinesForTest(
+        cols: 20,
+        rows: 5,
+        viewport: <TerminalCellLine>[_textLine('abcdef')],
+      );
 
       final backward = resolveSelectionEndpoints(
-        anchorCell: xt.CellOffset(4, top),
-        targetCell: xt.CellOffset(1, top),
-        viewWidth: terminal.viewWidth,
-        lineCount: terminal.buffer.lines.length,
+        anchorCell: const CellOffset(4, 0),
+        targetCell: const CellOffset(1, 0),
+        viewWidth: buffer.viewWidth,
+        lineCount: buffer.totalLines,
       )!;
       final text = terminalSelectionText(
-        terminal.buffer,
-        xt.BufferRangeLine(backward.$1, backward.$2),
+        buffer,
+        TerminalSelectionRange(backward.$1, backward.$2),
       );
       expect(text, 'bcde');
     });
 
     test(
-      'backward multi-line selection at right margin creates valid buffer anchors and includes rightmost cell',
+      'backward multi-line selection at right margin includes rightmost cell',
       () {
-        final terminal = xt.Terminal(maxLines: 100);
-        terminal.resize(10, 5);
-        terminal.write('0123456789\r\nabcdefghij');
-        final top = terminal.buffer.height - terminal.viewHeight;
+        final buffer = TerminalCellBuffer(cols: 10, rows: 5);
+        buffer.seedLinesForTest(
+          cols: 10,
+          rows: 5,
+          viewport: <TerminalCellLine>[
+            _textLine('0123456789', width: 10),
+            _textLine('abcdefghij', width: 10),
+          ],
+        );
 
         final backward = resolveSelectionEndpoints(
-          anchorCell: xt.CellOffset(terminal.viewWidth - 1, top + 1),
-          targetCell: xt.CellOffset(terminal.viewWidth - 1, top),
-          viewWidth: terminal.viewWidth,
-          lineCount: terminal.buffer.lines.length,
+          anchorCell: CellOffset(buffer.viewWidth - 1, 1),
+          targetCell: CellOffset(buffer.viewWidth - 1, 0),
+          viewWidth: buffer.viewWidth,
+          lineCount: buffer.totalLines,
         )!;
-        final baseAnchor = terminal.buffer.createAnchorFromOffset(backward.$1);
-        final extentAnchor = terminal.buffer.createAnchorFromOffset(
-          backward.$2,
-        );
-        expect(baseAnchor.x, terminal.viewWidth);
-        expect(extentAnchor.x, terminal.viewWidth - 1);
+        expect(backward.$1.x, buffer.viewWidth);
+        expect(backward.$2.x, buffer.viewWidth - 1);
 
         final text = terminalSelectionText(
-          terminal.buffer,
-          xt.BufferRangeLine(backward.$1, backward.$2),
+          buffer,
+          TerminalSelectionRange(backward.$1, backward.$2),
         );
         expect(text, '9\nabcdefghij');
       },
     );
   });
 
+  group('selectWordRangeAt', () {
+    test('selects identifier/path token around clicked cell', () {
+      final buffer = TerminalCellBuffer(cols: 30, rows: 2);
+      buffer.seedLinesForTest(
+        cols: 30,
+        rows: 2,
+        viewport: <TerminalCellLine>[
+          _textLine('run /usr/local/bin/triaged --ok', width: 30),
+        ],
+      );
+
+      final range = selectWordRangeAt(buffer, const CellOffset(8, 0))!;
+      expect(terminalSelectionText(buffer, range), '/usr/local/bin/triaged');
+    });
+
+    test('snaps trailing cell of wide CJK glyph to the leading cell', () {
+      final buffer = TerminalCellBuffer(cols: 10, rows: 2);
+      buffer.seedLinesForTest(
+        cols: 10,
+        rows: 2,
+        viewport: <TerminalCellLine>[
+          _line([' ', '世', null, '界', null, ' '], width: 10),
+        ],
+      );
+
+      final range = selectWordRangeAt(buffer, const CellOffset(2, 0))!;
+      expect(terminalSelectionText(buffer, range), '世界');
+    });
+  });
+
   group('shiftCellOffsetForHistoryPage', () {
     test('shifts row by addedLines and clamps to lineCount - 1', () {
       expect(
         shiftCellOffsetForHistoryPage(
-          offset: const xt.CellOffset(5, 10),
+          offset: const CellOffset(5, 10),
           addedLines: 25,
           lineCount: 101,
         ),
-        const xt.CellOffset(5, 35),
+        const CellOffset(5, 35),
       );
       expect(
         shiftCellOffsetForHistoryPage(
-          offset: const xt.CellOffset(5, 90),
+          offset: const CellOffset(5, 90),
           addedLines: 25,
           lineCount: 101,
         ),
-        const xt.CellOffset(5, 100),
+        const CellOffset(5, 100),
       );
     });
 
     test('preserves cell offset unchanged when addedLines is 0', () {
       expect(
         shiftCellOffsetForHistoryPage(
-          offset: const xt.CellOffset(7, 42),
+          offset: const CellOffset(7, 42),
           addedLines: 0,
           lineCount: 100,
         ),
-        const xt.CellOffset(7, 42),
+        const CellOffset(7, 42),
       );
     });
   });
@@ -358,5 +439,174 @@ void main() {
         isNull,
       );
     });
+
+    test(
+      'skips unloaded scrollback holes without blank lines and invalidates across alt-screen',
+      () {
+        final buffer = TerminalCellBuffer(cols: 20, rows: 2);
+        buffer.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: 2,
+            cols: 20,
+            totalScrollbackRows: 3, // virtual rows 0..2 are unloaded null holes
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags: kModeCursorVisible | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'vp row 0',
+              'vp row 1',
+            ], cols: 20),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+
+        final range = TerminalSelectionRange(
+          const CellOffset(0, 0),
+          const CellOffset(20, 4),
+          trimmedTopRows: buffer.trimmedTopRows,
+          eraseScrollbackGen: buffer.eraseScrollbackGen,
+          isAltScreen: buffer.isUsingAltBuffer,
+        );
+        expect(terminalSelectionText(buffer, range), 'vp row 0\nvp row 1');
+
+        // Enter alt-screen: primary-screen selection is no longer live.
+        buffer.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 2,
+            rows: 2,
+            cols: 20,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags: kModeAltScreen | kModeCursorVisible | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'alt 0',
+              'alt 1',
+            ], cols: 20),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+        expect(terminalSelectionIsLive(buffer, range), isFalse);
+        expect(terminalSelectionText(buffer, range), isEmpty);
+      },
+    );
+
+    test(
+      'terminalSelectionIsLive checks bounds and selectWordRangeAt handles Unicode words and wide journal lines',
+      () {
+        final buffer = TerminalCellBuffer(cols: 10, rows: 2);
+        buffer.seedLinesForTest(
+          cols: 10,
+          rows: 2,
+          scrollback: <TerminalCellLine>[
+            // Archived SGR journal line wider than current 10-col viewport:
+            _textLine('café\u00A0привет\u3000tail_word', width: 28),
+          ],
+          viewport: <TerminalCellLine>[
+            _textLine('row0', width: 10),
+            _textLine('row1', width: 10),
+          ],
+        );
+
+        // Selection completely past buffer.totalLines (3) is not live.
+        final belowBuffer = TerminalSelectionRange(
+          const CellOffset(0, 5),
+          const CellOffset(4, 6),
+          trimmedTopRows: 0,
+          eraseScrollbackGen: 0,
+          isAltScreen: false,
+        );
+        expect(terminalSelectionIsLive(buffer, belowBuffer), isFalse);
+
+        // Unicode word selection groups Latin accented and Cyrillic words, stops at NBSP / ideographic space,
+        // and spans beyond buffer.viewWidth on wide journal rows.
+        final latinWord = selectWordRangeAt(buffer, const CellOffset(2, 0));
+        expect(latinWord, isNotNull);
+        expect(terminalSelectionText(buffer, latinWord!), 'café');
+
+        final nbspRun = selectWordRangeAt(buffer, const CellOffset(4, 0));
+        expect(nbspRun, isNotNull);
+        expect(nbspRun!.base.x, 4);
+        expect(nbspRun.extent.x, 5);
+
+        final cyrillicWord = selectWordRangeAt(buffer, const CellOffset(6, 0));
+        expect(cyrillicWord, isNotNull);
+        expect(terminalSelectionText(buffer, cyrillicWord!), 'привет');
+
+        final wideTail = selectWordRangeAt(buffer, const CellOffset(14, 0));
+        expect(wideTail, isNotNull);
+        expect(terminalSelectionText(buffer, wideTail!), 'tail_word');
+
+        // Selection extending past buffer.viewWidth (10) on a wide journal row (28 cols)
+        // extracts the full span up to line.length without clamping at viewWidth.
+        final wideSpan = TerminalSelectionRange(
+          const CellOffset(12, 0),
+          const CellOffset(28, 0),
+          trimmedTopRows: 0,
+          eraseScrollbackGen: 0,
+          isAltScreen: false,
+        );
+        expect(terminalSelectionText(buffer, wideSpan), 'tail_word');
+
+        // Combining marks (`e\u0301`) and ZWJ emoji clusters stay grouped during word selection.
+        final clusterBuf = TerminalCellBuffer(cols: 12, rows: 1);
+        clusterBuf.seedLinesForTest(
+          cols: 12,
+          rows: 1,
+          scrollback: const <TerminalCellLine>[],
+          viewport: <TerminalCellLine>[
+            _line(<String?>[
+              'c',
+              'a',
+              'f',
+              'e\u0301',
+              ' ',
+              '\u{1F468}\u{200D}\u{1F4BB}',
+              null,
+              ' ',
+            ], width: 12),
+          ],
+        );
+        final decomposedWord = selectWordRangeAt(
+          clusterBuf,
+          const CellOffset(3, 0),
+        );
+        expect(decomposedWord, isNotNull);
+        expect(
+          terminalSelectionText(clusterBuf, decomposedWord!),
+          'cafe\u0301',
+        );
+
+        final zwjEmoji = selectWordRangeAt(clusterBuf, const CellOffset(5, 0));
+        expect(zwjEmoji, isNotNull);
+        expect(
+          terminalSelectionText(clusterBuf, zwjEmoji!),
+          '\u{1F468}\u{200D}\u{1F4BB}',
+        );
+      },
+    );
   });
 }

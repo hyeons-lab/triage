@@ -1,52 +1,41 @@
-// Live-daemon paging checks for scrollback history windows.
+// Live-daemon paging checks for virtual scrollback cell pages.
 //
-// Exercises the REAL daemon round trip: FlatBuffers attach windows come
-// back bounded by the window with older starts, and replaying a deeper
-// real SessionVm grows the terminal buffer. Skipped unless
-// TRIAGE_LIVE_WS points at a daemon (e.g. ws://<host>:7777/ws),
+// Exercises the real daemon round trip: FlatBuffers `SyncTerminal` frames and
+// `FetchTerminalRows` pages decode into `SessionVm` / `TerminalCellBuffer`.
+// Skipped unless `TRIAGE_LIVE_WS` points at a daemon (e.g. ws://<host>:7777/ws),
 // so CI stays hermetic.
 //
 // Run: `TRIAGE_LIVE_WS=ws://<host>:7777/ws flutter test
 // test/live_history_paging_test.dart`
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:math' show min;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/main.dart';
 import 'package:triage_client/services/triage_websocket_client.dart';
-import 'package:triage_client/terminal/terminal_intent.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 
 String? get _liveWs {
-  const url = String.fromEnvironment('TRIAGE_LIVE_WS');
-  if (url.isNotEmpty) return url;
-  return Platform.environment['TRIAGE_LIVE_WS'];
+  const fromDefine = String.fromEnvironment('TRIAGE_LIVE_WS');
+  final trimmedDefine = fromDefine.trim();
+  if (trimmedDefine.isNotEmpty) return trimmedDefine;
+  final fromEnv = Platform.environment['TRIAGE_LIVE_WS']?.trim();
+  return (fromEnv != null && fromEnv.isNotEmpty) ? fromEnv : null;
 }
 
 String get _liveSession {
-  const session = String.fromEnvironment('TRIAGE_LIVE_SESSION');
-  if (session.isNotEmpty) return session;
-  return Platform.environment['TRIAGE_LIVE_SESSION'] ?? 'session-255';
-}
-
-Future<Map<String, dynamic>> _window(
-  TriageWebSocketClient client,
-  String clientId,
-  int bytes,
-) async {
-  final res = await client.attachSession(
-    sessionId: _liveSession,
-    clientId: clientId,
-    mode: 'Observer',
-    historyBytes: bytes,
-  );
-  final response = res['response'] as Map<String, dynamic>?;
-  return response?['snapshot'] as Map<String, dynamic>? ?? {};
+  const fromDefine = String.fromEnvironment('TRIAGE_LIVE_SESSION');
+  final trimmedDefine = fromDefine.trim();
+  if (trimmedDefine.isNotEmpty) return trimmedDefine;
+  final fromEnv = Platform.environment['TRIAGE_LIVE_SESSION']?.trim();
+  return (fromEnv != null && fromEnv.isNotEmpty) ? fromEnv : 'session-255';
 }
 
 void main() {
   test(
-    'live FBS history windows widen with older starts',
+    'live FBS syncTerminalSession and fetchTerminalRows decode TCG1 cell batches',
     () async {
       final client = TriageWebSocketClient(Uri.parse(_liveWs!));
       try {
@@ -54,21 +43,41 @@ void main() {
         expect(client.isFlatBuffersNegotiated, isTrue);
         final token = await client.pairViaTailscale(clientId: 'live-probe');
         await client.hello(clientId: 'live-probe', token: token);
-        var olderStart = 1 << 62;
-        for (final window in [65536, 131072, 262144]) {
-          final snap = await _window(client, 'live-probe', window);
-          final raw = snap['raw_output'];
-          expect(raw, isA<Uint8List>());
-          final tail = raw as Uint8List;
-          // The serve splits the cap between the journaled prefix and the
-          // raw tail (overlay_raw_output_history): the raw tail is bounded
-          // by the window, with at least half the window when the log is
-          // deep enough to fill the split.
-          expect(tail.length, lessThanOrEqualTo(window));
-          expect(tail.length, greaterThanOrEqualTo(window ~/ 2));
-          final start = snap['raw_output_start'] as int;
-          expect(start, lessThan(olderStart));
-          olderStart = start;
+
+        final syncRes = await client.syncTerminalSession(
+          sessionId: _liveSession,
+          clientId: 'live-probe',
+          mode: 'Observer',
+          subscribe: false,
+          knownFrameSeq: 0,
+        );
+        final response =
+            syncRes['response'] as Map<String, dynamic>? ?? syncRes;
+        final frameMap = response['frame'] as Map<String, dynamic>?;
+        expect(frameMap, isNotNull);
+
+        final frame = TerminalSyncFrameData.fromMap(frameMap!);
+        expect(frame.rows, greaterThan(0));
+        expect(frame.cols, greaterThan(0));
+        expect(frame.viewportPayload, isNotEmpty);
+
+        final viewportRows = decodeTcg1Batch(
+          frame.viewportCompression,
+          frame.viewportPayload,
+        );
+        expect(viewportRows, isNotEmpty);
+
+        if (frame.totalScrollbackRows > 0) {
+          final count = min(kScrollbackPageSize, frame.totalScrollbackRows);
+          final pageRes = await client.fetchTerminalRows(
+            sessionId: _liveSession,
+            startRow: 0,
+            rowCount: count,
+          );
+          final page = TerminalRowsPageData.fromMap(pageRes);
+          expect(page.rowCount, greaterThan(0));
+          final decodedPage = decodeTcg1Batch(page.compression, page.payload);
+          expect(decodedPage.length, page.rowCount);
         }
       } finally {
         await client.disconnect();
@@ -79,15 +88,29 @@ void main() {
   );
 
   test(
-    'live deeper window replay grows the terminal buffer',
+    'live demand-paging populates SessionVm TerminalCellBuffer virtual scrollback',
     () async {
       final client = TriageWebSocketClient(Uri.parse(_liveWs!));
       try {
         await client.connect();
         final token = await client.pairViaTailscale(clientId: 'live-probe2');
         await client.hello(clientId: 'live-probe2', token: token);
-        final w64 = await _window(client, 'live-probe2', 65536);
-        final w128 = await _window(client, 'live-probe2', 131072);
+
+        final syncRes = await client.syncTerminalSession(
+          sessionId: _liveSession,
+          clientId: 'live-probe2',
+          mode: 'Observer',
+          cols: 80,
+          rows: 24,
+          resizePty: false,
+          subscribe: false,
+          knownFrameSeq: 0,
+        );
+        final response =
+            syncRes['response'] as Map<String, dynamic>? ?? syncRes;
+        final frame = TerminalSyncFrameData.fromMap(
+          response['frame'] as Map<String, dynamic>,
+        );
 
         final session = SessionVm(
           title: 'triage / $_liveSession',
@@ -98,27 +121,30 @@ void main() {
           rows: const [],
           isRemote: true,
         );
-        session.applyHistory(
-          (w64['raw_output'] as Uint8List).toList(),
-          throughOutputSeq: w64['output_seq'] as int?,
-          rawOutputStart: w64['raw_output_start'] as int?,
-          windowBytes: 65536,
-        );
-        session.noteViewFit(80, 24);
-        final firstLines = session.terminal.buffer.lines.length;
+        addTearDown(session.dispose);
 
-        session.store.dispatch(const Attach());
-        session.historyWindowBytes = 131072;
-        session.applyHistory(
-          (w128['raw_output'] as Uint8List).toList(),
-          throughOutputSeq: w128['output_seq'] as int?,
-          rawOutputStart: w128['raw_output_start'] as int?,
-          windowBytes: 131072,
+        session.applyTerminalSyncFrame(
+          frame,
+          notifyReplay: true,
+          snapshot: response['snapshot'] as Map<String, dynamic>?,
         );
         expect(
-          session.terminal.buffer.lines.length,
-          greaterThan(firstLines),
+          session.terminal.totalLines,
+          frame.totalScrollbackRows + frame.rows,
         );
+
+        if (frame.totalScrollbackRows > 0) {
+          expect(session.terminal.lineAtVirtualRow(0), isNull);
+          final count = min(kScrollbackPageSize, frame.totalScrollbackRows);
+          final pageRes = await client.fetchTerminalRows(
+            sessionId: _liveSession,
+            startRow: 0,
+            rowCount: count,
+          );
+          final page = TerminalRowsPageData.fromMap(pageRes);
+          session.terminal.applyFetchedRows(page);
+          expect(session.terminal.lineAtVirtualRow(0), isNotNull);
+        }
       } finally {
         await client.disconnect();
       }

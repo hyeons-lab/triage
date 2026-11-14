@@ -10,6 +10,7 @@ import 'package:triage_client/generated/triage_triage.generated_generated.dart'
     as fbs;
 import 'package:triage_client/services/flatbuffers_js_compat.dart' as fbjs;
 import 'package:triage_client/services/triage_websocket_client.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class FakeWebSocketChannel implements WebSocketChannel {
@@ -2269,5 +2270,412 @@ void main() {
         ),
       );
     });
+  });
+
+  group('Terminal Cell Sync Protocol (FlatBuffers & JSON)', () {
+    test(
+      'syncTerminalSession, fetchTerminalRows, ackTerminalSync, and TerminalSyncEvent round-trip over binary FlatBuffers',
+      () async {
+        final sink = RecordingWebSocketSink();
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-flatbuffers',
+        );
+        final client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        // 1. syncTerminalSession request + response
+        final syncFuture = client.syncTerminalSession(
+          sessionId: 'sess-1',
+          clientId: 'client-1',
+          mode: 'Observer',
+          cols: 120,
+          rows: 40,
+          resizePty: true,
+          restoreIfExited: true,
+          subscribe: true,
+          knownFrameSeq: 7,
+        );
+
+        expect(sink.sent, hasLength(1));
+        final syncReqMsg = fbs.ClientMessage(sink.sent.last as List<int>);
+        expect(syncReqMsg.id, equals('req-0'));
+        expect(
+          syncReqMsg.payloadType,
+          equals(fbs.ClientRequestPayloadTypeId.SyncTerminalRequestTable),
+        );
+        final syncReq = syncReqMsg.payload as fbs.SyncTerminalRequestTable;
+        expect(syncReq.sessionId, equals('sess-1'));
+        expect(syncReq.clientId, equals('client-1'));
+        expect(syncReq.mode, equals(fbs.AttachMode.Observer));
+        expect(syncReq.size!.cols, equals(120));
+        expect(syncReq.size!.rows, equals(40));
+        expect(syncReq.resizePty, isTrue);
+        expect(syncReq.restoreIfExited, isTrue);
+        expect(syncReq.subscribe, isTrue);
+        expect(syncReq.knownFrameSeq, equals(7));
+
+        final viewportTcg1 = encodeTcg1PlainTextRows(const <String>[
+          'prompt> hello',
+          'second row',
+        ], cols: 120);
+        final pushedTcg1 = encodeTcg1PlainTextRows(const <String>[
+          'scrolled line 0',
+        ], cols: 120);
+        final syncRespBytes = fbs.ServerMessageObjectBuilder(
+          payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+          payload: fbs.ResponsePayloadObjectBuilder(
+            id: 'req-0',
+            resultType: fbs.ServerResultPayloadTypeId.SyncTerminalResult,
+            result: fbs.SyncTerminalResultObjectBuilder(
+              subscriptionId: 'sub-sess-1',
+              snapshot: fbs.SessionSnapshotObjectBuilder(
+                outputSeq: 12,
+                bytesLogged: 512,
+                size: fbs.SessionSizeObjectBuilder(
+                  rows: 40,
+                  cols: 120,
+                  pixelWidth: 1200,
+                  pixelHeight: 800,
+                  dpi: 96,
+                ),
+                visibleRows: const <String>[],
+                styledRowsStart: 0,
+                styledRows: const <fbs.StyledRowObjectBuilder>[],
+                bracketedPasteEnabled: true,
+                exited: false,
+              ),
+              lease: fbs.InputLeaseStateObjectBuilder(generation: 3),
+              frame: fbs.TerminalSyncFrameObjectBuilder(
+                frameSeq: 8,
+                rows: 40,
+                cols: 120,
+                totalScrollbackRows: 250,
+                trimmedTopRows: 10,
+                eraseScrollbackGen: 2,
+                cursorX: 13,
+                cursorY: 0,
+                cursorStyle: 2,
+                modeFlags:
+                    kModeCursorVisible | kModeAutoWrap | kModeFullViewport,
+                mouseMode: 2,
+                mouseReportMode: 2,
+                kittyKeyboardFlags: 1,
+                title: 'zsh',
+                viewportCompression: kCellCompressionNone,
+                viewportPayload: viewportTcg1,
+                pushedScrollbackStartRow: 249,
+                pushedScrollbackRowCount: 1,
+                pushedScrollbackCompression: kCellCompressionNone,
+                pushedScrollbackPayload: pushedTcg1,
+              ),
+            ),
+          ),
+        ).toBytes();
+        channel.addIncoming(syncRespBytes);
+
+        final syncRes = await syncFuture;
+        expect(syncRes['result'], equals('sync_terminal'));
+        final syncInner = syncRes['response'] as Map<String, dynamic>;
+        expect(syncInner['subscription_id'], equals('sub-sess-1'));
+        final parsedFrame = TerminalSyncFrameData.fromMap(
+          syncInner['frame'] as Map<String, dynamic>,
+        );
+        expect(parsedFrame.frameSeq, equals(8));
+        expect(parsedFrame.cols, equals(120));
+        expect(parsedFrame.rows, equals(40));
+        expect(parsedFrame.totalScrollbackRows, equals(250));
+        expect(parsedFrame.trimmedTopRows, equals(10));
+        expect(parsedFrame.eraseScrollbackGen, equals(2));
+        expect(parsedFrame.mouseMode, equals(2));
+        expect(parsedFrame.mouseReportMode, equals(2));
+        expect(parsedFrame.kittyKeyboardFlags, equals(1));
+        expect(parsedFrame.title, equals('zsh'));
+        expect(parsedFrame.fullViewport, isTrue);
+        final decodedVp = decodeTcg1Batch(
+          parsedFrame.viewportCompression,
+          parsedFrame.viewportPayload,
+        );
+        expect(decodedVp, hasLength(2));
+
+        // 2. fetchTerminalRows request + response
+        final fetchFuture = client.fetchTerminalRows(
+          sessionId: 'sess-1',
+          startRow: 128,
+          rowCount: 64,
+        );
+        expect(sink.sent, hasLength(2));
+        final fetchReqMsg = fbs.ClientMessage(sink.sent.last as List<int>);
+        expect(fetchReqMsg.id, equals('req-1'));
+        expect(
+          fetchReqMsg.payloadType,
+          equals(fbs.ClientRequestPayloadTypeId.FetchTerminalRowsRequestTable),
+        );
+        final fetchReq =
+            fetchReqMsg.payload as fbs.FetchTerminalRowsRequestTable;
+        expect(fetchReq.sessionId, equals('sess-1'));
+        expect(fetchReq.startRow, equals(128));
+        expect(fetchReq.rowCount, equals(64));
+
+        final pageTcg1 = encodeTcg1PlainTextRows(const <String>[
+          'archived row 128',
+          'archived row 129',
+        ], cols: 120);
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType: fbs.ServerMessagePayloadTypeId.ResponsePayload,
+            payload: fbs.ResponsePayloadObjectBuilder(
+              id: 'req-1',
+              resultType: fbs.ServerResultPayloadTypeId.FetchTerminalRowsResult,
+              result: fbs.FetchTerminalRowsResultObjectBuilder(
+                sessionId: 'sess-1',
+                startRow: 128,
+                rowCount: 2,
+                totalScrollbackRows: 250,
+                trimmedTopRows: 10,
+                eraseScrollbackGen: 2,
+                compression: kCellCompressionNone,
+                payload: pageTcg1,
+              ),
+            ),
+          ).toBytes(),
+        );
+        final fetchRes = await fetchFuture;
+        final pageData = TerminalRowsPageData.fromMap(fetchRes);
+        expect(pageData.sessionId, equals('sess-1'));
+        expect(pageData.startRow, equals(128));
+        expect(pageData.rowCount, equals(2));
+        expect(
+          decodeTcg1Batch(pageData.compression, pageData.payload),
+          hasLength(2),
+        );
+
+        // 3. ackTerminalSync is fire-and-forget with null message id
+        client.ackTerminalSync(subscriptionId: 'sub-sess-1', frameSeq: 8);
+        expect(sink.sent, hasLength(3));
+        final ackMsg = fbs.ClientMessage(sink.sent.last as List<int>);
+        expect(ackMsg.id, isNull);
+        expect(
+          ackMsg.payloadType,
+          equals(fbs.ClientRequestPayloadTypeId.AckTerminalSyncRequestTable),
+        );
+        final ackReq = ackMsg.payload as fbs.AckTerminalSyncRequestTable;
+        expect(ackReq.subscriptionId, equals('sub-sess-1'));
+        expect(ackReq.frameSeq, equals(8));
+
+        // 4. TerminalSyncEvent server push
+        final eventFuture = client.events.first;
+        channel.addIncoming(
+          fbs.ServerMessageObjectBuilder(
+            payloadType: fbs.ServerMessagePayloadTypeId.EventPayload,
+            payload: fbs.EventPayloadObjectBuilder(
+              subscriptionId: 'sub-sess-1',
+              eventSeq: 99,
+              eventType: fbs.SessionEventPayloadTypeId.TerminalSyncEvent,
+              event: fbs.TerminalSyncEventObjectBuilder(
+                sessionId: 'sess-1',
+                frame: fbs.TerminalSyncFrameObjectBuilder(
+                  frameSeq: 9,
+                  rows: 40,
+                  cols: 120,
+                  totalScrollbackRows: 250,
+                  trimmedTopRows: 10,
+                  eraseScrollbackGen: 2,
+                  cursorX: 0,
+                  cursorY: 1,
+                  cursorStyle: 0,
+                  modeFlags: kModeCursorVisible,
+                  mouseMode: 0,
+                  mouseReportMode: 0,
+                  kittyKeyboardFlags: 0,
+                  viewportCompression: kCellCompressionNone,
+                  viewportPayload: encodeTcg1PlainTextRows(
+                    const <String>['delta update'],
+                    cols: 120,
+                    startRowIndex: 1,
+                  ),
+                  pushedScrollbackStartRow: 0,
+                  pushedScrollbackRowCount: 0,
+                  pushedScrollbackCompression: kCellCompressionNone,
+                  pushedScrollbackPayload: Uint8List(0),
+                ),
+              ),
+            ),
+          ).toBytes(),
+        );
+        final pushedEvt = await eventFuture;
+        expect(pushedEvt['type'], equals('event'));
+        expect(pushedEvt['subscription_id'], equals('sub-sess-1'));
+        final syncEvt =
+            ((pushedEvt['envelope'] as Map<String, dynamic>)['event']
+                    as Map<String, dynamic>)['TerminalSync']
+                as Map<String, dynamic>;
+        expect(syncEvt['session_id'], equals('sess-1'));
+        final deltaFrame = TerminalSyncFrameData.fromMap(
+          syncEvt['frame'] as Map<String, dynamic>,
+        );
+        expect(deltaFrame.frameSeq, equals(9));
+        expect(deltaFrame.fullViewport, isFalse);
+
+        await client.disconnect();
+      },
+    );
+
+    test(
+      'syncTerminalSession, fetchTerminalRows, and ackTerminalSync round-trip over JSON with Base64 TCG1 payloads',
+      () async {
+        final sink = RecordingWebSocketSink();
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-json',
+        );
+        final client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final syncFuture = client.syncTerminalSession(
+          sessionId: 'sess-json',
+          clientId: 'c-json',
+          mode: 'InteractiveController',
+          cols: 80,
+          rows: 24,
+        );
+        final reqJson =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        expect(reqJson['type'], equals('sync_terminal'));
+        final tcg1 = encodeTcg1PlainTextRows(const <String>[
+          'json row',
+        ], cols: 80);
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'response',
+            'id': reqJson['id'],
+            'result': {
+              'type': 'sync_terminal',
+              'response': {
+                'subscription_id': 'sub-json',
+                'snapshot': {'exited': false},
+                'lease': {'generation': 1},
+                'frame': {
+                  'frame_seq': 1,
+                  'rows': 24,
+                  'cols': 80,
+                  'mode_flags': kModeFullViewport | kModeCursorVisible,
+                  'viewport_compression': kCellCompressionNone,
+                  'viewport_payload': base64Encode(tcg1),
+                },
+              },
+            },
+          }),
+        );
+        final syncRes = await syncFuture;
+        final frame = TerminalSyncFrameData.fromMap(
+          (syncRes['response'] as Map<String, dynamic>)['frame']
+              as Map<String, dynamic>,
+        );
+        expect(
+          decodeTcg1Batch(frame.viewportCompression, frame.viewportPayload),
+          hasLength(1),
+        );
+
+        client.ackTerminalSync(subscriptionId: 'sub-json', frameSeq: 1);
+        final ackJson =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        expect(ackJson.containsKey('id'), isFalse);
+        expect(ackJson['type'], equals('ack_terminal_sync'));
+        expect(ackJson['subscription_id'], equals('sub-json'));
+        expect(ackJson['frame_seq'], equals(1));
+
+        await client.disconnect();
+      },
+    );
+
+    test(
+      'older daemon rejecting sync_terminal or fetch_terminal_rows surfaces TriageUnsupportedProtocolException',
+      () async {
+        final sink = RecordingWebSocketSink();
+        final channel = FakeWebSocketChannel(
+          sink: sink,
+          protocol: 'triage-json',
+        );
+        final client = TriageWebSocketClient(
+          Uri.parse('ws://localhost/ws'),
+          channelFactory: (_) => channel,
+        );
+        await client.connect();
+
+        final syncFuture = client.syncTerminalSession(
+          sessionId: 'main',
+          clientId: 'c1',
+        );
+        final req1 =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'error',
+            'id': req1['id'],
+            'error': {
+              'code': 'invalid_request',
+              'message':
+                  'unknown variant `sync_terminal`, expected one of `hello`, `attach_session`',
+            },
+          }),
+        );
+        await expectLater(
+          syncFuture,
+          throwsA(isA<TriageUnsupportedProtocolException>()),
+        );
+
+        final fetchFuture = client.fetchTerminalRows(
+          sessionId: 'main',
+          startRow: 0,
+          rowCount: 128,
+        );
+        final req2 =
+            jsonDecode(sink.sent.last as String) as Map<String, dynamic>;
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'error',
+            'id': req2['id'],
+            'error': {
+              'code': 'unsupported_payload',
+              'message': 'request payload is not recognized or supported',
+            },
+          }),
+        );
+        await expectLater(
+          fetchFuture,
+          throwsA(isA<TriageUnsupportedProtocolException>()),
+        );
+
+        // Older daemon rejecting binary FlatBuffers frame with id == null
+        // must immediately fail in-flight sync_terminal instead of hanging 30s.
+        final binaryNullIdFuture = client.syncTerminalSession(
+          sessionId: 'main',
+          clientId: 'c1',
+        );
+        channel.addIncoming(
+          jsonEncode({
+            'type': 'error',
+            'id': null,
+            'error': {
+              'code': 'invalid_flatbuffer',
+              'message': 'unknown request payload union type',
+            },
+          }),
+        );
+        await expectLater(
+          binaryNullIdFuture,
+          throwsA(isA<TriageUnsupportedProtocolException>()),
+        );
+
+        await client.disconnect();
+      },
+    );
   });
 }
