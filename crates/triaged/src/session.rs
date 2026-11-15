@@ -30,17 +30,19 @@ use tattoy_wezterm_term::{
     Intensity, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize, Underline,
 };
 use triage_core::agent::{AgentAttachment, AgentKind};
-use triage_core::judge::JudgeVerdict;
+use triage_core::judge::{JudgeDecision, JudgeSource, JudgeVerdict};
 use triage_core::session::{
     AttachSessionRequest, AttachSessionResponse, ClientId, CompletedSession,
     FetchTerminalRowsRequest, FetchTerminalRowsResponse, InputControllerKind, InputLeaseRequest,
     InputLeaseState, LeaseChange, PollTerminalSyncOutcome, RailLayout, ResizeSessionRequest,
     RestoreSessionRequest, SendSessionMessageRequest, SendSessionMessageResponse, SessionApi,
     SessionContext, SessionContextRow, SessionEvent, SessionEventEnvelope, SessionEventReceiver,
-    SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot, StartSessionRequest,
-    StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan, SubscribeSessionEventsRequest,
-    SyncTerminalRequest, TerminalColor, TerminalCursor, TerminalScreenCursor, TerminalStyle,
-    TerminalSyncCursor, TerminalSyncFrame, WaitForSessionMessagesRequest, WriteInputRequest,
+    SessionId, SessionMessage, SessionPins, SessionSize, SessionSnapshot, SessionWaitOutcome,
+    StartSessionRequest, StyledRow, StyledRowsRequest, StyledRowsResponse, StyledSpan,
+    SubscribeSessionEventsRequest, SyncTerminalRequest, TerminalColor, TerminalCursor,
+    TerminalScreenCursor, TerminalStyle, TerminalSyncCursor, TerminalSyncFrame,
+    WaitForSessionMessagesRequest, WaitForSessionsMode, WaitForSessionsRequest,
+    WaitForSessionsResponse, WaitedSessionStatus, WriteInputRequest,
 };
 use triage_core::session::{
     SESSION_INBOX_CAPACITY, SESSION_MESSAGE_MAX_BODY_LEN, SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
@@ -105,6 +107,12 @@ const MAX_OSC_BUFFER: usize = 4096;
 /// Maximum number of recent judge decisions retained in memory for the settings
 /// audit trail (e.g. ~24 hours of active agent tool traffic).
 const JUDGE_HISTORY_CAPACITY: usize = 2000;
+/// Automated wakes and agent-controller writes hold off while a human has an
+/// unsubmitted line draft newer than this window.
+const HUMAN_DRAFT_GUARD_WINDOW_MS: u64 = 60_000;
+/// Maximum sleep slice inside `wait_for_sessions` so idle thresholds advance
+/// without busy polling.
+const WAIT_POLL_SLICE: Duration = Duration::from_millis(150);
 
 /// Internal argv marker used by the daemon executable as a child-side exec
 /// shim. The daemon itself ignores TTIN/TTOU so handover terminal changes cannot
@@ -200,6 +208,77 @@ pub struct SessionActor {
     /// The rail's activity sort orders by this: output recency alone lets a
     /// noisy background job outrank sessions the user actually types in.
     last_input_ms: Arc<AtomicU64>,
+    /// Shared lifecycle guards (unsubmitted human draft timestamp and pending
+    /// approval flag) checked on wake and automated input paths.
+    lifecycle: Arc<ActorLifecycleShared>,
+}
+
+#[derive(Debug, Default)]
+struct ActorLifecycleShared {
+    draft_updated_ms: AtomicU64,
+    judge_pending_approval: AtomicBool,
+}
+
+impl ActorLifecycleShared {
+    fn has_active_human_draft(&self, now_ms: u64) -> bool {
+        let draft_ms = self.draft_updated_ms.load(Ordering::Relaxed);
+        draft_ms != 0 && now_ms.saturating_sub(draft_ms) < HUMAN_DRAFT_GUARD_WINDOW_MS
+    }
+
+    fn set_judge_pending_approval(&self, pending: bool) {
+        self.judge_pending_approval
+            .store(pending, Ordering::Relaxed);
+    }
+
+    fn has_judge_pending_approval(&self) -> bool {
+        self.judge_pending_approval.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Default)]
+struct SessionStateSignal {
+    seq: Mutex<u64>,
+    cond: Condvar,
+}
+
+impl SessionStateSignal {
+    fn current(&self) -> u64 {
+        *self.seq.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn notify(&self) {
+        let mut guard = self.seq.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = guard.wrapping_add(1);
+        self.cond.notify_all();
+    }
+
+    fn wait_timeout(&self, seen: u64, timeout: Duration) -> u64 {
+        let guard = self.seq.lock().unwrap_or_else(|p| p.into_inner());
+        if *guard != seen || timeout.is_zero() {
+            return *guard;
+        }
+        let (guard, _) = self
+            .cond
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|p| p.into_inner());
+        *guard
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActorLifecycleHooks {
+    exit_notify_tx: Option<Sender<SessionId>>,
+    state_signal: Option<Arc<SessionStateSignal>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActorWaitProbe {
+    exited: bool,
+    output_seq: u64,
+    last_activity_ms: u64,
+    confirmation_prompt: Option<String>,
+    has_active_turn: bool,
+    visible_rows: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,6 +566,15 @@ pub struct SessionManager {
     /// Guards [`Self::start_activity_persistence`] so a second call cannot spawn a
     /// second flush thread, both racing to rewrite the same manifest.
     activity_persistence_started: AtomicBool,
+    /// Per-session pending approval reason recorded when the judge asks for confirmation.
+    pending_approvals: Mutex<HashMap<SessionId, String>>,
+    /// Exited child notifications sent by actors when PTY output closes or exits.
+    exit_notify_tx: Sender<SessionId>,
+    exit_notify_rx: Mutex<Receiver<SessionId>>,
+    lifecycle_monitor_started: AtomicBool,
+    processed_exit_events: Mutex<HashSet<SessionId>>,
+    shutdown_initiated_ids: Mutex<HashSet<SessionId>>,
+    state_signal: Arc<SessionStateSignal>,
     _compression_worker: Arc<crate::storage::CompressionWorker>,
 }
 
@@ -734,6 +822,10 @@ struct PersistedSession {
     /// for manifests written before this field existed.
     #[serde(default)]
     agent: Option<AgentAttachment>,
+    #[serde(default)]
+    parent_session_id: Option<SessionId>,
+    #[serde(default)]
+    outlive_parent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -743,6 +835,8 @@ struct PersistedSessionLaunch {
     cwd: Option<PathBuf>,
     size: SessionSize,
     log_path: PathBuf,
+    parent_session_id: Option<SessionId>,
+    outlive_parent: bool,
 }
 
 impl From<&SessionConfig> for PersistedSessionLaunch {
@@ -753,6 +847,8 @@ impl From<&SessionConfig> for PersistedSessionLaunch {
             cwd: config.cwd.clone(),
             size: config.size.clone(),
             log_path: config.log_path.clone(),
+            parent_session_id: None,
+            outlive_parent: false,
         }
     }
 }
@@ -775,6 +871,8 @@ impl PersistedSessionLaunch {
             // Baseline carries no agent; callers (`ManagedSession::persisted`
             // and `demote_exited_session`) populate it when applicable.
             agent: None,
+            parent_session_id: self.parent_session_id,
+            outlive_parent: self.outlive_parent,
         }
     }
 }
@@ -802,6 +900,7 @@ impl SessionManager {
             };
         #[cfg(test)]
         let (require_pairing, tailscale_pair_users) = (true, Vec::new());
+        let (exit_notify_tx, exit_notify_rx) = mpsc::channel();
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
@@ -843,6 +942,13 @@ impl SessionManager {
             session_shutdowns_in_flight: AtomicU64::new(0),
             session_lifecycle_ids: Mutex::new(HashSet::new()),
             activity_persistence_started: AtomicBool::new(false),
+            pending_approvals: Mutex::new(HashMap::new()),
+            exit_notify_tx,
+            exit_notify_rx: Mutex::new(exit_notify_rx),
+            lifecycle_monitor_started: AtomicBool::new(false),
+            processed_exit_events: Mutex::new(HashSet::new()),
+            shutdown_initiated_ids: Mutex::new(HashSet::new()),
+            state_signal: Arc::new(SessionStateSignal::default()),
             _compression_worker: compression_worker,
         }
     }
@@ -1295,8 +1401,8 @@ impl SessionManager {
         snapshot
     }
 
-    /// Applies every manager-side overlay (snippet, agent) to an
-    /// actor-built snapshot. Snapshot-returning endpoints use this rather
+    /// Applies every manager-side overlay (snippet, agent, lifecycle, approval)
+    /// to an actor-built snapshot. Snapshot-returning endpoints use this rather
     /// than chaining the single overlays, so a new overlaid field cannot
     /// silently miss a path.
     fn overlay_manager_fields(
@@ -1305,7 +1411,236 @@ impl SessionManager {
         session_id: &SessionId,
     ) -> SessionSnapshot {
         let snapshot = self.overlay_snippet(snapshot, session_id);
-        self.overlay_agent(snapshot, session_id)
+        let mut snapshot = self.overlay_agent(snapshot, session_id);
+        let (parent_session_id, outlive_parent) = self.lineage_for(session_id);
+        snapshot.parent_session_id = parent_session_id;
+        snapshot.outlive_parent = outlive_parent;
+        let approval_reason = self.pending_approval_reason_for(session_id, &snapshot.visible_rows);
+        snapshot.pending_approval = approval_reason.is_some();
+        snapshot.pending_approval_reason = approval_reason;
+        snapshot
+    }
+
+    fn lineage_for(&self, session_id: &SessionId) -> (Option<SessionId>, bool) {
+        let Ok(sessions) = self.sessions() else {
+            return (None, false);
+        };
+        match sessions.get(session_id) {
+            Some(ManagedSession::Live { launch, .. }) => {
+                (launch.parent_session_id.clone(), launch.outlive_parent)
+            }
+            Some(ManagedSession::Historical { session, .. })
+            | Some(ManagedSession::Restoring { session, .. }) => (
+                session.persisted.parent_session_id.clone(),
+                session.persisted.outlive_parent,
+            ),
+            None => (None, false),
+        }
+    }
+
+    fn pending_approval_reason_for(
+        &self,
+        session_id: &SessionId,
+        visible_rows: &[String],
+    ) -> Option<String> {
+        if let Some(reason) = self
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned()
+        {
+            return Some(reason);
+        }
+        detect_confirmation_prompt(visible_rows)
+    }
+
+    pub fn start_lifecycle_monitor(self: &Arc<Self>) {
+        if self
+            .lifecycle_monitor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let signal = Arc::clone(&self.state_signal);
+        if let Err(error) = thread::Builder::new()
+            .name("triage-lifecycle-monitor".into())
+            .spawn(move || {
+                let mut seen = signal.current();
+                loop {
+                    let Some(manager) = weak.upgrade() else {
+                        return;
+                    };
+                    manager.process_exit_notifications();
+                    drop(manager);
+                    seen = signal.wait_timeout(seen, WAIT_POLL_SLICE);
+                }
+            })
+        {
+            self.lifecycle_monitor_started
+                .store(false, Ordering::Release);
+            tracing::error!(%error, "failed to spawn lifecycle-monitor thread");
+        }
+    }
+
+    fn send_parent_alert(&self, parent_id: &SessionId, child_id: &SessionId, body: String) {
+        let _ = self.send_session_message_with_options(
+            SendSessionMessageRequest::new(child_id.clone(), parent_id.clone(), body)
+                .with_wake(true),
+        );
+    }
+
+    fn clear_pending_approval(&self, session_id: &SessionId) {
+        let removed = self
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(session_id)
+            .is_some();
+        if let Ok(sessions) = self.sessions()
+            && let Some(ManagedSession::Live { actor, .. }) = sessions.get(session_id)
+        {
+            actor.lifecycle.set_judge_pending_approval(false);
+        }
+        if removed {
+            self.state_signal.notify();
+        }
+    }
+
+    fn record_pending_approval(&self, session_id: &SessionId, reason: String) {
+        let newly_blocked = {
+            let mut approvals = self
+                .pending_approvals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let was_present = approvals.contains_key(session_id);
+            approvals.insert(session_id.clone(), reason.clone());
+            !was_present
+        };
+        if let Ok(sessions) = self.sessions()
+            && let Some(ManagedSession::Live { actor, .. }) = sessions.get(session_id)
+        {
+            actor.lifecycle.set_judge_pending_approval(true);
+        }
+        self.state_signal.notify();
+        if newly_blocked && let (Some(parent_id), _) = self.lineage_for(session_id) {
+            self.send_parent_alert(
+                &parent_id,
+                session_id,
+                format!("[worker blocked] {session_id} awaiting approval: {reason}"),
+            );
+        }
+    }
+
+    fn cascade_shutdown_children(&self, parent_id: &SessionId) {
+        let child_ids: Vec<SessionId> = {
+            let Ok(sessions) = self.sessions() else {
+                return;
+            };
+            let mut ids: Vec<SessionId> = sessions
+                .iter()
+                .filter_map(|(id, managed)| match managed {
+                    ManagedSession::Live { launch, .. }
+                        if launch.parent_session_id.as_ref() == Some(parent_id)
+                            && !launch.outlive_parent =>
+                    {
+                        Some(id.clone())
+                    }
+                    ManagedSession::Restoring { session, .. }
+                        if session.persisted.parent_session_id.as_ref() == Some(parent_id)
+                            && !session.persisted.outlive_parent =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            ids.sort_by(|left, right| session_sort_key(left).cmp(&session_sort_key(right)));
+            ids
+        };
+        for child_id in child_ids {
+            if let Err(error) = self.shutdown_session(child_id.clone()) {
+                tracing::debug!(
+                    parent_id = %parent_id,
+                    child_id = %child_id,
+                    error = ?error,
+                    "failed cascading shutdown to child session"
+                );
+            }
+        }
+    }
+
+    fn process_exit_notifications(&self) {
+        let exited_ids: Vec<SessionId> = {
+            let Ok(rx) = self.exit_notify_rx.lock() else {
+                return;
+            };
+            let mut ids = Vec::new();
+            while let Ok(id) = rx.try_recv() {
+                ids.push(id);
+            }
+            ids
+        };
+        if exited_ids.is_empty() {
+            return;
+        }
+        for exited_id in exited_ids {
+            {
+                let mut processed = self
+                    .processed_exit_events
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if !processed.insert(exited_id.clone()) {
+                    continue;
+                }
+            }
+            let was_shutdown = self
+                .shutdown_initiated_ids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&exited_id);
+            let (parent_id, actor_tx) = {
+                let Ok(sessions) = self.sessions() else {
+                    continue;
+                };
+                match sessions.get(&exited_id) {
+                    Some(ManagedSession::Live { actor, launch, .. }) => {
+                        (launch.parent_session_id.clone(), Some(actor.tx.clone()))
+                    }
+                    Some(ManagedSession::Historical { session, .. })
+                    | Some(ManagedSession::Restoring { session, .. }) => {
+                        (session.persisted.parent_session_id.clone(), None)
+                    }
+                    None => (None, None),
+                }
+            };
+            self.clear_pending_approval(&exited_id);
+            if !was_shutdown && let Some(parent_id) = parent_id {
+                let tail = actor_tx
+                    .and_then(|tx| request_summary_rows(&tx).ok())
+                    .and_then(|(rows, _, _, _)| {
+                        rows.into_iter()
+                            .rev()
+                            .map(|row| row.trim().to_string())
+                            .find(|row| !row.is_empty())
+                    });
+                let body = match tail {
+                    Some(line) => format!("[worker exited] {exited_id} exited ({line})"),
+                    None => format!("[worker exited] {exited_id} exited"),
+                };
+                self.send_parent_alert(&parent_id, &exited_id, body);
+            }
+            self.cascade_shutdown_children(&exited_id);
+        }
+    }
+
+    fn actor_lifecycle_hooks(&self) -> ActorLifecycleHooks {
+        ActorLifecycleHooks {
+            exit_notify_tx: Some(self.exit_notify_tx.clone()),
+            state_signal: Some(Arc::clone(&self.state_signal)),
+        }
     }
 
     /// Registers a connection-wide push channel. The returned receiver is
@@ -1537,6 +1872,23 @@ impl SessionManager {
             reason = %verdict.reason,
             "judged agent tool call"
         );
+
+        match verdict.decision {
+            JudgeDecision::Ask => {
+                // Only record as a blocking approval when the judge is actively
+                // enabled on this session; when judging is disabled or off,
+                // screen confirmation prompt detection handles prompts directly.
+                if verdict.source != JudgeSource::Fallback
+                    || (!verdict.reason.starts_with("judging is disabled")
+                        && !verdict.reason.starts_with("judging is off"))
+                {
+                    self.record_pending_approval(&request.session_id, verdict.reason.clone());
+                }
+            }
+            JudgeDecision::Allow | JudgeDecision::Deny => {
+                self.clear_pending_approval(&request.session_id);
+            }
+        }
 
         verdict
     }
@@ -2346,6 +2698,10 @@ impl SessionManager {
             snippet: None,
             snippet_detail: None,
             agent: None,
+            parent_session_id: None,
+            outlive_parent: false,
+            pending_approval: false,
+            pending_approval_reason: None,
         };
         let mut overlaid = overlay_raw_output_history(
             base,
@@ -3017,6 +3373,8 @@ impl SessionManager {
                 parked_input,
                 agent,
                 terminal_modes: ext.terminal_modes,
+                parent_session_id: launch.parent_session_id,
+                outlive_parent: launch.outlive_parent,
             });
         }
 
@@ -3540,6 +3898,8 @@ impl SessionManager {
             cwd: h_sess.cwd.clone(),
             size: runtime.size.clone(),
             log_path: runtime.output.log_path.clone(),
+            parent_session_id: h_sess.parent_session_id.clone(),
+            outlive_parent: h_sess.outlive_parent,
         };
 
         let event_session_id = Some(h_sess.id.clone());
@@ -3548,6 +3908,9 @@ impl SessionManager {
         let agent_update_tx = self.agent_update_tx();
         let agent_tracking = agent_update_tx.is_some();
         let global_senders = Some(self.global_senders());
+        let lifecycle_hooks = self.actor_lifecycle_hooks();
+        let lifecycle = Arc::new(ActorLifecycleShared::default());
+        let actor_lifecycle = Arc::clone(&lifecycle);
 
         let PtyRuntime {
             master,
@@ -3635,6 +3998,9 @@ impl SessionManager {
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
+                    lifecycle: actor_lifecycle,
+                    exit_notify_tx: lifecycle_hooks.exit_notify_tx,
+                    state_signal: lifecycle_hooks.state_signal,
                 };
                 run_actor(state, command_rx, output_rx);
             })
@@ -3656,6 +4022,7 @@ impl SessionManager {
             writer: Some(writer_handle),
             last_activity_ms,
             last_input_ms,
+            lifecycle,
         };
 
         sessions.insert(
@@ -4156,6 +4523,11 @@ impl Drop for SessionShutdownGuard<'_> {
             .session_shutdowns_in_flight
             .fetch_sub(1, Ordering::AcqRel);
         self.manager
+            .shutdown_initiated_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+        self.manager
             .session_lifecycle_ids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4233,6 +4605,15 @@ impl SessionApi for SessionManager {
             bail!("a handover is in progress; try again once the daemon swap completes");
         }
         request.validate()?;
+        let parent_session_id = request.parent_session_id;
+        let outlive_parent = request.outlive_parent;
+        if let Some(parent_id) = parent_session_id.as_ref() {
+            let sessions = self.sessions()?;
+            ensure!(
+                matches!(sessions.get(parent_id), Some(ManagedSession::Live { .. })),
+                "parent session {parent_id} not found or not live"
+            );
+        }
         fs::create_dir_all(&self.config.log_dir).with_context(|| {
             format!("creating session log dir {}", self.config.log_dir.display())
         })?;
@@ -4247,11 +4628,13 @@ impl SessionApi for SessionManager {
             log_path,
             session_id: Some(session_id.clone()),
         };
-        let launch = PersistedSessionLaunch::from(&config);
+        let mut launch = PersistedSessionLaunch::from(&config);
+        launch.parent_session_id = parent_session_id;
+        launch.outlive_parent = outlive_parent;
         let last_known_cwd = launch.cwd.clone().or_else(|| std::env::current_dir().ok());
         let agent_update_tx = self.agent_update_tx();
         let agent_tracking = agent_update_tx.is_some();
-        let actor = SessionActor::spawn_managed(
+        let actor = SessionActor::spawn_managed_with_lifecycle(
             config,
             session_id.clone(),
             self.dirty_tx(),
@@ -4259,6 +4642,7 @@ impl SessionApi for SessionManager {
             agent_update_tx,
             Some(self.global_senders()),
             self.compression_tx(),
+            self.actor_lifecycle_hooks(),
         )?;
         let actor_tx = actor.tx.clone();
         let last_activity_ms = actor.last_activity_ms();
@@ -4339,6 +4723,7 @@ impl SessionApi for SessionManager {
             last_activity_ms,
             last_input_ms,
         });
+        self.state_signal.notify();
         Ok(session_id)
     }
 
@@ -4492,7 +4877,7 @@ impl SessionApi for SessionManager {
         // The write can block indefinitely on a child that has stopped
         // reading, and holding the manager mutex across it takes the whole daemon
         // down with that one session. See `request_write_input`.
-        let cmd_tx = {
+        let (cmd_tx, is_agent_controller, lifecycle) = {
             let sessions = self.sessions()?;
             let session = sessions
                 .get(&request.session_id)
@@ -4526,9 +4911,50 @@ impl SessionApi for SessionManager {
                 self.park_denied_input(&request.session_id, &request.client_id, request.bytes);
                 bail!(message);
             }
-            actor.tx.clone()
+            let is_agent_controller = lease
+                .holder
+                .as_ref()
+                .is_some_and(|holder| holder.kind == InputControllerKind::Agent);
+            (
+                actor.tx.clone(),
+                is_agent_controller,
+                Arc::clone(&actor.lifecycle),
+            )
         };
-        request_write_input(&cmd_tx, request.bytes)
+        if is_agent_controller {
+            let now_ms = now_unix_millis();
+            if lifecycle.has_active_human_draft(now_ms) {
+                bail!(
+                    "session {} has an unsubmitted human draft; refusing automated input",
+                    request.session_id
+                );
+            }
+            if lifecycle.has_judge_pending_approval()
+                || self
+                    .pending_approvals
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&request.session_id)
+            {
+                bail!(
+                    "session {} is awaiting approval; refusing automated input",
+                    request.session_id
+                );
+            }
+            if let Ok(probe) = request_wait_probe(&cmd_tx)
+                && probe.confirmation_prompt.is_some()
+            {
+                bail!(
+                    "session {} is showing a confirmation prompt; refusing automated input",
+                    request.session_id
+                );
+            }
+            return request_write_input(&cmd_tx, request.bytes);
+        }
+        if input_clears_pending_approval(&request.bytes) {
+            self.clear_pending_approval(&request.session_id);
+        }
+        request_write_human_input(&cmd_tx, request.bytes)
     }
 
     fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
@@ -4646,6 +5072,8 @@ impl SessionApi for SessionManager {
             cwd: shell_config.cwd.clone(),
             size: request.size.clone(),
             log_path: persisted.log_path.clone(),
+            parent_session_id: persisted.parent_session_id.clone(),
+            outlive_parent: persisted.outlive_parent,
         };
         let last_known_cwd = launch.cwd.clone();
         // The manifest's stamp, handed to the spawn rather than stored after it:
@@ -4690,7 +5118,7 @@ impl SessionApi for SessionManager {
         let agent_tracking = agent_update_tx.is_some();
         for (index, config) in spawn_configs.into_iter().enumerate() {
             let attempt_command = config.command.clone();
-            match SessionActor::spawn_restored(
+            match SessionActor::spawn_restored_with_lifecycle(
                 config,
                 request.session_id.clone(),
                 restored_activity_ms,
@@ -4705,6 +5133,7 @@ impl SessionApi for SessionManager {
                 agent_update_tx.clone(),
                 Some(self.global_senders()),
                 self.compression_tx(),
+                self.actor_lifecycle_hooks(),
             ) {
                 Ok(spawned) => {
                     actor = Some(spawned);
@@ -4860,6 +5289,12 @@ impl SessionApi for SessionManager {
             return Err(error);
         }
         drop(sessions);
+        self.processed_exit_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&request.session_id);
+        self.clear_pending_approval(&request.session_id);
+        self.state_signal.notify();
 
         Ok(self.overlay_manager_fields(snapshot, &request.session_id))
     }
@@ -4928,6 +5363,7 @@ impl SessionApi for SessionManager {
                 Instant::now().saturating_duration_since(last) < WAKE_NUDGE_COOLDOWN
             });
             self.inbox_signal.notify_all();
+            self.state_signal.notify();
             (id, has_active_waiters, cooldown_active)
         };
 
@@ -4955,6 +5391,7 @@ impl SessionApi for SessionManager {
     }
 
     fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
+        self.process_exit_notifications();
         self.require_known_session(&session_id)?;
         let mut inboxes = self.inboxes()?;
         let Some(inbox) = inboxes.get_mut(&session_id) else {
@@ -5044,6 +5481,218 @@ impl SessionApi for SessionManager {
         }
     }
 
+    fn wait_for_sessions(
+        &self,
+        request: WaitForSessionsRequest,
+    ) -> Result<WaitForSessionsResponse> {
+        ensure!(
+            !request.session_ids.is_empty(),
+            "wait_for_sessions requires at least one session_id"
+        );
+        ensure!(
+            request.timeout_ms <= SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
+            "wait_for_sessions timeout_ms exceeds {SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS} ms"
+        );
+        for session_id in &request.session_ids {
+            self.require_known_session(session_id)?;
+        }
+        if let Some(inbox_session_id) = request.for_inbox_session_id.as_ref() {
+            self.require_known_session(inbox_session_id)?;
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+        let mut seen_seq = self.state_signal.current();
+
+        loop {
+            self.process_exit_notifications();
+            let now_ms = now_unix_millis();
+
+            enum TargetState {
+                Live(Sender<ActorCommand>),
+                Historical { snippet: Option<String> },
+                Restoring,
+            }
+
+            let targets: Vec<(SessionId, TargetState)> = {
+                let sessions = self.sessions()?;
+                request
+                    .session_ids
+                    .iter()
+                    .map(|session_id| {
+                        let target = match sessions.get(session_id) {
+                            Some(ManagedSession::Live { actor, .. }) => {
+                                TargetState::Live(actor.tx.clone())
+                            }
+                            Some(ManagedSession::Historical { .. }) => TargetState::Historical {
+                                snippet: self.snippet_for(session_id).0,
+                            },
+                            Some(ManagedSession::Restoring { .. }) => TargetState::Restoring,
+                            None => TargetState::Historical { snippet: None },
+                        };
+                        (session_id.clone(), target)
+                    })
+                    .collect()
+            };
+
+            let mut statuses = Vec::with_capacity(targets.len());
+            let mut ready_sessions = Vec::new();
+            let mut shortest_idle_remaining: Option<Duration> = None;
+
+            for (session_id, target) in targets {
+                let snippet = self.snippet_for(&session_id).0;
+                match target {
+                    TargetState::Historical {
+                        snippet: hist_snippet,
+                    } => {
+                        let status = WaitedSessionStatus {
+                            session_id,
+                            outcome: SessionWaitOutcome::Exited,
+                            exited: true,
+                            pending_approval: false,
+                            pending_approval_reason: None,
+                            quiet_ms: 0,
+                            output_seq: 0,
+                            snippet: hist_snippet.or(snippet),
+                        };
+                        ready_sessions.push(status.clone());
+                        statuses.push(status);
+                    }
+                    TargetState::Restoring => {
+                        statuses.push(WaitedSessionStatus {
+                            session_id,
+                            outcome: SessionWaitOutcome::Running,
+                            exited: false,
+                            pending_approval: false,
+                            pending_approval_reason: None,
+                            quiet_ms: 0,
+                            output_seq: 0,
+                            snippet,
+                        });
+                    }
+                    TargetState::Live(tx) => {
+                        let probe = request_wait_probe(&tx);
+                        match probe {
+                            Ok(probe) => {
+                                let quiet_ms = if probe.last_activity_ms == 0 {
+                                    u64::MAX
+                                } else {
+                                    now_ms.saturating_sub(probe.last_activity_ms)
+                                };
+                                let approval_reason = self
+                                    .pending_approval_reason_for(&session_id, &probe.visible_rows);
+                                let pending_approval = approval_reason.is_some();
+                                let matched_output = request
+                                    .output_contains
+                                    .as_deref()
+                                    .filter(|needle| !needle.is_empty())
+                                    .is_some_and(|needle| {
+                                        probe.visible_rows.iter().any(|row| row.contains(needle))
+                                    });
+                                let is_idle = request.idle_ms > 0
+                                    && probe.output_seq > 0
+                                    && !probe.has_active_turn
+                                    && quiet_ms >= request.idle_ms;
+
+                                let (outcome, ready) = if probe.exited {
+                                    (SessionWaitOutcome::Exited, true)
+                                } else if pending_approval {
+                                    (SessionWaitOutcome::Blocked, true)
+                                } else if matched_output {
+                                    (SessionWaitOutcome::MatchedOutput, true)
+                                } else if is_idle {
+                                    (SessionWaitOutcome::Idle, true)
+                                } else {
+                                    if request.idle_ms > 0
+                                        && probe.output_seq > 0
+                                        && !probe.has_active_turn
+                                    {
+                                        let rem = Duration::from_millis(
+                                            request.idle_ms.saturating_sub(quiet_ms).max(1),
+                                        );
+                                        shortest_idle_remaining = Some(
+                                            shortest_idle_remaining
+                                                .map_or(rem, |prev| prev.min(rem)),
+                                        );
+                                    }
+                                    (SessionWaitOutcome::Running, false)
+                                };
+                                let status = WaitedSessionStatus {
+                                    session_id,
+                                    outcome,
+                                    exited: probe.exited,
+                                    pending_approval,
+                                    pending_approval_reason: approval_reason,
+                                    quiet_ms,
+                                    output_seq: probe.output_seq,
+                                    snippet,
+                                };
+                                if ready {
+                                    ready_sessions.push(status.clone());
+                                }
+                                statuses.push(status);
+                            }
+                            Err(_) => {
+                                let status = WaitedSessionStatus {
+                                    session_id,
+                                    outcome: SessionWaitOutcome::Exited,
+                                    exited: true,
+                                    pending_approval: false,
+                                    pending_approval_reason: None,
+                                    quiet_ms: 0,
+                                    output_seq: 0,
+                                    snippet,
+                                };
+                                ready_sessions.push(status.clone());
+                                statuses.push(status);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let inbox_messages =
+                if let Some(inbox_session_id) = request.for_inbox_session_id.as_ref() {
+                    let inboxes = self.inboxes()?;
+                    if let Some(inbox) = inboxes.get(inbox_session_id)
+                        && !inbox.removed
+                        && !inbox.messages.is_empty()
+                    {
+                        inbox.messages.iter().cloned().collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+            let interrupted_by_inbox = !inbox_messages.is_empty();
+
+            let satisfied = match request.mode {
+                WaitForSessionsMode::Any => !ready_sessions.is_empty(),
+                WaitForSessionsMode::All => ready_sessions.len() == request.session_ids.len(),
+            };
+
+            if interrupted_by_inbox
+                || satisfied
+                || request.timeout_ms == 0
+                || Instant::now() >= deadline
+            {
+                return Ok(WaitForSessionsResponse {
+                    timed_out: !interrupted_by_inbox && !satisfied,
+                    interrupted_by_inbox,
+                    ready_sessions,
+                    sessions: statuses,
+                    inbox_messages,
+                });
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_slice = shortest_idle_remaining
+                .map_or(WAIT_POLL_SLICE, |rem| rem.min(WAIT_POLL_SLICE))
+                .min(remaining);
+            seen_seq = self.state_signal.wait_timeout(seen_seq, wait_slice);
+        }
+    }
+
     fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
         self.require_known_session(&session_id)?;
         let mut inboxes = self.inboxes()?;
@@ -5087,6 +5736,10 @@ impl SessionApi for SessionManager {
             !self.session_awaits_adoption(&session_id),
             "session {session_id} is awaiting inherited PTY adoption"
         );
+        self.shutdown_initiated_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.clone());
 
         enum ShutdownTarget {
             Live {
@@ -5233,6 +5886,11 @@ impl SessionApi for SessionManager {
 
         self.forget_snippet(&session_id);
         self.forget_judge_override(&session_id);
+        self.clear_pending_approval(&session_id);
+        self.processed_exit_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
         self.forget_inbox(&session_id);
         self.forget_parked_input(&session_id);
         self.forget_custom_label(&session_id);
@@ -5240,6 +5898,8 @@ impl SessionApi for SessionManager {
         // A session removed from the manifest can never be restored, so its log
         // is unreachable from here on and would otherwise leak forever.
         remove_session_log(&session_id, &log_path);
+        self.cascade_shutdown_children(&session_id);
+        self.state_signal.notify();
         self.broadcast_global(ServerMessage::SessionTerminated {
             session_id: session_id.clone(),
         });
@@ -6887,6 +7547,51 @@ fn is_mouse_motion_only_sequence(bytes: &[u8]) -> bool {
     parse_mouse_reports(bytes) == Some(true)
 }
 
+fn detect_confirmation_prompt(rows: &[String]) -> Option<String> {
+    for trimmed in rows
+        .iter()
+        .rev()
+        .map(|row| row.trim())
+        .filter(|row| !row.is_empty())
+        .take(6)
+    {
+        let lower = trimmed.to_ascii_lowercase();
+        let is_yes_no = lower.contains("[y/n]")
+            || lower.contains("[y/n?")
+            || lower.contains("(y/n)")
+            || lower.contains("[yes/no]")
+            || lower.contains("(yes/no)");
+        let is_approval_phrase = lower.contains("do you want to proceed")
+            || lower.contains("do you want to continue")
+            || lower.contains("do you want to run")
+            || lower.contains("do you want to allow")
+            || lower.contains("allow once")
+            || lower.contains("yes, allow")
+            || lower.contains("yes, and don't ask again")
+            || lower.contains("approve this")
+            || lower.contains("waiting for approval")
+            || lower.contains("press enter to confirm");
+        if is_yes_no || is_approval_phrase {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn input_clears_human_draft(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|&b| matches!(b, b'\r' | b'\n' | 0x03 | 0x04 | 0x15))
+}
+
+fn input_clears_pending_approval(bytes: &[u8]) -> bool {
+    input_clears_human_draft(bytes)
+        || matches!(
+            bytes.trim_ascii(),
+            [b'y' | b'Y' | b'n' | b'N' | b'a' | b'A' | b'1'..=b'9' | 0x1b]
+        )
+}
+
 fn has_active_turn_indicator(rows: &[String]) -> bool {
     rows.iter().any(|row| {
         let lower = row.to_ascii_lowercase();
@@ -7290,10 +7995,13 @@ impl SessionActor {
             None,
             None,
             None,
+            ActorLifecycleHooks::default(),
             LogInitialization::Truncate,
         )
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn spawn_managed(
         config: SessionConfig,
         session_id: SessionId,
@@ -7302,6 +8010,29 @@ impl SessionActor {
         agent_update_tx: Option<AgentUpdateSender>,
         global_senders: Option<GlobalSenders>,
         compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
+    ) -> Result<Self> {
+        Self::spawn_managed_with_lifecycle(
+            config,
+            session_id,
+            dirty_tx,
+            cwd_update_tx,
+            agent_update_tx,
+            global_senders,
+            compression_tx,
+            ActorLifecycleHooks::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_managed_with_lifecycle(
+        config: SessionConfig,
+        session_id: SessionId,
+        dirty_tx: Option<DirtySender>,
+        cwd_update_tx: Option<CwdUpdateSender>,
+        agent_update_tx: Option<AgentUpdateSender>,
+        global_senders: Option<GlobalSenders>,
+        compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
+        lifecycle_hooks: ActorLifecycleHooks,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
@@ -7314,6 +8045,7 @@ impl SessionActor {
             agent_update_tx,
             global_senders,
             compression_tx,
+            lifecycle_hooks,
             LogInitialization::Truncate,
         )
     }
@@ -7325,7 +8057,7 @@ impl SessionActor {
     /// fact loses that race and re-stamps the session to "now", which is the
     /// collapse the seed exists to prevent.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_restored(
+    fn spawn_restored_with_lifecycle(
         config: SessionConfig,
         session_id: SessionId,
         initial_activity_ms: Option<u64>,
@@ -7336,6 +8068,7 @@ impl SessionActor {
         agent_update_tx: Option<AgentUpdateSender>,
         global_senders: Option<GlobalSenders>,
         compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
+        lifecycle_hooks: ActorLifecycleHooks,
     ) -> Result<Self> {
         Self::spawn_with_events(
             config,
@@ -7348,6 +8081,7 @@ impl SessionActor {
             agent_update_tx,
             global_senders,
             compression_tx,
+            lifecycle_hooks,
             LogInitialization::ReplayExisting,
         )
     }
@@ -7364,6 +8098,7 @@ impl SessionActor {
         agent_update_tx: Option<AgentUpdateSender>,
         global_senders: Option<GlobalSenders>,
         compression_tx: Option<Sender<crate::storage::WorkerMessage>>,
+        lifecycle_hooks: ActorLifecycleHooks,
         log_initialization: LogInitialization,
     ) -> Result<Self> {
         let initial_working_directory = config.cwd.clone().or_else(|| std::env::current_dir().ok());
@@ -7401,6 +8136,8 @@ impl SessionActor {
         // truth, not a bucket to avoid.
         let last_input_ms = Arc::new(AtomicU64::new(initial_input_ms.unwrap_or(0)));
         let actor_last_input_ms = Arc::clone(&last_input_ms);
+        let lifecycle = Arc::new(ActorLifecycleShared::default());
+        let actor_lifecycle = Arc::clone(&lifecycle);
         let reader = thread::Builder::new()
             .name("session-actor-reader".into())
             .spawn(move || read_pty_output(reader, output_tx))
@@ -7438,6 +8175,9 @@ impl SessionActor {
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
                     next_event_seq: 1,
+                    lifecycle: actor_lifecycle,
+                    exit_notify_tx: lifecycle_hooks.exit_notify_tx,
+                    state_signal: lifecycle_hooks.state_signal,
                 };
                 run_actor(state, command_rx, output_rx);
             })
@@ -7450,6 +8190,7 @@ impl SessionActor {
             writer: Some(writer_handle),
             last_activity_ms,
             last_input_ms,
+            lifecycle,
         })
     }
 
@@ -7634,6 +8375,9 @@ struct ActorState {
     subscribers: Vec<EventSubscriber>,
     event_log: VecDeque<SessionEventEnvelope>,
     next_event_seq: u64,
+    lifecycle: Arc<ActorLifecycleShared>,
+    exit_notify_tx: Option<Sender<SessionId>>,
+    state_signal: Option<Arc<SessionStateSignal>>,
 }
 
 struct EventSubscriber {
@@ -7759,8 +8503,14 @@ enum ActorCommand {
     WriteInput {
         bytes: Vec<u8>,
     },
+    WriteHumanInput {
+        bytes: Vec<u8>,
+    },
     WakeForInbox {
         response: Sender<bool>,
+    },
+    WaitProbe {
+        response: Sender<ActorResult<ActorWaitProbe>>,
     },
     Resize {
         size: SessionSize,
@@ -8356,6 +9106,7 @@ impl ActorState {
                         });
                     }
                     self.reset_stale_mouse_tracking_after_output(&bytes);
+                    self.notify_state_signal();
                 }
                 Err(error) => tracing::warn!(error = ?error, "failed to ingest PTY output"),
             },
@@ -8381,11 +9132,19 @@ impl ActorState {
     ) -> bool {
         match command {
             ActorCommand::WriteInput { bytes } => {
-                self.write_input(bytes);
+                self.write_input(bytes, false);
+                false
+            }
+            ActorCommand::WriteHumanInput { bytes } => {
+                self.write_input(bytes, true);
                 false
             }
             ActorCommand::WakeForInbox { response } => {
                 let _ = response.send(self.wake_for_inbox());
+                false
+            }
+            ActorCommand::WaitProbe { response } => {
+                let _ = response.send(Ok(self.wait_probe()));
                 false
             }
             ActorCommand::Resize { size, response } => {
@@ -8536,7 +9295,7 @@ impl ActorState {
         }
     }
 
-    fn write_input(&mut self, bytes: Vec<u8>) {
+    fn write_input(&mut self, bytes: Vec<u8>, is_human: bool) {
         if self.exited {
             return;
         }
@@ -8558,8 +9317,20 @@ impl ActorState {
         // write still means the user was here. Passive mouse hover motion does
         // not count as deliberate user input recency.
         if !is_hover_motion {
-            self.last_input_ms
-                .store(now_unix_millis(), Ordering::Relaxed);
+            let now_ms = now_unix_millis();
+            self.last_input_ms.store(now_ms, Ordering::Relaxed);
+            if is_human {
+                if input_clears_human_draft(&bytes) {
+                    self.lifecycle.draft_updated_ms.store(0, Ordering::Relaxed);
+                } else {
+                    self.lifecycle
+                        .draft_updated_ms
+                        .store(now_ms, Ordering::Relaxed);
+                }
+                if input_clears_pending_approval(&bytes) {
+                    self.lifecycle.set_judge_pending_approval(false);
+                }
+            }
         }
         if let Err(err) = self.writer_tx.try_send(bytes) {
             match err {
@@ -8587,7 +9358,15 @@ impl ActorState {
             return false;
         }
         let rows = visible_rows(&self.output.terminal);
+        if self.lifecycle.has_judge_pending_approval()
+            || detect_confirmation_prompt(&rows).is_some()
+        {
+            return false;
+        }
         let now_ms = now_unix_millis();
+        if self.lifecycle.has_active_human_draft(now_ms) {
+            return false;
+        }
         let last_activity = self.last_activity_ms.load(Ordering::Relaxed);
         let quiet_ms = if last_activity == 0 {
             u64::MAX
@@ -8601,6 +9380,24 @@ impl ActorState {
         self.writer_tx
             .try_send(WAKE_INBOX_PROMPT_TEXT.to_vec())
             .is_ok()
+    }
+
+    fn wait_probe(&self) -> ActorWaitProbe {
+        let rows = visible_rows(&self.output.terminal);
+        ActorWaitProbe {
+            exited: self.exited || self.output_closed,
+            output_seq: self.output.output_seq,
+            last_activity_ms: self.last_activity_ms.load(Ordering::Relaxed),
+            confirmation_prompt: detect_confirmation_prompt(&rows),
+            has_active_turn: has_active_turn_indicator(&rows),
+            visible_rows: rows,
+        }
+    }
+
+    fn notify_state_signal(&self) {
+        if let Some(signal) = &self.state_signal {
+            signal.notify();
+        }
     }
 
     fn resize(&mut self, size: SessionSize) -> Result<SessionSnapshot> {
@@ -8891,10 +9688,14 @@ impl ActorState {
         if let Some(session_id) = self.event_session_id.clone() {
             tracing::info!(session_id = %session_id, "session child is gone");
             self.broadcast(SessionEvent::Exited {
-                session_id,
+                session_id: session_id.clone(),
                 completed,
             });
+            if let Some(tx) = &self.exit_notify_tx {
+                let _ = tx.send(session_id);
+            }
         }
+        self.notify_state_signal();
         self.exit_broadcasted = true;
     }
 
@@ -11116,6 +11917,10 @@ fn snapshot_from_output(
         // Likewise populated by the manager from the live attachment (or the
         // persisted one for historical sessions); see `overlay_agent`.
         agent: None,
+        parent_session_id: None,
+        outlive_parent: false,
+        pending_approval: false,
+        pending_approval_reason: None,
     }
 }
 
@@ -11144,6 +11949,10 @@ fn metadata_snapshot_from_output(
         snippet: None,
         snippet_detail: None,
         agent: None,
+        parent_session_id: None,
+        outlive_parent: false,
+        pending_approval: false,
+        pending_approval_reason: None,
     }
 }
 
@@ -11878,6 +12687,18 @@ fn request_write_input(tx: &Sender<ActorCommand>, bytes: Vec<u8>) -> Result<()> 
         .context("sending session input command")
 }
 
+fn request_write_human_input(tx: &Sender<ActorCommand>, bytes: Vec<u8>) -> Result<()> {
+    tx.send(ActorCommand::WriteHumanInput { bytes })
+        .context("sending human session input command")
+}
+
+fn request_wait_probe(tx: &Sender<ActorCommand>) -> Result<ActorWaitProbe> {
+    let (resp_tx, resp_rx) = mpsc::channel();
+    tx.send(ActorCommand::WaitProbe { response: resp_tx })
+        .context("sending session wait probe command")?;
+    recv_actor_result(resp_rx, "probing session wait state")
+}
+
 /// Requests a resize via a cloned actor command channel. Same OFF-LOCK contract as
 /// [`request_summary_rows`].
 fn request_resize(tx: &Sender<ActorCommand>, size: SessionSize) -> Result<SessionSnapshot> {
@@ -12045,9 +12866,12 @@ fn reject_command_during_shutdown(command: ActorCommand) {
     let error = anyhow!("session is shutting down");
     match command {
         // No response channel to fail: dropping these is the whole rejection.
-        ActorCommand::WriteInput { .. } => {}
+        ActorCommand::WriteInput { .. } | ActorCommand::WriteHumanInput { .. } => {}
         ActorCommand::WakeForInbox { response, .. } => {
             let _ = response.send(false);
+        }
+        ActorCommand::WaitProbe { response } => {
+            let _ = response.send(Err(error));
         }
         #[cfg(unix)]
         ActorCommand::SetContext { .. } => {}
@@ -13458,6 +14282,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
 
         let mut master: libc::c_int = 0;
@@ -13618,6 +14444,8 @@ mod tests {
                         parked_input: Vec::new(),
                         agent: None,
                         terminal_modes: None,
+                        parent_session_id: None,
+                        outlive_parent: false,
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -14733,6 +15561,8 @@ mod tests {
                         parked_input: Vec::new(),
                         agent: None,
                         terminal_modes: None,
+                        parent_session_id: None,
+                        outlive_parent: false,
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -15787,6 +16617,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             }],
             ..Default::default()
         };
@@ -15880,6 +16712,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -16302,6 +17136,7 @@ mod tests {
                             writer: None,
                             last_activity_ms: Arc::new(AtomicU64::new(0)),
                             last_input_ms: Arc::new(AtomicU64::new(0)),
+                            lifecycle: Arc::default(),
                         },
                         lease: InputLeaseState::default(),
                         launch: PersistedSessionLaunch {
@@ -16310,6 +17145,8 @@ mod tests {
                             cwd: None,
                             size: SessionSize::default(),
                             log_path: log_dir.join(format!("{wedged_id}.log")),
+                            parent_session_id: None,
+                            outlive_parent: false,
                         },
                         last_known_cwd: None,
                         agent: None,
@@ -16812,6 +17649,7 @@ mod tests {
             writer: None,
             last_activity_ms: Arc::new(AtomicU64::new(0)),
             last_input_ms: Arc::new(AtomicU64::new(0)),
+            lifecycle: Arc::default(),
         };
 
         // Age the entry first: the restore must keep the original stamp,
@@ -17140,6 +17978,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -17362,6 +18202,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -17438,6 +18280,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -17502,6 +18346,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -17587,6 +18433,8 @@ mod tests {
                 last_activity_ms: persisted_activity_ms,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -17756,6 +18604,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -17807,6 +18657,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -17862,6 +18714,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -17912,6 +18766,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
@@ -18548,6 +19404,8 @@ mod tests {
                 ],
                 cwd: None,
                 size: SessionSize::default(),
+                parent_session_id: None,
+                outlive_parent: false,
             })
             .expect("start live session");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -20655,6 +21513,7 @@ mod tests {
                     writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
                     last_input_ms: Arc::new(AtomicU64::new(0)),
+                    lifecycle: Arc::default(),
                 },
                 lease,
                 launch: PersistedSessionLaunch {
@@ -20663,6 +21522,8 @@ mod tests {
                     cwd: None,
                     size: SessionSize::default(),
                     log_path: log_dir.join("session-stuck.log"),
+                    parent_session_id: None,
+                    outlive_parent: false,
                 },
                 last_known_cwd: None,
                 agent: None,
@@ -20687,8 +21548,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the writer should reach the actor's command channel");
         assert!(
-            matches!(command, ActorCommand::WriteInput { .. }),
-            "the writer should have sent a WriteInput command"
+            matches!(
+                command,
+                ActorCommand::WriteInput { .. } | ActorCommand::WriteHumanInput { .. }
+            ),
+            "the writer should have sent a write input command"
         );
 
         // Off-thread so a regression fails this test rather than hanging the suite
@@ -20780,6 +21644,7 @@ mod tests {
                         writer: None,
                         last_activity_ms: Arc::new(AtomicU64::new(0)),
                         last_input_ms: Arc::new(AtomicU64::new(0)),
+                        lifecycle: Arc::default(),
                     },
                     lease: InputLeaseState::default(),
                     launch: PersistedSessionLaunch {
@@ -20788,6 +21653,8 @@ mod tests {
                         cwd: None,
                         size: SessionSize::default(),
                         log_path: log_dir.join(format!("{name}.log")),
+                        parent_session_id: None,
+                        outlive_parent: false,
                     },
                     last_known_cwd: None,
                     agent: None,
@@ -20894,6 +21761,7 @@ mod tests {
                     writer: None,
                     last_activity_ms: Arc::new(AtomicU64::new(0)),
                     last_input_ms: Arc::new(AtomicU64::new(0)),
+                    lifecycle: Arc::default(),
                 },
                 lease: InputLeaseState::default(),
                 launch: PersistedSessionLaunch {
@@ -20902,6 +21770,8 @@ mod tests {
                     cwd: None,
                     size: SessionSize::default(),
                     log_path: PathBuf::from("unused.log"),
+                    parent_session_id: None,
+                    outlive_parent: false,
                 },
                 last_known_cwd: None,
                 agent: None,
@@ -21107,6 +21977,8 @@ mod tests {
                 args: vec!["-c".to_string(), "printf 'perm-test'; sleep 30".to_string()],
                 cwd: None,
                 size: SessionSize::default(),
+                parent_session_id: None,
+                outlive_parent: false,
             })
             .expect("start session");
 
@@ -21456,6 +22328,8 @@ mod tests {
                 last_activity_ms: 0,
                 last_input_ms: 0,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -21832,6 +22706,8 @@ mod tests {
                         parked_input: Vec::new(),
                         agent: None,
                         terminal_modes: None,
+                        parent_session_id: None,
+                        outlive_parent: false,
                     }],
                     has_tcp_listener: false,
                     sends_teardown_commit: true,
@@ -22470,6 +23346,9 @@ mod tests {
             subscribers: Vec::new(),
             event_log: VecDeque::new(),
             next_event_seq: 1,
+            lifecycle: Arc::default(),
+            exit_notify_tx: None,
+            state_signal: None,
         };
 
         // Prime the tracker so a subsequent unguarded poll detaches immediately:
@@ -22780,6 +23659,8 @@ mod tests {
             last_activity_ms: 0,
             last_input_ms: 0,
             agent: agent.then(test_attachment),
+            parent_session_id: None,
+            outlive_parent: false,
         };
         assert!(is_restorable_launch(&persisted("/bin/sh", false)));
         assert!(is_restorable_launch(&persisted("/bin/sh", true)));
@@ -22861,6 +23742,8 @@ mod tests {
                     exe_path: None,
                     last_seen_ms: 1,
                 }),
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -22948,6 +23831,8 @@ mod tests {
                     exe_path: Some(broken_exe),
                     last_seen_ms: 1,
                 }),
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -23035,6 +23920,8 @@ mod tests {
                     exe_path: Some(fail_exe),
                     last_seen_ms: 1,
                 }),
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -23131,6 +24018,8 @@ mod tests {
                     exe_path: Some(fail_exe),
                     last_seen_ms: 1,
                 }),
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -23238,6 +24127,8 @@ mod tests {
                     exe_path: Some(agent_exe),
                     last_seen_ms: 1,
                 }),
+                parent_session_id: None,
+                outlive_parent: false,
             },
         );
 
@@ -23371,6 +24262,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
 
         let mut master: libc::c_int = 0;
@@ -23499,6 +24392,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
 
         let mut master: libc::c_int = -1;
@@ -23741,6 +24636,8 @@ mod tests {
                 title: "Adopted TUI".into(),
                 ..Default::default()
             }),
+            parent_session_id: None,
+            outlive_parent: false,
         };
 
         let mut master: libc::c_int = -1;
@@ -24205,5 +25102,393 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_child_cascade_shutdown_respects_outlive_parent() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let parent = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start parent");
+        let mut ephemeral_req =
+            StartSessionRequest::new(long_running_shell_command()).with_parent(parent.clone());
+        ephemeral_req.outlive_parent = false;
+        let ephemeral = manager
+            .start_session(ephemeral_req)
+            .expect("start ephemeral child");
+
+        let survivor_req = StartSessionRequest::new(long_running_shell_command())
+            .with_parent(parent.clone())
+            .with_outlive_parent(true);
+        let survivor = manager
+            .start_session(survivor_req)
+            .expect("start survivor child");
+
+        let eph_snap = manager
+            .snapshot_session(ephemeral.clone())
+            .expect("ephemeral snap");
+        assert_eq!(eph_snap.parent_session_id.as_ref(), Some(&parent));
+        assert!(!eph_snap.outlive_parent);
+
+        let surv_snap = manager
+            .snapshot_session(survivor.clone())
+            .expect("survivor snap");
+        assert_eq!(surv_snap.parent_session_id.as_ref(), Some(&parent));
+        assert!(surv_snap.outlive_parent);
+
+        manager
+            .shutdown_session(parent.clone())
+            .expect("shutdown parent");
+
+        let remaining = manager.list_sessions().expect("list sessions");
+        assert!(!remaining.contains(&parent));
+        assert!(!remaining.contains(&ephemeral));
+        assert!(remaining.contains(&survivor));
+
+        let _ = manager.shutdown_session(survivor);
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn child_unexpected_exit_sends_parent_inbox_alert() {
+        let log_dir = unique_log_dir();
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        manager.start_lifecycle_monitor();
+
+        let parent = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start parent");
+        let mut child_req = StartSessionRequest::new("/bin/sh").with_parent(parent.clone());
+        child_req.args = vec![
+            "-c".to_string(),
+            "printf 'fatal error\\n'; exit 1".to_string(),
+        ];
+        let child = manager.start_session(child_req).expect("start child");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let messages = loop {
+            let inbox = manager
+                .receive_session_messages(parent.clone())
+                .expect("read parent inbox");
+            if !inbox.is_empty() {
+                break inbox;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for parent inbox exit alert"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert_eq!(messages[0].from, child);
+        assert!(messages[0].body.contains("[worker exited]"));
+        assert!(messages[0].body.contains(child.as_str()));
+
+        let _ = manager.shutdown_session(parent);
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn wake_and_agent_write_enforce_draft_and_approval_guards() {
+        let log_dir = unique_log_dir();
+        let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
+
+        let mut req = StartSessionRequest::new("/bin/sh");
+        req.args = vec![
+            "-c".to_string(),
+            "printf 'agent> \\n'; printf 'Proceed? [y/N] '; sleep 30".to_string(),
+        ];
+        let target = manager.start_session(req).expect("start target");
+        let sender = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start sender");
+
+        // Wait for confirmation prompt text to appear in visible rows.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = manager.snapshot_session(target.clone()).expect("snap");
+            if snap.pending_approval {
+                assert!(
+                    snap.pending_approval_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("[y/N]")),
+                    "expected [y/N] reason, got {:?}",
+                    snap.pending_approval_reason
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for prompt");
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        // 1. Wake is blocked while confirmation prompt is visible.
+        let wake_resp = manager
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(
+                    sender.clone(),
+                    target.clone(),
+                    "blocked-by-prompt".to_string(),
+                )
+                .with_wake(true),
+            )
+            .expect("send message");
+        assert!(
+            !wake_resp.woke,
+            "wake must be suppressed during confirmation prompt"
+        );
+
+        // 2. Agent-controlled write_input is refused during confirmation prompt and judge Ask.
+        let agent_client = ClientId::new("mcp-agent").expect("client id");
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: target.clone(),
+                client_id: agent_client.clone(),
+                kind: InputControllerKind::Agent,
+            })
+            .expect("acquire agent lease");
+        let err = manager
+            .write_input(WriteInputRequest {
+                session_id: target.clone(),
+                client_id: agent_client.clone(),
+                bytes: b"auto\r".to_vec(),
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("confirmation prompt")
+                || err.to_string().contains("awaiting approval"),
+            "unexpected error: {err:#}"
+        );
+
+        // 3. Human unsubmitted draft blocks agent writes even without confirmation prompt.
+        let mut draft_req = StartSessionRequest::new("/bin/sh");
+        draft_req.args = vec!["-c".to_string(), "cat".to_string()];
+        let draft_target = manager
+            .start_session(draft_req)
+            .expect("start draft target");
+        let human_client = ClientId::new("human-tui").expect("client id");
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: draft_target.clone(),
+                client_id: human_client.clone(),
+                kind: InputControllerKind::Interactive,
+            })
+            .expect("acquire human lease");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: draft_target.clone(),
+                client_id: human_client.clone(),
+                bytes: b"partial prompt".to_vec(),
+            })
+            .expect("write human draft");
+
+        let draft_wake = manager
+            .send_session_message_with_options(
+                SendSessionMessageRequest::new(sender, draft_target.clone(), "check".to_string())
+                    .with_wake(true),
+            )
+            .expect("send while draft active");
+        assert!(
+            !draft_wake.woke,
+            "wake must respect unsubmitted human draft"
+        );
+
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: draft_target.clone(),
+                client_id: agent_client.clone(),
+                kind: InputControllerKind::Agent,
+            })
+            .expect("steal agent lease");
+        let draft_err = manager
+            .write_input(WriteInputRequest {
+                session_id: draft_target.clone(),
+                client_id: agent_client.clone(),
+                bytes: b"steal\r".to_vec(),
+            })
+            .unwrap_err();
+        assert!(
+            draft_err.to_string().contains("unsubmitted human draft"),
+            "unexpected draft guard error: {draft_err:#}"
+        );
+
+        // Judge approval state clears on interactive confirmation key and blocks agent writes while set.
+        manager.record_pending_approval(&draft_target, "Edit file?".to_string());
+        assert!(
+            manager
+                .snapshot_session(draft_target.clone())
+                .expect("snap")
+                .pending_approval
+        );
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: draft_target.clone(),
+                client_id: human_client.clone(),
+                kind: InputControllerKind::Interactive,
+            })
+            .expect("reacquire human lease");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: draft_target.clone(),
+                client_id: human_client,
+                bytes: b"y\r".to_vec(),
+            })
+            .expect("human confirms and submits draft");
+        assert!(
+            !manager
+                .snapshot_session(draft_target.clone())
+                .expect("snap")
+                .pending_approval
+        );
+
+        // After human submitted (\r) and cleared approval, agent write succeeds.
+        manager
+            .acquire_input_lease(InputLeaseRequest {
+                session_id: draft_target.clone(),
+                client_id: agent_client.clone(),
+                kind: InputControllerKind::Agent,
+            })
+            .expect("acquire agent lease after submit");
+        manager
+            .write_input(WriteInputRequest {
+                session_id: draft_target,
+                client_id: agent_client,
+                bytes: b"allowed\r".to_vec(),
+            })
+            .expect("agent write allowed once draft & approval clear");
+
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    fn wait_for_sessions_covers_output_blocked_exit_inbox_and_timeout() {
+        let log_dir = unique_log_dir();
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+
+        let mut fast_req = StartSessionRequest::new("/bin/sh");
+        fast_req.args = vec![
+            "-c".to_string(),
+            "printf 'WORKER_READY\\n'; sleep 30".to_string(),
+        ];
+        let fast = manager.start_session(fast_req).expect("start fast");
+
+        let mut slow_req = StartSessionRequest::new("/bin/sh");
+        slow_req.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        let slow = manager.start_session(slow_req).expect("start slow");
+
+        let coord = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start coordinator");
+
+        // 1. output_contains matches `fast` in Any mode even while `slow` is still silent/running.
+        let matched = manager
+            .wait_for_sessions(WaitForSessionsRequest {
+                session_ids: vec![slow.clone(), fast.clone()],
+                mode: WaitForSessionsMode::Any,
+                output_contains: Some("WORKER_READY".to_string()),
+                idle_ms: 0,
+                for_inbox_session_id: None,
+                timeout_ms: 5_000,
+            })
+            .expect("wait output match");
+        assert!(!matched.timed_out);
+        assert_eq!(matched.ready_sessions.len(), 1);
+        assert_eq!(matched.ready_sessions[0].session_id, fast);
+        assert_eq!(
+            matched.ready_sessions[0].outcome,
+            SessionWaitOutcome::MatchedOutput
+        );
+
+        // 2. Blocked prompt triggers SessionWaitOutcome::Blocked.
+        let mut blocked_req = StartSessionRequest::new("/bin/sh");
+        blocked_req.args = vec![
+            "-c".to_string(),
+            "printf 'Approve write? [y/N]'; sleep 30".to_string(),
+        ];
+        let blocked = manager.start_session(blocked_req).expect("start blocked");
+        let blocked_wait = manager
+            .wait_for_sessions(WaitForSessionsRequest {
+                session_ids: vec![blocked.clone()],
+                mode: WaitForSessionsMode::Any,
+                output_contains: None,
+                idle_ms: 0,
+                for_inbox_session_id: None,
+                timeout_ms: 5_000,
+            })
+            .expect("wait blocked");
+        assert!(!blocked_wait.timed_out);
+        assert_eq!(
+            blocked_wait.ready_sessions[0].outcome,
+            SessionWaitOutcome::Blocked
+        );
+        assert!(blocked_wait.ready_sessions[0].pending_approval);
+
+        // 3. Coordinator inbox message interrupts wait immediately.
+        let wait_mgr = Arc::clone(&manager);
+        let slow_for_wait = slow.clone();
+        let coord_for_wait = coord.clone();
+        let handle = thread::spawn(move || {
+            wait_mgr.wait_for_sessions(WaitForSessionsRequest {
+                session_ids: vec![slow_for_wait],
+                mode: WaitForSessionsMode::All,
+                output_contains: Some("NEVER_PRINTED".to_string()),
+                idle_ms: 0,
+                for_inbox_session_id: Some(coord_for_wait),
+                timeout_ms: 5_000,
+            })
+        });
+        thread::sleep(Duration::from_millis(40));
+        manager
+            .send_session_message(fast.clone(), coord.clone(), "ping coord".to_string())
+            .expect("send coord mail");
+        let inbox_wait = handle
+            .join()
+            .expect("join wait thread")
+            .expect("wait result");
+        assert!(!inbox_wait.timed_out);
+        assert!(inbox_wait.interrupted_by_inbox);
+        assert_eq!(inbox_wait.inbox_messages.len(), 1);
+        assert_eq!(inbox_wait.inbox_messages[0].body, "ping coord");
+
+        // 4. Short timeout expires cleanly.
+        let timed_out = manager
+            .wait_for_sessions(WaitForSessionsRequest {
+                session_ids: vec![slow.clone()],
+                mode: WaitForSessionsMode::All,
+                output_contains: Some("NEVER_PRINTED".to_string()),
+                idle_ms: 0,
+                for_inbox_session_id: None,
+                timeout_ms: 60,
+            })
+            .expect("timeout wait");
+        assert!(timed_out.timed_out);
+        assert!(!timed_out.interrupted_by_inbox);
+
+        // 5. Exited worker reports Exited.
+        let mut exit_req = StartSessionRequest::new("/bin/sh");
+        exit_req.args = vec!["-c".to_string(), "exit 0".to_string()];
+        let exiting = manager.start_session(exit_req).expect("start exiting");
+        let exit_wait = manager
+            .wait_for_sessions(WaitForSessionsRequest {
+                session_ids: vec![exiting.clone()],
+                mode: WaitForSessionsMode::Any,
+                output_contains: None,
+                idle_ms: 0,
+                for_inbox_session_id: None,
+                timeout_ms: 5_000,
+            })
+            .expect("wait exit");
+        assert!(!exit_wait.timed_out);
+        assert_eq!(
+            exit_wait.ready_sessions[0].outcome,
+            SessionWaitOutcome::Exited
+        );
+        assert!(exit_wait.ready_sessions[0].exited);
+
+        let _ = fs::remove_dir_all(&log_dir);
     }
 }

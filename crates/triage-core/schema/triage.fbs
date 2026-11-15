@@ -117,6 +117,11 @@ table SessionSnapshot {
     // null here is "unknown", not "absent": clients must preserve their
     // last known attachment rather than clear it.
     agent: AgentAttachment;
+    // Appended parent-child orchestration and approval-state fields.
+    parent_session_id: string;
+    outlive_parent: bool = false;
+    pending_approval: bool = false;
+    pending_approval_reason: string;
 }
 
 enum AgentKind : byte { Claude = 0, Codex = 1, Antigravity = 2, Muse = 3, Grok = 4 }
@@ -196,6 +201,8 @@ table StartSessionRequestTable {
     args: [string];
     cwd: string;
     size: SessionSize;
+    parent_session_id: string;
+    outlive_parent: bool = false;
 }
 
 table AttachSessionRequestTable {

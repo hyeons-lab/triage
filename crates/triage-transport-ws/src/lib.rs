@@ -2349,6 +2349,10 @@ mod tests {
             snippet: None,
             snippet_detail: None,
             agent: None,
+            parent_session_id: None,
+            outlive_parent: false,
+            pending_approval: false,
+            pending_approval_reason: None,
         }
     }
 
