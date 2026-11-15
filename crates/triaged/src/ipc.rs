@@ -482,27 +482,279 @@ impl IpcClient {
 pub use crate::session::PairingPinInfo;
 pub use triage_core::ipc::default_socket_path;
 
+pub const REMOTE_RPC_PATH: &str = "/rpc";
+
+pub trait WireRpcTransport {
+    fn round_trip_json(&self, request_json: &[u8], extra_timeout: Duration) -> Result<Vec<u8>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct WireRpcClient<T> {
+    transport: T,
+}
+
+impl<T> WireRpcClient<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+}
+
+trait WireRoundTrip {
+    fn round_trip_wire(&self, request: WireRequest, extra_timeout: Duration)
+    -> Result<WireSuccess>;
+}
+
+impl WireRoundTrip for IpcClient {
+    fn round_trip_wire(
+        &self,
+        request: WireRequest,
+        extra_timeout: Duration,
+    ) -> Result<WireSuccess> {
+        self.round_trip_with_extra_read_timeout(request, extra_timeout)
+    }
+}
+
+impl<T: WireRpcTransport> WireRoundTrip for WireRpcClient<T> {
+    fn round_trip_wire(
+        &self,
+        request: WireRequest,
+        extra_timeout: Duration,
+    ) -> Result<WireSuccess> {
+        let body = serde_json::to_vec(&request).context("encoding RPC request")?;
+        let response_bytes = self.transport.round_trip_json(&body, extra_timeout)?;
+        let response: WireResponse =
+            serde_json::from_slice(&response_bytes).context("decoding RPC response")?;
+        response.into_result()
+    }
+}
+
+macro_rules! impl_wire_session_api_methods {
+    () => {
+        fn list_sessions(&self) -> Result<Vec<SessionId>> {
+            match self.round_trip_wire(WireRequest::ListSessions, Duration::ZERO)? {
+                WireSuccess::SessionIds(session_ids) => Ok(session_ids),
+                other => bail!("unexpected list_sessions response: {other:?}"),
+            }
+        }
+
+        fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
+            match self.round_trip_wire(WireRequest::StartSession(request), Duration::ZERO)? {
+                WireSuccess::SessionId(session_id) => Ok(session_id),
+                other => bail!("unexpected start_session response: {other:?}"),
+            }
+        }
+
+        fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
+            match self.round_trip_wire(WireRequest::AttachSession(request), Duration::ZERO)? {
+                WireSuccess::AttachSession(response) => Ok(response),
+                other => bail!("unexpected attach_session response: {other:?}"),
+            }
+        }
+
+        fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
+            match self.round_trip_wire(WireRequest::AcquireInputLease(request), Duration::ZERO)? {
+                WireSuccess::LeaseChange(change) => Ok(change),
+                other => bail!("unexpected acquire_input_lease response: {other:?}"),
+            }
+        }
+
+        fn release_input_lease(
+            &self,
+            session_id: SessionId,
+            client_id: ClientId,
+        ) -> Result<LeaseChange> {
+            match self.round_trip_wire(
+                WireRequest::ReleaseInputLease {
+                    session_id,
+                    client_id,
+                },
+                Duration::ZERO,
+            )? {
+                WireSuccess::LeaseChange(change) => Ok(change),
+                other => bail!("unexpected release_input_lease response: {other:?}"),
+            }
+        }
+
+        fn write_input(&self, request: WriteInputRequest) -> Result<()> {
+            match self.round_trip_wire(WireRequest::WriteInput(request), Duration::ZERO)? {
+                WireSuccess::Unit => Ok(()),
+                other => bail!("unexpected write_input response: {other:?}"),
+            }
+        }
+
+        fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
+            match self.round_trip_wire(WireRequest::ResizeSession(request), Duration::ZERO)? {
+                WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
+                other => bail!("unexpected resize_session response: {other:?}"),
+            }
+        }
+
+        fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
+            match self.round_trip_wire(WireRequest::RestoreSession(request), Duration::ZERO)? {
+                WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
+                other => bail!("unexpected restore_session response: {other:?}"),
+            }
+        }
+
+        fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
+            match self
+                .round_trip_wire(WireRequest::SnapshotSession { session_id }, Duration::ZERO)?
+            {
+                WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
+                other => bail!("unexpected snapshot_session response: {other:?}"),
+            }
+        }
+
+        fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
+            match self.round_trip_wire(WireRequest::StyledRows(request), Duration::ZERO)? {
+                WireSuccess::StyledRows(response) => Ok(response),
+                other => bail!("unexpected styled_rows response: {other:?}"),
+            }
+        }
+
+        fn send_session_message(
+            &self,
+            from: SessionId,
+            to: SessionId,
+            body: String,
+        ) -> Result<u64> {
+            match self.round_trip_wire(
+                WireRequest::SendSessionMessage { from, to, body },
+                Duration::ZERO,
+            )? {
+                WireSuccess::SessionMessageId(id) => Ok(id),
+                other => bail!("unexpected send_session_message response: {other:?}"),
+            }
+        }
+
+        fn send_session_message_with_options(
+            &self,
+            request: SendSessionMessageRequest,
+        ) -> Result<SendSessionMessageResponse> {
+            match self.round_trip_wire(
+                WireRequest::SendSessionMessageWithOptions(request),
+                Duration::ZERO,
+            )? {
+                WireSuccess::SendSessionMessageResponse(response) => Ok(response),
+                other => bail!("unexpected send_session_message_with_options response: {other:?}"),
+            }
+        }
+
+        fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
+            match self.round_trip_wire(
+                WireRequest::ReceiveSessionMessages { session_id },
+                Duration::ZERO,
+            )? {
+                WireSuccess::SessionMessages(messages) => Ok(messages),
+                other => bail!("unexpected receive_session_messages response: {other:?}"),
+            }
+        }
+
+        fn wait_for_session_messages(
+            &self,
+            request: WaitForSessionMessagesRequest,
+        ) -> Result<Vec<SessionMessage>> {
+            let extra = Duration::from_millis(request.timeout_ms);
+            match self.round_trip_wire(WireRequest::WaitForSessionMessages(request), extra)? {
+                WireSuccess::SessionMessages(messages) => Ok(messages),
+                other => bail!("unexpected wait_for_session_messages response: {other:?}"),
+            }
+        }
+
+        fn wait_for_sessions(
+            &self,
+            request: WaitForSessionsRequest,
+        ) -> Result<WaitForSessionsResponse> {
+            let extra = Duration::from_millis(request.timeout_ms);
+            match self.round_trip_wire(WireRequest::WaitForSessions(request), extra)? {
+                WireSuccess::WaitForSessions(response) => Ok(response),
+                other => bail!("unexpected wait_for_sessions response: {other:?}"),
+            }
+        }
+
+        fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
+            match self.round_trip_wire(
+                WireRequest::AckSessionMessages {
+                    session_id,
+                    message_ids,
+                },
+                Duration::ZERO,
+            )? {
+                WireSuccess::Unit => Ok(()),
+                other => bail!("unexpected ack_session_messages response: {other:?}"),
+            }
+        }
+
+        fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
+            match self
+                .round_trip_wire(WireRequest::ShutdownSession { session_id }, Duration::ZERO)?
+            {
+                WireSuccess::CompletedSession(completed) => Ok(completed),
+                other => bail!("unexpected shutdown_session response: {other:?}"),
+            }
+        }
+
+        fn session_judge_policy(&self, session_id: SessionId) -> Result<SessionJudgePolicy> {
+            match self.round_trip_wire(
+                WireRequest::SessionJudgePolicy { session_id },
+                Duration::ZERO,
+            )? {
+                WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
+                other => bail!("unexpected session_judge_policy response: {other:?}"),
+            }
+        }
+
+        fn set_session_judge_policy(
+            &self,
+            session_id: SessionId,
+            enabled: Option<bool>,
+        ) -> Result<triage_core::judge::SessionJudgePolicy> {
+            match self.round_trip_wire(
+                WireRequest::SetSessionJudgePolicy {
+                    session_id,
+                    enabled,
+                },
+                Duration::ZERO,
+            )? {
+                WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
+                other => bail!("unexpected set_session_judge_policy response: {other:?}"),
+            }
+        }
+
+        fn get_rail_layout(&self) -> Result<RailLayout> {
+            match self.round_trip_wire(WireRequest::GetRailLayout, Duration::ZERO)? {
+                WireSuccess::RailLayout(layout) => Ok(layout),
+                other => bail!("unexpected get_rail_layout response: {other:?}"),
+            }
+        }
+
+        /// Ask the daemon for its update status (Phase 4, the TUI banner). This is a
+        /// best-effort, read-only query: any IPC failure (daemon mid-restart,
+        /// unexpected reply) falls back to "this build, nothing newer" so the banner
+        /// simply stays hidden rather than surfacing an error.
+        fn server_update_info(&self) -> ServerUpdateInfo {
+            match self.round_trip_wire(WireRequest::ServerUpdateInfo, Duration::ZERO) {
+                Ok(WireSuccess::ServerUpdateInfo(info)) => info,
+                _ => ServerUpdateInfo {
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    update_available: false,
+                    latest_version: None,
+                },
+            }
+        }
+    };
+}
+
+impl<T: WireRpcTransport + Send + Sync> SessionApi for WireRpcClient<T> {
+    impl_wire_session_api_methods!();
+
+    fn subscribe_session_events(&self, _session_id: SessionId) -> Result<SessionEventReceiver> {
+        bail!("session event subscriptions are not supported over remote HTTP RPC")
+    }
+}
+
 impl SessionApi for IpcClient {
-    fn list_sessions(&self) -> Result<Vec<SessionId>> {
-        match self.round_trip(WireRequest::ListSessions)? {
-            WireSuccess::SessionIds(session_ids) => Ok(session_ids),
-            other => bail!("unexpected list_sessions response: {other:?}"),
-        }
-    }
-
-    fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
-        match self.round_trip(WireRequest::StartSession(request))? {
-            WireSuccess::SessionId(session_id) => Ok(session_id),
-            other => bail!("unexpected start_session response: {other:?}"),
-        }
-    }
-
-    fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
-        match self.round_trip(WireRequest::AttachSession(request))? {
-            WireSuccess::AttachSession(response) => Ok(response),
-            other => bail!("unexpected attach_session response: {other:?}"),
-        }
-    }
+    impl_wire_session_api_methods!();
 
     fn subscribe_session_events(&self, session_id: SessionId) -> Result<SessionEventReceiver> {
         self.subscribe_session_events_from(SubscribeSessionEventsRequest {
@@ -561,173 +813,6 @@ impl SessionApi for IpcClient {
             .context("spawning Unix socket event reader")?;
 
         Ok(rx)
-    }
-
-    fn acquire_input_lease(&self, request: InputLeaseRequest) -> Result<LeaseChange> {
-        match self.round_trip(WireRequest::AcquireInputLease(request))? {
-            WireSuccess::LeaseChange(change) => Ok(change),
-            other => bail!("unexpected acquire_input_lease response: {other:?}"),
-        }
-    }
-
-    fn release_input_lease(
-        &self,
-        session_id: SessionId,
-        client_id: ClientId,
-    ) -> Result<LeaseChange> {
-        match self.round_trip(WireRequest::ReleaseInputLease {
-            session_id,
-            client_id,
-        })? {
-            WireSuccess::LeaseChange(change) => Ok(change),
-            other => bail!("unexpected release_input_lease response: {other:?}"),
-        }
-    }
-
-    fn write_input(&self, request: WriteInputRequest) -> Result<()> {
-        match self.round_trip(WireRequest::WriteInput(request))? {
-            WireSuccess::Unit => Ok(()),
-            other => bail!("unexpected write_input response: {other:?}"),
-        }
-    }
-
-    fn resize_session(&self, request: ResizeSessionRequest) -> Result<SessionSnapshot> {
-        match self.round_trip(WireRequest::ResizeSession(request))? {
-            WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
-            other => bail!("unexpected resize_session response: {other:?}"),
-        }
-    }
-
-    fn restore_session(&self, request: RestoreSessionRequest) -> Result<SessionSnapshot> {
-        match self.round_trip(WireRequest::RestoreSession(request))? {
-            WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
-            other => bail!("unexpected restore_session response: {other:?}"),
-        }
-    }
-
-    fn snapshot_session(&self, session_id: SessionId) -> Result<SessionSnapshot> {
-        match self.round_trip(WireRequest::SnapshotSession { session_id })? {
-            WireSuccess::SessionSnapshot(snapshot) => Ok(snapshot),
-            other => bail!("unexpected snapshot_session response: {other:?}"),
-        }
-    }
-
-    fn styled_rows(&self, request: StyledRowsRequest) -> Result<StyledRowsResponse> {
-        match self.round_trip(WireRequest::StyledRows(request))? {
-            WireSuccess::StyledRows(response) => Ok(response),
-            other => bail!("unexpected styled_rows response: {other:?}"),
-        }
-    }
-
-    fn send_session_message(&self, from: SessionId, to: SessionId, body: String) -> Result<u64> {
-        match self.round_trip(WireRequest::SendSessionMessage { from, to, body })? {
-            WireSuccess::SessionMessageId(id) => Ok(id),
-            other => bail!("unexpected send_session_message response: {other:?}"),
-        }
-    }
-
-    fn send_session_message_with_options(
-        &self,
-        request: SendSessionMessageRequest,
-    ) -> Result<SendSessionMessageResponse> {
-        match self.round_trip(WireRequest::SendSessionMessageWithOptions(request))? {
-            WireSuccess::SendSessionMessageResponse(response) => Ok(response),
-            other => bail!("unexpected send_session_message_with_options response: {other:?}"),
-        }
-    }
-
-    fn receive_session_messages(&self, session_id: SessionId) -> Result<Vec<SessionMessage>> {
-        match self.round_trip(WireRequest::ReceiveSessionMessages { session_id })? {
-            WireSuccess::SessionMessages(messages) => Ok(messages),
-            other => bail!("unexpected receive_session_messages response: {other:?}"),
-        }
-    }
-
-    fn wait_for_session_messages(
-        &self,
-        request: WaitForSessionMessagesRequest,
-    ) -> Result<Vec<SessionMessage>> {
-        let extra = Duration::from_millis(request.timeout_ms);
-        match self.round_trip_with_extra_read_timeout(
-            WireRequest::WaitForSessionMessages(request),
-            extra,
-        )? {
-            WireSuccess::SessionMessages(messages) => Ok(messages),
-            other => bail!("unexpected wait_for_session_messages response: {other:?}"),
-        }
-    }
-
-    fn wait_for_sessions(
-        &self,
-        request: WaitForSessionsRequest,
-    ) -> Result<WaitForSessionsResponse> {
-        let extra = Duration::from_millis(request.timeout_ms);
-        match self
-            .round_trip_with_extra_read_timeout(WireRequest::WaitForSessions(request), extra)?
-        {
-            WireSuccess::WaitForSessions(response) => Ok(response),
-            other => bail!("unexpected wait_for_sessions response: {other:?}"),
-        }
-    }
-
-    fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
-        match self.round_trip(WireRequest::AckSessionMessages {
-            session_id,
-            message_ids,
-        })? {
-            WireSuccess::Unit => Ok(()),
-            other => bail!("unexpected ack_session_messages response: {other:?}"),
-        }
-    }
-
-    fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
-        match self.round_trip(WireRequest::ShutdownSession { session_id })? {
-            WireSuccess::CompletedSession(completed) => Ok(completed),
-            other => bail!("unexpected shutdown_session response: {other:?}"),
-        }
-    }
-
-    fn session_judge_policy(&self, session_id: SessionId) -> Result<SessionJudgePolicy> {
-        match self.round_trip(WireRequest::SessionJudgePolicy { session_id })? {
-            WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
-            other => bail!("unexpected session_judge_policy response: {other:?}"),
-        }
-    }
-
-    fn set_session_judge_policy(
-        &self,
-        session_id: SessionId,
-        enabled: Option<bool>,
-    ) -> Result<triage_core::judge::SessionJudgePolicy> {
-        match self.round_trip(WireRequest::SetSessionJudgePolicy {
-            session_id,
-            enabled,
-        })? {
-            WireSuccess::SessionJudgePolicy(policy) => Ok(policy),
-            other => bail!("unexpected set_session_judge_policy response: {other:?}"),
-        }
-    }
-
-    fn get_rail_layout(&self) -> Result<RailLayout> {
-        match self.round_trip(WireRequest::GetRailLayout)? {
-            WireSuccess::RailLayout(layout) => Ok(layout),
-            other => bail!("unexpected get_rail_layout response: {other:?}"),
-        }
-    }
-
-    /// Ask the daemon for its update status (Phase 4, the TUI banner). This is a
-    /// best-effort, read-only query: any IPC failure (daemon mid-restart,
-    /// unexpected reply) falls back to "this build, nothing newer" so the banner
-    /// simply stays hidden rather than surfacing an error.
-    fn server_update_info(&self) -> ServerUpdateInfo {
-        match self.round_trip(WireRequest::ServerUpdateInfo) {
-            Ok(WireSuccess::ServerUpdateInfo(info)) => info,
-            _ => ServerUpdateInfo {
-                server_version: env!("CARGO_PKG_VERSION").to_string(),
-                update_available: false,
-                latest_version: None,
-            },
-        }
     }
 }
 
@@ -1912,9 +1997,68 @@ fn handle_subscription(
     }
 }
 
+pub fn handle_remote_rpc_json(manager: &SessionManager, body: &[u8]) -> Result<Vec<u8>> {
+    let request: WireRequest = serde_json::from_slice(body).context("decoding RPC request")?;
+    let result = match request {
+        WireRequest::SubscribeSessionEvents { .. }
+        | WireRequest::Handover
+        | WireRequest::HandoverV2
+        | WireRequest::HandoverProbe { .. }
+        | WireRequest::ReloadClientAssets
+        | WireRequest::DisableShutdownRescue
+        | WireRequest::ApprovePairingDeviceCode { .. } => {
+            Err(anyhow!("request is not permitted over remote HTTP RPC"))
+        }
+        other => handle_session_rpc_request(manager, other),
+    };
+    serde_json::to_vec(&WireResponse::from_result(result)).context("encoding RPC response")
+}
+
 fn handle_request(
     manager: &SessionManager,
     web_cache: &crate::http::WebAssetCache,
+    request: WireRequest,
+) -> Result<WireSuccess> {
+    match request {
+        WireRequest::SubscribeSessionEvents { .. } => {
+            bail!("subscription requests require streaming handler")
+        }
+        WireRequest::Handover | WireRequest::HandoverV2 => {
+            bail!("handover requests require direct socket handler")
+        }
+        WireRequest::HandoverProbe { owner_token } => {
+            #[cfg(unix)]
+            {
+                if owner_token == daemon_instance_token() {
+                    Ok(WireSuccess::Unit)
+                } else {
+                    bail!("requested handover belongs to a different daemon")
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = owner_token;
+                bail!("handover probes are only supported on Unix-like operating systems")
+            }
+        }
+        WireRequest::ReloadClientAssets => {
+            web_cache.reload();
+            Ok(WireSuccess::Unit)
+        }
+        WireRequest::DisableShutdownRescue => {
+            #[cfg(unix)]
+            crate::shutdown::disable_rescue();
+            Ok(WireSuccess::Unit)
+        }
+        WireRequest::ApprovePairingDeviceCode { device_code } => manager
+            .approve_pairing_device_code(&device_code)
+            .map(WireSuccess::PairingPin),
+        other => handle_session_rpc_request(manager, other),
+    }
+}
+
+fn handle_session_rpc_request(
+    manager: &SessionManager,
     request: WireRequest,
 ) -> Result<WireSuccess> {
     match request {
@@ -1925,9 +2069,6 @@ fn handle_request(
         WireRequest::AttachSession(request) => manager
             .attach_session(request)
             .map(WireSuccess::AttachSession),
-        WireRequest::SubscribeSessionEvents { .. } => {
-            bail!("subscription requests require streaming handler")
-        }
         WireRequest::AcquireInputLease(request) => manager
             .acquire_input_lease(request)
             .map(WireSuccess::LeaseChange),
@@ -1976,35 +2117,8 @@ fn handle_request(
         WireRequest::ShutdownSession { session_id } => manager
             .shutdown_session(session_id)
             .map(WireSuccess::CompletedSession),
-        WireRequest::Handover | WireRequest::HandoverV2 => {
-            bail!("handover requests require direct socket handler")
-        }
-        WireRequest::HandoverProbe { owner_token } => {
-            #[cfg(unix)]
-            {
-                if owner_token == daemon_instance_token() {
-                    Ok(WireSuccess::Unit)
-                } else {
-                    bail!("requested handover belongs to a different daemon")
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = owner_token;
-                bail!("handover probes are only supported on Unix-like operating systems")
-            }
-        }
-        WireRequest::ReloadClientAssets => {
-            web_cache.reload();
-            Ok(WireSuccess::Unit)
-        }
         WireRequest::ServerUpdateInfo => {
             Ok(WireSuccess::ServerUpdateInfo(manager.server_update_info()))
-        }
-        WireRequest::DisableShutdownRescue => {
-            #[cfg(unix)]
-            crate::shutdown::disable_rescue();
-            Ok(WireSuccess::Unit)
         }
         // Deliberately infallible: `judge_tool_call` resolves every failure to
         // `ask`, so the shim never has to interpret an error string to stay
@@ -2023,9 +2137,15 @@ fn handle_request(
             .set_session_judge_policy(session_id, enabled)
             .map(WireSuccess::SessionJudgePolicy),
         WireRequest::GetRailLayout => manager.get_rail_layout().map(WireSuccess::RailLayout),
-        WireRequest::ApprovePairingDeviceCode { device_code } => manager
-            .approve_pairing_device_code(&device_code)
-            .map(WireSuccess::PairingPin),
+        WireRequest::SubscribeSessionEvents { .. }
+        | WireRequest::Handover
+        | WireRequest::HandoverV2
+        | WireRequest::HandoverProbe { .. }
+        | WireRequest::ReloadClientAssets
+        | WireRequest::DisableShutdownRescue
+        | WireRequest::ApprovePairingDeviceCode { .. } => {
+            unreachable!("handled by caller")
+        }
     }
 }
 
