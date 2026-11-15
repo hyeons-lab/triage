@@ -2147,6 +2147,10 @@ class TriageWebSocketClient {
       // Foreground AI coding agent observed by the daemon, if any. Shape
       // matches the JSON protocol's serde keys.
       'agent': _parseAgentAttachment(snap.agent),
+      'parent_session_id': snap.parentSessionId,
+      'outlive_parent': snap.outliveParent,
+      'pending_approval': snap.pendingApproval,
+      'pending_approval_reason': snap.pendingApprovalReason,
     };
   }
 

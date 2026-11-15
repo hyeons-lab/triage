@@ -47,6 +47,7 @@ import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/platform_env_io.dart'
     if (dart.library.js_util) 'package:triage_client/platform_env_web.dart';
 import 'package:triage_client/services/external_navigation.dart';
+import 'package:triage_client/terminal/approval_prompt_parser.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
 import 'package:triage_client/terminal/debug_log.dart';
@@ -61,8 +62,10 @@ import 'package:triage_client/terminal/terminal_mouse_encoder.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
+import 'package:triage_client/widgets/approval_chips_bar.dart';
 import 'package:triage_client/widgets/multiline_paste_dialog.dart';
 import 'package:triage_client/widgets/terminal_accessory_bar.dart';
+import 'package:triage_client/widgets/terminal_composer_bar.dart';
 import 'package:triage_client/widgets/terminal_grid_render_box.dart';
 import 'package:triage_client/widgets/terminal_scrollbar.dart';
 
@@ -365,6 +368,8 @@ class TerminalPane extends StatefulWidget {
     this.onFetchScrollbackRows,
     this.onOpenUrl,
     this.bracketedPasteEnabled = false,
+    this.pendingApproval = false,
+    this.pendingApprovalReason,
     this.isExited = false,
     this.isLoading = false,
     this.isObscured = false,
@@ -380,6 +385,8 @@ class TerminalPane extends StatefulWidget {
   onFetchScrollbackRows;
   final FutureOr<void> Function(Uri uri)? onOpenUrl;
   final bool bracketedPasteEnabled;
+  final bool pendingApproval;
+  final String? pendingApprovalReason;
 
   /// Plain rows rendered only by the FLUTTER_TEST fallback view.
   final List<StyledRow> fallbackRows;
@@ -417,6 +424,7 @@ class TerminalPane extends StatefulWidget {
     }
     _TerminalPaneState._clearSavedSessionScroll(terminalId);
     _TerminalPaneState._sessionBracketedPasteModes.remove(terminalId);
+    _TerminalPaneState._sessionDrafts.remove(terminalId);
     _TerminalPaneState._sessionLastResizeOutCols.remove(terminalId);
     _TerminalPaneState._sessionLastResizeOutRows.remove(terminalId);
     _TerminalPaneState._sessionLastGridSize.remove(terminalId);
@@ -498,6 +506,7 @@ class _TerminalPaneState extends State<TerminalPane>
   static final Map<String, int> _sessionLastResizeOutRows = {};
   static final Map<String, (int, int)> _sessionLastGridSize = {};
   static final Map<String, bool> _sessionBracketedPasteModes = {};
+  static final Map<String, String> _sessionDrafts = {};
   static (int, int)? _lastWorkspaceFittedSize;
 
   static void _clearSavedSessionScroll(String id) {
@@ -593,6 +602,11 @@ class _TerminalPaneState extends State<TerminalPane>
   int? _pendingResizeOutRows;
 
   bool _ctrlArmed = false;
+  bool _composerOpen = false;
+  final TextEditingController _composerController = TextEditingController();
+  final FocusNode _composerFocusNode = FocusNode();
+  String? _dismissedApprovalSignature;
+  String? _lastObservedApprovalSignature;
   bool _isPasting = false;
   bool _isPasteDialogShowing = false;
   void Function()? _disposeWebPasteListener;
@@ -684,6 +698,7 @@ class _TerminalPaneState extends State<TerminalPane>
       _scrollAnchor.copyFrom(savedAnchor);
     }
     _scrollController = ScrollController(initialScrollOffset: initialOffset);
+    _composerController.text = _sessionDrafts[widget.terminalId] ?? '';
     _focusNode.addListener(_onFocusChanged);
     _suppressAnchorCapture = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -825,7 +840,16 @@ class _TerminalPaneState extends State<TerminalPane>
         widget.onTerminalResizeBind?.call(_onTerminalResize);
       }
     }
+    if (!sessionSwapped &&
+        (oldWidget.pendingApproval != widget.pendingApproval ||
+            oldWidget.pendingApprovalReason != widget.pendingApprovalReason)) {
+      _dismissedApprovalSignature = null;
+    }
     if (sessionSwapped) {
+      _sessionDrafts[oldWidget.terminalId] = _composerController.text;
+      _composerController.text = _sessionDrafts[widget.terminalId] ?? '';
+      _dismissedApprovalSignature = null;
+      _lastObservedApprovalSignature = null;
       _clearPageAnchor();
       _pageJumpGeneration++;
       dismissNoOlderScrollback();
@@ -998,6 +1022,8 @@ class _TerminalPaneState extends State<TerminalPane>
     cancelNoOlderScrollbackTimer();
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
+    _composerController.dispose();
+    _composerFocusNode.dispose();
     _focusNode.dispose();
     _metricsSettleTimer?.cancel();
     _resizeOutDebounceTimer?.cancel();
@@ -1019,6 +1045,7 @@ class _TerminalPaneState extends State<TerminalPane>
         isMobile: _isMobile,
         softKeyboardEnabled: widget.softKeyboardEnabled,
       ) &&
+      !_composerOpen &&
       !widget.isExited &&
       _isRouteCurrentAndUnobscured &&
       _focusNode.hasFocus;
@@ -3027,6 +3054,7 @@ class _TerminalPaneState extends State<TerminalPane>
       _altScrollDeltaAccum = 0.0;
       _rebuildForCopyButton();
     }
+    _syncLiveApprovalPrompt();
     if (_selection != null &&
         !terminalSelectionIsLive(_terminal, _selection!)) {
       _clearSelection();
@@ -3746,12 +3774,130 @@ class _TerminalPaneState extends State<TerminalPane>
       defaultTargetPlatform == TargetPlatform.android ||
       isWebMobileBrowser();
 
-  Widget _buildAccessoryBar() {
-    return TerminalAccessoryBar(
-      onSend: _sendAccessory,
-      onToggleCtrl: _toggleCtrl,
-      onPaste: () => unawaited(_pasteFromClipboard()),
-      ctrlArmed: _ctrlArmed,
+  List<String> _visiblePlainRows() {
+    final rows = _terminal.viewportStyledRows(trimTrailingBlankRows: true);
+    final source = rows.isNotEmpty ? rows : widget.fallbackRows;
+    return [
+      for (final row in source) row.spans.map((span) => span.text).join(),
+    ];
+  }
+
+  ApprovalPromptState? _evaluateRawApprovalPrompt() {
+    if (widget.isExited) return null;
+    return parseApprovalPrompt(
+      pendingApproval: widget.pendingApproval,
+      pendingApprovalReason: widget.pendingApprovalReason,
+      visibleRows: _visiblePlainRows(),
+    );
+  }
+
+  ApprovalPromptState? _activeApprovalPrompt() {
+    final prompt = _evaluateRawApprovalPrompt();
+    if (prompt == null) return null;
+    if (prompt.signature == _dismissedApprovalSignature) return null;
+    return prompt;
+  }
+
+  void _syncLiveApprovalPrompt() {
+    if (!_isMobile) return;
+    final nextSig = _evaluateRawApprovalPrompt()?.signature;
+    if (nextSig == _lastObservedApprovalSignature) return;
+    _lastObservedApprovalSignature = nextSig;
+    if (nextSig == null || nextSig != _dismissedApprovalSignature) {
+      _dismissedApprovalSignature = null;
+    }
+    _rebuildForCopyButton();
+  }
+
+  void _handleApprovalChoice(
+    ApprovalChoice choice,
+    ApprovalPromptState prompt,
+  ) {
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
+    _dismissedApprovalSignature = prompt.signature;
+    _sendAccessory(choice.bytes);
+    setState(() {});
+  }
+
+  void _toggleComposer() {
+    if (!mounted) return;
+    if (!_composerOpen) {
+      _flushImeComposing();
+      setState(() => _composerOpen = true);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _composerOpen) {
+          _composerFocusNode.requestFocus();
+        }
+      });
+    } else {
+      _sessionDrafts[widget.terminalId] = _composerController.text;
+      setState(() => _composerOpen = false);
+      if (!widget.isExited && widget.softKeyboardEnabled) {
+        _focusNode.requestFocus();
+      }
+    }
+  }
+
+  void _sendComposerDraft() {
+    final raw = _composerController.text;
+    if (!mounted || widget.isExited || !_isRouteCurrentAndUnobscured) return;
+    if (raw.trim().isEmpty) return;
+    _disarmCtrl();
+    _mobileAutoSpace.reset();
+    _clearSavedSessionScroll(widget.terminalId);
+    _scrollAnchor.clear();
+    if (_scrollController.hasClients &&
+        _scrollController.position.hasContentDimensions) {
+      _snapToBottom(_scrollController.position);
+    }
+    widget.controller.notifyInteraction();
+    if (raw.contains('\n')) {
+      final bracketed = _isBracketedPasteEnabled();
+      final payload = formatPasteInput(raw, bracketed);
+      widget.controller.sendInput(payload);
+      if (bracketed) {
+        Future.microtask(() {
+          if (mounted && !widget.isExited) {
+            widget.controller.sendInput('\r');
+          }
+        });
+      } else if (!payload.endsWith('\r')) {
+        widget.controller.sendInput('\r');
+      }
+    } else {
+      widget.controller.sendInput('$raw\r');
+    }
+    _composerController.clear();
+    _sessionDrafts.remove(widget.terminalId);
+  }
+
+  Widget _buildMobileBottomChrome() {
+    final approvalPrompt = _activeApprovalPrompt();
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (approvalPrompt != null)
+          ApprovalChipsBar(
+            prompt: approvalPrompt,
+            onSelect: (choice) => _handleApprovalChoice(choice, approvalPrompt),
+          ),
+        if (_composerOpen)
+          TerminalComposerBar(
+            controller: _composerController,
+            focusNode: _composerFocusNode,
+            enabled: !widget.isExited && widget.interactionEnabled,
+            onSend: _sendComposerDraft,
+            onClose: _toggleComposer,
+          ),
+        TerminalAccessoryBar(
+          onSend: _sendAccessory,
+          onToggleCtrl: _toggleCtrl,
+          onPaste: () => unawaited(_pasteFromClipboard()),
+          ctrlArmed: _ctrlArmed,
+          onToggleComposer: _toggleComposer,
+          composeOpen: _composerOpen,
+        ),
+      ],
     );
   }
 
@@ -4012,7 +4158,7 @@ class _TerminalPaneState extends State<TerminalPane>
               ),
             ),
           ),
-          if (_isMobile) _buildAccessoryBar(),
+          if (_isMobile) _buildMobileBottomChrome(),
         ],
       ),
     );
