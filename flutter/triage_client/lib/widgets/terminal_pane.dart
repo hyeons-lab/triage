@@ -551,6 +551,7 @@ class _TerminalPaneState extends State<TerminalPane>
     text: _kImeSentinel,
     selection: TextSelection.collapsed(offset: _kImeSentinel.length),
   );
+  String _imeCommittedPrefix = '';
 
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
@@ -1048,22 +1049,30 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  void _resetLocalImeState() {
+    _currentImeValue = const TextEditingValue(
+      text: _kImeSentinel,
+      selection: TextSelection.collapsed(offset: _kImeSentinel.length),
+    );
+    _imeCommittedPrefix = '';
+  }
+
   void _syncImeConnection({bool showKeyboard = false}) {
     if (!mounted) return;
     if (_shouldAttachSoftKeyboardIme) {
       var newlyAttached = false;
       if (_textInputConnection == null || !_textInputConnection!.attached) {
-        _currentImeValue = const TextEditingValue(
-          text: _kImeSentinel,
-          selection: TextSelection.collapsed(offset: _kImeSentinel.length),
-        );
+        _resetLocalImeState();
+        // Keep enableSuggestions: true on mobile so Android keyboards expose
+        // TYPE_CLASS_TEXT instead of TYPE_TEXT_VARIATION_VISIBLE_PASSWORD, which
+        // disables gesture/swipe typing across Gboard and Samsung keyboards.
         _textInputConnection = TextInput.attach(
           this,
           const TextInputConfiguration(
             inputType: TextInputType.text,
             inputAction: TextInputAction.newline,
             autocorrect: false,
-            enableSuggestions: false,
+            enableSuggestions: true,
             smartDashesType: SmartDashesType.disabled,
             smartQuotesType: SmartQuotesType.disabled,
           ),
@@ -1080,10 +1089,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _closeImeConnection() {
-    _currentImeValue = const TextEditingValue(
-      text: _kImeSentinel,
-      selection: TextSelection.collapsed(offset: _kImeSentinel.length),
-    );
+    _resetLocalImeState();
     if (_textInputConnection != null) {
       if (_textInputConnection!.attached) {
         _textInputConnection!.close();
@@ -1093,40 +1099,49 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _resetImeSentinel() {
-    _currentImeValue = const TextEditingValue(
-      text: _kImeSentinel,
-      selection: TextSelection.collapsed(offset: _kImeSentinel.length),
-    );
+    _resetLocalImeState();
     if (_textInputConnection != null && _textInputConnection!.attached) {
       _textInputConnection!.setEditingState(_currentImeValue);
     }
   }
 
+  void _emitImeTextDiff(String expected, String actual) {
+    var common = 0;
+    while (common < expected.length &&
+        common < actual.length &&
+        expected.codeUnitAt(common) == actual.codeUnitAt(common)) {
+      common++;
+    }
+    if (common > 0 && common < expected.length) {
+      final prevUnit = expected.codeUnitAt(common - 1);
+      if (prevUnit >= 0xD800 && prevUnit <= 0xDBFF) {
+        common--;
+      }
+    }
+    if (common < expected.length) {
+      final deleted = expected.substring(common).runes.length;
+      for (var i = 0; i < deleted; i++) {
+        _onTerminalOutput('\x7f');
+      }
+    }
+    final inserted = actual.substring(common);
+    if (inserted.isEmpty) return;
+    _onTerminalOutput(inserted.replaceAll('\n', '\r'));
+  }
+
   void _flushImeComposing() {
     final value = _currentImeValue;
     final text = value.text;
-    if (text == _kImeSentinel) {
+    if (text == _kImeSentinel && _imeCommittedPrefix.isEmpty) {
       if (!value.selection.isCollapsed ||
           value.selection.extentOffset != _kImeSentinel.length) {
         _resetImeSentinel();
       }
       return;
     }
+    final expected = '$_kImeSentinel$_imeCommittedPrefix';
     _resetImeSentinel();
-    var common = 0;
-    while (common < _kImeSentinel.length &&
-        common < text.length &&
-        _kImeSentinel.codeUnitAt(common) == text.codeUnitAt(common)) {
-      common++;
-    }
-    final deleted = _kImeSentinel.length - common;
-    for (var i = 0; i < deleted; i++) {
-      _onTerminalOutput('\x7f');
-    }
-    final inserted = text.substring(common);
-    if (inserted.isNotEmpty) {
-      _onTerminalOutput(inserted == '\n' ? '\r' : inserted);
-    }
+    _emitImeTextDiff(expected, text);
   }
 
   @override
@@ -1138,8 +1153,9 @@ class _TerminalPaneState extends State<TerminalPane>
   @override
   void updateEditingValue(TextEditingValue value) {
     _currentImeValue = value;
-    if (_ctrlArmed && value.text.startsWith(_kImeSentinel)) {
-      final pending = value.text.substring(_kImeSentinel.length);
+    final expected = '$_kImeSentinel$_imeCommittedPrefix';
+    if (_ctrlArmed && value.text.startsWith(expected)) {
+      final pending = value.text.substring(expected.length);
       if (pending.length == 1 && controlByteForChar(pending) != null) {
         _resetImeSentinel();
         _onTerminalOutput(pending);
@@ -1147,10 +1163,26 @@ class _TerminalPaneState extends State<TerminalPane>
       }
     }
     if (value.composing.isValid && !value.composing.isCollapsed) {
+      // Batched swipe/IME keyboards commit prior words before the active
+      // composing span; flush that committed prefix immediately without
+      // mutating the platform buffer mid-composing.
+      if (value.text.startsWith(_kImeSentinel) &&
+          value.composing.start >= _kImeSentinel.length &&
+          value.composing.start <= value.text.length) {
+        final committedPrefix = value.text.substring(
+          _kImeSentinel.length,
+          value.composing.start,
+        );
+        if (committedPrefix != _imeCommittedPrefix) {
+          final previousPrefix = _imeCommittedPrefix;
+          _imeCommittedPrefix = committedPrefix;
+          _emitImeTextDiff(previousPrefix, committedPrefix);
+        }
+      }
       return;
     }
     final text = value.text;
-    if (text == _kImeSentinel) {
+    if (text == _kImeSentinel && _imeCommittedPrefix.isEmpty) {
       if (!value.selection.isCollapsed ||
           value.selection.extentOffset != _kImeSentinel.length) {
         _resetImeSentinel();
@@ -1158,38 +1190,7 @@ class _TerminalPaneState extends State<TerminalPane>
       return;
     }
     _resetImeSentinel();
-    if (_kImeSentinel.startsWith(text)) {
-      final deleted = _kImeSentinel.length - text.length;
-      for (var i = 0; i < deleted; i++) {
-        _onTerminalOutput('\x7f');
-      }
-      return;
-    }
-    if (text.startsWith(_kImeSentinel)) {
-      final inserted = text.substring(_kImeSentinel.length);
-      if (inserted.isEmpty) return;
-      if (inserted == '\n') {
-        _onTerminalOutput('\r');
-      } else {
-        _onTerminalOutput(inserted);
-      }
-      return;
-    }
-    // Partial prefix replacement (e.g. autocorrect/backspace+insert in one edit).
-    var common = 0;
-    while (common < _kImeSentinel.length &&
-        common < text.length &&
-        _kImeSentinel.codeUnitAt(common) == text.codeUnitAt(common)) {
-      common++;
-    }
-    final deleted = _kImeSentinel.length - common;
-    for (var i = 0; i < deleted; i++) {
-      _onTerminalOutput('\x7f');
-    }
-    final inserted = text.substring(common);
-    if (inserted.isNotEmpty) {
-      _onTerminalOutput(inserted == '\n' ? '\r' : inserted);
-    }
+    _emitImeTextDiff(expected, text);
   }
 
   @override
@@ -1220,10 +1221,7 @@ class _TerminalPaneState extends State<TerminalPane>
   @override
   void connectionClosed() {
     _textInputConnection = null;
-    _currentImeValue = const TextEditingValue(
-      text: _kImeSentinel,
-      selection: TextSelection.collapsed(offset: _kImeSentinel.length),
-    );
+    _resetLocalImeState();
   }
 
   @override
