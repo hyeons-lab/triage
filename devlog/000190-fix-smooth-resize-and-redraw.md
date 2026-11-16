@@ -30,13 +30,18 @@ Eliminate visible top-to-bottom layout jumps and mid-redraw tearing during keybo
 - `2026-11-16T07:52-0800 crates/triaged/src/session.rs`: Bumped `note_resize_burst` to `50 ms` and burst hold windows to `(10 ms quiet, 45 ms max)` for real non-keyboard resizes.
 - `2026-11-16T07:52-0800 flutter/triage_client/lib/terminal/terminal_cell_buffer.dart`, `lib/widgets/terminal_pane.dart`, `lib/widgets/terminal_grid_render_box.dart`: Added `trailingBlankViewportRows`, read raw OS insets via `View.maybeOf` alongside `MediaQuery.maybeViewInsetsOf`, preserved full-height primary PTY rows across soft-keyboard and composer open/close, and clamped auto-bottom layout extent (`keepKeyboardCursorVisible`) so prompts remain visible above the keyboard without triggering `SIGWINCH`.
 - `2026-11-16T07:52-0800 flutter/triage_client/test/terminal_hardware_key_test.dart`: Added test verifying soft-keyboard inset open/close preserves primary PTY rows without emitting `SIGWINCH` resize.
+- `2026-11-16T09:52-0800 crates/triage-term/src/lib.rs`, `crates/triaged/src/session.rs`: Added `CSI 2K` burst tracking, handed off active resize holds to burst quiescence once PTY output arrives, raised burst hold windows to `(180 ms sync, 22 ms quiet, 110 ms max)` and initial `SIGWINCH` grace to `90 ms`.
+- `2026-11-16T09:52-0800 flutter/triage_client/lib/main.dart`, `lib/widgets/terminal_grid_render_box.dart`, `lib/widgets/terminal_pane.dart`: Removed `ValueKey(session.title)` on `TerminalPane` so session switches swap buffers in place while keeping `RenderTerminalGrid` and `_glyphCache` warm; gated occlusion/wake resume refit on actual PTY size drift without double-jiggling `rows - 1`; unified `RenderTerminalGrid.effectiveTotalLines` with `TerminalPane._effectiveMaxScrollExtent` and `_autoBottomTarget` so bottom pinning and `maxScrollExtent` never diverge.
+- `2026-11-16T09:52-0800 flutter/triage_client/test/widget_test.dart`, `test/terminal_hardware_key_test.dart`: Updated occlusion resume and drift reclaim assertions and added bottom-stick regression coverage with trailing blank rows.
 
 ## Decisions
 
 - `2026-11-15T22:24-0800 Decision`: Hold multi-chunk repaint bursts inside `ActorCommand::PollTerminalSync` rather than `OutputState::poll_sync_frame` so unit tests driving `OutputState` directly stay synchronous while live WebSocket streams coalesce full-screen redraws.
 - `2026-11-16T07:52-0800 Decision`: Keep primary-screen PTY `rows` unchanged when soft keyboard or mobile composer opens at unchanged `cols`, reading `View.maybeOf(context)?.viewInsets.bottom` because `Scaffold(resizeToAvoidBottomInset: true)` strips `MediaQuery.viewInsets.bottom` from descendants. This avoids `SIGWINCH` full-screen top-to-bottom CLI redraws on keyboard open/close while alt-screen TUI apps still resize normally.
+- `2026-11-16T09:52-0800 Decision`: Trim `trailingBlankViewportRows` inside `RenderTerminalGrid.effectiveTotalLines` itself (instead of separating `autoBottomExtent` from `newMaxExtent`) so `maxScrollExtent`, `_snapToBottom`, and `_saveScrollOffset` always agree on a single bottom coordinate.
 
 ## Commits
 
 - `8f2aab1`: `fix(terminal): coalesce resize redraws and bottom-anchor keyboard transitions`
-- `HEAD`: `fix(mobile): preserve primary PTY rows across soft keyboard open and close`
+- `603bed7`: `fix(mobile): preserve primary PTY rows across soft keyboard open and close`
+- `HEAD`: `fix(client,daemon): stop unhide refit churn, keep bottom pin unified, and coalesce TUI redraws`

@@ -9270,9 +9270,9 @@ impl ActorState {
                     && !self.exited
                     && self.output.mode_tracker.should_hold_sync_poll(
                         Instant::now(),
-                        Duration::from_millis(150),
-                        Duration::from_millis(10),
-                        Duration::from_millis(45),
+                        Duration::from_millis(180),
+                        Duration::from_millis(22),
+                        Duration::from_millis(110),
                     ) {
                     PollTerminalSyncOutcome::HoldForSynchronizedUpdate
                 } else {
@@ -9438,7 +9438,7 @@ impl ActorState {
         if resized {
             self.output
                 .mode_tracker
-                .note_resize_burst(Instant::now(), Duration::from_millis(50));
+                .note_resize_burst(Instant::now(), Duration::from_millis(90));
             self.output.scroll_seq_baseline = None;
             if let Some(logical_counts) = pre_logical {
                 self.output

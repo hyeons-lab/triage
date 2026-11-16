@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:math' show max, min;
+import 'dart:math' show max;
 
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb, visibleForTesting;
@@ -2731,7 +2731,7 @@ class _TerminalPaneState extends State<TerminalPane>
     if (render != null && render.attached && render.hasSize) {
       final lh = render.lineHeight;
       if (lh > 0) {
-        return max(_terminal.totalLines * lh - render.size.height, 0.0);
+        return max(render.effectiveTotalLines * lh - render.size.height, 0.0);
       }
     }
     return position.maxScrollExtent;
@@ -3039,23 +3039,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   double _autoBottomTarget(ScrollPosition position) {
-    final maxExtent = _effectiveMaxScrollExtent(position);
-    final render = _renderGrid;
-    if (render != null &&
-        render.attached &&
-        render.hasSize &&
-        !_terminal.isUsingAltBuffer &&
-        _terminal.viewHeight > render.fittedRows) {
-      final lh = render.lineHeight;
-      if (lh > 0) {
-        final contentRows = max(
-          0,
-          _terminal.totalLines - _terminal.trailingBlankViewportRows,
-        );
-        return min(maxExtent, max(0.0, contentRows * lh - render.size.height));
-      }
-    }
-    return maxExtent;
+    return _effectiveMaxScrollExtent(position);
   }
 
   void _snapToBottom(ScrollPosition position) {

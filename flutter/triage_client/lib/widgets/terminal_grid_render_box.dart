@@ -429,6 +429,7 @@ class RenderTerminalGrid extends RenderBox {
     }
     _knownTotalLines = -1;
     _lastMaxScrollExtent = 0.0;
+    _lastAutoBottomExtent = 0.0;
     _resetMetricsNotification();
     _pendingMissingFirst = -1;
     _pendingMissingLast = -1;
@@ -627,18 +628,30 @@ class RenderTerminalGrid extends RenderBox {
   }
 
   void _onBufferChanged() {
+    final nextTotalLines = effectiveTotalLines;
     if (_inPerformLayout) {
       markNeedsPaint();
-      if (_layoutInputsConsumed && _buffer.totalLines != _knownTotalLines) {
+      if (_layoutInputsConsumed && nextTotalLines != _knownTotalLines) {
         _scheduleDeferredLayout();
       }
       return;
     }
-    if (_buffer.totalLines != _knownTotalLines) {
+    if (nextTotalLines != _knownTotalLines) {
       markNeedsLayout();
     } else {
       markNeedsPaint();
     }
+  }
+
+  int get effectiveTotalLines {
+    final totalLines = _buffer.totalLines;
+    if (_keepKeyboardCursorVisible &&
+        !_buffer.isUsingAltBuffer &&
+        _buffer.viewHeight > _fittedRows) {
+      final trimmed = totalLines - _buffer.trailingBlankViewportRows;
+      return min(totalLines, max(_fittedRows, max(0, trimmed)));
+    }
+    return totalLines;
   }
 
   void _onScrollOffsetChanged() {
@@ -813,22 +826,12 @@ class RenderTerminalGrid extends RenderBox {
         }
       }
 
-      final totalLines = _buffer.totalLines;
+      final totalLines = effectiveTotalLines;
       _knownTotalLines = totalLines;
       _layoutInputsConsumed = true;
       final contentHeight = max(size.height, totalLines * _cellHeight);
       final newMaxExtent = max(0.0, contentHeight - size.height);
-      final trailingBlank =
-          (_keepKeyboardCursorVisible &&
-              !_buffer.isUsingAltBuffer &&
-              _buffer.viewHeight > _fittedRows)
-          ? _buffer.trailingBlankViewportRows
-          : 0;
-      final autoBottomRows = max(0, totalLines - trailingBlank);
-      final autoBottomExtent = min(
-        newMaxExtent,
-        max(0.0, autoBottomRows * _cellHeight - size.height),
-      );
+      final autoBottomExtent = newMaxExtent;
 
       _offset.applyViewportDimension(size.height);
 

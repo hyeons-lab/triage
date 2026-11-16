@@ -1,3 +1,5 @@
+import 'dart:math' show max;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -1349,6 +1351,114 @@ void main() {
         } finally {
           TerminalPane.debugForceNativeTerminalView = false;
           TerminalPane.destroySession('mobile-kbd-inset-no-sigwinch');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
+      'mobile keyboard open with trailing blank rows sticks cleanly to maxScrollExtent',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        TerminalPane.debugForceNativeTerminalView = true;
+        const sid = 'mobile-kbd-bottom-stick';
+        TerminalPane.destroySession(sid);
+        try {
+          final term = TerminalCellBuffer();
+          final ctrl = TerminalController();
+          addTearDown(() {
+            tester.view.resetViewInsets();
+            tester.view.resetPhysicalSize();
+          });
+          tester.view.physicalSize =
+              const Size(400, 600) * tester.view.devicePixelRatio;
+          tester.view.viewInsets = FakeViewPadding(
+            bottom: 300 * tester.view.devicePixelRatio,
+          );
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: sid,
+                  terminal: term,
+                  controller: ctrl,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 1,
+                ),
+              ),
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 350));
+
+          final cols = term.viewWidth;
+          final rows = max(term.viewHeight, 24);
+          final scrollback = List<TerminalCellLine>.generate(
+            60,
+            (i) => _cellLine('sb-$i', cols: cols),
+          );
+          final viewport = List<TerminalCellLine>.generate(
+            rows,
+            (i) => i < rows - 3
+                ? _cellLine('row-$i', cols: cols)
+                : TerminalCellLine.blank(cols),
+          );
+          term.seedLinesForTest(
+            cols: cols,
+            rows: rows,
+            scrollback: scrollback,
+            viewport: viewport,
+            cursorY: rows - 4,
+          );
+          await tester.pumpAndSettle();
+
+          final scrollable = tester.state<ScrollableState>(
+            find.descendant(
+              of: find.byType(TerminalGridView),
+              matching: find.byType(Scrollable),
+            ),
+          );
+          final renderGrid = tester.renderObject<RenderTerminalGrid>(
+            find.byWidgetPredicate(
+              (w) => w.runtimeType.toString() == '_TerminalGridRenderWidget',
+            ),
+          );
+          final pos = scrollable.position;
+          expect(pos.maxScrollExtent, greaterThan(0));
+          expect(pos.pixels, closeTo(pos.maxScrollExtent, 0.5));
+          expect(renderGrid.stickToBottom, isTrue);
+
+          // Scroll up then scroll back to bottom and confirm it stays pinned
+          // as additional scrollback lines arrive.
+          await tester.drag(find.byType(TerminalPane), const Offset(0, 120));
+          await tester.pumpAndSettle();
+          expect(pos.pixels, lessThan(pos.maxScrollExtent - 20));
+
+          await tester.drag(find.byType(TerminalPane), const Offset(0, -400));
+          await tester.pumpAndSettle();
+          expect(pos.pixels, closeTo(pos.maxScrollExtent, 0.5));
+          expect(renderGrid.stickToBottom, isTrue);
+
+          final prevExtent = pos.maxScrollExtent;
+          term.seedLinesForTest(
+            cols: cols,
+            rows: rows,
+            scrollback: <TerminalCellLine>[
+              ...scrollback,
+              _cellLine('sb-60', cols: cols),
+              _cellLine('sb-61', cols: cols),
+            ],
+            viewport: viewport,
+            cursorY: rows - 4,
+          );
+          await tester.pumpAndSettle();
+          expect(pos.maxScrollExtent, greaterThan(prevExtent));
+          expect(pos.pixels, closeTo(pos.maxScrollExtent, 0.5));
+          expect(renderGrid.stickToBottom, isTrue);
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession(sid);
           debugDefaultTargetPlatformOverride = null;
         }
       },

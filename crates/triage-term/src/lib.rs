@@ -661,7 +661,7 @@ impl TerminalModeTracker {
             return;
         }
         if self.repaint_burst_started_at.is_some_and(|started| {
-            now.saturating_duration_since(started) >= Duration::from_millis(50)
+            now.saturating_duration_since(started) >= Duration::from_millis(150)
         }) {
             self.repaint_burst_started_at = None;
         }
@@ -786,17 +786,19 @@ impl TerminalModeTracker {
         if bytes.is_empty() {
             return (bytes, 0, false);
         }
+        let now = Instant::now();
+        if let Some(until) = self.resize_hold_until.take()
+            && now < until
+        {
+            self.note_repaint_burst(now);
+        } else if self.repaint_burst_started_at.is_some() {
+            self.last_burst_byte_at = Some(now);
+        }
         if self.scan_state == EscapeScanState::Ground
             && self.utf8_state == Utf8ScanState::Ground
             && bytes.iter().all(|&b| b < 0x80 && b != 0x1b && b != 0x07)
         {
-            if self.repaint_burst_started_at.is_some() {
-                self.last_burst_byte_at = Some(Instant::now());
-            }
             return (bytes, bytes.len(), false);
-        }
-        if self.repaint_burst_started_at.is_some() {
-            self.last_burst_byte_at = Some(Instant::now());
         }
 
         let start_erase_gen = self.erase_scrollback_gen;
@@ -1569,6 +1571,14 @@ impl TerminalModeTracker {
             }
             b'H' | b'f' | b'A' if self.csi_private_prefix.is_none() => {
                 self.note_repaint_burst(Instant::now());
+            }
+            b'K' if self.csi_private_prefix.is_none() => {
+                if !buf.contains(&b';')
+                    && !buf.contains(&b':')
+                    && parse_u32_strict_ascii(&buf) == Some(2)
+                {
+                    self.note_repaint_burst(Instant::now());
+                }
             }
             b'u' => {
                 match buf.first().copied() {
@@ -3774,5 +3784,28 @@ mod tests {
         tracker.note_resize_burst(Instant::now(), Duration::from_millis(30));
         feed(&mut term, &mut tracker, b"\x1b[?2026hrebuilt\x1b[?2026l");
         assert!(!tracker.should_hold_sync_poll(Instant::now(), sync_hold, quiet, max_burst));
+
+        // Full-line erase (CSI 2K) opens a repaint burst, and subsequent output
+        // after a resize hold transitions to burst quiescence.
+        feed(&mut term, &mut tracker, b"\x1b[2Kline redraw\r\n");
+        let erase_t0 = Instant::now();
+        assert!(tracker.should_hold_sync_poll(erase_t0, sync_hold, quiet, max_burst));
+        assert!(!tracker.should_hold_sync_poll(
+            erase_t0 + Duration::from_millis(12),
+            sync_hold,
+            quiet,
+            max_burst
+        ));
+
+        tracker.note_resize_burst(Instant::now(), Duration::from_millis(90));
+        feed(&mut term, &mut tracker, b"zsh prompt> ");
+        let post_resize = Instant::now();
+        assert!(tracker.should_hold_sync_poll(post_resize, sync_hold, quiet, max_burst));
+        assert!(!tracker.should_hold_sync_poll(
+            post_resize + Duration::from_millis(12),
+            sync_hold,
+            quiet,
+            max_burst
+        ));
     }
 }
