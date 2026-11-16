@@ -42,6 +42,7 @@ class TerminalGridView extends StatefulWidget {
     this.onKeyEvent,
     this.autoResize = true,
     this.stickToBottom = true,
+    this.keepKeyboardCursorVisible = false,
     this.showCursor = true,
     this.fontSize = 15.0,
     this.lineHeightScale = 1.2,
@@ -60,6 +61,7 @@ class TerminalGridView extends StatefulWidget {
   final FocusOnKeyEventCallback? onKeyEvent;
   final bool autoResize;
   final bool stickToBottom;
+  final bool keepKeyboardCursorVisible;
   final bool showCursor;
   final double fontSize;
   final double lineHeightScale;
@@ -147,6 +149,7 @@ class TerminalGridViewState extends State<TerminalGridView> {
           hasFocus: _hasFocus,
           autoResize: widget.autoResize,
           stickToBottom: widget.stickToBottom,
+          keepKeyboardCursorVisible: widget.keepKeyboardCursorVisible,
           showCursor: widget.showCursor,
           fontSize: widget.fontSize,
           lineHeightScale: widget.lineHeightScale,
@@ -181,6 +184,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
     required this.hasFocus,
     required this.autoResize,
     required this.stickToBottom,
+    required this.keepKeyboardCursorVisible,
     required this.showCursor,
     required this.fontSize,
     required this.lineHeightScale,
@@ -197,6 +201,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
   final bool hasFocus;
   final bool autoResize;
   final bool stickToBottom;
+  final bool keepKeyboardCursorVisible;
   final bool showCursor;
   final double fontSize;
   final double lineHeightScale;
@@ -215,6 +220,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
       hasFocus: hasFocus,
       autoResize: autoResize,
       stickToBottom: stickToBottom,
+      keepKeyboardCursorVisible: keepKeyboardCursorVisible,
       showCursor: showCursor,
       fontSize: fontSize,
       lineHeightScale: lineHeightScale,
@@ -238,6 +244,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
       ..hasFocus = hasFocus
       ..autoResize = autoResize
       ..stickToBottom = stickToBottom
+      ..keepKeyboardCursorVisible = keepKeyboardCursorVisible
       ..showCursor = showCursor
       ..fontSize = fontSize
       ..lineHeightScale = lineHeightScale
@@ -279,6 +286,7 @@ class RenderTerminalGrid extends RenderBox {
     required bool hasFocus,
     required bool autoResize,
     required bool stickToBottom,
+    required bool keepKeyboardCursorVisible,
     required bool showCursor,
     required double fontSize,
     required double lineHeightScale,
@@ -293,6 +301,7 @@ class RenderTerminalGrid extends RenderBox {
        _hasFocus = hasFocus,
        _autoResize = autoResize,
        _stickToBottom = stickToBottom,
+       _keepKeyboardCursorVisible = keepKeyboardCursorVisible,
        _showCursor = showCursor,
        _fontSize = fontSize,
        _lineHeightScale = lineHeightScale,
@@ -313,6 +322,7 @@ class RenderTerminalGrid extends RenderBox {
   bool _hasFocus;
   bool _autoResize;
   bool _stickToBottom;
+  bool _keepKeyboardCursorVisible;
   bool _showCursor;
   double _fontSize;
   double _lineHeightScale;
@@ -334,6 +344,7 @@ class RenderTerminalGrid extends RenderBox {
   double _notifiedCellHeight = -1.0;
   int _knownTotalLines = -1;
   double _lastMaxScrollExtent = 0.0;
+  double _lastAutoBottomExtent = 0.0;
   bool _inPerformLayout = false;
   bool _layoutInputsConsumed = false;
   bool _deferredLayoutNeeded = false;
@@ -445,6 +456,7 @@ class RenderTerminalGrid extends RenderBox {
     _scrollControllerSwapped = false;
     if (!preserveExtent) {
       _lastMaxScrollExtent = 0.0;
+      _lastAutoBottomExtent = 0.0;
     }
     if (attached) {
       _offset.removeListener(_onScrollOffsetChanged);
@@ -496,6 +508,13 @@ class RenderTerminalGrid extends RenderBox {
     if (value) {
       markNeedsLayout();
     }
+  }
+
+  bool get keepKeyboardCursorVisible => _keepKeyboardCursorVisible;
+  set keepKeyboardCursorVisible(bool value) {
+    if (_keepKeyboardCursorVisible == value) return;
+    _keepKeyboardCursorVisible = value;
+    markNeedsLayout();
   }
 
   bool get showCursor => _showCursor;
@@ -799,6 +818,17 @@ class RenderTerminalGrid extends RenderBox {
       _layoutInputsConsumed = true;
       final contentHeight = max(size.height, totalLines * _cellHeight);
       final newMaxExtent = max(0.0, contentHeight - size.height);
+      final trailingBlank =
+          (_keepKeyboardCursorVisible &&
+              !_buffer.isUsingAltBuffer &&
+              _buffer.viewHeight > _fittedRows)
+          ? _buffer.trailingBlankViewportRows
+          : 0;
+      final autoBottomRows = max(0, totalLines - trailingBlank);
+      final autoBottomExtent = min(
+        newMaxExtent,
+        max(0.0, autoBottomRows * _cellHeight - size.height),
+      );
 
       _offset.applyViewportDimension(size.height);
 
@@ -809,15 +839,18 @@ class RenderTerminalGrid extends RenderBox {
         final currentPixels = _offset.pixels;
         if (!currentPixels.isFinite) {
           final targetPixels = currentPixels.isNaN
-              ? (_stickToBottom ? newMaxExtent : 0.0)
-              : (currentPixels > 0.0 ? newMaxExtent : 0.0);
+              ? (_stickToBottom ? autoBottomExtent : 0.0)
+              : (currentPixels > 0.0 ? autoBottomExtent : 0.0);
           if (_offset is ScrollPosition) {
             (_offset as ScrollPosition).correctPixels(targetPixels);
           }
         } else {
-          final wasAtBottom = currentPixels >= _lastMaxScrollExtent - 0.5;
-          if (_stickToBottom && wasAtBottom && newMaxExtent != currentPixels) {
-            _offset.correctBy(newMaxExtent - currentPixels);
+          final pinAnchor = min(_lastMaxScrollExtent, _lastAutoBottomExtent);
+          final wasAtBottom = currentPixels >= pinAnchor - 0.5;
+          if (_stickToBottom &&
+              wasAtBottom &&
+              autoBottomExtent != currentPixels) {
+            _offset.correctBy(autoBottomExtent - currentPixels);
           } else if (currentPixels > newMaxExtent) {
             _offset.correctBy(newMaxExtent - currentPixels);
           } else if (currentPixels < 0.0) {
@@ -826,6 +859,7 @@ class RenderTerminalGrid extends RenderBox {
         }
       }
       _lastMaxScrollExtent = newMaxExtent;
+      _lastAutoBottomExtent = autoBottomExtent;
       _offset.applyContentDimensions(0.0, newMaxExtent);
     } finally {
       _inPerformLayout = false;

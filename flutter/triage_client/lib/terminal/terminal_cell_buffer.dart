@@ -387,6 +387,22 @@ class TerminalCellBuffer extends ChangeNotifier {
   int get totalScrollbackRows => _isAltScreen ? 0 : _primaryScrollbackRows;
   int get trimmedTopRows => _isAltScreen ? 0 : _primaryTrimmedTopRows;
   int get totalLines => totalScrollbackRows + _viewHeight;
+
+  /// Trailing blank rows below both the cursor and lowest non-blank line on
+  /// the current viewport, used to keep content/cursor visible when mobile
+  /// viewport height shrinks temporarily beneath the soft keyboard.
+  int get trailingBlankViewportRows {
+    if (_viewportLines.isEmpty) return 0;
+    var lastContent = _cursorY.clamp(0, _viewportLines.length - 1);
+    for (var r = _viewportLines.length - 1; r > lastContent; r--) {
+      if (_viewportLines[r].storedCols > 0) {
+        lastContent = r;
+        break;
+      }
+    }
+    return max(0, _viewportLines.length - 1 - lastContent);
+  }
+
   int get reflowGen => _reflowGen;
   int get eraseScrollbackGen => _eraseScrollbackGen;
   int get lastFrameSeq => _lastFrameSeq;

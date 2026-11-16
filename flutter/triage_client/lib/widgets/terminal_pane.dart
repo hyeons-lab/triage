@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:math' show max;
+import 'dart:math' show max, min;
 
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform, kIsWeb, visibleForTesting;
@@ -603,6 +603,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
   bool _ctrlArmed = false;
   bool _composerOpen = false;
+  double _observedViewInsetsBottom = 0.0;
   final TextEditingController _composerController = TextEditingController();
   final FocusNode _composerFocusNode = FocusNode();
   String? _dismissedApprovalSignature;
@@ -2557,6 +2558,27 @@ class _TerminalPaneState extends State<TerminalPane>
 
   // --- Grid sizing & resize debounce ---
 
+  bool get _isSoftKeyboardOrComposerActive {
+    if (!_isMobile) return false;
+    if (_composerOpen || _observedViewInsetsBottom > 0.5) return true;
+    final view = WidgetsBinding.instance.platformDispatcher.implicitView;
+    return view != null && view.viewInsets.bottom > 0.5;
+  }
+
+  int _effectiveTerminalRowsForViewport(int nextCols, int fittedRows) {
+    // Keep backend PTY rows at full height while mobile soft keyboard or
+    // composer bar temporarily occludes a primary-screen terminal so
+    // opening/closing the keyboard never sends SIGWINCH or triggers a full
+    // TUI clear-and-reload. Alt-screen apps (vim/less) still shrink cleanly.
+    if (_isSoftKeyboardOrComposerActive &&
+        !_terminal.isUsingAltBuffer &&
+        nextCols == _terminal.viewWidth &&
+        fittedRows < _terminal.viewHeight) {
+      return _terminal.viewHeight;
+    }
+    return fittedRows;
+  }
+
   void _handleGridMetricsChanged(
     int cols,
     int rows,
@@ -2564,7 +2586,8 @@ class _TerminalPaneState extends State<TerminalPane>
     double cellHeight,
   ) {
     final nextCols = cols.clamp(1, kMaxEncodedCols);
-    final nextRows = rows.clamp(1, kMaxViewportRows);
+    final fittedRows = rows.clamp(1, kMaxViewportRows);
+    final nextRows = _effectiveTerminalRowsForViewport(nextCols, fittedRows);
     final pw = (nextCols * cellWidth).round();
     final ph = (nextRows * cellHeight).round();
     _onTerminalResize(nextCols, nextRows, pw, ph);
@@ -2775,8 +2798,9 @@ class _TerminalPaneState extends State<TerminalPane>
       return;
     }
     final cols = max(2, render.size.width ~/ cell.width);
-    final rows = max(1, render.size.height ~/ cell.height);
-    if (cols <= 0 || rows <= 0) return;
+    final fittedRows = max(1, render.size.height ~/ cell.height);
+    if (cols <= 0 || fittedRows <= 0) return;
+    final rows = _effectiveTerminalRowsForViewport(cols, fittedRows);
 
     _lastWorkspaceFittedSize = (rows, cols);
     if (widget.isExited) {
@@ -3014,9 +3038,29 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  double _autoBottomTarget(ScrollPosition position) {
+    final maxExtent = _effectiveMaxScrollExtent(position);
+    final render = _renderGrid;
+    if (render != null &&
+        render.attached &&
+        render.hasSize &&
+        !_terminal.isUsingAltBuffer &&
+        _terminal.viewHeight > render.fittedRows) {
+      final lh = render.lineHeight;
+      if (lh > 0) {
+        final contentRows = max(
+          0,
+          _terminal.totalLines - _terminal.trailingBlankViewportRows,
+        );
+        return min(maxExtent, max(0.0, contentRows * lh - render.size.height));
+      }
+    }
+    return maxExtent;
+  }
+
   void _snapToBottom(ScrollPosition position) {
     if (!position.hasContentDimensions) return;
-    final target = _effectiveMaxScrollExtent(position);
+    final target = _autoBottomTarget(position);
     _jumpPositionTo(position, target, stickToBottom: true);
     _clearSavedSessionScroll(widget.terminalId);
     _scrollAnchor.clear();
@@ -3913,6 +3957,9 @@ class _TerminalPaneState extends State<TerminalPane>
   @override
   Widget build(BuildContext context) {
     _didBuildOnce = true;
+    final mqInsetBottom = MediaQuery.maybeViewInsetsOf(context)?.bottom ?? 0.0;
+    final viewInsetBottom = View.maybeOf(context)?.viewInsets.bottom ?? 0.0;
+    _observedViewInsetsBottom = max(mqInsetBottom, viewInsetBottom);
     final isTest = runningUnderFlutterTest();
     final useTestFallback =
         isTest && !TerminalPane.debugForceNativeTerminalView;
@@ -4117,6 +4164,9 @@ class _TerminalPaneState extends State<TerminalPane>
                                       onKeyEvent: _handleGridKeyEvent,
                                       autoResize: !_metricsResizeSettling,
                                       stickToBottom: !hasSavedScroll,
+                                      keepKeyboardCursorVisible:
+                                          _isSoftKeyboardOrComposerActive &&
+                                          !_terminal.isUsingAltBuffer,
                                       showCursor: !widget.isExited,
                                       fontSize: _kFontSize,
                                       lineHeightScale: _kLineHeightScale,

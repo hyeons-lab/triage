@@ -1292,6 +1292,69 @@ void main() {
     );
 
     testWidgets(
+      'mobile soft-keyboard inset open and close preserves primary PTY rows without emitting SIGWINCH resize',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        TerminalPane.debugForceNativeTerminalView = true;
+        TerminalPane.destroySession('mobile-kbd-inset-no-sigwinch');
+        try {
+          final term = TerminalCellBuffer();
+          final ctrl = TerminalController();
+          final resizeOuts = <(int, int)>[];
+          ctrl.addResizeOutListener((cols, rows) {
+            resizeOuts.add((cols, rows));
+          });
+
+          addTearDown(() {
+            tester.view.resetViewInsets();
+            tester.view.resetPhysicalSize();
+          });
+          tester.view.physicalSize =
+              Size(400, 600) * tester.view.devicePixelRatio;
+          tester.view.viewInsets = FakeViewPadding.zero;
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: TerminalPane(
+                  terminalId: 'mobile-kbd-inset-no-sigwinch',
+                  terminal: term,
+                  controller: ctrl,
+                  fallbackRows: const [],
+                  onTerminalResizeBind: (_) {},
+                  focusCursorRevision: 1,
+                ),
+              ),
+            ),
+          );
+          await tester.pump(const Duration(milliseconds: 300));
+          final fullRows = term.viewHeight;
+          expect(fullRows, greaterThan(10));
+          resizeOuts.clear();
+
+          // Open soft keyboard via FlutterView viewInsets: Scaffold shrinks,
+          // but primary PTY keeps fullRows without emitting SIGWINCH resize.
+          tester.view.viewInsets = FakeViewPadding(
+            bottom: 300 * tester.view.devicePixelRatio,
+          );
+          await tester.pump(const Duration(milliseconds: 350));
+          expect(term.viewHeight, fullRows);
+          expect(resizeOuts, isEmpty);
+
+          // Close soft keyboard: height returns, still zero resizeOut / SIGWINCH.
+          tester.view.viewInsets = FakeViewPadding.zero;
+          await tester.pump(const Duration(milliseconds: 350));
+          expect(term.viewHeight, fullRows);
+          expect(resizeOuts, isEmpty);
+        } finally {
+          TerminalPane.debugForceNativeTerminalView = false;
+          TerminalPane.destroySession('mobile-kbd-inset-no-sigwinch');
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
       'desktop primary click and wheel use 0-based viewport cell coordinates when mouse reporting is active',
       (WidgetTester tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.macOS;

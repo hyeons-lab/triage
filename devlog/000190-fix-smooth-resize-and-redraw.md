@@ -27,11 +27,16 @@ Eliminate visible top-to-bottom layout jumps and mid-redraw tearing during keybo
 - `2026-11-15T22:24-0800 flutter/triage_client/lib/widgets/terminal_pane.dart`: Raised mobile `didChangeMetrics()` settle delay to `260 ms` across keyboard slide animations and snapped bottom-pinned offsets synchronously inside `_onTerminalResize`.
 - `2026-11-15T22:24-0800 flutter/triage_client/lib/widgets/terminal_grid_render_box.dart`: Batched contiguous single-width printable ASCII text runs sharing foreground and bold/italic attributes in `RenderTerminalGrid.paint()`.
 - `2026-11-15T22:24-0800 flutter/triage_client/test/terminal/terminal_cell_buffer_test.dart`, `test/terminal/terminal_grid_render_box_test.dart`, `test/terminal_hardware_key_test.dart`: Added tests for resize bottom anchoring and run-batched painting and updated keyboard animation settle timing to `300 ms`.
+- `2026-11-16T07:52-0800 crates/triaged/src/session.rs`: Bumped `note_resize_burst` to `50 ms` and burst hold windows to `(10 ms quiet, 45 ms max)` for real non-keyboard resizes.
+- `2026-11-16T07:52-0800 flutter/triage_client/lib/terminal/terminal_cell_buffer.dart`, `lib/widgets/terminal_pane.dart`, `lib/widgets/terminal_grid_render_box.dart`: Added `trailingBlankViewportRows`, read raw OS insets via `View.maybeOf` alongside `MediaQuery.maybeViewInsetsOf`, preserved full-height primary PTY rows across soft-keyboard and composer open/close, and clamped auto-bottom layout extent (`keepKeyboardCursorVisible`) so prompts remain visible above the keyboard without triggering `SIGWINCH`.
+- `2026-11-16T07:52-0800 flutter/triage_client/test/terminal_hardware_key_test.dart`: Added test verifying soft-keyboard inset open/close preserves primary PTY rows without emitting `SIGWINCH` resize.
 
 ## Decisions
 
 - `2026-11-15T22:24-0800 Decision`: Hold multi-chunk repaint bursts inside `ActorCommand::PollTerminalSync` rather than `OutputState::poll_sync_frame` so unit tests driving `OutputState` directly stay synchronous while live WebSocket streams coalesce full-screen redraws.
+- `2026-11-16T07:52-0800 Decision`: Keep primary-screen PTY `rows` unchanged when soft keyboard or mobile composer opens at unchanged `cols`, reading `View.maybeOf(context)?.viewInsets.bottom` because `Scaffold(resizeToAvoidBottomInset: true)` strips `MediaQuery.viewInsets.bottom` from descendants. This avoids `SIGWINCH` full-screen top-to-bottom CLI redraws on keyboard open/close while alt-screen TUI apps still resize normally.
 
 ## Commits
 
-- `HEAD`: `fix(terminal): coalesce resize redraws and bottom-anchor keyboard transitions`
+- `8f2aab1`: `fix(terminal): coalesce resize redraws and bottom-anchor keyboard transitions`
+- `HEAD`: `fix(mobile): preserve primary PTY rows across soft keyboard open and close`
