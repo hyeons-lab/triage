@@ -9268,11 +9268,12 @@ impl ActorState {
             } => {
                 let outcome = if !force_full
                     && !self.exited
-                    && self
-                        .output
-                        .mode_tracker
-                        .is_in_synchronized_update(Instant::now(), Duration::from_millis(40))
-                {
+                    && self.output.mode_tracker.should_hold_sync_poll(
+                        Instant::now(),
+                        Duration::from_millis(150),
+                        Duration::from_millis(8),
+                        Duration::from_millis(35),
+                    ) {
                     PollTerminalSyncOutcome::HoldForSynchronizedUpdate
                 } else {
                     self.output.poll_sync_frame(&mut cursor, force_full)
@@ -9435,6 +9436,9 @@ impl ActorState {
         triage_term::prevent_trailing_wrapped_line_drop_on_resize(&mut self.output.terminal);
         self.output.terminal.resize(terminal_size(&size));
         if resized {
+            self.output
+                .mode_tracker
+                .note_resize_burst(Instant::now(), Duration::from_millis(30));
             self.output.scroll_seq_baseline = None;
             if let Some(logical_counts) = pre_logical {
                 self.output

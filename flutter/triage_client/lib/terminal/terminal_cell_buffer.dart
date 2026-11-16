@@ -462,16 +462,61 @@ class TerminalCellBuffer extends ChangeNotifier {
     if (nextCols == _viewWidth && nextRows == _viewHeight) {
       return;
     }
+    final oldLines = _viewportLines;
+    final oldHeight = oldLines.length;
     _viewWidth = nextCols;
     _viewHeight = nextRows;
-    _viewportLines = List<TerminalCellLine>.generate(
-      _viewHeight,
-      (i) => i < _viewportLines.length
-          ? _viewportLines[i]
-          : TerminalCellLine.blank(_viewWidth),
-    );
+
+    if (nextRows == oldHeight) {
+      _cursorX = _cursorX.clamp(0, max(0, _viewWidth - 1));
+      _cursorY = _cursorY.clamp(0, max(0, _viewHeight - 1));
+      notifyListeners();
+      return;
+    }
+
+    if (nextRows < oldHeight) {
+      var lastContentRow = _cursorY.clamp(0, oldHeight - 1);
+      for (var r = oldHeight - 1; r > lastContentRow; r--) {
+        if (oldLines[r].storedCols > 0) {
+          lastContentRow = r;
+          break;
+        }
+      }
+      final keepEnd = (lastContentRow + 1).clamp(nextRows, oldHeight);
+      final dropTop = keepEnd - nextRows;
+      _viewportLines = oldLines.sublist(dropTop, keepEnd);
+      _cursorX = _cursorX.clamp(0, max(0, _viewWidth - 1));
+      _cursorY = (_cursorY - dropTop).clamp(0, max(0, _viewHeight - 1));
+      notifyListeners();
+      return;
+    }
+
+    // Pull resident bottom scrollback rows down into newly exposed rows so
+    // growing height (e.g. closing mobile keyboard) stays bottom-anchored
+    // until the daemon sends its reflowed TerminalSync frame.
+    final grow = nextRows - oldHeight;
+    final pullCount = (!_isAltScreen && _primaryScrollbackRows > 0)
+        ? min(grow, _primaryScrollbackRows)
+        : 0;
+    final pulled = <TerminalCellLine>[];
+    if (pullCount > 0) {
+      final startVirtual = _primaryScrollbackRows - pullCount;
+      for (var i = 0; i < pullCount; i++) {
+        pulled.add(
+          lineAtVirtualRow(startVirtual + i) ??
+              TerminalCellLine.blank(_viewWidth),
+        );
+      }
+    }
+    final trailingBlanks = max(0, nextRows - pullCount - oldHeight);
+    _viewportLines = <TerminalCellLine>[
+      ...pulled,
+      ...oldLines,
+      for (var i = 0; i < trailingBlanks; i++)
+        TerminalCellLine.blank(_viewWidth),
+    ];
     _cursorX = _cursorX.clamp(0, max(0, _viewWidth - 1));
-    _cursorY = _cursorY.clamp(0, max(0, _viewHeight - 1));
+    _cursorY = (_cursorY + pullCount).clamp(0, max(0, _viewHeight - 1));
     notifyListeners();
   }
 

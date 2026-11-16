@@ -1279,7 +1279,7 @@ void main() {
           expect(term.viewHeight, initialRows);
           expect(resizeOuts, isEmpty);
 
-          await tester.pump(const Duration(milliseconds: 100));
+          await tester.pump(const Duration(milliseconds: 300));
           expect(term.viewHeight, lessThan(initialRows));
           expect(resizeOuts.length, 1);
           expect(resizeOuts.single.$2, term.viewHeight);
@@ -1702,60 +1702,59 @@ void main() {
       },
     );
 
-    testWidgets(
-      'Web DOM paste yields to another focused TextField',
-      (tester) async {
-        debugDefaultTargetPlatformOverride = TargetPlatform.windows;
-        TerminalPane.debugOverrideWebPaste = true;
+    testWidgets('Web DOM paste yields to another focused TextField', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      TerminalPane.debugOverrideWebPaste = true;
 
-        final terminal = TerminalCellBuffer(cols: 80, rows: 24);
-        final controller = TerminalController();
-        final inputs = <String>[];
-        controller.addInputListener(inputs.add);
+      final terminal = TerminalCellBuffer(cols: 80, rows: 24);
+      final controller = TerminalController();
+      final inputs = <String>[];
+      controller.addInputListener(inputs.add);
 
-        try {
-          await tester.pumpWidget(
-            MaterialApp(
-              home: Scaffold(
-                body: Column(
-                  children: [
-                    const TextField(),
-                    Expanded(
-                      child: TerminalPane(
-                        terminalId: 'web-paste-textfield-yield',
-                        terminal: terminal,
-                        controller: controller,
-                        fallbackRows: const [],
-                        onTerminalResizeBind: (_) {},
-                        focusCursorRevision: 0,
-                        bracketedPasteEnabled: true,
-                      ),
+      try {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: Column(
+                children: [
+                  const TextField(),
+                  Expanded(
+                    child: TerminalPane(
+                      terminalId: 'web-paste-textfield-yield',
+                      terminal: terminal,
+                      controller: controller,
+                      fallbackRows: const [],
+                      onTerminalResizeBind: (_) {},
+                      focusCursorRevision: 0,
+                      bracketedPasteEnabled: true,
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
-          );
-          await tester.pumpAndSettle();
+          ),
+        );
+        await tester.pumpAndSettle();
 
-          await tester.tap(find.byType(TextField));
-          await tester.pump();
+        await tester.tap(find.byType(TextField));
+        await tester.pump();
 
-          final consumed = TerminalPane.dispatchWebDomPasteForTest(
-            'web-paste-textfield-yield',
-            'for-textfield',
-          );
-          expect(consumed, isFalse);
-          await tester.pump();
-          expect(inputs, isEmpty);
-        } finally {
-          TerminalPane.destroySession('web-paste-textfield-yield');
-          TerminalPane.debugOverrideWebPaste = null;
-          TerminalPane.debugForceNativeTerminalView = false;
-          debugDefaultTargetPlatformOverride = null;
-        }
-      },
-    );
+        final consumed = TerminalPane.dispatchWebDomPasteForTest(
+          'web-paste-textfield-yield',
+          'for-textfield',
+        );
+        expect(consumed, isFalse);
+        await tester.pump();
+        expect(inputs, isEmpty);
+      } finally {
+        TerminalPane.destroySession('web-paste-textfield-yield');
+        TerminalPane.debugOverrideWebPaste = null;
+        TerminalPane.debugForceNativeTerminalView = false;
+        debugDefaultTargetPlatformOverride = null;
+      }
+    });
 
     testWidgets(
       'Native Windows Ctrl+V reads clipboard immediately and notifies interaction',

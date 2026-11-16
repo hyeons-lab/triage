@@ -2607,7 +2607,12 @@ class _TerminalPaneState extends State<TerminalPane>
       if (isAtBottom && !_metricsRestoreInFlight) {
         _scrollAnchor.clear();
         _clearSavedSessionScroll(widget.terminalId);
-        if (_scrollController.hasClients) {
+        _renderGrid?.stickToBottom = true;
+        if (pos != null &&
+            pos.hasContentDimensions &&
+            pos.pixels < pos.maxScrollExtent - 0.5) {
+          _snapToBottom(pos);
+        } else if (_scrollController.hasClients) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted && !_sessionDestroyed && _scrollController.hasClients) {
               final p = _scrollController.position;
@@ -2717,8 +2722,12 @@ class _TerminalPaneState extends State<TerminalPane>
       setState(() => _metricsResizeSettling = true);
     }
     _metricsSettleTimer?.cancel();
+    // Mobile soft-keyboard open/close inset animations span ~200-250 ms; wait
+    // until animation settles before dispatching SIGWINCH to the daemon.
     _metricsSettleTimer = Timer(
-      const Duration(milliseconds: 80),
+      _isMobile
+          ? const Duration(milliseconds: 260)
+          : const Duration(milliseconds: 80),
       _finishMetricsResizeSettle,
     );
     final hasSavedScroll = _hasValidSavedScroll();

@@ -430,6 +430,9 @@ pub struct TerminalModeTracker {
     in_tmux_title: bool,
     last_observed_title: String,
     sync_update_started_at: Option<Instant>,
+    repaint_burst_started_at: Option<Instant>,
+    last_burst_byte_at: Option<Instant>,
+    resize_hold_until: Option<Instant>,
     scan_state: EscapeScanState,
     utf8_state: Utf8ScanState,
     osc_head_len: u8,
@@ -479,6 +482,9 @@ impl TerminalModeTracker {
             in_tmux_title: false,
             last_observed_title: String::new(),
             sync_update_started_at: None,
+            repaint_burst_started_at: None,
+            last_burst_byte_at: None,
+            resize_hold_until: None,
             scan_state: EscapeScanState::Ground,
             utf8_state: Utf8ScanState::Ground,
             osc_head_len: 0,
@@ -642,6 +648,53 @@ impl TerminalModeTracker {
             .is_some_and(|started| now.saturating_duration_since(started) < max_hold)
     }
 
+    /// Holds `PollTerminalSync` briefly right after a PTY resize so the child's
+    /// immediate `SIGWINCH` redraw coalesces into one frame.
+    pub fn note_resize_burst(&mut self, now: Instant, hold: Duration) {
+        self.resize_hold_until = Some(now + hold);
+        self.repaint_burst_started_at = None;
+        self.last_burst_byte_at = None;
+    }
+
+    fn note_repaint_burst(&mut self, now: Instant) {
+        if self.sync_update_started_at.is_some() {
+            return;
+        }
+        if self.repaint_burst_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started) >= Duration::from_millis(50)
+        }) {
+            self.repaint_burst_started_at = None;
+        }
+        self.repaint_burst_started_at.get_or_insert(now);
+        self.last_burst_byte_at = Some(now);
+    }
+
+    /// Returns whether `PollTerminalSync` should hold briefly so an in-flight
+    /// synchronized update (`?2026h..l`), PTY resize (`SIGWINCH`), or multi-chunk
+    /// cursor-home/erase repaint commits in one atomic frame.
+    pub fn should_hold_sync_poll(
+        &self,
+        now: Instant,
+        sync_max_hold: Duration,
+        burst_quiet: Duration,
+        burst_max_hold: Duration,
+    ) -> bool {
+        if self.is_in_synchronized_update(now, sync_max_hold) {
+            return true;
+        }
+        if self.resize_hold_until.is_some_and(|until| now < until) {
+            return true;
+        }
+        if let (Some(started), Some(last_byte)) =
+            (self.repaint_burst_started_at, self.last_burst_byte_at)
+        {
+            let within_cap = now.saturating_duration_since(started) < burst_max_hold;
+            let still_arriving = now.saturating_duration_since(last_byte) < burst_quiet;
+            return within_cap && still_arriving;
+        }
+        false
+    }
+
     /// Syncs `last_observed_title` against `terminal.get_title()` (falling back
     /// to a handover-restored title only until the session updates or resets its
     /// title) and returns `(effective_title, title_gen)`.
@@ -737,7 +790,13 @@ impl TerminalModeTracker {
             && self.utf8_state == Utf8ScanState::Ground
             && bytes.iter().all(|&b| b < 0x80 && b != 0x1b && b != 0x07)
         {
+            if self.repaint_burst_started_at.is_some() {
+                self.last_burst_byte_at = Some(Instant::now());
+            }
             return (bytes, bytes.len(), false);
+        }
+        if self.repaint_burst_started_at.is_some() {
+            self.last_burst_byte_at = Some(Instant::now());
         }
 
         let start_erase_gen = self.erase_scrollback_gen;
@@ -1469,6 +1528,9 @@ impl TerminalModeTracker {
         self.saw_title_osc = false;
         self.in_tmux_title = false;
         self.sync_update_started_at = None;
+        self.repaint_burst_started_at = None;
+        self.last_burst_byte_at = None;
+        self.resize_hold_until = None;
         self.erase_display_gen = self.erase_display_gen.wrapping_add(1);
         self.erase_scrollback_gen = self.erase_scrollback_gen.wrapping_add(1);
     }
@@ -1500,7 +1562,13 @@ impl TerminalModeTracker {
                     } else if code == Some(3) && !self.in_alt_screen {
                         self.erase_scrollback_gen = self.erase_scrollback_gen.wrapping_add(1);
                     }
+                    if matches!(code, Some(0 | 2)) {
+                        self.note_repaint_burst(Instant::now());
+                    }
                 }
+            }
+            b'H' | b'f' | b'A' if self.csi_private_prefix.is_none() => {
+                self.note_repaint_burst(Instant::now());
             }
             b'u' => {
                 match buf.first().copied() {
@@ -1663,6 +1731,9 @@ impl TerminalModeTracker {
                     }
                 } else {
                     self.sync_update_started_at = None;
+                    self.repaint_burst_started_at = None;
+                    self.last_burst_byte_at = None;
+                    self.resize_hold_until = None;
                 }
             }
             _ => {}
@@ -3659,5 +3730,49 @@ mod tests {
         assert!(rows[1].combining.contains(&(2, 0x200D)));
         assert!(rows[1].combining.contains(&(2, 0x1F4BB)));
         assert!(rows[1].combining.contains(&(4, 0x1F1F8)));
+    }
+
+    #[test]
+    fn sync_poll_hold_coalesces_repaint_bursts_and_resize_windows() {
+        let mut term = make_terminal(40, 8);
+        let mut tracker = TerminalModeTracker::new();
+        let quiet = Duration::from_millis(8);
+        let max_burst = Duration::from_millis(35);
+        let sync_hold = Duration::from_millis(150);
+
+        // Plain text output without cursor-home/erase controls releases immediately.
+        feed(&mut term, &mut tracker, b"plain line\r\n");
+        assert!(!tracker.should_hold_sync_poll(Instant::now(), sync_hold, quiet, max_burst));
+
+        // Cursor-home + erase burst triggers short hold that releases after quiet window.
+        feed(&mut term, &mut tracker, b"\x1b[H\x1b[2Jrow 1\r\n");
+        let burst_t0 = Instant::now();
+        assert!(tracker.should_hold_sync_poll(burst_t0, sync_hold, quiet, max_burst));
+        assert!(!tracker.should_hold_sync_poll(
+            burst_t0 + Duration::from_millis(10),
+            sync_hold,
+            quiet,
+            max_burst
+        ));
+
+        // Resize burst holds until deadline and releases immediately once ?2026l closes.
+        let resize_t0 = Instant::now();
+        tracker.note_resize_burst(resize_t0, Duration::from_millis(30));
+        assert!(tracker.should_hold_sync_poll(
+            resize_t0 + Duration::from_millis(10),
+            sync_hold,
+            quiet,
+            max_burst
+        ));
+        assert!(!tracker.should_hold_sync_poll(
+            resize_t0 + Duration::from_millis(35),
+            sync_hold,
+            quiet,
+            max_burst
+        ));
+
+        tracker.note_resize_burst(Instant::now(), Duration::from_millis(30));
+        feed(&mut term, &mut tracker, b"\x1b[?2026hrebuilt\x1b[?2026l");
+        assert!(!tracker.should_hold_sync_poll(Instant::now(), sync_hold, quiet, max_burst));
     }
 }

@@ -984,22 +984,95 @@ class RenderTerminalGrid extends RenderBox {
       }
 
       // 3. Foregrounds, box-drawing/block elements, and text decorations.
-      for (var col = 0; col < maxStored; col++) {
+      var col = 0;
+      while (col < maxStored) {
         final cp = line.getCodePoint(col);
         final width = line.getWidth(col);
         if (cp == 0 && width == 0) {
           // Trailing half of a wide glyph.
+          col++;
           continue;
         }
         final attrs = line.getAttrs(col);
         if ((attrs & kAttrInvisible) != 0) {
+          col++;
           continue;
         }
         final fg = _effectiveCellForeground(line, col, defaultFg, defaultBg);
+        final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
+        if (!hasExtraCombining && width == 1 && cp >= 0x21 && cp <= 0x7E) {
+          final styleMask =
+              ((attrs & kAttrBold) != 0 ? 1 : 0) |
+              ((attrs & kAttrItalic) != 0 ? 2 : 0);
+          final runStart = col;
+          final runBuf = StringBuffer()..writeCharCode(cp);
+          var pendingSpaces = 0;
+          var scan = col + 1;
+          while (scan < maxStored) {
+            final nextCp = line.getCodePoint(scan);
+            final nextWidth = line.getWidth(scan);
+            if (nextWidth != 1) break;
+            final nextAttrs = line.getAttrs(scan);
+            if ((nextAttrs & kAttrInvisible) != 0) break;
+            if (line.getCombining(scan)?.isNotEmpty ?? false) break;
+            if (nextCp == 0x20 || nextCp == 0) {
+              if (pendingSpaces >= 1) break;
+              pendingSpaces++;
+              scan++;
+              continue;
+            }
+            if (nextCp < 0x21 || nextCp > 0x7E) break;
+            final nextFg = _effectiveCellForeground(
+              line,
+              scan,
+              defaultFg,
+              defaultBg,
+            );
+            final nextMask =
+                ((nextAttrs & kAttrBold) != 0 ? 1 : 0) |
+                ((nextAttrs & kAttrItalic) != 0 ? 2 : 0);
+            if (nextFg != fg || nextMask != styleMask) break;
+            if (pendingSpaces == 1) {
+              runBuf.writeCharCode(0x20);
+              pendingSpaces = 0;
+            }
+            runBuf.writeCharCode(nextCp);
+            scan++;
+          }
+          final runEnd = scan - pendingSpaces;
+          final tp = _obtainGlyphPainter(runBuf.toString(), fg, attrs);
+          tp.paint(
+            canvas,
+            Offset(
+              offset.dx + runStart * _cellWidth,
+              rowTop + _glyphBaselineOffset,
+            ),
+          );
+          for (var d = runStart; d < runEnd; d++) {
+            final cellAttrs = line.getAttrs(d);
+            if ((cellAttrs &
+                    (kAttrUnderline | kAttrStrikethrough | kAttrOverline)) !=
+                0) {
+              _paintCellDecorations(
+                canvas,
+                Rect.fromLTWH(
+                  offset.dx + d * _cellWidth,
+                  rowTop,
+                  _cellWidth,
+                  _cellHeight,
+                ),
+                fg,
+                cellAttrs,
+              );
+            }
+          }
+          col = runEnd;
+          continue;
+        }
+
         final cellX = offset.dx + col * _cellWidth;
         final spanWidth = (width == 2 ? 2 : 1) * _cellWidth;
 
-        final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
         if (cp != 0 && (cp != 0x20 || hasExtraCombining)) {
           final paintedVector =
               !hasExtraCombining &&
@@ -1029,6 +1102,7 @@ class RenderTerminalGrid extends RenderBox {
             attrs,
           );
         }
+        col++;
       }
     }
 
