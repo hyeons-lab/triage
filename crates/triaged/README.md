@@ -87,7 +87,7 @@ Every decision passes through three evaluation tiers:
 
 1. **Layer 1: Deterministic Deny Rules**: Destructive commands (`rm -rf /`, formatting disks), credential exfiltration, and dangerous operations are denied immediately without model invocation.
 2. **Layer 2: Deterministic Allow Rules**: Safe inspection commands (`git status`, `ls`, `cargo check`, `npm test`) are instantly auto-approved (<10ms).
-3. **Layer 3: Resident Model**: Ambiguous operations are evaluated by the resident `cera` engine (`LFM2-2.6B-GGUF`), constrained by grammar decoding strictly to `allow` or `ask`.
+3. **Layer 3: Resident Decision Model**: Ambiguous operations are evaluated locally by a Liquid `d1` decision model (`LiquidAI/d1-2B-GGUF` via `cera::d1::D1Engine`), scoring `allow` vs `ask` in a single calibrated forward pass with zero generated tokens.
 
 For full setup, agent hook configs, audit logs, and rules customization, see [`docs/approval-judge.md`](../../docs/approval-judge.md).
 
@@ -114,13 +114,16 @@ require_pairing = true
 enabled = true
 default_enabled_per_session = true
 timeout_ms = 8000
+model = "LiquidAI/d1-2B-GGUF"
+quant = "Q4_K_M"
+min_allow_confidence_pct = 65
 deny_substrings = ["terraform apply"]
 allow_commands = ["npm test", "pnpm lint"]
 
 [summarizer]
 enabled = true
-bundle_id = "LFM2-2.6B-GGUF"
-quant = "Q4_K_M"
+bundle_id = "LFM2.5-1.2B-Instruct-GGUF"
+quant = "Q4_0"
 ```
 
 For the complete list of configuration options, defaults, and validation rules, see the [Configuration Reference](../../docs/configuration.md).

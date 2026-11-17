@@ -16,7 +16,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-const DEFAULT_FILTER: &str = "info,wezterm_term::terminalstate::performer=warn,tattoy_wezterm_term::terminalstate::performer=warn";
+const DEFAULT_FILTER: &str = "info,wezterm_term::terminalstate::performer=warn,tattoy_wezterm_term::terminalstate::performer=warn,cera::bundle=error";
 
 pub struct Config {
     pub log_file: PathBuf,
@@ -92,6 +92,7 @@ mod tests {
     fn default_filters_suppress_terminal_bell_info_logs() {
         assert!(DEFAULT_FILTER.contains("wezterm_term::terminalstate::performer=warn"));
         assert!(DEFAULT_FILTER.contains("tattoy_wezterm_term::terminalstate::performer=warn"));
+        assert!(DEFAULT_FILTER.contains("cera::bundle=error"));
         EnvFilter::try_new(DEFAULT_FILTER).expect("valid default filter");
     }
 }

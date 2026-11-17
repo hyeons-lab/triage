@@ -1603,10 +1603,17 @@ pub fn builtin_deny_substrings() -> Vec<String> {
 
 pub fn persist_judge_config(config: &crate::config::JudgeConfig) -> anyhow::Result<()> {
     let target_path = crate::config::Config::default_path()?;
+    persist_judge_config_to(&target_path, config)
+}
+
+pub(crate) fn persist_judge_config_to(
+    target_path: &std::path::Path,
+    config: &crate::config::JudgeConfig,
+) -> anyhow::Result<()> {
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let path = std::fs::canonicalize(&target_path).unwrap_or(target_path);
+    let path = std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let mut table: toml::Table = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
         toml::from_str(&content)
@@ -1627,8 +1634,27 @@ pub fn persist_judge_config(config: &crate::config::JudgeConfig) -> anyhow::Resu
     );
     judge_table.insert(
         "timeout_ms".into(),
-        toml::Value::Integer(config.timeout_ms as i64),
+        toml::Value::Integer(i64::try_from(config.timeout_ms).unwrap_or(i64::MAX)),
     );
+    judge_table.insert("model".into(), toml::Value::String(config.model.clone()));
+    judge_table.insert("quant".into(), toml::Value::String(config.quant.clone()));
+    judge_table.insert(
+        "min_allow_confidence_pct".into(),
+        toml::Value::Integer(i64::from(config.min_allow_confidence_pct)),
+    );
+    match config
+        .cache_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(dir) => {
+            judge_table.insert("cache_dir".into(), toml::Value::String(dir.to_string()));
+        }
+        None => {
+            judge_table.remove("cache_dir");
+        }
+    }
 
     let allow_arr = config
         .allow_commands
@@ -5151,5 +5177,50 @@ mod tests {
         let v = rules.evaluate(&auth_req).unwrap();
         assert_eq!(v.decision, JudgeDecision::Ask);
         assert!(v.reason.contains("credential path"));
+    }
+
+    #[test]
+    fn persist_judge_config_to_preserves_d1_fields_and_clears_removed_cache_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "triage-persist-judge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg_path = dir.join("config.toml");
+        std::fs::write(&cfg_path, "[summarizer]\nenabled = false\n").expect("seed config");
+
+        let custom = crate::config::JudgeConfig {
+            enabled: true,
+            default_enabled_per_session: false,
+            timeout_ms: 9_500,
+            deny_substrings: vec!["rm -rf".to_string()],
+            allow_commands: vec!["cargo check".to_string()],
+            model: "LiquidAI/d1-omni-600M-GGUF".to_string(),
+            quant: "Q8_0".to_string(),
+            min_allow_confidence_pct: 82,
+            cache_dir: Some("~/.cache/custom-d1".to_string()),
+        };
+        persist_judge_config_to(&cfg_path, &custom).expect("persist custom judge config");
+
+        let raw1 = std::fs::read_to_string(&cfg_path).expect("read persisted config");
+        let parsed1: crate::config::Config = toml::from_str(&raw1).expect("parse persisted config");
+        assert!(!parsed1.summarizer.enabled);
+        assert_eq!(parsed1.judge, custom);
+
+        let mut cleared = custom;
+        cleared.cache_dir = None;
+        persist_judge_config_to(&cfg_path, &cleared).expect("persist cleared cache_dir");
+        let raw2 = std::fs::read_to_string(&cfg_path).expect("read updated config");
+        let parsed2: crate::config::Config = toml::from_str(&raw2).expect("parse updated config");
+        assert_eq!(parsed2.judge.cache_dir, None);
+        assert_eq!(parsed2.judge.model, "LiquidAI/d1-omni-600M-GGUF");
+        assert_eq!(parsed2.judge.quant, "Q8_0");
+        assert_eq!(parsed2.judge.min_allow_confidence_pct, 82);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

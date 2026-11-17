@@ -2,8 +2,8 @@
 
 Lets an agent CLI running inside a Triage session auto-approve its own routine
 tool calls, while anything risky still stops and prompts you. The decision is
-made locally, by the model the daemon already keeps resident for session
-summaries. Nothing leaves the machine.
+made locally inside `triaged` by a Liquid `d1` decision model. Nothing leaves
+the machine.
 
 This is not `--dangerously-skip-permissions`. That flag removes the decision
 point entirely; this adds one and answers it.
@@ -23,30 +23,34 @@ Every request passes through three layers, in order:
 Two properties are worth knowing, because they bound how much the model is
 trusted:
 
-- **The model can never deny.** Decode is grammar-constrained to `allow|ask`, so
-  emitting `deny` is impossible rather than merely discouraged. A denial the
+- **The model can never deny.** Layer 3 runs a two-option `choice` (`allow` vs
+  `ask`) forward pass on a `d1` decision model with zero output tokens, so
+  `deny` is not in the option set rather than merely discouraged. A denial the
   model invented would look, to you, identical to one a rule meant.
 - **Every failure is an `ask`.** A disabled judge, an unreachable daemon, an
   unloaded model, a timeout, an unparseable payload: all answer `ask`, which is
   precisely what the agent does with no hook installed. The worst a broken judge
   can do is give you back the prompts you already had.
 
-Layer 3 is the summarizer's model. The judge does not load one of its own, so
-`[summarizer] enabled = false` removes that layer: the deterministic rules still
-run, and everything they do not settle becomes `ask`. That is a safe
-configuration, just a quieter one, and worth knowing before you conclude the
-judge is ignoring you.
+Layer 3 loads its own Liquid `d1` decision model (`LiquidAI/d1-2B-GGUF` at
+`Q4_K_M` by default) lazily on the first ambiguous command, sharing the
+daemon's priority inference worker thread with the session summarizer so the
+two models never contend for GPU/CPU resources and arriving judge queries
+preempt in-flight session summaries. Disabling `[summarizer] enabled = false`
+turns off background session summaries while keeping Layer 3 `d1` judging
+active; set `[judge] enabled = false` to turn judging off.
 
-The default resident bundle is `LFM2-2.6B-GGUF` (`Q4_K_M`). If customizing the
-underlying summarizer model bundle, note that the approval judge requires single-token
-grammar constraint (`allow|ask`) at decode step 0; reasoning models (e.g. `LFM2.5`) that
-emit mandatory `<think>` blocks before the decision token will fail grammar evaluation
-and fall back to `ask`.
+`d1` decision models evaluate structured `(working_directory, command)` state
+against explicit `allow` and `ask` criteria in a single calibrated forward pass
+(`output_tokens = 0`), requiring both `choice == "allow"` and calibrated
+`P(allow)` at or above `judge.min_allow_confidence_pct` (default `65`). Any
+`<|...|>` delimiter text inside a shell command is escaped before tokenizing so
+command arguments cannot forge prompt boundaries.
 
 The hook blocks the agent's loop for as long as a decision takes, so the layering
 is also a cost decision. Layers 1 and 2 answer in under 10ms. Layer 3 costs about
-40ms on Apple silicon, where the engine runs on Metal, and closer to 0.7s on the
-CPU path, which is what you get on a platform without a Metal build.
+90 to 120ms on Apple silicon, where the `d1` trunk runs on Metal, and stays well
+inside `judge.timeout_ms` on CPU paths.
 
 Allow rules match a leading token sequence, and only on a command containing no
 shell metacharacter at all. That guard is what makes prefix matching safe: with
@@ -88,6 +92,10 @@ out of the box for all sessions:
 enabled = true
 # Already the default; set to false to make judging opt-in per session.
 default_enabled_per_session = true
+# Liquid d1 decision model (HF repo, direct .gguf URL, or local .gguf path).
+model = "LiquidAI/d1-2B-GGUF"
+quant = "Q4_K_M"
+min_allow_confidence_pct = 65
 # Extra rules, additive to the built-ins. Config can extend the deny list but
 # never weaken it, and an allow entry is still subject to the metacharacter guard.
 deny_substrings = ["terraform apply"]

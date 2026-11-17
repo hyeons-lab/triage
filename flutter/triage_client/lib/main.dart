@@ -8792,7 +8792,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                         ),
                       ),
                       child: const Text(
-                        'Local AI · LFM2-2.6B',
+                        'Local AI · Liquid d1-2B',
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
@@ -9663,7 +9663,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
             iconColor: const Color(0xffffc857),
             title: 'Layer 3: Local Model',
             description:
-                'Ambiguous commands are evaluated by resident model using GBNF grammar constraints (allow/ask).',
+                'Ambiguous commands are scored in a single forward pass by the resident Liquid d1 decision model (allow/ask).',
           ),
           const SizedBox(height: 16),
 
