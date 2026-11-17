@@ -25179,6 +25179,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
     fn child_unexpected_exit_sends_parent_inbox_alert() {
         let log_dir = unique_log_dir();
         let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
@@ -25497,7 +25501,20 @@ mod tests {
         assert!(timed_out.timed_out);
         assert!(!timed_out.interrupted_by_inbox);
 
-        // 5. Exited worker reports Exited.
+        let _ = fs::remove_dir_all(&log_dir);
+    }
+
+    #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "portable-pty ConPTY EOF handling needs a dedicated Windows lifecycle test"
+    )]
+    fn wait_for_sessions_reports_exited_worker() {
+        let log_dir = unique_log_dir();
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+
         let exiting = manager
             .start_session(shell_command_request("exit 0", "exit 0", false))
             .expect("start exiting");
