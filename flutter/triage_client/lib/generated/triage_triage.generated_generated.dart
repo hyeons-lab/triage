@@ -1103,10 +1103,14 @@ class SessionSnapshot {
   String? get snippetDetail => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 32);
   List<int>? get rawOutputPrefix => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 34);
   AgentAttachment? get agent => AgentAttachment.reader.vTableGetNullable(_bc, _bcOffset, 36);
+  String? get parentSessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 38);
+  bool get outliveParent => const fb.BoolReader().vTableGet(_bc, _bcOffset, 40, false);
+  bool get pendingApproval => const fb.BoolReader().vTableGet(_bc, _bcOffset, 42, false);
+  String? get pendingApprovalReason => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 44);
 
   @override
   String toString() {
-    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}, snippetDetail: ${snippetDetail}, rawOutputPrefix: ${rawOutputPrefix}, agent: ${agent}}';
+    return 'SessionSnapshot{outputSeq: ${outputSeq}, bytesLogged: ${bytesLogged}, size: ${size}, visibleRows: ${visibleRows}, styledRowsStart: ${styledRowsStart}, styledRows: ${styledRows}, cursor: ${cursor}, currentWorkingDirectory: ${currentWorkingDirectory}, context: ${context}, bracketedPasteEnabled: ${bracketedPasteEnabled}, exited: ${exited}, rawOutput: ${rawOutput}, rawOutputStart: ${rawOutputStart}, snippet: ${snippet}, snippetDetail: ${snippetDetail}, rawOutputPrefix: ${rawOutputPrefix}, agent: ${agent}, parentSessionId: ${parentSessionId}, outliveParent: ${outliveParent}, pendingApproval: ${pendingApproval}, pendingApprovalReason: ${pendingApprovalReason}}';
   }
 }
 
@@ -1124,7 +1128,7 @@ class SessionSnapshotBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(17);
+    fbBuilder.startTable(21);
   }
 
   int addOutputSeq(int? outputSeq) {
@@ -1195,6 +1199,22 @@ class SessionSnapshotBuilder {
     fbBuilder.addOffset(16, offset);
     return fbBuilder.offset;
   }
+  int addParentSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(17, offset);
+    return fbBuilder.offset;
+  }
+  int addOutliveParent(bool? outliveParent) {
+    fbBuilder.addBool(18, outliveParent);
+    return fbBuilder.offset;
+  }
+  int addPendingApproval(bool? pendingApproval) {
+    fbBuilder.addBool(19, pendingApproval);
+    return fbBuilder.offset;
+  }
+  int addPendingApprovalReasonOffset(int? offset) {
+    fbBuilder.addOffset(20, offset);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -1219,6 +1239,10 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
   final String? _snippetDetail;
   final List<int>? _rawOutputPrefix;
   final AgentAttachmentObjectBuilder? _agent;
+  final String? _parentSessionId;
+  final bool? _outliveParent;
+  final bool? _pendingApproval;
+  final String? _pendingApprovalReason;
 
   SessionSnapshotObjectBuilder({
     int? outputSeq,
@@ -1238,6 +1262,10 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     String? snippetDetail,
     List<int>? rawOutputPrefix,
     AgentAttachmentObjectBuilder? agent,
+    String? parentSessionId,
+    bool? outliveParent,
+    bool? pendingApproval,
+    String? pendingApprovalReason,
   })
       : _outputSeq = outputSeq,
         _bytesLogged = bytesLogged,
@@ -1255,7 +1283,11 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
         _snippet = snippet,
         _snippetDetail = snippetDetail,
         _rawOutputPrefix = rawOutputPrefix,
-        _agent = agent;
+        _agent = agent,
+        _parentSessionId = parentSessionId,
+        _outliveParent = outliveParent,
+        _pendingApproval = pendingApproval,
+        _pendingApprovalReason = pendingApprovalReason;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -1276,7 +1308,11 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     final int? rawOutputPrefixOffset = _rawOutputPrefix == null ? null
         : fbBuilder.writeListUint8(_rawOutputPrefix!);
     final int? agentOffset = _agent?.getOrCreateOffset(fbBuilder);
-    fbBuilder.startTable(17);
+    final int? parentSessionIdOffset = _parentSessionId == null ? null
+        : fbBuilder.writeString(_parentSessionId!);
+    final int? pendingApprovalReasonOffset = _pendingApprovalReason == null ? null
+        : fbBuilder.writeString(_pendingApprovalReason!);
+    fbBuilder.startTable(21);
     fbjs.addUint64(fbBuilder, 0, _outputSeq);
     fbjs.addUint64(fbBuilder, 1, _bytesLogged);
     if (_size != null) {
@@ -1298,6 +1334,10 @@ class SessionSnapshotObjectBuilder extends fb.ObjectBuilder {
     fbBuilder.addOffset(14, snippetDetailOffset);
     fbBuilder.addOffset(15, rawOutputPrefixOffset);
     fbBuilder.addOffset(16, agentOffset);
+    fbBuilder.addOffset(17, parentSessionIdOffset);
+    fbBuilder.addBool(18, _outliveParent);
+    fbBuilder.addBool(19, _pendingApproval);
+    fbBuilder.addOffset(20, pendingApprovalReasonOffset);
     return fbBuilder.endTable();
   }
 
@@ -2325,10 +2365,12 @@ class StartSessionRequestTable {
   List<String>? get args => const fb.ListReader<String>(fb.StringReader()).vTableGetNullable(_bc, _bcOffset, 6);
   String? get cwd => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 8);
   SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 10);
+  String? get parentSessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 12);
+  bool get outliveParent => const fb.BoolReader().vTableGet(_bc, _bcOffset, 14, false);
 
   @override
   String toString() {
-    return 'StartSessionRequestTable{command: ${command}, args: ${args}, cwd: ${cwd}, size: ${size}}';
+    return 'StartSessionRequestTable{command: ${command}, args: ${args}, cwd: ${cwd}, size: ${size}, parentSessionId: ${parentSessionId}, outliveParent: ${outliveParent}}';
   }
 }
 
@@ -2346,7 +2388,7 @@ class StartSessionRequestTableBuilder {
   final fb.Builder fbBuilder;
 
   void begin() {
-    fbBuilder.startTable(4);
+    fbBuilder.startTable(6);
   }
 
   int addCommandOffset(int? offset) {
@@ -2365,6 +2407,14 @@ class StartSessionRequestTableBuilder {
     fbBuilder.addStruct(3, offset);
     return fbBuilder.offset;
   }
+  int addParentSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(4, offset);
+    return fbBuilder.offset;
+  }
+  int addOutliveParent(bool? outliveParent) {
+    fbBuilder.addBool(5, outliveParent);
+    return fbBuilder.offset;
+  }
 
   int finish() {
     return fbBuilder.endTable();
@@ -2376,17 +2426,23 @@ class StartSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
   final List<String>? _args;
   final String? _cwd;
   final SessionSizeObjectBuilder? _size;
+  final String? _parentSessionId;
+  final bool? _outliveParent;
 
   StartSessionRequestTableObjectBuilder({
     String? command,
     List<String>? args,
     String? cwd,
     SessionSizeObjectBuilder? size,
+    String? parentSessionId,
+    bool? outliveParent,
   })
       : _command = command,
         _args = args,
         _cwd = cwd,
-        _size = size;
+        _size = size,
+        _parentSessionId = parentSessionId,
+        _outliveParent = outliveParent;
 
   /// Finish building, and store into the [fbBuilder].
   @override
@@ -2397,13 +2453,17 @@ class StartSessionRequestTableObjectBuilder extends fb.ObjectBuilder {
         : fbBuilder.writeList(_args!.map(fbBuilder.writeString).toList());
     final int? cwdOffset = _cwd == null ? null
         : fbBuilder.writeString(_cwd!);
-    fbBuilder.startTable(4);
+    final int? parentSessionIdOffset = _parentSessionId == null ? null
+        : fbBuilder.writeString(_parentSessionId!);
+    fbBuilder.startTable(6);
     fbBuilder.addOffset(0, commandOffset);
     fbBuilder.addOffset(1, argsOffset);
     fbBuilder.addOffset(2, cwdOffset);
     if (_size != null) {
       fbBuilder.addStruct(3, _size!.finish(fbBuilder));
     }
+    fbBuilder.addOffset(4, parentSessionIdOffset);
+    fbBuilder.addBool(5, _outliveParent);
     return fbBuilder.endTable();
   }
 

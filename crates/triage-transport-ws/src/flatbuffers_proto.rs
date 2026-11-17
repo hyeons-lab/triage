@@ -138,12 +138,20 @@ pub fn parse_client_message(
                 pixel_height: fb_size.pixel_height() as usize,
                 dpi: fb_size.dpi() as usize,
             };
+            let parent_session_id = req
+                .parent_session_id()
+                .filter(|id| !id.is_empty())
+                .map(SessionId::new)
+                .transpose()
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
             ClientRequest::StartSession {
                 request: StartSessionRequest {
                     command,
                     args,
                     cwd,
                     size,
+                    parent_session_id,
+                    outlive_parent: req.outlive_parent(),
                 },
             }
         }
@@ -806,6 +814,10 @@ pub fn build_client_message<'a>(
                 request.size.pixel_height as u32,
                 request.size.dpi as u32,
             );
+            let parent_session_id = request
+                .parent_session_id
+                .as_ref()
+                .map(|id| builder.create_string(id.as_str()));
             let req = fb::StartSessionRequestTable::create(
                 builder,
                 &fb::StartSessionRequestTableArgs {
@@ -813,6 +825,8 @@ pub fn build_client_message<'a>(
                     args: Some(args_offset),
                     cwd: cwd_str,
                     size: Some(&size),
+                    parent_session_id,
+                    outlive_parent: request.outlive_parent,
                 },
             );
             (

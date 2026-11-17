@@ -150,6 +150,14 @@ pub fn build_session_snapshot<'a>(
         .agent
         .as_ref()
         .map(|a| build_agent_attachment(builder, a));
+    let parent_session_id = snap
+        .parent_session_id
+        .as_ref()
+        .map(|id| builder.create_string(id.as_str()));
+    let pending_approval_reason = snap
+        .pending_approval_reason
+        .as_deref()
+        .map(|reason| builder.create_string(reason));
 
     fb::SessionSnapshot::create(
         builder,
@@ -171,6 +179,10 @@ pub fn build_session_snapshot<'a>(
             snippet,
             snippet_detail,
             agent,
+            parent_session_id,
+            outlive_parent: snap.outlive_parent,
+            pending_approval: snap.pending_approval,
+            pending_approval_reason,
         },
     )
 }
@@ -447,6 +459,10 @@ mod tests {
             snippet: None,
             snippet_detail: None,
             agent: None,
+            parent_session_id: None,
+            outlive_parent: false,
+            pending_approval: false,
+            pending_approval_reason: None,
         }
     }
 

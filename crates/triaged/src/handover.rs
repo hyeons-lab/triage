@@ -75,6 +75,12 @@ pub struct HandoverSession {
     /// stacks, and OSC title across zero-downtime handover.
     #[serde(default)]
     pub terminal_modes: Option<triage_term::HandoverTerminalModes>,
+    /// Optional parent session that spawned this worker.
+    #[serde(default)]
+    pub parent_session_id: Option<SessionId>,
+    /// Whether this child outlives parent exit or shutdown.
+    #[serde(default)]
+    pub outlive_parent: bool,
 }
 
 impl HandoverSession {

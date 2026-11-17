@@ -28,7 +28,8 @@ use triage_core::session::{
     SendSessionMessageRequest, SendSessionMessageResponse, ServerUpdateInfo, SessionApi,
     SessionEventEnvelope, SessionEventReceiver, SessionId, SessionMessage, SessionSnapshot,
     StartSessionRequest, StyledRowsRequest, StyledRowsResponse, SubscribeSessionEventsRequest,
-    WaitForSessionMessagesRequest, WriteInputRequest,
+    WaitForSessionMessagesRequest, WaitForSessionsRequest, WaitForSessionsResponse,
+    WriteInputRequest,
 };
 
 #[cfg(unix)]
@@ -656,6 +657,19 @@ impl SessionApi for IpcClient {
         }
     }
 
+    fn wait_for_sessions(
+        &self,
+        request: WaitForSessionsRequest,
+    ) -> Result<WaitForSessionsResponse> {
+        let extra = Duration::from_millis(request.timeout_ms);
+        match self
+            .round_trip_with_extra_read_timeout(WireRequest::WaitForSessions(request), extra)?
+        {
+            WireSuccess::WaitForSessions(response) => Ok(response),
+            other => bail!("unexpected wait_for_sessions response: {other:?}"),
+        }
+    }
+
     fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
         match self.round_trip(WireRequest::AckSessionMessages {
             session_id,
@@ -748,6 +762,7 @@ enum WireRequest {
         session_id: SessionId,
     },
     WaitForSessionMessages(WaitForSessionMessagesRequest),
+    WaitForSessions(WaitForSessionsRequest),
     AckSessionMessages {
         session_id: SessionId,
         message_ids: Vec<u64>,
@@ -825,6 +840,7 @@ enum WireSuccess {
     SessionMessageId(u64),
     SendSessionMessageResponse(SendSessionMessageResponse),
     SessionMessages(Vec<SessionMessage>),
+    WaitForSessions(WaitForSessionsResponse),
     CompletedSession(CompletedSession),
     Subscribed,
     SessionEvent(SessionEventEnvelope),
@@ -1948,6 +1964,9 @@ fn handle_request(
         WireRequest::WaitForSessionMessages(request) => manager
             .wait_for_session_messages(request)
             .map(WireSuccess::SessionMessages),
+        WireRequest::WaitForSessions(request) => manager
+            .wait_for_sessions(request)
+            .map(WireSuccess::WaitForSessions),
         WireRequest::AckSessionMessages {
             session_id,
             message_ids,
@@ -2732,5 +2751,67 @@ mod tests {
         assert!(verify_peer_uid(&s1, my_uid).is_ok());
         let err = verify_peer_uid(&s1, other_uid).unwrap_err();
         assert!(err.to_string().contains("unauthorized peer UID"));
+    }
+
+    #[test]
+    fn ipc_wait_for_sessions_and_parent_link_round_trip() {
+        let socket_path = unique_socket_path("ipc-wait");
+        let log_dir = unique_dir("ipc-wait-logs");
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let cache = Arc::new(crate::http::WebAssetCache::new(None));
+        let server = IpcServer::new(
+            Arc::clone(&manager),
+            cache,
+            IpcConfig::new(socket_path.clone()),
+        );
+        spawn_server(server);
+
+        let client = IpcClient::new(&socket_path);
+        let parent = client
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start parent via IPC");
+        let mut child_req = StartSessionRequest::new(long_running_shell_command())
+            .with_parent(parent.clone())
+            .with_outlive_parent(true);
+        #[cfg(not(windows))]
+        {
+            child_req.args = vec![
+                "-c".to_string(),
+                "printf 'IPC_WAIT_OK\\n'; sleep 30".to_string(),
+            ];
+        }
+        let child = client
+            .start_session(child_req)
+            .expect("start child via IPC");
+
+        let snap = client
+            .snapshot_session(child.clone())
+            .expect("snapshot child via IPC");
+        assert_eq!(snap.parent_session_id.as_ref(), Some(&parent));
+        assert!(snap.outlive_parent);
+
+        #[cfg(not(windows))]
+        {
+            let waited = client
+                .wait_for_sessions(triage_core::session::WaitForSessionsRequest {
+                    session_ids: vec![child.clone()],
+                    mode: triage_core::session::WaitForSessionsMode::Any,
+                    output_contains: Some("IPC_WAIT_OK".to_string()),
+                    idle_ms: 0,
+                    for_inbox_session_id: None,
+                    timeout_ms: 5_000,
+                })
+                .expect("wait_for_sessions via IPC");
+            assert!(!waited.timed_out);
+            assert_eq!(
+                waited.ready_sessions[0].outcome,
+                triage_core::session::SessionWaitOutcome::MatchedOutput
+            );
+        }
+
+        let _ = client.shutdown_session(child);
+        let _ = client.shutdown_session(parent);
     }
 }

@@ -1018,6 +1018,10 @@ mod tests {
             snippet: None,
             snippet_detail: None,
             agent: None,
+            parent_session_id: None,
+            outlive_parent: false,
+            pending_approval: false,
+            pending_approval_reason: None,
         };
 
         let mut app = LocalSessionApp::start_with_manager(
@@ -1753,6 +1757,10 @@ mod tests {
                 snippet: None,
                 snippet_detail: None,
                 agent: None,
+                parent_session_id: None,
+                outlive_parent: false,
+                pending_approval: false,
+                pending_approval_reason: None,
             },
             lease: InputLeaseState::default(),
             last_completed: None,
@@ -1847,6 +1855,10 @@ mod tests {
                     snippet: None,
                     snippet_detail: None,
                     agent: None,
+                    parent_session_id: None,
+                    outlive_parent: false,
+                    pending_approval: false,
+                    pending_approval_reason: None,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {
@@ -2030,6 +2042,10 @@ mod tests {
                     snippet: None,
                     snippet_detail: None,
                     agent: None,
+                    parent_session_id: None,
+                    outlive_parent: false,
+                    pending_approval: false,
+                    pending_approval_reason: None,
                 },
                 lease: InputLeaseState {
                     holder: request.mode.controller_kind().map(|kind| InputLeaseHolder {

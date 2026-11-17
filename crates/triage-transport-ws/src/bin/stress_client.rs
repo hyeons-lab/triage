@@ -283,6 +283,8 @@ async fn main() -> Result<()> {
                         args: vec![],
                         cwd: None,
                         size: SessionSize::default(),
+                        parent_session_id: None,
+                        outlive_parent: false,
                     },
                 },
             };

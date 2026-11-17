@@ -172,6 +172,18 @@ pub struct SessionSnapshot {
     /// from old hosts.
     #[serde(default)]
     pub agent: Option<AgentAttachment>,
+    /// Optional parent session that spawned this worker.
+    #[serde(default)]
+    pub parent_session_id: Option<SessionId>,
+    /// When true, this child session stays running if its parent exits or shuts down.
+    #[serde(default)]
+    pub outlive_parent: bool,
+    /// True when the session appears blocked on a tool-call approval or prompt.
+    #[serde(default)]
+    pub pending_approval: bool,
+    /// Short description of the pending approval prompt, when known.
+    #[serde(default)]
+    pub pending_approval_reason: Option<String>,
 }
 
 mod compressed_bytes {
@@ -560,6 +572,10 @@ pub struct StartSessionRequest {
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub size: SessionSize,
+    #[serde(default)]
+    pub parent_session_id: Option<SessionId>,
+    #[serde(default)]
+    pub outlive_parent: bool,
 }
 
 impl StartSessionRequest {
@@ -569,7 +585,19 @@ impl StartSessionRequest {
             args: Vec::new(),
             cwd: None,
             size: SessionSize::default(),
+            parent_session_id: None,
+            outlive_parent: false,
         }
+    }
+
+    pub fn with_parent(mut self, parent_session_id: SessionId) -> Self {
+        self.parent_session_id = Some(parent_session_id);
+        self
+    }
+
+    pub fn with_outlive_parent(mut self, outlive_parent: bool) -> Self {
+        self.outlive_parent = outlive_parent;
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -958,6 +986,83 @@ pub struct SendSessionMessageResponse {
     pub woke: bool,
 }
 
+/// Default idle quiet period (in milliseconds) for `wait_for_sessions`.
+pub const SESSION_WAIT_DEFAULT_IDLE_MS: u64 = 2_000;
+
+fn default_wait_idle_ms() -> u64 {
+    SESSION_WAIT_DEFAULT_IDLE_MS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitForSessionsMode {
+    #[default]
+    Any,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionWaitOutcome {
+    Exited,
+    Blocked,
+    MatchedOutput,
+    Idle,
+    InboxMessage,
+    Running,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitForSessionsRequest {
+    pub session_ids: Vec<SessionId>,
+    #[serde(default)]
+    pub mode: WaitForSessionsMode,
+    #[serde(default)]
+    pub output_contains: Option<String>,
+    #[serde(default = "default_wait_idle_ms")]
+    pub idle_ms: u64,
+    #[serde(default)]
+    pub for_inbox_session_id: Option<SessionId>,
+    pub timeout_ms: u64,
+}
+
+impl WaitForSessionsRequest {
+    pub fn new(session_ids: Vec<SessionId>, timeout_ms: u64) -> Self {
+        Self {
+            session_ids,
+            mode: WaitForSessionsMode::Any,
+            output_contains: None,
+            idle_ms: SESSION_WAIT_DEFAULT_IDLE_MS,
+            for_inbox_session_id: None,
+            timeout_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitedSessionStatus {
+    pub session_id: SessionId,
+    pub outcome: SessionWaitOutcome,
+    pub exited: bool,
+    pub pending_approval: bool,
+    #[serde(default)]
+    pub pending_approval_reason: Option<String>,
+    pub quiet_ms: u64,
+    pub output_seq: u64,
+    #[serde(default)]
+    pub snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitForSessionsResponse {
+    pub timed_out: bool,
+    pub interrupted_by_inbox: bool,
+    pub ready_sessions: Vec<WaitedSessionStatus>,
+    pub sessions: Vec<WaitedSessionStatus>,
+    #[serde(default)]
+    pub inbox_messages: Vec<SessionMessage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitForSessionMessagesRequest {
     pub session_id: SessionId,
@@ -1033,6 +1138,15 @@ pub trait SessionApi {
         _request: WaitForSessionMessagesRequest,
     ) -> Result<Vec<SessionMessage>> {
         anyhow::bail!("session messaging is not supported by this session API")
+    }
+    /// Wait up to `request.timeout_ms` for any or all target sessions to
+    /// exit, hit an approval block, match output, become idle, or (optionally)
+    /// for a coordinator inbox to receive a message. Default: unsupported.
+    fn wait_for_sessions(
+        &self,
+        _request: WaitForSessionsRequest,
+    ) -> Result<WaitForSessionsResponse> {
+        anyhow::bail!("wait_for_sessions is not supported by this session API")
     }
     /// Confirm receipt, removing the ids from the session's inbox. Unknown
     /// ids are ignored (idempotent). Default: unsupported.
@@ -1258,6 +1372,12 @@ impl<T: SessionApi + ?Sized> SessionApi for std::sync::Arc<T> {
         request: WaitForSessionMessagesRequest,
     ) -> Result<Vec<SessionMessage>> {
         (**self).wait_for_session_messages(request)
+    }
+    fn wait_for_sessions(
+        &self,
+        request: WaitForSessionsRequest,
+    ) -> Result<WaitForSessionsResponse> {
+        (**self).wait_for_sessions(request)
     }
     fn ack_session_messages(&self, session_id: SessionId, message_ids: Vec<u64>) -> Result<()> {
         (**self).ack_session_messages(session_id, message_ids)
@@ -1536,6 +1656,10 @@ mod tests {
             snippet: None,
             snippet_detail: None,
             agent: None,
+            parent_session_id: None,
+            outlive_parent: false,
+            pending_approval: false,
+            pending_approval_reason: None,
         };
 
         let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");
@@ -1577,6 +1701,10 @@ mod tests {
             snippet: None,
             snippet_detail: None,
             agent: None,
+            parent_session_id: None,
+            outlive_parent: false,
+            pending_approval: false,
+            pending_approval_reason: None,
         };
 
         let json_str = serde_json::to_string(&snapshot).expect("serialize snapshot");

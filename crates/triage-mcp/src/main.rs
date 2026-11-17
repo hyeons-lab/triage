@@ -7,8 +7,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use triage_core::session::{
     SESSION_MESSAGE_DEFAULT_WAIT_TIMEOUT_MS, SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
-    SendSessionMessageRequest, SessionApi, SessionId, SessionSize, StartSessionRequest,
-    StyledRowsRequest, WaitForSessionMessagesRequest,
+    SESSION_WAIT_DEFAULT_IDLE_MS, SendSessionMessageRequest, SessionApi, SessionId, SessionSize,
+    StartSessionRequest, StyledRowsRequest, WaitForSessionMessagesRequest, WaitForSessionsMode,
+    WaitForSessionsRequest,
 };
 #[cfg(any(unix, windows))]
 use triaged::ipc::{IpcClient, default_socket_path};
@@ -206,6 +207,7 @@ impl<A: SessionApi> McpServer<A> {
             "wait_for_session_message" => {
                 tool_result(wait_for_session_message(&self.api, arguments)?)
             }
+            "wait_for_sessions" => tool_result(wait_for_sessions(&self.api, arguments)?),
             "ack_session_messages" => tool_result(ack_session_messages(&self.api, arguments)?),
             other => {
                 Err(JsonRpcError::invalid_params(format!("unknown Triage tool {other}")).into())
@@ -280,7 +282,9 @@ fn tool_definitions() -> Value {
                     "args": { "type": "array", "items": { "type": "string" }, "description": "Literal argv entries, including any agent-specific initial prompt or launch flags. Defaults to []." },
                     "cwd": { "type": "string", "minLength": 1, "description": "Absolute working directory on the daemon host." },
                     "rows": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY rows (default 24)." },
-                    "cols": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY columns (default 80)." }
+                    "cols": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY columns (default 80)." },
+                    "parent_session_id": { "type": "string", "minLength": 1, "description": "Optional live parent session id for worker lifecycle notifications and cascade shutdown." },
+                    "outlive_parent": { "type": "boolean", "description": "When true, keep this worker running after its parent session exits instead of shutting it down automatically (default false)." }
                 },
                 "required": ["command", "cwd"],
                 "additionalProperties": false
@@ -445,6 +449,55 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "wait_for_sessions",
+            "title": "Wait For Sessions",
+            "description": "Block until any (or all) tracked worker sessions exit, become blocked on an approval/confirmation prompt, match output_contains, settle idle for idle_ms without an active turn, or until for_inbox_session_id receives unacked mail (or timeout_ms elapses).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string", "minLength": 1 },
+                        "description": "Worker session ids to wait on."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["any", "all"],
+                        "description": "Return when any target session is ready (default) or only when all are ready."
+                    },
+                    "output_contains": {
+                        "type": "string",
+                        "description": "Optional substring to match in any visible terminal row of a waited session."
+                    },
+                    "idle_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Consider a session idle once it has output and stays quiet without an active turn indicator for at least this many milliseconds (default 2000; 0 disables idle trigger)."
+                    },
+                    "for_inbox_session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Optional coordinator session id; unacked mail in its inbox interrupts the wait immediately."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS,
+                        "description": "Maximum milliseconds to wait before returning (default 30000, max 300000)."
+                    }
+                },
+                "required": ["session_ids"],
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "ack_session_messages",
             "title": "Acknowledge Session Messages",
             "description": "Confirm receipt of inbox mail, removing it so it stops redelivering. Unknown ids are ignored.",
@@ -487,6 +540,10 @@ struct StartSessionArguments {
     rows: usize,
     #[serde(default = "default_session_cols")]
     cols: usize,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+    #[serde(default)]
+    outlive_parent: bool,
 }
 
 fn default_session_rows() -> usize {
@@ -520,11 +577,18 @@ fn start_session(
             JsonRpcError::invalid_params("cwd must be an absolute path without NUL bytes").into(),
         );
     }
+    let parent_session_id = arguments
+        .parent_session_id
+        .map(SessionId::new)
+        .transpose()
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
     let mut request = StartSessionRequest::new(arguments.command);
     request.args = arguments.args;
     request.cwd = Some(cwd);
     request.size.rows = arguments.rows;
     request.size.cols = arguments.cols;
+    request.parent_session_id = parent_session_id;
+    request.outlive_parent = arguments.outlive_parent;
     request
         .validate()
         .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
@@ -685,6 +749,75 @@ fn wait_for_session_message(
         .with_context(|| format!("waiting for messages for session {session_id}"))?;
 
     Ok(format_session_messages_result(session_id, &messages))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitForSessionsArguments {
+    session_ids: Vec<String>,
+    #[serde(default)]
+    mode: WaitForSessionsMode,
+    #[serde(default)]
+    output_contains: Option<String>,
+    #[serde(default = "default_wait_idle_ms_arg")]
+    idle_ms: u64,
+    #[serde(default)]
+    for_inbox_session_id: Option<String>,
+    #[serde(default = "default_wait_timeout_ms_arg")]
+    timeout_ms: u64,
+}
+
+fn default_wait_idle_ms_arg() -> u64 {
+    SESSION_WAIT_DEFAULT_IDLE_MS
+}
+
+fn default_wait_timeout_ms_arg() -> u64 {
+    SESSION_MESSAGE_DEFAULT_WAIT_TIMEOUT_MS
+}
+
+fn wait_for_sessions(
+    api: &impl SessionApi,
+    arguments: Value,
+) -> std::result::Result<Value, ToolCallError> {
+    arguments_object(&arguments)?;
+    let arguments: WaitForSessionsArguments =
+        serde_json::from_value(arguments).map_err(|error| {
+            JsonRpcError::invalid_params(format!("invalid wait_for_sessions arguments: {error}"))
+        })?;
+    if arguments.session_ids.is_empty() {
+        return Err(JsonRpcError::invalid_params(
+            "session_ids must contain at least one session id",
+        )
+        .into());
+    }
+    if arguments.timeout_ms > SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS {
+        return Err(JsonRpcError::invalid_params(format!(
+            "timeout_ms must be at most {SESSION_MESSAGE_MAX_WAIT_TIMEOUT_MS}"
+        ))
+        .into());
+    }
+    let session_ids = arguments
+        .session_ids
+        .into_iter()
+        .map(SessionId::new)
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    let for_inbox_session_id = arguments
+        .for_inbox_session_id
+        .map(SessionId::new)
+        .transpose()
+        .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+    let response = api
+        .wait_for_sessions(WaitForSessionsRequest {
+            session_ids,
+            mode: arguments.mode,
+            output_contains: arguments.output_contains,
+            idle_ms: arguments.idle_ms,
+            for_inbox_session_id,
+            timeout_ms: arguments.timeout_ms,
+        })
+        .context("waiting for sessions")?;
+    Ok(json!(response))
 }
 
 fn format_session_messages_result(
@@ -979,6 +1112,7 @@ mod tests {
         layout_error: bool,
         starts: Rc<RefCell<Vec<StartSessionRequest>>>,
         shutdowns: Rc<RefCell<Vec<SessionId>>>,
+        waits: Rc<RefCell<Vec<WaitForSessionsRequest>>>,
         lifecycle_error: Option<&'static str>,
     }
 
@@ -1008,6 +1142,10 @@ mod tests {
                     snippet: None,
                     snippet_detail: None,
                     agent: None,
+                    parent_session_id: None,
+                    outlive_parent: false,
+                    pending_approval: false,
+                    pending_approval_reason: None,
                 },
                 snapshot_error: None,
                 inbox: RefCell::new(Vec::new()),
@@ -1015,6 +1153,7 @@ mod tests {
                 layout_error: false,
                 starts: Rc::new(RefCell::new(Vec::new())),
                 shutdowns: Rc::new(RefCell::new(Vec::new())),
+                waits: Rc::new(RefCell::new(Vec::new())),
                 lifecycle_error: None,
             }
         }
@@ -1133,6 +1272,34 @@ mod tests {
             Ok(self.inbox.borrow().clone())
         }
 
+        fn wait_for_sessions(
+            &self,
+            request: WaitForSessionsRequest,
+        ) -> Result<triage_core::session::WaitForSessionsResponse> {
+            self.waits.borrow_mut().push(request.clone());
+            let statuses: Vec<_> = request
+                .session_ids
+                .into_iter()
+                .map(|session_id| triage_core::session::WaitedSessionStatus {
+                    session_id,
+                    outcome: triage_core::session::SessionWaitOutcome::Idle,
+                    exited: false,
+                    pending_approval: self.snapshot.pending_approval,
+                    pending_approval_reason: self.snapshot.pending_approval_reason.clone(),
+                    quiet_ms: request.idle_ms,
+                    output_seq: self.snapshot.output_seq,
+                    snippet: self.snapshot.snippet.clone(),
+                })
+                .collect();
+            Ok(triage_core::session::WaitForSessionsResponse {
+                timed_out: false,
+                interrupted_by_inbox: false,
+                ready_sessions: statuses.clone(),
+                sessions: statuses,
+                inbox_messages: Vec::new(),
+            })
+        }
+
         fn ack_session_messages(
             &self,
             _session_id: SessionId,
@@ -1184,7 +1351,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         assert_eq!(tools[0]["name"], "list_sessions");
         let names = tools
             .iter()
@@ -1201,6 +1368,7 @@ mod tests {
                 "send_session_message",
                 "receive_session_messages",
                 "wait_for_session_message",
+                "wait_for_sessions",
                 "ack_session_messages",
             ]
         );
@@ -2007,5 +2175,112 @@ mod tests {
         for response in responses {
             assert_eq!(response["result"]["isError"], false);
         }
+    }
+
+    #[test]
+    fn start_session_forwards_parent_and_wait_for_sessions_and_snapshot_approval() {
+        let mut api = RecordingApi::new();
+        api.snapshot.parent_session_id = Some(SessionId::new("coord-1").unwrap());
+        api.snapshot.outlive_parent = true;
+        api.snapshot.pending_approval = true;
+        api.snapshot.pending_approval_reason = Some("Proceed? [y/N]".to_string());
+        let waits = Rc::clone(&api.waits);
+        let starts = Rc::clone(&api.starts);
+        let server = McpServer::new(api);
+
+        let start_resp = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_session",
+                        "arguments": {
+                            "command": "worker",
+                            "cwd": absolute_test_cwd(),
+                            "parent_session_id": "coord-1",
+                            "outlive_parent": true
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(start_resp.result.unwrap()["isError"], false);
+        let recorded_start = starts.borrow();
+        assert_eq!(
+            recorded_start[0].parent_session_id,
+            Some(SessionId::new("coord-1").unwrap())
+        );
+        assert!(recorded_start[0].outlive_parent);
+
+        let wait_resp = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "wait_for_sessions",
+                        "arguments": {
+                            "session_ids": ["worker-1"],
+                            "mode": "all",
+                            "output_contains": "DONE",
+                            "idle_ms": 500,
+                            "for_inbox_session_id": "coord-1",
+                            "timeout_ms": 1500
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let wait_result = wait_resp.result.unwrap();
+        assert_eq!(wait_result["isError"], false);
+        assert_eq!(
+            wait_result["structuredContent"]["ready_sessions"][0]["pending_approval"],
+            true
+        );
+        let recorded_waits = waits.borrow();
+        assert_eq!(recorded_waits.len(), 1);
+        assert_eq!(recorded_waits[0].mode, WaitForSessionsMode::All);
+        assert_eq!(recorded_waits[0].idle_ms, 500);
+        assert_eq!(
+            recorded_waits[0].for_inbox_session_id,
+            Some(SessionId::new("coord-1").unwrap())
+        );
+
+        let snap_resp = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "snapshot_session",
+                        "arguments": { "session_id": "worker-1" }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let snap_struct = snap_resp.result.unwrap();
+        assert_eq!(
+            snap_struct["structuredContent"]["snapshot"]["parent_session_id"],
+            "coord-1"
+        );
+        assert_eq!(
+            snap_struct["structuredContent"]["snapshot"]["outlive_parent"],
+            true
+        );
+        assert_eq!(
+            snap_struct["structuredContent"]["snapshot"]["pending_approval"],
+            true
+        );
+        assert_eq!(
+            snap_struct["structuredContent"]["snapshot"]["pending_approval_reason"],
+            "Proceed? [y/N]"
+        );
     }
 }

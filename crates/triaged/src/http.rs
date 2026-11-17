@@ -910,6 +910,8 @@ mod history_http_tests {
                 ],
                 cwd: None,
                 size: SessionSize::default(),
+                parent_session_id: None,
+                outlive_parent: false,
             })
             .expect("start session");
 
@@ -1179,6 +1181,8 @@ mod history_http_tests {
                 args: vec!["-c".to_string(), "printf 'hi'; sleep 30".to_string()],
                 cwd: None,
                 size: SessionSize::default(),
+                parent_session_id: None,
+                outlive_parent: false,
             })
             .expect("start session");
 

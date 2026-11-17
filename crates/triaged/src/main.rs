@@ -478,6 +478,7 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     // as it changes, so a daemon kill restores the session by resuming the
     // same conversation. Always on, independent of the summarizer.
     manager.start_agent_persistence();
+    manager.start_lifecycle_monitor();
 
     // Start periodically recording each live session's last-output time into the
     // manifest, so the client rail's activity ordering survives a daemon kill.

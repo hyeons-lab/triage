@@ -137,6 +137,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         let original = session.clone();
 
@@ -180,6 +182,8 @@ mod tests {
                 parked_input: Vec::new(),
                 agent: None,
                 terminal_modes: None,
+                parent_session_id: None,
+                outlive_parent: false,
             })
             .collect();
         let state = crate::handover::HandoverState {
@@ -261,6 +265,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session],
@@ -352,6 +358,8 @@ mod tests {
                 parked_input: Vec::new(),
                 agent: None,
                 terminal_modes: None,
+                parent_session_id: None,
+                outlive_parent: false,
             }],
             has_tcp_listener: false,
             sends_teardown_commit: true,
@@ -419,6 +427,8 @@ mod tests {
             ],
             cwd: Some(std::env::current_dir()?),
             size: SessionSize::default(),
+            parent_session_id: None,
+            outlive_parent: false,
         };
         let session_id = manager.start_session(req)?;
 
@@ -567,6 +577,8 @@ mod tests {
             args: vec!["-c".to_string(), "sleep 100".to_string()],
             cwd: Some(std::env::current_dir()?),
             size: SessionSize::default(),
+            parent_session_id: None,
+            outlive_parent: false,
         })?;
         assert_eq!(next_id.as_str(), "session-2");
         let _ = new_manager.shutdown_session(next_id);
@@ -620,6 +632,8 @@ mod tests {
             args: vec!["-c".to_string(), "sleep 100".to_string()],
             cwd: Some(std::env::current_dir()?),
             size: SessionSize::default(),
+            parent_session_id: None,
+            outlive_parent: false,
         })?;
 
         let holder = ClientId::new("lease-holder")?;
@@ -694,6 +708,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         let mut value = serde_json::to_value(crate::handover::HandoverState {
             sessions: vec![session],
@@ -861,6 +877,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         let state = crate::handover::HandoverState {
             sessions: vec![session.clone(), session],
@@ -962,6 +980,8 @@ mod tests {
                 parked_input: Vec::new(),
                 agent: None,
                 terminal_modes: None,
+                parent_session_id: None,
+                outlive_parent: false,
             })
         };
 
@@ -1097,6 +1117,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1158,6 +1180,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         crate::handover::remember_recovered_handover_for_test(
             crate::handover::HandoverState {
@@ -1225,6 +1249,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         crate::handover::remember_tokenless_recovered_handover_for_test(
             socket_identity,
@@ -1301,6 +1327,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         let snapshot = |owner_token, fd| {
             crate::handover::remember_recovered_handover_for_test(
@@ -1805,6 +1833,8 @@ mod tests {
             parked_input: Vec::new(),
             agent: None,
             terminal_modes: None,
+            parent_session_id: None,
+            outlive_parent: false,
         };
         assert_eq!(session.logged_output_seq(), 42);
         assert_eq!(session.logged_tail_bytes(), 16);
