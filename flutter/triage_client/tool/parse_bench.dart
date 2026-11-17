@@ -1,18 +1,14 @@
-// Headless 1 MiB / 256 KiB replay benchmark for xterm2 5.2.0. Pure Dart:
-// `dart tool/parse_bench.dart` (JIT) or AOT via `dart compile exe tool/parse_bench.dart`.
-//
-// Payload mimics daemon replay bytes: SGR-heavy agent output with CRLF line
-// endings, 256-color segments, box drawing, and occasional wide chars.
+// Headless TCG1 cell-batch decode and TerminalCellBuffer apply benchmark.
+// Run with `flutter test tool/parse_bench.dart` inside flutter/triage_client.
 // ignore_for_file: avoid_print
-import 'dart:convert';
-import 'dart:math';
+import 'dart:typed_data';
 
-import 'package:xterm2/core.dart' as xterm2;
+import 'package:archive/archive.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:triage_client/terminal/terminal_cell_buffer.dart';
+import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 
 import 'bench_payload.dart';
-
-const int kMaxLines = 50000; // matches the product's native Terminal
-const int kChunkBytes = 8 * 1024;
 
 double _median(List<double> xs) {
   final sorted = List<double>.of(xs)..sort();
@@ -24,61 +20,116 @@ double _median(List<double> xs) {
 
 void _runArm({
   required String label,
-  required int payloadUtf8Bytes,
-  required int Function() makeTerminalAndWrite,
+  required int payloadBytes,
+  required int Function() runOnce,
   required int rounds,
 }) {
-  // Warmup (JIT + first-trim paths), followed by measured rounds.
-  makeTerminalAndWrite();
+  runOnce();
   final times = <double>[];
   for (var r = 0; r < rounds; r++) {
     final sw = Stopwatch()..start();
-    final lines = makeTerminalAndWrite();
+    final rows = runOnce();
     sw.stop();
-    if (lines < 100) throw StateError('$label wrote only $lines lines');
+    if (rows < 24) {
+      throw StateError('$label processed only $rows rows');
+    }
     times.add(sw.elapsedMicroseconds / 1000.0);
   }
   final med = _median(times);
-  final mibPerSec = (payloadUtf8Bytes / (1024 * 1024)) / (med / 1000.0);
+  final mibPerSec = (payloadBytes / (1024 * 1024)) / (med / 1000.0);
   print(
-    '$label: median ${med.toStringAsFixed(1)} ms '
+    '$label: median ${med.toStringAsFixed(2)} ms '
     '(${mibPerSec.toStringAsFixed(1)} MiB/s) over $rounds rounds',
   );
 }
 
-void _benchSize(int sizeBytes, int rounds) {
-  final payload = buildBenchPayload(sizeBytes);
-  final payloadUtf8Bytes = utf8.encode(payload).length;
-  print(
-    '--- ${(sizeBytes / 1024).round()} KiB target '
-    '(${payload.length} chars, $payloadUtf8Bytes UTF-8 bytes) ---',
+void _benchBatch({
+  required int cols,
+  required int viewportRows,
+  required int scrollbackRows,
+  required int rounds,
+}) {
+  final viewportLines = buildBenchLines(viewportRows, cols: cols);
+  final scrollbackLines = buildBenchLines(scrollbackRows, cols: cols);
+  final rawViewport = encodeTcg1PlainTextRows(viewportLines, cols: cols);
+  final rawScrollback = encodeTcg1PlainTextRows(scrollbackLines, cols: cols);
+  final zlibScrollback = Uint8List.fromList(
+    const ZLibEncoder().encode(rawScrollback),
   );
+  print(
+    '=== ${cols}x$viewportRows viewport (${rawViewport.length} B) + '
+    '$scrollbackRows scrollback rows (${rawScrollback.length} B raw, '
+    '${zlibScrollback.length} B zlib) ===',
+  );
+
   _runArm(
-    label: 'xterm2 one-shot ',
-    payloadUtf8Bytes: payloadUtf8Bytes,
+    label: 'TCG1 raw sync + scrollback ',
+    payloadBytes: rawViewport.length + rawScrollback.length,
     rounds: rounds,
-    makeTerminalAndWrite: () {
-      final t = xterm2.Terminal(maxLines: kMaxLines);
-      t.write(payload);
-      return t.mainBuffer.lines.length;
+    runOnce: () {
+      final buf = TerminalCellBuffer(cols: cols, rows: viewportRows);
+      try {
+        buf.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: viewportRows,
+            cols: cols,
+            totalScrollbackRows: scrollbackRows,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: viewportRows - 1,
+            cursorStyle: 0,
+            modeFlags: kModeFullViewport | kModeCursorVisible,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: rawViewport,
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: scrollbackRows,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: rawScrollback,
+          ),
+        );
+        return buf.totalLines;
+      } finally {
+        buf.dispose();
+      }
     },
   );
+
   _runArm(
-    label: 'xterm2 chunked  ',
-    payloadUtf8Bytes: payloadUtf8Bytes,
+    label: 'TCG1 zlib page decode      ',
+    payloadBytes: rawScrollback.length,
     rounds: rounds,
-    makeTerminalAndWrite: () {
-      final t = xterm2.Terminal(maxLines: kMaxLines);
-      for (var i = 0; i < payload.length; i += kChunkBytes) {
-        final end = min(i + kChunkBytes, payload.length);
-        t.write(payload.substring(i, end));
+    runOnce: () {
+      final buf = TerminalCellBuffer(cols: cols, rows: viewportRows);
+      try {
+        buf.applyFetchedRows(
+          TerminalRowsPageData(
+            sessionId: 'bench',
+            startRow: 0,
+            rowCount: scrollbackRows,
+            totalScrollbackRows: scrollbackRows,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            compression: kCellCompressionZlib,
+            payload: zlibScrollback,
+          ),
+        );
+        return buf.totalLines;
+      } finally {
+        buf.dispose();
       }
-      return t.mainBuffer.lines.length;
     },
   );
 }
 
 void main() {
-  _benchSize(256 * 1024, 5);
-  _benchSize(1024 * 1024, 3);
+  test('TCG1 cell-batch decode and TerminalCellBuffer apply benchmark', () {
+    _benchBatch(cols: 120, viewportRows: 40, scrollbackRows: 512, rounds: 7);
+    _benchBatch(cols: 120, viewportRows: 40, scrollbackRows: 2048, rounds: 5);
+  });
 }

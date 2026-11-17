@@ -217,6 +217,11 @@ const JOURNAL_MAGIC: &[u8; 4] = b"TSJ1";
 const JOURNAL_FORMAT_VERSION: u16 = 1;
 const JOURNAL_HEADER_LEN: usize = 6;
 
+const JOURNAL_META_FILE_NAME: &str = "scrollback.meta";
+const JOURNAL_META_MAGIC: &[u8; 4] = b"TSM1";
+const JOURNAL_META_VERSION: u16 = 1;
+const JOURNAL_META_LEN: usize = 18;
+
 /// Appends between writer flushes. Reads never flush (the serve paths
 /// hold only a shared reference), so this bounds how many trailing
 /// records a read can miss. The miss is nearly always irrelevant to
@@ -256,6 +261,23 @@ pub struct JournalRecord {
     pub bytes: Vec<u8>,
 }
 
+const MAX_SEGMENT_CACHE_ENTRIES: usize = 2;
+
+#[derive(Debug, Clone)]
+struct SegmentIndexEntry {
+    file_index: u32,
+    base_seq: u64,
+    record_count: u32,
+    min_log_offset: u64,
+    max_log_offset: u64,
+}
+
+struct DecodedSegmentCacheEntry {
+    file_index: u32,
+    record_count_when_cached: u32,
+    records: Vec<JournalRecord>,
+}
+
 /// Append-only per-session journal of scrolled lines.
 ///
 /// Layout beside the log segments: `scrollback-{:06}.slog` (active,
@@ -274,6 +296,14 @@ pub struct ScrollbackJournal {
     /// [`Self::drain_pending_seals`], synchronously or via the worker).
     /// A list because one chunk can rotate more than once.
     pending_seals: Vec<(PathBuf, PathBuf)>,
+    /// Monotonic sequence index of the oldest retained record on disk.
+    first_retained_seq: u64,
+    /// Monotonic sequence index to assign to the next appended record.
+    next_seq: u64,
+    /// Ordered segment metadata for O(log segments) random-access row paging.
+    segments: Vec<SegmentIndexEntry>,
+    /// Small bounded cache of decoded segment records for sequential scrollback paging.
+    segment_cache: Vec<DecodedSegmentCacheEntry>,
     /// Set on the first I/O failure; the journal stays inert afterwards.
     broken: bool,
     warned: bool,
@@ -336,7 +366,8 @@ pub fn purge_journal_files(session_dir: &Path) {
 }
 
 fn is_journal_artifact(file_name: &str) -> bool {
-    ScrollbackJournal::parse_journal_index(file_name).is_some()
+    file_name == JOURNAL_META_FILE_NAME
+        || ScrollbackJournal::parse_journal_index(file_name).is_some()
         || (file_name.starts_with("scrollback-") && file_name.contains(".tmp."))
 }
 
@@ -351,6 +382,10 @@ impl ScrollbackJournal {
             writer: None,
             since_flush: 0,
             pending_seals: Vec::new(),
+            first_retained_seq: 0,
+            next_seq: 0,
+            segments: Vec::new(),
+            segment_cache: Vec::new(),
             broken: false,
             warned: false,
             #[cfg(test)]
@@ -373,6 +408,10 @@ impl ScrollbackJournal {
             writer: None,
             since_flush: 0,
             pending_seals: Vec::new(),
+            first_retained_seq: 0,
+            next_seq: 0,
+            segments: Vec::new(),
+            segment_cache: Vec::new(),
             broken: true,
             warned: true,
             #[cfg(test)]
@@ -392,6 +431,196 @@ impl ScrollbackJournal {
         self.broken
     }
 
+    /// Sequence index of the oldest retained record on disk (0 until retention
+    /// or rebase drops older segments).
+    pub fn first_retained_seq(&self) -> u64 {
+        if self.broken {
+            0
+        } else {
+            self.first_retained_seq
+        }
+    }
+
+    /// Exclusive upper bound on monotonic record sequence indices in this journal.
+    pub fn next_seq(&self) -> u64 {
+        if self.broken { 0 } else { self.next_seq }
+    }
+
+    /// Counts retained records stamped strictly above `raw_start` (`log_offset > raw_start`),
+    /// corresponding to scrolled lines produced inside the `(raw_start ..]` tail window.
+    pub fn count_records_after_log_offset(&mut self, raw_start: u64) -> u64 {
+        if self.broken || self.segments.is_empty() {
+            return 0;
+        }
+        self.flush_buffer();
+        let mut total = 0u64;
+        for idx in (0..self.segments.len()).rev() {
+            let seg = self.segments[idx].clone();
+            if seg.record_count == 0 {
+                continue;
+            }
+            if seg.min_log_offset > raw_start {
+                total += u64::from(seg.record_count);
+                continue;
+            }
+            if seg.max_log_offset <= raw_start {
+                continue;
+            }
+            let Some(records) = self.cached_segment_records(seg.file_index, seg.record_count)
+            else {
+                continue;
+            };
+            total += records.iter().filter(|r| r.log_offset > raw_start).count() as u64;
+        }
+        total
+    }
+
+    /// Groups the trailing `tail_records` retained journal entries into per-logical-line
+    /// record counts using `encode_line`'s `\r\n` hard-break terminator (`!wrapped`).
+    /// Returns `None` if any part of `[next_seq - tail_records .. next_seq)` was pruned
+    /// or could not be read cleanly.
+    pub fn tail_logical_line_counts(&mut self, tail_records: u64) -> Option<Vec<u32>> {
+        if tail_records == 0 {
+            return Some(Vec::new());
+        }
+        if self.broken || self.segments.is_empty() || self.next_seq < tail_records {
+            return None;
+        }
+        let start_seq = self.next_seq - tail_records;
+        if start_seq < self.first_retained_seq {
+            return None;
+        }
+        self.flush_buffer();
+        let first_seg_idx = match self
+            .segments
+            .binary_search_by_key(&start_seq, |s| s.base_seq)
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        let mut cursor_seq = start_seq;
+        let mut logical = Vec::new();
+        let mut acc = 0u32;
+        for seg_idx in first_seg_idx..self.segments.len() {
+            let seg = self.segments[seg_idx].clone();
+            let seg_end = seg.base_seq + u64::from(seg.record_count);
+            if seg.base_seq >= self.next_seq {
+                break;
+            }
+            if seg_end <= cursor_seq {
+                continue;
+            }
+            if seg.base_seq > cursor_seq {
+                return None;
+            }
+            let local_start = (cursor_seq - seg.base_seq) as usize;
+            let local_end =
+                (self.next_seq - seg.base_seq).min(u64::from(seg.record_count)) as usize;
+            let records = self.cached_segment_records(seg.file_index, seg.record_count)?;
+            if local_end > records.len() {
+                return None;
+            }
+            for record in &records[local_start..local_end] {
+                acc = acc.saturating_add(1);
+                if record.bytes.ends_with(b"\r\n") {
+                    logical.push(acc);
+                    acc = 0;
+                }
+            }
+            cursor_seq = seg.base_seq + local_end as u64;
+        }
+        if cursor_seq != self.next_seq {
+            return None;
+        }
+        if acc > 0 {
+            logical.push(acc);
+        }
+        Some(logical)
+    }
+
+    /// Packs retained records in `[start_seq .. start_seq + count)` into `builder`,
+    /// emitting row indices relative to `batch_base_seq`. Unreadable, broken, or
+    /// trimmed slots are filled with blank placeholder rows so `FetchTerminalRows`
+    /// always returns a dense `[0 .. count)` slice.
+    pub fn pack_record_range(
+        &mut self,
+        start_seq: u64,
+        count: usize,
+        batch_base_seq: u64,
+        logical_cols: usize,
+        builder: &mut triage_term::Tcg1BatchBuilder,
+    ) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let end_seq = start_seq.saturating_add(count as u64);
+        let emit_blank_range =
+            |from_seq: u64, to_seq: u64, builder: &mut triage_term::Tcg1BatchBuilder| -> usize {
+                for seq in from_seq..to_seq {
+                    let rel_row = seq.saturating_sub(batch_base_seq) as u32;
+                    builder.push_sgr_journal_record(rel_row, b"\r\n", logical_cols);
+                }
+                (to_seq - from_seq) as usize
+            };
+        if self.broken || self.segments.is_empty() {
+            return emit_blank_range(start_seq, end_seq, builder);
+        }
+        let readable_end = end_seq.min(self.next_seq);
+        let clamped_start = start_seq.max(self.first_retained_seq).min(readable_end);
+        let mut packed = emit_blank_range(start_seq, clamped_start, builder);
+        let mut cursor_seq = clamped_start;
+
+        let first_seg_idx = match self
+            .segments
+            .binary_search_by_key(&clamped_start, |s| s.base_seq)
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        for seg_idx in first_seg_idx..self.segments.len() {
+            let seg = self.segments[seg_idx].clone();
+            let seg_end = seg.base_seq + u64::from(seg.record_count);
+            if seg.base_seq >= readable_end {
+                break;
+            }
+            if seg_end <= cursor_seq {
+                continue;
+            }
+            let req_start = cursor_seq.max(seg.base_seq);
+            if cursor_seq < req_start {
+                packed += emit_blank_range(cursor_seq, req_start, builder);
+                cursor_seq = req_start;
+            }
+            if seg.file_index == self.active_index && self.since_flush > 0 {
+                self.flush_buffer();
+            }
+            let local_start = (req_start - seg.base_seq) as usize;
+            let local_end = (readable_end - seg.base_seq).min(u64::from(seg.record_count)) as usize;
+            if let Some(records) = self.cached_segment_records(seg.file_index, seg.record_count) {
+                let upper = local_end.min(records.len());
+                if local_start < upper {
+                    for (offset_in_slice, record) in records[local_start..upper].iter().enumerate()
+                    {
+                        let abs_seq = seg.base_seq + (local_start + offset_in_slice) as u64;
+                        let rel_row = abs_seq.saturating_sub(batch_base_seq) as u32;
+                        builder.push_sgr_journal_record(rel_row, &record.bytes, logical_cols);
+                        packed += 1;
+                    }
+                    cursor_seq = seg.base_seq + upper as u64;
+                }
+            }
+            let target_end = readable_end.min(seg_end);
+            if cursor_seq < target_end {
+                packed += emit_blank_range(cursor_seq, target_end, builder);
+                cursor_seq = target_end;
+            }
+        }
+        if cursor_seq < end_seq {
+            packed += emit_blank_range(cursor_seq, end_seq, builder);
+        }
+        packed
+    }
+
     /// Returns a lightweight read-only handle referencing the same journal
     /// directory so callers can serve history prefixes off the actor thread
     /// without cloning or locking the active writer.
@@ -403,6 +632,10 @@ impl ScrollbackJournal {
             writer: None,
             since_flush: 0,
             pending_seals: Vec::new(),
+            first_retained_seq: self.first_retained_seq,
+            next_seq: self.next_seq,
+            segments: self.segments.clone(),
+            segment_cache: Vec::new(),
             broken: self.broken,
             warned: self.warned,
             #[cfg(test)]
@@ -671,7 +904,148 @@ impl ScrollbackJournal {
         }
         self.active_lines = Self::truncate_to_valid_prefix(&resume_path);
         self.writer = None;
+        self.rebuild_segment_index(&seen);
         Ok(())
+    }
+
+    fn meta_path(&self) -> PathBuf {
+        self.dir.join(JOURNAL_META_FILE_NAME)
+    }
+
+    fn write_meta(
+        &self,
+        lowest_retained_index: u32,
+        first_retained_seq: u64,
+    ) -> anyhow::Result<()> {
+        let tmp = self
+            .dir
+            .join(format!("scrollback-meta.tmp.{}", std::process::id()));
+        let write_res = (|| -> anyhow::Result<()> {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            crate::session::set_private_file_permissions(&tmp);
+            let mut writer = BufWriter::new(file);
+            writer.write_all(JOURNAL_META_MAGIC)?;
+            writer.write_all(&JOURNAL_META_VERSION.to_le_bytes())?;
+            writer.write_all(&lowest_retained_index.to_le_bytes())?;
+            writer.write_all(&first_retained_seq.to_le_bytes())?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        if write_res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        write_res?;
+        if let Err(err) = std::fs::rename(&tmp, self.meta_path()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
+    fn read_meta(&self) -> Option<(u32, u64)> {
+        let bytes = std::fs::read(self.meta_path()).ok()?;
+        if bytes.len() != JOURNAL_META_LEN || &bytes[..4] != JOURNAL_META_MAGIC {
+            return None;
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != JOURNAL_META_VERSION {
+            return None;
+        }
+        let lowest_idx = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+        let first_seq = u64::from_le_bytes([
+            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+        ]);
+        Some((lowest_idx, first_seq))
+    }
+
+    fn rebuild_segment_index(&mut self, discovered_indices: &[u32]) {
+        self.segments.clear();
+        self.segment_cache.clear();
+        self.first_retained_seq = 0;
+        self.next_seq = 0;
+
+        if discovered_indices.is_empty() {
+            let _ = std::fs::remove_file(self.meta_path());
+            return;
+        }
+
+        let mut ordered: Vec<u32> = discovered_indices.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+
+        let mut scanned: Vec<(u32, u32, u64, u64)> = Vec::new();
+        for index in ordered {
+            if index == self.active_index && self.active_lines == 0 {
+                continue;
+            }
+            let Ok(bytes) = self.read_file_raw_bytes(index) else {
+                continue;
+            };
+            let Some((count, min_off, max_off)) = scan_record_headers(&bytes) else {
+                continue;
+            };
+            if count == 0 {
+                continue;
+            }
+            scanned.push((index, count, min_off, max_off));
+        }
+
+        let start_seq = if let Some((meta_lowest_idx, meta_first_seq)) = self.read_meta() {
+            let pre_records: u64 = scanned
+                .iter()
+                .filter(|(idx, _, _, _)| *idx < meta_lowest_idx)
+                .map(|(_, count, _, _)| u64::from(*count))
+                .sum();
+            meta_first_seq.saturating_sub(pre_records)
+        } else {
+            0
+        };
+
+        self.first_retained_seq = start_seq;
+        let mut cursor_seq = start_seq;
+        for (index, count, min_off, max_off) in scanned {
+            self.segments.push(SegmentIndexEntry {
+                file_index: index,
+                base_seq: cursor_seq,
+                record_count: count,
+                min_log_offset: min_off,
+                max_log_offset: max_off,
+            });
+            cursor_seq += u64::from(count);
+        }
+        self.next_seq = cursor_seq;
+    }
+
+    fn cached_segment_records(
+        &mut self,
+        file_index: u32,
+        expected_count: u32,
+    ) -> Option<&[JournalRecord]> {
+        if let Some(pos) = self.segment_cache.iter().position(|entry| {
+            entry.file_index == file_index && entry.record_count_when_cached == expected_count
+        }) {
+            if pos + 1 < self.segment_cache.len() {
+                let entry = self.segment_cache.remove(pos);
+                self.segment_cache.push(entry);
+            }
+            return self.segment_cache.last().map(|e| e.records.as_slice());
+        }
+
+        let records = self.read_file_records(file_index).ok()?;
+        if self.segment_cache.len() >= MAX_SEGMENT_CACHE_ENTRIES {
+            self.segment_cache.remove(0);
+        }
+        self.segment_cache.push(DecodedSegmentCacheEntry {
+            file_index,
+            record_count_when_cached: expected_count,
+            records,
+        });
+        self.segment_cache.last().map(|e| e.records.as_slice())
     }
 
     fn ensure_writer(&mut self) -> anyhow::Result<&mut BufWriter<File>> {
@@ -782,6 +1156,22 @@ impl ScrollbackJournal {
         writer.write_all(bytes)?;
         self.active_lines += 1;
         self.since_flush += 1;
+        if let Some(last) = self.segments.last_mut()
+            && last.file_index == self.active_index
+        {
+            last.record_count = last.record_count.saturating_add(1);
+            last.min_log_offset = last.min_log_offset.min(log_offset);
+            last.max_log_offset = last.max_log_offset.max(log_offset);
+        } else {
+            self.segments.push(SegmentIndexEntry {
+                file_index: self.active_index,
+                base_seq: self.next_seq,
+                record_count: 1,
+                min_log_offset: log_offset,
+                max_log_offset: log_offset,
+            });
+        }
+        self.next_seq = self.next_seq.saturating_add(1);
         if self.since_flush >= JOURNAL_FLUSH_EVERY
             && let Some(writer) = self.writer.as_mut()
         {
@@ -891,20 +1281,38 @@ impl ScrollbackJournal {
             }
         }
         files.sort_unstable();
-        let mut evicted: Vec<u32> = Vec::new();
-        while files.len() > JOURNAL_RETAINED_FILES {
-            let oldest = files.remove(0);
+        if files.len() <= JOURNAL_RETAINED_FILES {
+            return Ok(());
+        }
+        let drop_count = files.len() - JOURNAL_RETAINED_FILES;
+        let evicted: Vec<u32> = files.drain(..drop_count).collect();
+        let new_lowest_idx = files.first().copied().unwrap_or(self.active_index);
+        let new_first_seq = self
+            .segments
+            .iter()
+            .find(|seg| !evicted.contains(&seg.file_index))
+            .map_or(self.next_seq, |seg| seg.base_seq);
+        if let Err(err) = self.write_meta(new_lowest_idx, new_first_seq) {
+            tracing::warn!(
+                ?err,
+                dir = %self.dir.display(),
+                "failed to persist scrollback journal retention metadata"
+            );
+        }
+        for &oldest in &evicted {
             let active = self.active_path(oldest);
             self.pending_seals.retain(|(raw, _)| raw != &active);
             if oldest != self.active_index {
                 let _ = std::fs::remove_file(&active);
             }
             let _ = std::fs::remove_file(self.sealed_path(oldest));
-            evicted.push(oldest);
         }
-        if !evicted.is_empty() {
-            self.remove_sealed_twins(&evicted);
-        }
+        self.remove_sealed_twins(&evicted);
+        self.segments
+            .retain(|seg| !evicted.contains(&seg.file_index));
+        self.segment_cache
+            .retain(|entry| !evicted.contains(&entry.file_index));
+        self.first_retained_seq = new_first_seq;
         Ok(())
     }
 
@@ -933,25 +1341,25 @@ impl ScrollbackJournal {
         indices
     }
 
-    fn read_file_records(&self, index: u32) -> anyhow::Result<Vec<JournalRecord>> {
+    fn read_file_raw_bytes(&self, index: u32) -> anyhow::Result<Vec<u8>> {
         let sealed = self.sealed_path(index);
         match File::open(&sealed) {
             Ok(file) => {
                 let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))?;
                 let mut bytes = Vec::new();
                 decoder.read_to_end(&mut bytes)?;
-                Ok(parse_records(&bytes))
+                Ok(bytes)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let active = self.active_path(index);
                 match std::fs::read(&active) {
-                    Ok(bytes) => Ok(parse_records(&bytes)),
+                    Ok(bytes) => Ok(bytes),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                         if let Ok(file) = File::open(&sealed) {
                             let mut decoder = zstd::stream::Decoder::new(BufReader::new(file))?;
                             let mut bytes = Vec::new();
                             decoder.read_to_end(&mut bytes)?;
-                            Ok(parse_records(&bytes))
+                            Ok(bytes)
                         } else {
                             Ok(Vec::new())
                         }
@@ -961,6 +1369,11 @@ impl ScrollbackJournal {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn read_file_records(&self, index: u32) -> anyhow::Result<Vec<JournalRecord>> {
+        let bytes = self.read_file_raw_bytes(index)?;
+        Ok(parse_records(&bytes))
     }
 
     /// Cheapest useful fact about a file: its first record's offset.
@@ -1262,6 +1675,31 @@ impl ScrollbackJournal {
         self.active_index = fresh;
         self.active_lines = survivors.len();
         self.since_flush = 0;
+        self.segments.clear();
+        self.segment_cache.clear();
+        self.first_retained_seq = self.next_seq.saturating_sub(survivors.len() as u64);
+        if let Err(err) = self.write_meta(fresh, self.first_retained_seq) {
+            tracing::warn!(
+                ?err,
+                dir = %self.dir.display(),
+                "failed to persist scrollback journal rebase metadata"
+            );
+        }
+        if let (Some(first), Some(last)) = (survivors.first(), survivors.last()) {
+            let mut min_off = first.log_offset;
+            let mut max_off = last.log_offset;
+            for rec in &survivors {
+                min_off = min_off.min(rec.log_offset);
+                max_off = max_off.max(rec.log_offset);
+            }
+            self.segments.push(SegmentIndexEntry {
+                file_index: fresh,
+                base_seq: self.first_retained_seq,
+                record_count: survivors.len() as u32,
+                min_log_offset: min_off,
+                max_log_offset: max_off,
+            });
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -1278,6 +1716,40 @@ impl ScrollbackJournal {
         for index in indices {
             let _ = std::fs::remove_file(self.sealed_path(*index));
         }
+    }
+}
+
+/// Zero-allocation header scan returning `(record_count, min_log_offset, max_log_offset)`,
+/// or `None` if the file header indicates a newer format.
+fn scan_record_headers(bytes: &[u8]) -> Option<(u32, u64, u64)> {
+    let mut cursor = file_header_len(bytes)?;
+    let mut count = 0u32;
+    let mut min_off = u64::MAX;
+    let mut max_off = 0u64;
+    while cursor + RECORD_HEADER_LEN <= bytes.len() {
+        let offset = u64::from_le_bytes(
+            *bytes[cursor..cursor + 8]
+                .first_chunk()
+                .expect("8-byte slice"),
+        );
+        let len = u32::from_le_bytes(
+            *bytes[cursor + 8..cursor + 12]
+                .first_chunk()
+                .expect("4-byte slice"),
+        ) as usize;
+        cursor += RECORD_HEADER_LEN;
+        if len > bytes.len().saturating_sub(cursor) {
+            break;
+        }
+        count = count.saturating_add(1);
+        min_off = min_off.min(offset);
+        max_off = max_off.max(offset);
+        cursor += len;
+    }
+    if count == 0 {
+        Some((0, 0, 0))
+    } else {
+        Some((count, min_off, max_off))
     }
 }
 
@@ -2724,6 +3196,82 @@ mod tests {
         assert!(!dir.join("scrollback-000001.slog.zst").exists());
         assert!(!dir.join("scrollback-000001.slog.zst.tmp.9999").exists());
         assert!(dir.join("segment-000000.log").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pack_record_range_emits_dense_blank_placeholders_for_unreadable_segments() {
+        let dir = unique_journal_dir("dense-placeholders");
+        let mut journal = ScrollbackJournal::open(&dir);
+        journal.append(10, b"row-0");
+        journal.append(20, b"row-1");
+        journal.append(30, b"row-2");
+        journal.flush_buffer();
+
+        // Remove the underlying segment file after open so cached_segment_records fails.
+        std::fs::remove_file(dir.join("scrollback-000000.slog")).expect("remove active slog");
+
+        let mut builder = triage_term::Tcg1BatchBuilder::with_row_capacity(3, 20);
+        let packed = journal.pack_record_range(0, 3, 0, 20, &mut builder);
+        assert_eq!(packed, 3);
+        let encoded = builder.finish_encoded();
+        assert_eq!(encoded.row_count, 3);
+        let decoded = triage_term::decode_tcg1_batch(encoded.compression, &encoded.payload)
+            .expect("decode dense fallback batch");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(
+            decoded.iter().map(|r| r.row_index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_and_rebase_persist_metadata_floor_across_reopen_and_purge() {
+        let dir = unique_journal_dir("meta-floor");
+        let mut journal = ScrollbackJournal::open(&dir);
+        // Rotate past JOURNAL_RETAINED_FILES (20) so retention evicts older segments.
+        for seg_idx in 0..24u64 {
+            journal.append(seg_idx * 100 + 10, b"line-a\r\n");
+            journal.append(seg_idx * 100 + 20, b"line-b\r\n");
+            journal.rotate().expect("rotate segment");
+        }
+        journal.drain_pending_seals(&None);
+        journal.append(2500, b"tail-line\r\n");
+        journal.flush_buffer();
+        let expected_first = journal.first_retained_seq();
+        let expected_next = journal.next_seq();
+        assert!(
+            expected_first > 0,
+            "expected retention to advance first_retained_seq"
+        );
+        assert!(dir.join("scrollback.meta").exists());
+        drop(journal);
+
+        // Reopen must recover `first_retained_seq` and `next_seq` from `scrollback.meta`
+        // rather than resetting `first_retained_seq` to 0.
+        let mut reopened = ScrollbackJournal::open(&dir);
+        assert_eq!(reopened.first_retained_seq(), expected_first);
+        assert_eq!(reopened.next_seq(), expected_next);
+
+        // Rebase drops records below cut and updates `scrollback.meta` atomically across reopen.
+        reopened.rebase(1000);
+        let rebased_first = reopened.first_retained_seq();
+        let rebased_next = reopened.next_seq();
+        drop(reopened);
+
+        let reopened_after_rebase = ScrollbackJournal::open(&dir);
+        assert_eq!(reopened_after_rebase.first_retained_seq(), rebased_first);
+        assert_eq!(reopened_after_rebase.next_seq(), rebased_next);
+        drop(reopened_after_rebase);
+
+        // `purge_journal_files` removes `scrollback.meta` and staged `scrollback-meta.tmp.*`.
+        std::fs::write(dir.join("scrollback-meta.tmp.4242"), b"tmp").expect("write meta tmp");
+        purge_journal_files(&dir);
+        assert!(!dir.join("scrollback.meta").exists());
+        assert!(!dir.join("scrollback-meta.tmp.4242").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

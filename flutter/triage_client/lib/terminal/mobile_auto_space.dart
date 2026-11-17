@@ -110,6 +110,9 @@ class MobileAutoSpaceTracker {
   /// Whether a character code point represents an alphanumeric word character.
   /// Supports ASCII, Latin-1, and global Unicode scripts (letters and numbers).
   static bool isWordChar(int codePoint) {
+    if (codePoint < 0 || codePoint > 0x10ffff) {
+      return false;
+    }
     if (codePoint < 0x80) {
       return (codePoint >= 0x30 && codePoint <= 0x39) || // 0-9
           (codePoint >= 0x41 && codePoint <= 0x5a) || // A-Z
@@ -128,7 +131,8 @@ class MobileAutoSpaceTracker {
     if ((codePoint >= 0x0400 && codePoint <= 0x04ff) || // Cyrillic
         (codePoint >= 0x0370 && codePoint <= 0x03ff) || // Greek
         (codePoint >= 0xac00 && codePoint <= 0xd7af) || // Hangul Syllables
-        (codePoint >= 0x4e00 && codePoint <= 0x9fff)) { // CJK Unified Ideographs
+        (codePoint >= 0x4e00 && codePoint <= 0x9fff)) {
+      // CJK Unified Ideographs
       return true;
     }
     return _unicodeWordCharRegex.hasMatch(String.fromCharCode(codePoint));

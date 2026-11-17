@@ -131,15 +131,44 @@ void main() {
 
       // Shift-Tab (BackTab)
       expect(isEmulatorQueryResponse('\x1b[Z'), isFalse);
+
+      // Hardware-key provenance permits CPR-shaped key sequences while blocking DA/Kitty replies.
+      expect(isEmulatorQueryResponse('\x1b[1;1R'), isTrue);
+      expect(
+        isEmulatorQueryResponse('\x1b[1;1R', fromHardwareKey: true),
+        isFalse,
+      );
+      expect(
+        isEmulatorQueryResponse('\x1b[?1;2c', fromHardwareKey: true),
+        isTrue,
+      );
+      expect(
+        isEmulatorQueryResponse('\x1b[?5u', fromHardwareKey: true),
+        isTrue,
+      );
+
+      // 8-bit C1 responses (CSI \u009b, OSC \u009d, DCS \u0090 .. ST \u009c) and concatenated replies.
+      expect(isEmulatorQueryResponse('\u009b?1;2c'), isTrue);
+      expect(
+        isEmulatorQueryResponse('\u009d11;rgb:1111/2222/3333\u009c'),
+        isTrue,
+      );
+      expect(isEmulatorQueryResponse('\u00901\$r0m\u009c'), isTrue);
+      expect(
+        isEmulatorQueryResponse('\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b[?1;2c'),
+        isTrue,
+      );
     });
   });
 
   group('isTerminalMouseReport', () {
-    test('matches SGR and X10 mouse reports', () {
+    test('matches SGR, urxvt, UTF-8, and X10 mouse reports', () {
       expect(isTerminalMouseReport('\x1b[<0;61;459M'), isTrue);
       expect(isTerminalMouseReport('\x1b[<0;61;459m'), isTrue);
       expect(isTerminalMouseReport('\x1b[<0;61;459M\x1b[<0;61;459m'), isTrue);
       expect(isTerminalMouseReport('\x1b[<35;55;29M\x1b[<35;54;29M'), isTrue);
+      expect(isTerminalMouseReport('\x1b[32;201;151M'), isTrue);
+      expect(isTerminalMouseReport('\x1b[M \u00e9\u00b7'), isTrue);
       expect(isTerminalMouseReport('\x1b[M !#'), isTrue);
     });
 

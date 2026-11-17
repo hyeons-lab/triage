@@ -71,6 +71,10 @@ pub struct HandoverSession {
     /// existed.
     #[serde(default)]
     pub agent: Option<triage_core::agent::AgentAttachment>,
+    /// Preserved DEC private modes, mouse reporting flags, Kitty keyboard
+    /// stacks, and OSC title across zero-downtime handover.
+    #[serde(default)]
+    pub terminal_modes: Option<triage_term::HandoverTerminalModes>,
 }
 
 impl HandoverSession {

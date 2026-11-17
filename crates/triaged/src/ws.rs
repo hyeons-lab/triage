@@ -81,6 +81,38 @@ pub fn start_websocket_server(
     })
 }
 
+async fn flush_conn_events<S>(
+    ws_sender: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    conn: &mut WebSocketSessionConnection<Arc<SessionManager>, Arc<SessionManager>>,
+    format: triage_transport_ws::ProtocolFormat,
+) -> Result<bool>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let messages = conn.drain_events();
+    if messages.is_empty() {
+        return Ok(true);
+    }
+    for msg in messages {
+        let ws_msg = match format {
+            triage_transport_ws::ProtocolFormat::Json => {
+                let serialized =
+                    serde_json::to_string(&msg).context("serializing session event")?;
+                Message::Text(serialized)
+            }
+            triage_transport_ws::ProtocolFormat::Flatbuffers => {
+                let serialized =
+                    triage_transport_ws::flatbuffers_proto::serialize_server_message(&msg);
+                Message::Binary(serialized)
+            }
+        };
+        if ws_sender.feed(ws_msg).await.is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(ws_sender.flush().await.is_ok())
+}
+
 /// Handle upgraded WebSocket connections on the Hyper multiplexed port.
 pub async fn handle_upgraded_ws<S>(
     manager: Arc<SessionManager>,
@@ -114,11 +146,16 @@ where
                         match msg {
                             Message::Text(text) => {
                                 if format == triage_transport_ws::ProtocolFormat::Json {
-                                    let response = conn.handle_text_message(&text);
+                                    let maybe_response = conn.handle_text_message_optional(&text);
                                     if conn.is_authenticated() && !conn.has_global_receiver() {
                                         conn.set_global_receiver(manager.register_global_receiver());
                                     }
-                                    if ws_sender.send(Message::Text(response)).await.is_err() {
+                                    if let Some(response) = maybe_response
+                                        && ws_sender.send(Message::Text(response)).await.is_err()
+                                    {
+                                        break;
+                                    }
+                                    if !flush_conn_events(&mut ws_sender, &mut conn, format).await? {
                                         break;
                                     }
                                 } else {
@@ -133,11 +170,16 @@ where
                             }
                             Message::Binary(bytes) => {
                                 if format == triage_transport_ws::ProtocolFormat::Flatbuffers {
-                                    let response = conn.handle_binary_message(&bytes);
+                                    let maybe_response = conn.handle_binary_message_optional(&bytes);
                                     if conn.is_authenticated() && !conn.has_global_receiver() {
                                         conn.set_global_receiver(manager.register_global_receiver());
                                     }
-                                    if ws_sender.send(Message::Binary(response)).await.is_err() {
+                                    if let Some(response) = maybe_response
+                                        && ws_sender.send(Message::Binary(response)).await.is_err()
+                                    {
+                                        break;
+                                    }
+                                    if !flush_conn_events(&mut ws_sender, &mut conn, format).await? {
                                         break;
                                     }
                                 } else {
@@ -170,28 +212,7 @@ where
                 next_msg = ws_receiver.next();
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                let messages = conn.drain_events();
-                let mut send_failed = false;
-                for msg in messages {
-                    match format {
-                        triage_transport_ws::ProtocolFormat::Json => {
-                            let serialized = serde_json::to_string(&msg)
-                                .context("serializing session event")?;
-                            if ws_sender.send(Message::Text(serialized)).await.is_err() {
-                                send_failed = true;
-                                break;
-                            }
-                        }
-                        triage_transport_ws::ProtocolFormat::Flatbuffers => {
-                            let serialized = triage_transport_ws::flatbuffers_proto::serialize_server_message(&msg);
-                            if ws_sender.send(Message::Binary(serialized)).await.is_err() {
-                                send_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if send_failed {
+                if !flush_conn_events(&mut ws_sender, &mut conn, format).await? {
                     break;
                 }
             }

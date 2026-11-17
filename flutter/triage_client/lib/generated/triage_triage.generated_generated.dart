@@ -228,7 +228,10 @@ enum ClientRequestPayloadTypeId {
   SetRailPinsRequest(30),
   SetSessionCustomLabelRequest(31),
   GetDaemonStatsRequest(32),
-  PairViaTailscaleRequest(33);
+  PairViaTailscaleRequest(33),
+  SyncTerminalRequestTable(34),
+  FetchTerminalRowsRequestTable(35),
+  AckTerminalSyncRequestTable(36);
 
   final int value;
   const ClientRequestPayloadTypeId(this.value);
@@ -269,6 +272,9 @@ enum ClientRequestPayloadTypeId {
       case 31: return ClientRequestPayloadTypeId.SetSessionCustomLabelRequest;
       case 32: return ClientRequestPayloadTypeId.GetDaemonStatsRequest;
       case 33: return ClientRequestPayloadTypeId.PairViaTailscaleRequest;
+      case 34: return ClientRequestPayloadTypeId.SyncTerminalRequestTable;
+      case 35: return ClientRequestPayloadTypeId.FetchTerminalRowsRequestTable;
+      case 36: return ClientRequestPayloadTypeId.AckTerminalSyncRequestTable;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -277,7 +283,7 @@ enum ClientRequestPayloadTypeId {
       value == null ? null : ClientRequestPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 33;
+  static const int maxValue = 36;
   static const fb.Reader<ClientRequestPayloadTypeId> reader = _ClientRequestPayloadTypeIdReader();
 }
 
@@ -314,7 +320,9 @@ enum ServerResultPayloadTypeId {
   JudgeHistoryResult(18),
   JudgeRulesResult(19),
   RailLayoutResult(20),
-  DaemonStatsResult(21);
+  DaemonStatsResult(21),
+  SyncTerminalResult(22),
+  FetchTerminalRowsResult(23);
 
   final int value;
   const ServerResultPayloadTypeId(this.value);
@@ -343,6 +351,8 @@ enum ServerResultPayloadTypeId {
       case 19: return ServerResultPayloadTypeId.JudgeRulesResult;
       case 20: return ServerResultPayloadTypeId.RailLayoutResult;
       case 21: return ServerResultPayloadTypeId.DaemonStatsResult;
+      case 22: return ServerResultPayloadTypeId.SyncTerminalResult;
+      case 23: return ServerResultPayloadTypeId.FetchTerminalRowsResult;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -351,7 +361,7 @@ enum ServerResultPayloadTypeId {
       value == null ? null : ServerResultPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 21;
+  static const int maxValue = 23;
   static const fb.Reader<ServerResultPayloadTypeId> reader = _ServerResultPayloadTypeIdReader();
 }
 
@@ -372,7 +382,8 @@ enum SessionEventPayloadTypeId {
   OutputEvent(2),
   SnapshotEvent(3),
   LeaseChangedEvent(4),
-  ExitedEvent(5);
+  ExitedEvent(5),
+  TerminalSyncEvent(6);
 
   final int value;
   const SessionEventPayloadTypeId(this.value);
@@ -385,6 +396,7 @@ enum SessionEventPayloadTypeId {
       case 3: return SessionEventPayloadTypeId.SnapshotEvent;
       case 4: return SessionEventPayloadTypeId.LeaseChangedEvent;
       case 5: return SessionEventPayloadTypeId.ExitedEvent;
+      case 6: return SessionEventPayloadTypeId.TerminalSyncEvent;
       default: throw StateError('Invalid value $value for bit flag enum');
     }
   }
@@ -393,7 +405,7 @@ enum SessionEventPayloadTypeId {
       value == null ? null : SessionEventPayloadTypeId.fromValue(value);
 
   static const int minValue = 0;
-  static const int maxValue = 5;
+  static const int maxValue = 6;
   static const fb.Reader<SessionEventPayloadTypeId> reader = _SessionEventPayloadTypeIdReader();
 }
 
@@ -4374,6 +4386,328 @@ class SetSessionCustomLabelRequestObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class SyncTerminalRequestTable {
+  SyncTerminalRequestTable._(this._bc, this._bcOffset);
+  factory SyncTerminalRequestTable(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SyncTerminalRequestTable> reader = _SyncTerminalRequestTableReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  String? get clientId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 6);
+  AttachMode get mode => AttachMode.fromValue(const fb.Int8Reader().vTableGet(_bc, _bcOffset, 8, 0));
+  SessionSize? get size => SessionSize.reader.vTableGetNullable(_bc, _bcOffset, 10);
+  bool get hasSize => const fb.BoolReader().vTableGet(_bc, _bcOffset, 12, false);
+  bool get resizePty => const fb.BoolReader().vTableGet(_bc, _bcOffset, 14, false);
+  bool get restoreIfExited => const fb.BoolReader().vTableGet(_bc, _bcOffset, 16, false);
+  bool get subscribe => const fb.BoolReader().vTableGet(_bc, _bcOffset, 18, false);
+  int get knownFrameSeq => fbjs.readUint64(_bc, _bcOffset, 20, 0);
+
+  @override
+  String toString() {
+    return 'SyncTerminalRequestTable{sessionId: ${sessionId}, clientId: ${clientId}, mode: ${mode}, size: ${size}, hasSize: ${hasSize}, resizePty: ${resizePty}, restoreIfExited: ${restoreIfExited}, subscribe: ${subscribe}, knownFrameSeq: ${knownFrameSeq}}';
+  }
+}
+
+class _SyncTerminalRequestTableReader extends fb.TableReader<SyncTerminalRequestTable> {
+  const _SyncTerminalRequestTableReader();
+
+  @override
+  SyncTerminalRequestTable createObject(fb.BufferContext bc, int offset) => 
+    SyncTerminalRequestTable._(bc, offset);
+}
+
+class SyncTerminalRequestTableBuilder {
+  SyncTerminalRequestTableBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(9);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addClientIdOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addMode(AttachMode? mode) {
+    fbBuilder.addInt8(2, mode?.value);
+    return fbBuilder.offset;
+  }
+  int addSize(int offset) {
+    fbBuilder.addStruct(3, offset);
+    return fbBuilder.offset;
+  }
+  int addHasSize(bool? hasSize) {
+    fbBuilder.addBool(4, hasSize);
+    return fbBuilder.offset;
+  }
+  int addResizePty(bool? resizePty) {
+    fbBuilder.addBool(5, resizePty);
+    return fbBuilder.offset;
+  }
+  int addRestoreIfExited(bool? restoreIfExited) {
+    fbBuilder.addBool(6, restoreIfExited);
+    return fbBuilder.offset;
+  }
+  int addSubscribe(bool? subscribe) {
+    fbBuilder.addBool(7, subscribe);
+    return fbBuilder.offset;
+  }
+  int addKnownFrameSeq(int? knownFrameSeq) {
+    fbjs.addUint64(fbBuilder, 8, knownFrameSeq);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SyncTerminalRequestTableObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final String? _clientId;
+  final AttachMode? _mode;
+  final SessionSizeObjectBuilder? _size;
+  final bool? _hasSize;
+  final bool? _resizePty;
+  final bool? _restoreIfExited;
+  final bool? _subscribe;
+  final int? _knownFrameSeq;
+
+  SyncTerminalRequestTableObjectBuilder({
+    String? sessionId,
+    String? clientId,
+    AttachMode? mode,
+    SessionSizeObjectBuilder? size,
+    bool? hasSize,
+    bool? resizePty,
+    bool? restoreIfExited,
+    bool? subscribe,
+    int? knownFrameSeq,
+  })
+      : _sessionId = sessionId,
+        _clientId = clientId,
+        _mode = mode,
+        _size = size,
+        _hasSize = hasSize,
+        _resizePty = resizePty,
+        _restoreIfExited = restoreIfExited,
+        _subscribe = subscribe,
+        _knownFrameSeq = knownFrameSeq;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? clientIdOffset = _clientId == null ? null
+        : fbBuilder.writeString(_clientId!);
+    fbBuilder.startTable(9);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, clientIdOffset);
+    fbBuilder.addInt8(2, _mode?.value);
+    if (_size != null) {
+      fbBuilder.addStruct(3, _size!.finish(fbBuilder));
+    }
+    fbBuilder.addBool(4, _hasSize);
+    fbBuilder.addBool(5, _resizePty);
+    fbBuilder.addBool(6, _restoreIfExited);
+    fbBuilder.addBool(7, _subscribe);
+    fbjs.addUint64(fbBuilder, 8, _knownFrameSeq);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class FetchTerminalRowsRequestTable {
+  FetchTerminalRowsRequestTable._(this._bc, this._bcOffset);
+  factory FetchTerminalRowsRequestTable(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<FetchTerminalRowsRequestTable> reader = _FetchTerminalRowsRequestTableReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  int get startRow => fbjs.readUint64(_bc, _bcOffset, 6, 0);
+  int get rowCount => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 8, 0);
+
+  @override
+  String toString() {
+    return 'FetchTerminalRowsRequestTable{sessionId: ${sessionId}, startRow: ${startRow}, rowCount: ${rowCount}}';
+  }
+}
+
+class _FetchTerminalRowsRequestTableReader extends fb.TableReader<FetchTerminalRowsRequestTable> {
+  const _FetchTerminalRowsRequestTableReader();
+
+  @override
+  FetchTerminalRowsRequestTable createObject(fb.BufferContext bc, int offset) => 
+    FetchTerminalRowsRequestTable._(bc, offset);
+}
+
+class FetchTerminalRowsRequestTableBuilder {
+  FetchTerminalRowsRequestTableBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(3);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addStartRow(int? startRow) {
+    fbjs.addUint64(fbBuilder, 1, startRow);
+    return fbBuilder.offset;
+  }
+  int addRowCount(int? rowCount) {
+    fbBuilder.addUint32(2, rowCount);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class FetchTerminalRowsRequestTableObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final int? _startRow;
+  final int? _rowCount;
+
+  FetchTerminalRowsRequestTableObjectBuilder({
+    String? sessionId,
+    int? startRow,
+    int? rowCount,
+  })
+      : _sessionId = sessionId,
+        _startRow = startRow,
+        _rowCount = rowCount;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    fbBuilder.startTable(3);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbjs.addUint64(fbBuilder, 1, _startRow);
+    fbBuilder.addUint32(2, _rowCount);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class AckTerminalSyncRequestTable {
+  AckTerminalSyncRequestTable._(this._bc, this._bcOffset);
+  factory AckTerminalSyncRequestTable(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<AckTerminalSyncRequestTable> reader = _AckTerminalSyncRequestTableReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get subscriptionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  int get frameSeq => fbjs.readUint64(_bc, _bcOffset, 6, 0);
+
+  @override
+  String toString() {
+    return 'AckTerminalSyncRequestTable{subscriptionId: ${subscriptionId}, frameSeq: ${frameSeq}}';
+  }
+}
+
+class _AckTerminalSyncRequestTableReader extends fb.TableReader<AckTerminalSyncRequestTable> {
+  const _AckTerminalSyncRequestTableReader();
+
+  @override
+  AckTerminalSyncRequestTable createObject(fb.BufferContext bc, int offset) => 
+    AckTerminalSyncRequestTable._(bc, offset);
+}
+
+class AckTerminalSyncRequestTableBuilder {
+  AckTerminalSyncRequestTableBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addSubscriptionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addFrameSeq(int? frameSeq) {
+    fbjs.addUint64(fbBuilder, 1, frameSeq);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class AckTerminalSyncRequestTableObjectBuilder extends fb.ObjectBuilder {
+  final String? _subscriptionId;
+  final int? _frameSeq;
+
+  AckTerminalSyncRequestTableObjectBuilder({
+    String? subscriptionId,
+    int? frameSeq,
+  })
+      : _subscriptionId = subscriptionId,
+        _frameSeq = frameSeq;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? subscriptionIdOffset = _subscriptionId == null ? null
+        : fbBuilder.writeString(_subscriptionId!);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, subscriptionIdOffset);
+    fbjs.addUint64(fbBuilder, 1, _frameSeq);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ClientMessage {
   ClientMessage._(this._bc, this._bcOffset);
   factory ClientMessage(List<int> bytes) {
@@ -4423,6 +4757,9 @@ class ClientMessage {
       case 31: return SetSessionCustomLabelRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 32: return GetDaemonStatsRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 33: return PairViaTailscaleRequest.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 34: return SyncTerminalRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 35: return FetchTerminalRowsRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 36: return AckTerminalSyncRequestTable.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -6703,6 +7040,495 @@ class DaemonStatsResultObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class TerminalSyncFrame {
+  TerminalSyncFrame._(this._bc, this._bcOffset);
+  factory TerminalSyncFrame(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<TerminalSyncFrame> reader = _TerminalSyncFrameReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  int get frameSeq => fbjs.readUint64(_bc, _bcOffset, 4, 0);
+  int get rows => const fb.Uint16Reader().vTableGet(_bc, _bcOffset, 6, 0);
+  int get cols => const fb.Uint16Reader().vTableGet(_bc, _bcOffset, 8, 0);
+  int get totalScrollbackRows => fbjs.readUint64(_bc, _bcOffset, 10, 0);
+  int get trimmedTopRows => fbjs.readUint64(_bc, _bcOffset, 12, 0);
+  int get eraseScrollbackGen => fbjs.readUint64(_bc, _bcOffset, 14, 0);
+  int get cursorX => const fb.Uint16Reader().vTableGet(_bc, _bcOffset, 16, 0);
+  int get cursorY => const fb.Uint16Reader().vTableGet(_bc, _bcOffset, 18, 0);
+  int get cursorStyle => const fb.Uint8Reader().vTableGet(_bc, _bcOffset, 20, 0);
+  int get modeFlags => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 22, 0);
+  int get mouseMode => const fb.Uint8Reader().vTableGet(_bc, _bcOffset, 24, 0);
+  int get mouseReportMode => const fb.Uint8Reader().vTableGet(_bc, _bcOffset, 26, 0);
+  int get kittyKeyboardFlags => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 28, 0);
+  String? get title => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 30);
+  int get viewportCompression => const fb.Uint8Reader().vTableGet(_bc, _bcOffset, 32, 0);
+  List<int>? get viewportPayload => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 34);
+  int get pushedScrollbackStartRow => fbjs.readUint64(_bc, _bcOffset, 36, 0);
+  int get pushedScrollbackRowCount => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 38, 0);
+  int get pushedScrollbackCompression => const fb.Uint8Reader().vTableGet(_bc, _bcOffset, 40, 0);
+  List<int>? get pushedScrollbackPayload => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 42);
+
+  @override
+  String toString() {
+    return 'TerminalSyncFrame{frameSeq: ${frameSeq}, rows: ${rows}, cols: ${cols}, totalScrollbackRows: ${totalScrollbackRows}, trimmedTopRows: ${trimmedTopRows}, eraseScrollbackGen: ${eraseScrollbackGen}, cursorX: ${cursorX}, cursorY: ${cursorY}, cursorStyle: ${cursorStyle}, modeFlags: ${modeFlags}, mouseMode: ${mouseMode}, mouseReportMode: ${mouseReportMode}, kittyKeyboardFlags: ${kittyKeyboardFlags}, title: ${title}, viewportCompression: ${viewportCompression}, viewportPayload: ${viewportPayload}, pushedScrollbackStartRow: ${pushedScrollbackStartRow}, pushedScrollbackRowCount: ${pushedScrollbackRowCount}, pushedScrollbackCompression: ${pushedScrollbackCompression}, pushedScrollbackPayload: ${pushedScrollbackPayload}}';
+  }
+}
+
+class _TerminalSyncFrameReader extends fb.TableReader<TerminalSyncFrame> {
+  const _TerminalSyncFrameReader();
+
+  @override
+  TerminalSyncFrame createObject(fb.BufferContext bc, int offset) => 
+    TerminalSyncFrame._(bc, offset);
+}
+
+class TerminalSyncFrameBuilder {
+  TerminalSyncFrameBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(20);
+  }
+
+  int addFrameSeq(int? frameSeq) {
+    fbjs.addUint64(fbBuilder, 0, frameSeq);
+    return fbBuilder.offset;
+  }
+  int addRows(int? rows) {
+    fbBuilder.addUint16(1, rows);
+    return fbBuilder.offset;
+  }
+  int addCols(int? cols) {
+    fbBuilder.addUint16(2, cols);
+    return fbBuilder.offset;
+  }
+  int addTotalScrollbackRows(int? totalScrollbackRows) {
+    fbjs.addUint64(fbBuilder, 3, totalScrollbackRows);
+    return fbBuilder.offset;
+  }
+  int addTrimmedTopRows(int? trimmedTopRows) {
+    fbjs.addUint64(fbBuilder, 4, trimmedTopRows);
+    return fbBuilder.offset;
+  }
+  int addEraseScrollbackGen(int? eraseScrollbackGen) {
+    fbjs.addUint64(fbBuilder, 5, eraseScrollbackGen);
+    return fbBuilder.offset;
+  }
+  int addCursorX(int? cursorX) {
+    fbBuilder.addUint16(6, cursorX);
+    return fbBuilder.offset;
+  }
+  int addCursorY(int? cursorY) {
+    fbBuilder.addUint16(7, cursorY);
+    return fbBuilder.offset;
+  }
+  int addCursorStyle(int? cursorStyle) {
+    fbBuilder.addUint8(8, cursorStyle);
+    return fbBuilder.offset;
+  }
+  int addModeFlags(int? modeFlags) {
+    fbBuilder.addUint32(9, modeFlags);
+    return fbBuilder.offset;
+  }
+  int addMouseMode(int? mouseMode) {
+    fbBuilder.addUint8(10, mouseMode);
+    return fbBuilder.offset;
+  }
+  int addMouseReportMode(int? mouseReportMode) {
+    fbBuilder.addUint8(11, mouseReportMode);
+    return fbBuilder.offset;
+  }
+  int addKittyKeyboardFlags(int? kittyKeyboardFlags) {
+    fbBuilder.addUint32(12, kittyKeyboardFlags);
+    return fbBuilder.offset;
+  }
+  int addTitleOffset(int? offset) {
+    fbBuilder.addOffset(13, offset);
+    return fbBuilder.offset;
+  }
+  int addViewportCompression(int? viewportCompression) {
+    fbBuilder.addUint8(14, viewportCompression);
+    return fbBuilder.offset;
+  }
+  int addViewportPayloadOffset(int? offset) {
+    fbBuilder.addOffset(15, offset);
+    return fbBuilder.offset;
+  }
+  int addPushedScrollbackStartRow(int? pushedScrollbackStartRow) {
+    fbjs.addUint64(fbBuilder, 16, pushedScrollbackStartRow);
+    return fbBuilder.offset;
+  }
+  int addPushedScrollbackRowCount(int? pushedScrollbackRowCount) {
+    fbBuilder.addUint32(17, pushedScrollbackRowCount);
+    return fbBuilder.offset;
+  }
+  int addPushedScrollbackCompression(int? pushedScrollbackCompression) {
+    fbBuilder.addUint8(18, pushedScrollbackCompression);
+    return fbBuilder.offset;
+  }
+  int addPushedScrollbackPayloadOffset(int? offset) {
+    fbBuilder.addOffset(19, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class TerminalSyncFrameObjectBuilder extends fb.ObjectBuilder {
+  final int? _frameSeq;
+  final int? _rows;
+  final int? _cols;
+  final int? _totalScrollbackRows;
+  final int? _trimmedTopRows;
+  final int? _eraseScrollbackGen;
+  final int? _cursorX;
+  final int? _cursorY;
+  final int? _cursorStyle;
+  final int? _modeFlags;
+  final int? _mouseMode;
+  final int? _mouseReportMode;
+  final int? _kittyKeyboardFlags;
+  final String? _title;
+  final int? _viewportCompression;
+  final List<int>? _viewportPayload;
+  final int? _pushedScrollbackStartRow;
+  final int? _pushedScrollbackRowCount;
+  final int? _pushedScrollbackCompression;
+  final List<int>? _pushedScrollbackPayload;
+
+  TerminalSyncFrameObjectBuilder({
+    int? frameSeq,
+    int? rows,
+    int? cols,
+    int? totalScrollbackRows,
+    int? trimmedTopRows,
+    int? eraseScrollbackGen,
+    int? cursorX,
+    int? cursorY,
+    int? cursorStyle,
+    int? modeFlags,
+    int? mouseMode,
+    int? mouseReportMode,
+    int? kittyKeyboardFlags,
+    String? title,
+    int? viewportCompression,
+    List<int>? viewportPayload,
+    int? pushedScrollbackStartRow,
+    int? pushedScrollbackRowCount,
+    int? pushedScrollbackCompression,
+    List<int>? pushedScrollbackPayload,
+  })
+      : _frameSeq = frameSeq,
+        _rows = rows,
+        _cols = cols,
+        _totalScrollbackRows = totalScrollbackRows,
+        _trimmedTopRows = trimmedTopRows,
+        _eraseScrollbackGen = eraseScrollbackGen,
+        _cursorX = cursorX,
+        _cursorY = cursorY,
+        _cursorStyle = cursorStyle,
+        _modeFlags = modeFlags,
+        _mouseMode = mouseMode,
+        _mouseReportMode = mouseReportMode,
+        _kittyKeyboardFlags = kittyKeyboardFlags,
+        _title = title,
+        _viewportCompression = viewportCompression,
+        _viewportPayload = viewportPayload,
+        _pushedScrollbackStartRow = pushedScrollbackStartRow,
+        _pushedScrollbackRowCount = pushedScrollbackRowCount,
+        _pushedScrollbackCompression = pushedScrollbackCompression,
+        _pushedScrollbackPayload = pushedScrollbackPayload;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? titleOffset = _title == null ? null
+        : fbBuilder.writeString(_title!);
+    final int? viewportPayloadOffset = _viewportPayload == null ? null
+        : fbBuilder.writeListUint8(_viewportPayload!);
+    final int? pushedScrollbackPayloadOffset = _pushedScrollbackPayload == null ? null
+        : fbBuilder.writeListUint8(_pushedScrollbackPayload!);
+    fbBuilder.startTable(20);
+    fbjs.addUint64(fbBuilder, 0, _frameSeq);
+    fbBuilder.addUint16(1, _rows);
+    fbBuilder.addUint16(2, _cols);
+    fbjs.addUint64(fbBuilder, 3, _totalScrollbackRows);
+    fbjs.addUint64(fbBuilder, 4, _trimmedTopRows);
+    fbjs.addUint64(fbBuilder, 5, _eraseScrollbackGen);
+    fbBuilder.addUint16(6, _cursorX);
+    fbBuilder.addUint16(7, _cursorY);
+    fbBuilder.addUint8(8, _cursorStyle);
+    fbBuilder.addUint32(9, _modeFlags);
+    fbBuilder.addUint8(10, _mouseMode);
+    fbBuilder.addUint8(11, _mouseReportMode);
+    fbBuilder.addUint32(12, _kittyKeyboardFlags);
+    fbBuilder.addOffset(13, titleOffset);
+    fbBuilder.addUint8(14, _viewportCompression);
+    fbBuilder.addOffset(15, viewportPayloadOffset);
+    fbjs.addUint64(fbBuilder, 16, _pushedScrollbackStartRow);
+    fbBuilder.addUint32(17, _pushedScrollbackRowCount);
+    fbBuilder.addUint8(18, _pushedScrollbackCompression);
+    fbBuilder.addOffset(19, pushedScrollbackPayloadOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class SyncTerminalResult {
+  SyncTerminalResult._(this._bc, this._bcOffset);
+  factory SyncTerminalResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<SyncTerminalResult> reader = _SyncTerminalResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get subscriptionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  SessionSnapshot? get snapshot => SessionSnapshot.reader.vTableGetNullable(_bc, _bcOffset, 6);
+  InputLeaseState? get lease => InputLeaseState.reader.vTableGetNullable(_bc, _bcOffset, 8);
+  TerminalSyncFrame? get frame => TerminalSyncFrame.reader.vTableGetNullable(_bc, _bcOffset, 10);
+
+  @override
+  String toString() {
+    return 'SyncTerminalResult{subscriptionId: ${subscriptionId}, snapshot: ${snapshot}, lease: ${lease}, frame: ${frame}}';
+  }
+}
+
+class _SyncTerminalResultReader extends fb.TableReader<SyncTerminalResult> {
+  const _SyncTerminalResultReader();
+
+  @override
+  SyncTerminalResult createObject(fb.BufferContext bc, int offset) => 
+    SyncTerminalResult._(bc, offset);
+}
+
+class SyncTerminalResultBuilder {
+  SyncTerminalResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(4);
+  }
+
+  int addSubscriptionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addSnapshotOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+  int addLeaseOffset(int? offset) {
+    fbBuilder.addOffset(2, offset);
+    return fbBuilder.offset;
+  }
+  int addFrameOffset(int? offset) {
+    fbBuilder.addOffset(3, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class SyncTerminalResultObjectBuilder extends fb.ObjectBuilder {
+  final String? _subscriptionId;
+  final SessionSnapshotObjectBuilder? _snapshot;
+  final InputLeaseStateObjectBuilder? _lease;
+  final TerminalSyncFrameObjectBuilder? _frame;
+
+  SyncTerminalResultObjectBuilder({
+    String? subscriptionId,
+    SessionSnapshotObjectBuilder? snapshot,
+    InputLeaseStateObjectBuilder? lease,
+    TerminalSyncFrameObjectBuilder? frame,
+  })
+      : _subscriptionId = subscriptionId,
+        _snapshot = snapshot,
+        _lease = lease,
+        _frame = frame;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? subscriptionIdOffset = _subscriptionId == null ? null
+        : fbBuilder.writeString(_subscriptionId!);
+    final int? snapshotOffset = _snapshot?.getOrCreateOffset(fbBuilder);
+    final int? leaseOffset = _lease?.getOrCreateOffset(fbBuilder);
+    final int? frameOffset = _frame?.getOrCreateOffset(fbBuilder);
+    fbBuilder.startTable(4);
+    fbBuilder.addOffset(0, subscriptionIdOffset);
+    fbBuilder.addOffset(1, snapshotOffset);
+    fbBuilder.addOffset(2, leaseOffset);
+    fbBuilder.addOffset(3, frameOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
+class FetchTerminalRowsResult {
+  FetchTerminalRowsResult._(this._bc, this._bcOffset);
+  factory FetchTerminalRowsResult(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<FetchTerminalRowsResult> reader = _FetchTerminalRowsResultReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  int get startRow => fbjs.readUint64(_bc, _bcOffset, 6, 0);
+  int get rowCount => const fb.Uint32Reader().vTableGet(_bc, _bcOffset, 8, 0);
+  int get totalScrollbackRows => fbjs.readUint64(_bc, _bcOffset, 10, 0);
+  int get trimmedTopRows => fbjs.readUint64(_bc, _bcOffset, 12, 0);
+  int get eraseScrollbackGen => fbjs.readUint64(_bc, _bcOffset, 14, 0);
+  int get compression => const fb.Uint8Reader().vTableGet(_bc, _bcOffset, 16, 0);
+  List<int>? get payload => const fb.Uint8ListReader().vTableGetNullable(_bc, _bcOffset, 18);
+
+  @override
+  String toString() {
+    return 'FetchTerminalRowsResult{sessionId: ${sessionId}, startRow: ${startRow}, rowCount: ${rowCount}, totalScrollbackRows: ${totalScrollbackRows}, trimmedTopRows: ${trimmedTopRows}, eraseScrollbackGen: ${eraseScrollbackGen}, compression: ${compression}, payload: ${payload}}';
+  }
+}
+
+class _FetchTerminalRowsResultReader extends fb.TableReader<FetchTerminalRowsResult> {
+  const _FetchTerminalRowsResultReader();
+
+  @override
+  FetchTerminalRowsResult createObject(fb.BufferContext bc, int offset) => 
+    FetchTerminalRowsResult._(bc, offset);
+}
+
+class FetchTerminalRowsResultBuilder {
+  FetchTerminalRowsResultBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(8);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addStartRow(int? startRow) {
+    fbjs.addUint64(fbBuilder, 1, startRow);
+    return fbBuilder.offset;
+  }
+  int addRowCount(int? rowCount) {
+    fbBuilder.addUint32(2, rowCount);
+    return fbBuilder.offset;
+  }
+  int addTotalScrollbackRows(int? totalScrollbackRows) {
+    fbjs.addUint64(fbBuilder, 3, totalScrollbackRows);
+    return fbBuilder.offset;
+  }
+  int addTrimmedTopRows(int? trimmedTopRows) {
+    fbjs.addUint64(fbBuilder, 4, trimmedTopRows);
+    return fbBuilder.offset;
+  }
+  int addEraseScrollbackGen(int? eraseScrollbackGen) {
+    fbjs.addUint64(fbBuilder, 5, eraseScrollbackGen);
+    return fbBuilder.offset;
+  }
+  int addCompression(int? compression) {
+    fbBuilder.addUint8(6, compression);
+    return fbBuilder.offset;
+  }
+  int addPayloadOffset(int? offset) {
+    fbBuilder.addOffset(7, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class FetchTerminalRowsResultObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final int? _startRow;
+  final int? _rowCount;
+  final int? _totalScrollbackRows;
+  final int? _trimmedTopRows;
+  final int? _eraseScrollbackGen;
+  final int? _compression;
+  final List<int>? _payload;
+
+  FetchTerminalRowsResultObjectBuilder({
+    String? sessionId,
+    int? startRow,
+    int? rowCount,
+    int? totalScrollbackRows,
+    int? trimmedTopRows,
+    int? eraseScrollbackGen,
+    int? compression,
+    List<int>? payload,
+  })
+      : _sessionId = sessionId,
+        _startRow = startRow,
+        _rowCount = rowCount,
+        _totalScrollbackRows = totalScrollbackRows,
+        _trimmedTopRows = trimmedTopRows,
+        _eraseScrollbackGen = eraseScrollbackGen,
+        _compression = compression,
+        _payload = payload;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? payloadOffset = _payload == null ? null
+        : fbBuilder.writeListUint8(_payload!);
+    fbBuilder.startTable(8);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbjs.addUint64(fbBuilder, 1, _startRow);
+    fbBuilder.addUint32(2, _rowCount);
+    fbjs.addUint64(fbBuilder, 3, _totalScrollbackRows);
+    fbjs.addUint64(fbBuilder, 4, _trimmedTopRows);
+    fbjs.addUint64(fbBuilder, 5, _eraseScrollbackGen);
+    fbBuilder.addUint8(6, _compression);
+    fbBuilder.addOffset(7, payloadOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class ResponsePayload {
   ResponsePayload._(this._bc, this._bcOffset);
   factory ResponsePayload(List<int> bytes) {
@@ -6740,6 +7566,8 @@ class ResponsePayload {
       case 19: return JudgeRulesResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 20: return RailLayoutResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       case 21: return DaemonStatsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 22: return SyncTerminalResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
+      case 23: return FetchTerminalRowsResult.reader.vTableGetNullable(_bc, _bcOffset, 8);
       default: return null;
     }
   }
@@ -7349,6 +8177,89 @@ class ExitedEventObjectBuilder extends fb.ObjectBuilder {
     return fbBuilder.buffer;
   }
 }
+class TerminalSyncEvent {
+  TerminalSyncEvent._(this._bc, this._bcOffset);
+  factory TerminalSyncEvent(List<int> bytes) {
+    final rootRef = fb.BufferContext.fromBytes(bytes);
+    return reader.read(rootRef, 0);
+  }
+
+  static const fb.Reader<TerminalSyncEvent> reader = _TerminalSyncEventReader();
+
+  final fb.BufferContext _bc;
+  final int _bcOffset;
+
+  String? get sessionId => const fb.StringReader().vTableGetNullable(_bc, _bcOffset, 4);
+  TerminalSyncFrame? get frame => TerminalSyncFrame.reader.vTableGetNullable(_bc, _bcOffset, 6);
+
+  @override
+  String toString() {
+    return 'TerminalSyncEvent{sessionId: ${sessionId}, frame: ${frame}}';
+  }
+}
+
+class _TerminalSyncEventReader extends fb.TableReader<TerminalSyncEvent> {
+  const _TerminalSyncEventReader();
+
+  @override
+  TerminalSyncEvent createObject(fb.BufferContext bc, int offset) => 
+    TerminalSyncEvent._(bc, offset);
+}
+
+class TerminalSyncEventBuilder {
+  TerminalSyncEventBuilder(this.fbBuilder);
+
+  final fb.Builder fbBuilder;
+
+  void begin() {
+    fbBuilder.startTable(2);
+  }
+
+  int addSessionIdOffset(int? offset) {
+    fbBuilder.addOffset(0, offset);
+    return fbBuilder.offset;
+  }
+  int addFrameOffset(int? offset) {
+    fbBuilder.addOffset(1, offset);
+    return fbBuilder.offset;
+  }
+
+  int finish() {
+    return fbBuilder.endTable();
+  }
+}
+
+class TerminalSyncEventObjectBuilder extends fb.ObjectBuilder {
+  final String? _sessionId;
+  final TerminalSyncFrameObjectBuilder? _frame;
+
+  TerminalSyncEventObjectBuilder({
+    String? sessionId,
+    TerminalSyncFrameObjectBuilder? frame,
+  })
+      : _sessionId = sessionId,
+        _frame = frame;
+
+  /// Finish building, and store into the [fbBuilder].
+  @override
+  int finish(fb.Builder fbBuilder) {
+    final int? sessionIdOffset = _sessionId == null ? null
+        : fbBuilder.writeString(_sessionId!);
+    final int? frameOffset = _frame?.getOrCreateOffset(fbBuilder);
+    fbBuilder.startTable(2);
+    fbBuilder.addOffset(0, sessionIdOffset);
+    fbBuilder.addOffset(1, frameOffset);
+    return fbBuilder.endTable();
+  }
+
+  /// Convenience method to serialize to byte list.
+  @override
+  Uint8List toBytes([String? fileIdentifier]) {
+    final fbBuilder = fb.Builder(deduplicateTables: false);
+    fbBuilder.finish(finish(fbBuilder), fileIdentifier);
+    return fbBuilder.buffer;
+  }
+}
 class EventPayload {
   EventPayload._(this._bc, this._bcOffset);
   factory EventPayload(List<int> bytes) {
@@ -7371,6 +8282,7 @@ class EventPayload {
       case 3: return SnapshotEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
       case 4: return LeaseChangedEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
       case 5: return ExitedEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
+      case 6: return TerminalSyncEvent.reader.vTableGetNullable(_bc, _bcOffset, 10);
       default: return null;
     }
   }

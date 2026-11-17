@@ -1,10 +1,10 @@
-use crate::{ClientMessage, ClientRequest, ServerMessage, ServerResult};
+use crate::{ClientMessage, ClientRequest, ServerMessage, ServerResult, SubscriptionId};
 use flatbuffers::FlatBufferBuilder;
 use triage_core::generated::triage::generated as fb;
 use triage_core::session::{
-    AttachMode, AttachSessionRequest, ClientId, InputControllerKind, InputLeaseRequest,
-    ResizeSessionRequest, RestoreSessionRequest, SessionEvent, SessionId, StartSessionRequest,
-    StyledRowsRequest, WriteInputRequest,
+    AttachMode, AttachSessionRequest, ClientId, FetchTerminalRowsRequest, InputControllerKind,
+    InputLeaseRequest, ResizeSessionRequest, RestoreSessionRequest, SessionEvent, SessionId,
+    StartSessionRequest, StyledRowsRequest, SyncTerminalRequest, WriteInputRequest,
 };
 
 /// Host percent to the wire: unknown encodes as -1 (0 is a valid reading).
@@ -603,6 +603,104 @@ pub fn parse_client_message(
             };
             ClientRequest::SetSessionCustomLabel { session_id, label }
         }
+        fb::ClientRequestPayload::SyncTerminalRequestTable => {
+            let req = msg
+                .payload_as_sync_terminal_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "SyncTerminalRequestTable payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            let client_id_str = req.client_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "client_id is missing")
+            })?;
+            let client_id = ClientId::new(client_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_client_id", e.to_string()))?;
+            let mode = match req.mode() {
+                fb::AttachMode::Observer => AttachMode::Observer,
+                fb::AttachMode::InteractiveController => AttachMode::InteractiveController,
+                fb::AttachMode::AgentController => AttachMode::AgentController,
+                other => {
+                    return Err(crate::ProtocolError::new(
+                        "invalid_enum",
+                        format!("invalid AttachMode value: {:?}", other.0),
+                    ));
+                }
+            };
+            let size = if req.has_size() {
+                let fb_size = req
+                    .size()
+                    .ok_or_else(|| crate::ProtocolError::new("missing_field", "size is missing"))?;
+                Some(triage_core::session::SessionSize {
+                    rows: fb_size.rows() as usize,
+                    cols: fb_size.cols() as usize,
+                    pixel_width: fb_size.pixel_width() as usize,
+                    pixel_height: fb_size.pixel_height() as usize,
+                    dpi: fb_size.dpi() as usize,
+                })
+            } else {
+                None
+            };
+            ClientRequest::SyncTerminal {
+                request: SyncTerminalRequest {
+                    session_id,
+                    client_id,
+                    mode,
+                    size,
+                    resize_pty: req.resize_pty(),
+                    restore_if_exited: req.restore_if_exited(),
+                    subscribe: req.subscribe(),
+                    known_frame_seq: req.known_frame_seq(),
+                },
+            }
+        }
+        fb::ClientRequestPayload::FetchTerminalRowsRequestTable => {
+            let req = msg
+                .payload_as_fetch_terminal_rows_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "FetchTerminalRowsRequestTable payload is missing",
+                    )
+                })?;
+            let session_id_str = req.session_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "session_id is missing")
+            })?;
+            let session_id = SessionId::new(session_id_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_session_id", e.to_string()))?;
+            ClientRequest::FetchTerminalRows {
+                request: FetchTerminalRowsRequest {
+                    session_id,
+                    start_row: req.start_row(),
+                    row_count: req.row_count(),
+                },
+            }
+        }
+        fb::ClientRequestPayload::AckTerminalSyncRequestTable => {
+            let req = msg
+                .payload_as_ack_terminal_sync_request_table()
+                .ok_or_else(|| {
+                    crate::ProtocolError::new(
+                        "invalid_flatbuffer",
+                        "AckTerminalSyncRequestTable payload is missing",
+                    )
+                })?;
+            let sub_str = req.subscription_id().ok_or_else(|| {
+                crate::ProtocolError::new("missing_field", "subscription_id is missing")
+            })?;
+            let subscription_id = SubscriptionId::new(sub_str)
+                .map_err(|e| crate::ProtocolError::new("invalid_subscription_id", e.to_string()))?;
+            ClientRequest::AckTerminalSync {
+                subscription_id,
+                frame_seq: req.frame_seq(),
+            }
+        }
         _ => {
             return Err(crate::ProtocolError::new(
                 "unsupported_payload",
@@ -1110,6 +1208,74 @@ pub fn build_client_message<'a>(
                 req.as_union_value(),
             )
         }
+        ClientRequest::SyncTerminal { request } => {
+            let sid_str = builder.create_string(request.session_id.as_str());
+            let cid_str = builder.create_string(request.client_id.as_str());
+            let mode = match request.mode {
+                AttachMode::Observer => fb::AttachMode::Observer,
+                AttachMode::InteractiveController => fb::AttachMode::InteractiveController,
+                AttachMode::AgentController => fb::AttachMode::AgentController,
+            };
+            let fb_size = request.size.as_ref().map(|sz| {
+                fb::SessionSize::new(
+                    sz.rows as u32,
+                    sz.cols as u32,
+                    sz.pixel_width as u32,
+                    sz.pixel_height as u32,
+                    sz.dpi as u32,
+                )
+            });
+            let req = fb::SyncTerminalRequestTable::create(
+                builder,
+                &fb::SyncTerminalRequestTableArgs {
+                    session_id: Some(sid_str),
+                    client_id: Some(cid_str),
+                    mode,
+                    size: fb_size.as_ref(),
+                    has_size: request.size.is_some(),
+                    resize_pty: request.resize_pty,
+                    restore_if_exited: request.restore_if_exited,
+                    subscribe: request.subscribe,
+                    known_frame_seq: request.known_frame_seq,
+                },
+            );
+            (
+                fb::ClientRequestPayload::SyncTerminalRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::FetchTerminalRows { request } => {
+            let sid_str = builder.create_string(request.session_id.as_str());
+            let req = fb::FetchTerminalRowsRequestTable::create(
+                builder,
+                &fb::FetchTerminalRowsRequestTableArgs {
+                    session_id: Some(sid_str),
+                    start_row: request.start_row,
+                    row_count: request.row_count,
+                },
+            );
+            (
+                fb::ClientRequestPayload::FetchTerminalRowsRequestTable,
+                req.as_union_value(),
+            )
+        }
+        ClientRequest::AckTerminalSync {
+            subscription_id,
+            frame_seq,
+        } => {
+            let sub_str = builder.create_string(subscription_id.as_str());
+            let req = fb::AckTerminalSyncRequestTable::create(
+                builder,
+                &fb::AckTerminalSyncRequestTableArgs {
+                    subscription_id: Some(sub_str),
+                    frame_seq: *frame_seq,
+                },
+            );
+            (
+                fb::ClientRequestPayload::AckTerminalSyncRequestTable,
+                req.as_union_value(),
+            )
+        }
     };
 
     fb::ClientMessage::create(
@@ -1579,6 +1745,24 @@ pub fn build_server_message<'a>(
                         r.as_union_value(),
                     )
                 }
+                ServerResult::SyncTerminal { response } => {
+                    let r = triage_core::flatbuffers_proto::build_sync_terminal_result(
+                        builder, response,
+                    );
+                    (
+                        fb::ServerResultPayload::SyncTerminalResult,
+                        r.as_union_value(),
+                    )
+                }
+                ServerResult::FetchTerminalRows { response } => {
+                    let r = triage_core::flatbuffers_proto::build_fetch_terminal_rows_result(
+                        builder, response,
+                    );
+                    (
+                        fb::ServerResultPayload::FetchTerminalRowsResult,
+                        r.as_union_value(),
+                    )
+                }
             };
 
             let res_payload = fb::ResponsePayload::create(
@@ -1707,6 +1891,22 @@ pub fn build_server_message<'a>(
                         },
                     );
                     (fb::SessionEventPayload::ExitedEvent, e.as_union_value())
+                }
+                SessionEvent::TerminalSync { session_id, frame } => {
+                    let sid = builder.create_string(session_id.as_str());
+                    let fb_frame =
+                        triage_core::flatbuffers_proto::build_terminal_sync_frame(builder, frame);
+                    let e = fb::TerminalSyncEvent::create(
+                        builder,
+                        &fb::TerminalSyncEventArgs {
+                            session_id: Some(sid),
+                            frame: Some(fb_frame),
+                        },
+                    );
+                    (
+                        fb::SessionEventPayload::TerminalSyncEvent,
+                        e.as_union_value(),
+                    )
                 }
             };
 
@@ -1993,6 +2193,23 @@ pub enum ServerResultBorrowed<'a> {
         battery_percent: Option<u8>,
         battery_state: triage_core::host::BatteryState,
     },
+    SyncTerminal {
+        subscription_id: Option<&'a str>,
+        frame_seq: u64,
+        rows: u16,
+        cols: u16,
+        total_scrollback_rows: u64,
+        viewport_compression: u8,
+        viewport_payload: &'a [u8],
+    },
+    FetchTerminalRows {
+        session_id: &'a str,
+        start_row: u64,
+        row_count: u32,
+        total_scrollback_rows: u64,
+        compression: u8,
+        payload: &'a [u8],
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2014,6 +2231,15 @@ pub enum SessionEventBorrowed<'a> {
     },
     Exited {
         session_id: &'a str,
+    },
+    TerminalSync {
+        session_id: &'a str,
+        frame_seq: u64,
+        rows: u16,
+        cols: u16,
+        total_scrollback_rows: u64,
+        viewport_compression: u8,
+        viewport_payload: &'a [u8],
     },
 }
 
@@ -2244,6 +2470,49 @@ pub fn parse_fb_server_message_borrowed<'a>(
                         battery_state: battery_state_from_fb(stats.battery_state()),
                     }
                 }
+                fb::ServerResultPayload::SyncTerminalResult => {
+                    let sync_res = resp.result_as_sync_terminal_result().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing sync terminal result",
+                        )
+                    })?;
+                    let frame = sync_res.frame().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing sync terminal frame",
+                        )
+                    })?;
+                    ServerResultBorrowed::SyncTerminal {
+                        subscription_id: sync_res.subscription_id(),
+                        frame_seq: frame.frame_seq(),
+                        rows: frame.rows(),
+                        cols: frame.cols(),
+                        total_scrollback_rows: frame.total_scrollback_rows(),
+                        viewport_compression: frame.viewport_compression(),
+                        viewport_payload: frame
+                            .viewport_payload()
+                            .map(|b| b.bytes())
+                            .unwrap_or(&[]),
+                    }
+                }
+                fb::ServerResultPayload::FetchTerminalRowsResult => {
+                    let fetch_res =
+                        resp.result_as_fetch_terminal_rows_result().ok_or_else(|| {
+                            crate::ProtocolError::new(
+                                "invalid_flatbuffer",
+                                "missing fetch terminal rows result",
+                            )
+                        })?;
+                    ServerResultBorrowed::FetchTerminalRows {
+                        session_id: fetch_res.session_id().unwrap_or(""),
+                        start_row: fetch_res.start_row(),
+                        row_count: fetch_res.row_count(),
+                        total_scrollback_rows: fetch_res.total_scrollback_rows(),
+                        compression: fetch_res.compression(),
+                        payload: fetch_res.payload().map(|b| b.bytes()).unwrap_or(&[]),
+                    }
+                }
                 fb::ServerResultPayload::UnitResult | fb::ServerResultPayload::NONE => {
                     ServerResultBorrowed::Unit
                 }
@@ -2325,6 +2594,32 @@ pub fn parse_fb_server_message_borrowed<'a>(
                     })?;
                     SessionEventBorrowed::Exited {
                         session_id: exited.session_id().unwrap_or(""),
+                    }
+                }
+                fb::SessionEventPayload::TerminalSyncEvent => {
+                    let sync_evt = evt.event_as_terminal_sync_event().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing terminal sync event",
+                        )
+                    })?;
+                    let frame = sync_evt.frame().ok_or_else(|| {
+                        crate::ProtocolError::new(
+                            "invalid_flatbuffer",
+                            "missing terminal sync event frame",
+                        )
+                    })?;
+                    SessionEventBorrowed::TerminalSync {
+                        session_id: sync_evt.session_id().unwrap_or(""),
+                        frame_seq: frame.frame_seq(),
+                        rows: frame.rows(),
+                        cols: frame.cols(),
+                        total_scrollback_rows: frame.total_scrollback_rows(),
+                        viewport_compression: frame.viewport_compression(),
+                        viewport_payload: frame
+                            .viewport_payload()
+                            .map(|b| b.bytes())
+                            .unwrap_or(&[]),
                     }
                 }
                 _ => {

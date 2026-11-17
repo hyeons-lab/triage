@@ -1,5 +1,8 @@
 import 'dart:io' show Platform;
 
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, VoidCallback;
+
 // Native/desktop/mobile implementations of the small bits of process-env access
 // the side rail needs. The web build swaps in `platform_env_web.dart` via a
 // conditional import, since `dart:io` (and `Platform.environment`) is
@@ -47,3 +50,22 @@ void resetWebExit() {}
 
 /// Always false on native platforms. Overridden on web to detect mobile browsers and touch devices.
 bool isWebMobileBrowser() => false;
+
+/// Always true on native platforms (system `Clipboard.getData` is available).
+bool canReadWebClipboardAsync() => true;
+
+/// Copies [text] to the system clipboard, returning `true` on success.
+Future<bool> copyTextWithWebFallback(String text) async {
+  try {
+    await Clipboard.setData(ClipboardData(text: text));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// No-op on native platforms; overridden on web to listen for browser `paste`
+/// DOM events (including over plain-HTTP LAN/Tailscale URLs where
+/// `navigator.clipboard` is unavailable).
+VoidCallback? registerWebPasteListener(bool Function(String text) onPaste) =>
+    null;

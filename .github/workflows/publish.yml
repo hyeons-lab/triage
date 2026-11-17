@@ -108,6 +108,9 @@ jobs:
             echo "Packaging triage-core..."
             cargo package -p triage-core --allow-dirty
 
+            echo "Packaging triage-term..."
+            cargo package -p triage-term --allow-dirty
+
             # Downstream crates depend on internal versions that may not exist on crates.io yet.
             # `cargo check --workspace --locked` already verifies the workspace with local path deps.
             echo "Packaging triage-transport-ws..."
@@ -117,17 +120,20 @@ jobs:
             echo "Packaging triaged..."
             cargo package -p triaged --allow-dirty --no-verify \
               --config "patch.crates-io.triage-core.path='crates/triage-core'" \
+              --config "patch.crates-io.triage-term.path='crates/triage-term'" \
               --config "patch.crates-io.triage-transport-ws.path='crates/triage-transport-ws'"
 
             echo "Packaging triage-mcp..."
             cargo package -p triage-mcp --allow-dirty --no-verify \
               --config "patch.crates-io.triage-core.path='crates/triage-core'" \
+              --config "patch.crates-io.triage-term.path='crates/triage-term'" \
               --config "patch.crates-io.triage-transport-ws.path='crates/triage-transport-ws'" \
               --config "patch.crates-io.triaged.path='crates/triaged'"
 
             echo "Packaging triage..."
             cargo package -p triage --allow-dirty --no-verify \
               --config "patch.crates-io.triage-core.path='crates/triage-core'" \
+              --config "patch.crates-io.triage-term.path='crates/triage-term'" \
               --config "patch.crates-io.triage-transport-ws.path='crates/triage-transport-ws'" \
               --config "patch.crates-io.triaged.path='crates/triaged'"
 
@@ -189,7 +195,7 @@ jobs:
 
           # Strict topological order: each crate is published before anything that
           # depends on it.
-          CRATES="triage-core triage-transport-ws triaged triage-mcp triage"
+          CRATES="triage-core triage-term triage-transport-ws triaged triage-mcp triage"
           LAST_CRATE="${CRATES##* }"
 
           for crate in $CRATES; do

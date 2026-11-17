@@ -313,6 +313,29 @@ table SetSessionCustomLabelRequest {
     has_label: bool;
 }
 
+table SyncTerminalRequestTable {
+    session_id: string;
+    client_id: string;
+    mode: AttachMode = Observer;
+    size: SessionSize;
+    has_size: bool;
+    resize_pty: bool;
+    restore_if_exited: bool;
+    subscribe: bool;
+    known_frame_seq: uint64;
+}
+
+table FetchTerminalRowsRequestTable {
+    session_id: string;
+    start_row: uint64;
+    row_count: uint32;
+}
+
+table AckTerminalSyncRequestTable {
+    subscription_id: string;
+    frame_seq: uint64;
+}
+
 union ClientRequestPayload {
     HelloRequest,
     PairRequest,
@@ -346,7 +369,10 @@ union ClientRequestPayload {
     SetRailPinsRequest,
     SetSessionCustomLabelRequest,
     GetDaemonStatsRequest,
-    PairViaTailscaleRequest
+    PairViaTailscaleRequest,
+    SyncTerminalRequestTable,
+    FetchTerminalRowsRequestTable,
+    AckTerminalSyncRequestTable
 }
 
 table ClientMessage {
@@ -525,6 +551,47 @@ table DaemonStatsResult {
     battery_state: BatteryState = Unknown;
 }
 
+table TerminalSyncFrame {
+    frame_seq: uint64;
+    rows: uint16;
+    cols: uint16;
+    total_scrollback_rows: uint64;
+    trimmed_top_rows: uint64;
+    erase_scrollback_gen: uint64;
+    cursor_x: uint16;
+    cursor_y: uint16;
+    cursor_style: uint8;
+    mode_flags: uint32;
+    mouse_mode: uint8;
+    mouse_report_mode: uint8;
+    kitty_keyboard_flags: uint32;
+    title: string;
+    viewport_compression: uint8;
+    viewport_payload: [ubyte];
+    pushed_scrollback_start_row: uint64;
+    pushed_scrollback_row_count: uint32;
+    pushed_scrollback_compression: uint8;
+    pushed_scrollback_payload: [ubyte];
+}
+
+table SyncTerminalResult {
+    subscription_id: string;
+    snapshot: SessionSnapshot;
+    lease: InputLeaseState;
+    frame: TerminalSyncFrame;
+}
+
+table FetchTerminalRowsResult {
+    session_id: string;
+    start_row: uint64;
+    row_count: uint32;
+    total_scrollback_rows: uint64;
+    trimmed_top_rows: uint64;
+    erase_scrollback_gen: uint64;
+    compression: uint8;
+    payload: [ubyte];
+}
+
 union ServerResultPayload {
     UnitResult,
     HelloResult,
@@ -546,7 +613,9 @@ union ServerResultPayload {
     JudgeHistoryResult,
     JudgeRulesResult,
     RailLayoutResult,
-    DaemonStatsResult
+    DaemonStatsResult,
+    SyncTerminalResult,
+    FetchTerminalRowsResult
 }
 
 table ResponsePayload {
@@ -587,12 +656,18 @@ table ExitedEvent {
     completed: CompletedSession;
 }
 
+table TerminalSyncEvent {
+    session_id: string;
+    frame: TerminalSyncFrame;
+}
+
 union SessionEventPayload {
     ResyncRequiredEvent,
     OutputEvent,
     SnapshotEvent,
     LeaseChangedEvent,
-    ExitedEvent
+    ExitedEvent,
+    TerminalSyncEvent
 }
 
 table EventPayload {
