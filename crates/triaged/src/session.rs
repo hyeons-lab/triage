@@ -1838,7 +1838,7 @@ impl SessionManager {
     /// Decides whether an agent's tool call may run without prompting the user.
     ///
     /// Never returns an error. Every failure resolves to
-    /// [`JudgeDecision::Ask`](triage_core::judge::JudgeDecision::Ask), which is
+    /// [`JudgeDecision::Ask`], which is
     /// exactly what the agent does with no judge installed, so a broken judge
     /// degrades to the status quo rather than to a broken agent.
     ///

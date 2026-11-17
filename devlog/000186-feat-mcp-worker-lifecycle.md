@@ -35,6 +35,11 @@ Add structured multi-agent worker lifecycle orchestration and automated input sa
 - `2026-11-15T15:14-0800 Decision`: Store `parent_session_id` and `outlive_parent` on `PersistedSessionLaunch`, `PersistedSession`, and `HandoverSession` so parent-child links survive daemon reloads and handovers without extra session-map wrappers.
 - `2026-11-15T15:14-0800 Decision`: Share `ActorLifecycleShared` atomics between `SessionActor` and `ActorState` and split `ActorCommand::WriteHumanInput` from `WriteInput` so interactive vs automated (`Agent`) writes update draft state without an extra synchronous actor round-trip.
 
+## Issues
+
+- `2026-11-16T18:05-0800 crates/triaged/src/session.rs`: Importing `JudgeDecision` at module scope made the pre-existing explicit doc link target `triage_core::judge::JudgeDecision::Ask` redundant under `RUSTDOCFLAGS="-D warnings"` (`rustdoc::redundant_explicit_links`). Removed the redundant explicit target.
+
 ## Commits
 
-- `HEAD: feat: add worker lifecycle, blocking wait, and input guards`
+- `0160a30`: feat: add worker lifecycle, blocking wait, and input guards
+- `HEAD`: fix(triaged): remove redundant rustdoc link on JudgeDecision::Ask
