@@ -4036,8 +4036,11 @@ name = "triage-mcp"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "reqwest",
  "serde",
  "serde_json",
+ "tokio",
+ "toml",
  "triage-core",
  "triaged",
 ]

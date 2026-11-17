@@ -9,6 +9,7 @@ use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, header};
 use rust_embed::RustEmbed;
+use triage_transport_ws::WebSocketAuthenticator;
 
 #[cfg(embed_packaged_client)]
 #[derive(RustEmbed)]
@@ -197,12 +198,18 @@ pub async fn serve_http<B>(
 ) -> Result<Response<Full<Bytes>>, Infallible>
 where
     B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
     if let Some(raw_session_id) = parse_history_session_id(&path) {
         return Ok(handle_session_history_http(req, manager, raw_session_id).await);
+    }
+
+    if path == crate::ipc::REMOTE_RPC_PATH {
+        return Ok(handle_rpc_http(req, manager).await);
     }
 
     if method != hyper::Method::GET {
@@ -295,6 +302,8 @@ fn handle_ws_upgrade<B>(
 ) -> Response<Full<Bytes>>
 where
     B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     use triage_transport_ws::WebSocketAuthenticator;
 
@@ -590,6 +599,160 @@ pub fn encode_history_frame(meta: &serde_json::Value, prefix: &[u8], raw: &[u8])
     Bytes::from(out)
 }
 
+fn authorize_pairing_headers(
+    headers: &header::HeaderMap,
+    manager: &crate::session::SessionManager,
+    require_pairing: bool,
+) -> Result<(), Box<Response<Full<Bytes>>>> {
+    use triage_transport_ws::WebSocketAuthenticator;
+
+    if !require_pairing {
+        return Ok(());
+    }
+    let Some(token) = extract_bearer_token(headers) else {
+        return Err(Box::new(json_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid Authorization bearer token",
+            require_pairing,
+        )));
+    };
+    let Some(raw_client_id) = headers
+        .get("x-triage-client-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Err(Box::new(json_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing X-Triage-Client-Id header",
+            require_pairing,
+        )));
+    };
+    let Ok(client_id) = triage_core::session::ClientId::new(raw_client_id) else {
+        return Err(Box::new(json_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid X-Triage-Client-Id header",
+            require_pairing,
+        )));
+    };
+    match manager.authenticate(&client_id, token) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(Box::new(json_error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid client credentials",
+            require_pairing,
+        ))),
+    }
+}
+
+async fn handle_rpc_http<B>(
+    req: Request<B>,
+    manager: Arc<crate::session::SessionManager>,
+) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use http_body_util::{BodyExt, Limited};
+
+    const MAX_RPC_BODY_BYTES: usize = 2 * 1024 * 1024;
+    let require_pairing = manager.require_pairing();
+    if !require_pairing && !is_allowed_unpaired_origin(req.headers()) {
+        return json_error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden_origin",
+            "cross-origin access is not permitted when pairing is disabled",
+            false,
+        );
+    }
+
+    if req.method() == hyper::Method::OPTIONS {
+        let mut res = Response::new(Full::new(Bytes::new()));
+        *res.status_mut() = StatusCode::NO_CONTENT;
+        if require_pairing {
+            apply_history_cors_headers(res.headers_mut());
+            res.headers_mut().insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("POST, OPTIONS"),
+            );
+            res.headers_mut().insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("Authorization, X-Triage-Client-Id, Content-Type"),
+            );
+        }
+        return res;
+    }
+
+    if req.method() != hyper::Method::POST {
+        return json_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "only POST and OPTIONS are supported",
+            require_pairing,
+        );
+    }
+
+    if let Err(err_res) = authorize_pairing_headers(req.headers(), &manager, require_pairing) {
+        return *err_res;
+    }
+
+    let body = match Limited::new(req.into_body(), MAX_RPC_BODY_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => {
+            return json_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "RPC request body could not be read or exceeded 2 MiB limit",
+                require_pairing,
+            );
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || crate::ipc::handle_remote_rpc_json(&manager, &body))
+        .await
+    {
+        Ok(Ok(bytes)) => {
+            let body_len = bytes.len();
+            let mut res = Response::new(Full::new(Bytes::from(bytes)));
+            *res.status_mut() = StatusCode::OK;
+            let headers = res.headers_mut();
+            if require_pairing {
+                apply_history_cors_headers(headers);
+            }
+            headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+            );
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body_len));
+            res
+        }
+        Ok(Err(error)) => json_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_rpc_request",
+            &error.to_string(),
+            require_pairing,
+        ),
+        Err(error) => json_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rpc_task_failed",
+            &error.to_string(),
+            require_pairing,
+        ),
+    }
+}
+
 async fn handle_session_history_http<B>(
     req: Request<B>,
     manager: Arc<crate::session::SessionManager>,
@@ -597,9 +760,9 @@ async fn handle_session_history_http<B>(
 ) -> Response<Full<Bytes>>
 where
     B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
-    use triage_transport_ws::WebSocketAuthenticator;
-
     let require_pairing = manager.require_pairing();
     if !require_pairing && !is_allowed_unpaired_origin(req.headers()) {
         return json_error_response(
@@ -628,48 +791,8 @@ where
         );
     }
 
-    if require_pairing {
-        let Some(token) = extract_bearer_token(req.headers()) else {
-            return json_error_response(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing or invalid Authorization bearer token",
-                require_pairing,
-            );
-        };
-        let Some(raw_client_id) = req
-            .headers()
-            .get("x-triage-client-id")
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        else {
-            return json_error_response(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing X-Triage-Client-Id header",
-                require_pairing,
-            );
-        };
-        let Ok(client_id) = triage_core::session::ClientId::new(raw_client_id) else {
-            return json_error_response(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "invalid X-Triage-Client-Id header",
-                require_pairing,
-            );
-        };
-        match manager.authenticate(&client_id, token) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                return json_error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "invalid client credentials",
-                    require_pairing,
-                );
-            }
-        }
+    if let Err(err_res) = authorize_pairing_headers(req.headers(), &manager, require_pairing) {
+        return *err_res;
     }
 
     let Ok(session_id) = triage_core::session::SessionId::new(raw_session_id) else {
@@ -1272,5 +1395,101 @@ mod history_http_tests {
 
         let _ = manager.shutdown_session(session_id);
         let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_http_endpoint_enforces_auth_and_round_trips_wire_requests() {
+        let log_dir = std::env::temp_dir().join(format!(
+            "triage-http-rpc-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manager = Arc::new(SessionManager::new(SessionManagerConfig::new(
+            log_dir.clone(),
+        )));
+        let cache = Arc::new(WebAssetCache::new(None));
+
+        let client_id = ClientId::new("rpc-test-client").unwrap();
+        let challenge = manager.request_pairing_challenge(&client_id).unwrap();
+        let pin = manager
+            .approve_pairing_device_code(&challenge.device_code)
+            .unwrap();
+        let token = manager.pair(&pin.pin, &client_id).expect("pair client");
+
+        // Unauthorized POST /rpc is rejected with 401.
+        let unauth_req = Request::builder()
+            .method("POST")
+            .uri("/rpc")
+            .body(Full::new(Bytes::from_static(br#"{"ListSessions":null}"#)))
+            .unwrap();
+        let unauth_res = serve_http(unauth_req, cache.clone(), manager.clone())
+            .await
+            .unwrap();
+        assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+
+        // Authorized POST /rpc executes ListSessions via WireRpcClient.
+        let rpc_client = crate::ipc::WireRpcClient::new(TestServeTransport {
+            manager: Arc::clone(&manager),
+            cache: Arc::clone(&cache),
+            client_id: client_id.as_str().to_string(),
+            token,
+        });
+        assert!(rpc_client.list_sessions().unwrap().is_empty());
+
+        let session_id = rpc_client
+            .start_session(StartSessionRequest {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 10".to_string()],
+                cwd: None,
+                size: SessionSize::default(),
+                parent_session_id: None,
+                outlive_parent: false,
+            })
+            .expect("start remote session over /rpc");
+        assert_eq!(
+            rpc_client.list_sessions().unwrap(),
+            vec![session_id.clone()]
+        );
+
+        let _ = rpc_client.shutdown_session(session_id);
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    struct TestServeTransport {
+        manager: Arc<SessionManager>,
+        cache: Arc<WebAssetCache>,
+        client_id: String,
+        token: String,
+    }
+
+    impl crate::ipc::WireRpcTransport for TestServeTransport {
+        fn round_trip_json(
+            &self,
+            request_json: &[u8],
+            _extra_timeout: Duration,
+        ) -> anyhow::Result<Vec<u8>> {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/rpc")
+                .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
+                .header("x-triage-client-id", &self.client_id)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::copy_from_slice(request_json)))
+                .unwrap();
+            let rt = tokio::runtime::Handle::current();
+            let manager = Arc::clone(&self.manager);
+            let cache = Arc::clone(&self.cache);
+            let res = tokio::task::block_in_place(|| {
+                rt.block_on(serve_http(req, cache, manager)).unwrap()
+            });
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = tokio::task::block_in_place(|| rt.block_on(res.into_body().collect()))
+                .unwrap()
+                .to_bytes();
+            Ok(body.to_vec())
+        }
     }
 }

@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -13,6 +13,9 @@ use triage_core::session::{
 };
 #[cfg(any(unix, windows))]
 use triaged::ipc::{IpcClient, default_socket_path};
+
+mod hosts;
+mod templates;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "triage-mcp";
@@ -129,13 +132,68 @@ fn display_os_str(value: &OsStr) -> String {
     value.to_string_lossy().into_owned()
 }
 
-struct McpServer<A> {
-    api: A,
+trait HostBackend {
+    type RemoteApi: SessionApi;
+
+    fn summaries(&self) -> Result<Vec<hosts::RemoteHostSummary>>;
+    fn connect(&self, host: &str) -> Result<Self::RemoteApi>;
 }
 
-impl<A: SessionApi> McpServer<A> {
+struct RegistryHostBackend {
+    hosts_path: Option<PathBuf>,
+}
+
+impl RegistryHostBackend {
+    fn from_env() -> Self {
+        Self {
+            hosts_path: hosts::default_hosts_path(),
+        }
+    }
+
+    fn load_registry(&self) -> Result<hosts::HostRegistry> {
+        match &self.hosts_path {
+            Some(path) => hosts::HostRegistry::load(path),
+            None => Ok(hosts::HostRegistry::default()),
+        }
+    }
+}
+
+impl HostBackend for RegistryHostBackend {
+    type RemoteApi = triaged::ipc::WireRpcClient<hosts::HttpRpcTransport>;
+
+    fn summaries(&self) -> Result<Vec<hosts::RemoteHostSummary>> {
+        Ok(self.load_registry()?.summaries())
+    }
+
+    fn connect(&self, host: &str) -> Result<Self::RemoteApi> {
+        self.load_registry()?.connect(host)
+    }
+}
+
+struct McpServer<A, H = RegistryHostBackend> {
+    api: A,
+    templates_dir: Option<PathBuf>,
+    hosts: H,
+}
+
+impl<A: SessionApi> McpServer<A, RegistryHostBackend> {
     fn new(api: A) -> Self {
-        Self { api }
+        Self {
+            api,
+            templates_dir: templates::default_templates_dir(),
+            hosts: RegistryHostBackend::from_env(),
+        }
+    }
+}
+
+impl<A: SessionApi, H: HostBackend> McpServer<A, H> {
+    #[cfg(test)]
+    fn with_resources(api: A, templates_dir: Option<PathBuf>, hosts: H) -> Self {
+        Self {
+            api,
+            templates_dir,
+            hosts,
+        }
     }
 
     fn handle(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -189,31 +247,98 @@ impl<A: SessionApi> McpServer<A> {
             .as_object()
             .ok_or_else(|| JsonRpcError::invalid_params("tools/call params must be an object"))?;
         let name = required_string(params, "name")?;
-        let arguments = params
+        let mut arguments = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
 
         match name {
-            "list_sessions" => tool_result(list_sessions(&self.api)?),
-            "start_session" => tool_result(start_session(&self.api, arguments)?),
-            "shutdown_session" => tool_result(shutdown_session(&self.api, arguments)?),
-            "snapshot_session" => tool_result(snapshot_session(&self.api, arguments)?),
-            "styled_rows" => tool_result(styled_rows(&self.api, arguments)?),
-            "send_session_message" => tool_result(send_session_message(&self.api, arguments)?),
-            "receive_session_messages" => {
-                tool_result(receive_session_messages(&self.api, arguments)?)
+            "list_templates" => {
+                let map = arguments_object(&arguments)?;
+                if !map.is_empty() {
+                    return Err(JsonRpcError::invalid_params(
+                        "list_templates does not accept arguments",
+                    )
+                    .into());
+                }
+                return tool_result(list_templates(self.templates_dir.as_deref())?);
             }
-            "wait_for_session_message" => {
-                tool_result(wait_for_session_message(&self.api, arguments)?)
+            "list_hosts" => {
+                let map = arguments_object(&arguments)?;
+                if !map.is_empty() {
+                    return Err(JsonRpcError::invalid_params(
+                        "list_hosts does not accept arguments",
+                    )
+                    .into());
+                }
+                return tool_result(list_hosts(&self.hosts)?);
             }
-            "wait_for_sessions" => tool_result(wait_for_sessions(&self.api, arguments)?),
-            "ack_session_messages" => tool_result(ack_session_messages(&self.api, arguments)?),
+            _ => {}
+        }
+
+        let host = extract_optional_host_arg(&mut arguments)?;
+        if let Some(host_name) = host {
+            let remote = self
+                .hosts
+                .connect(&host_name)
+                .with_context(|| format!("connecting to remote Triage host {host_name:?}"))?;
+            self.dispatch_session_tool(&remote, name, arguments)
+        } else {
+            self.dispatch_session_tool(&self.api, name, arguments)
+        }
+    }
+
+    fn dispatch_session_tool(
+        &self,
+        api: &impl SessionApi,
+        name: &str,
+        arguments: Value,
+    ) -> std::result::Result<Value, ToolCallError> {
+        match name {
+            "list_sessions" => {
+                arguments_object(&arguments)?;
+                tool_result(list_sessions(api)?)
+            }
+            "start_session" => tool_result(start_session(
+                api,
+                self.templates_dir.as_deref(),
+                arguments,
+            )?),
+            "shutdown_session" => tool_result(shutdown_session(api, arguments)?),
+            "snapshot_session" => tool_result(snapshot_session(api, arguments)?),
+            "styled_rows" => tool_result(styled_rows(api, arguments)?),
+            "send_session_message" => tool_result(send_session_message(api, arguments)?),
+            "receive_session_messages" => tool_result(receive_session_messages(api, arguments)?),
+            "wait_for_session_message" => tool_result(wait_for_session_message(api, arguments)?),
+            "wait_for_sessions" => tool_result(wait_for_sessions(api, arguments)?),
+            "ack_session_messages" => tool_result(ack_session_messages(api, arguments)?),
             other => {
                 Err(JsonRpcError::invalid_params(format!("unknown Triage tool {other}")).into())
             }
         }
     }
+}
+
+fn extract_optional_host_arg(
+    arguments: &mut Value,
+) -> std::result::Result<Option<String>, ToolCallError> {
+    let Some(map) = arguments.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(raw) = map.remove("host") else {
+        return Ok(None);
+    };
+    let Some(host) = raw.as_str() else {
+        return Err(JsonRpcError::invalid_params("host must be a non-empty string").into());
+    };
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err(JsonRpcError::invalid_params("host must not be blank").into());
+    }
+    if trimmed == "local" {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn decode_json_rpc_request(
@@ -255,7 +380,7 @@ fn requested_protocol_version(params: Option<Value>) -> Option<&'static str> {
 }
 
 fn tool_definitions() -> Value {
-    json!([
+    let Value::Array(mut tools) = json!([
         {
             "name": "list_sessions",
             "title": "List Triage Sessions",
@@ -274,19 +399,20 @@ fn tool_definitions() -> Value {
         {
             "name": "start_session",
             "title": "Start Triage Session",
-            "description": "Start an executable in a new daemon-owned terminal session with an explicit absolute working directory. Arguments are passed directly, without shell expansion. Returns session_id; track it to manage only this worker. Launch flags and initial prompts are runtime-specific. An ambiguous failure must be reconciled before retrying because this operation is not idempotent.",
+            "description": "Start an executable (or named Markdown role template) in a new daemon-owned terminal session. Arguments are passed directly, without shell expansion. Returns session_id; track it to manage only this worker. An ambiguous failure must be reconciled before retrying because this operation is not idempotent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "minLength": 1, "description": "Executable name or path, not a shell command line." },
-                    "args": { "type": "array", "items": { "type": "string" }, "description": "Literal argv entries, including any agent-specific initial prompt or launch flags. Defaults to []." },
-                    "cwd": { "type": "string", "minLength": 1, "description": "Absolute working directory on the daemon host." },
+                    "template": { "type": "string", "minLength": 1, "description": "Optional role template name from ~/.config/triage/templates/<name>.md supplying default command, args, cwd, outlive_parent, and system instructions." },
+                    "task": { "type": "string", "minLength": 1, "description": "Optional task text interpolated into {{task}}/{task} or appended as the prompt argument." },
+                    "command": { "type": "string", "minLength": 1, "description": "Executable name or path, not a shell command line (required unless supplied by template)." },
+                    "args": { "type": "array", "items": { "type": "string" }, "description": "Literal argv entries, appended after any template args." },
+                    "cwd": { "type": "string", "minLength": 1, "description": "Absolute working directory on the daemon host (required unless supplied by template)." },
                     "rows": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY rows (default 24)." },
                     "cols": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "PTY columns (default 80)." },
                     "parent_session_id": { "type": "string", "minLength": 1, "description": "Optional live parent session id for worker lifecycle notifications and cascade shutdown." },
-                    "outlive_parent": { "type": "boolean", "description": "When true, keep this worker running after its parent session exits instead of shutting it down automatically (default false)." }
+                    "outlive_parent": { "type": "boolean", "description": "When true, keep this worker running after its parent session exits instead of shutting it down automatically (default from template or false)." }
                 },
-                "required": ["command", "cwd"],
                 "additionalProperties": false
             },
             "annotations": {
@@ -526,16 +652,72 @@ fn tool_definitions() -> Value {
                 "openWorldHint": false
             }
         }
-    ])
+    ]) else {
+        unreachable!();
+    };
+    for tool in &mut tools {
+        if let Some(props) = tool
+            .pointer_mut("/inputSchema/properties")
+            .and_then(Value::as_object_mut)
+        {
+            props.insert(
+                "host".to_string(),
+                json!({
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional configured host name from ~/.config/triage/hosts.toml (or \"local\" for this machine)."
+                }),
+            );
+        }
+    }
+    tools.push(json!({
+        "name": "list_templates",
+        "title": "List Role Templates",
+        "description": "List available Markdown worker role templates from ~/.config/triage/templates.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    }));
+    tools.push(json!({
+        "name": "list_hosts",
+        "title": "List Configured Triage Hosts",
+        "description": "List configured remote Triage daemons from ~/.config/triage/hosts.toml available for cross-host delegation via the optional host parameter.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        },
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    }));
+    Value::Array(tools)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartSessionArguments {
-    command: String,
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
-    cwd: String,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default = "default_session_rows")]
     rows: usize,
     #[serde(default = "default_session_cols")]
@@ -543,7 +725,7 @@ struct StartSessionArguments {
     #[serde(default)]
     parent_session_id: Option<String>,
     #[serde(default)]
-    outlive_parent: bool,
+    outlive_parent: Option<bool>,
 }
 
 fn default_session_rows() -> usize {
@@ -554,25 +736,99 @@ fn default_session_cols() -> usize {
     SessionSize::default().cols
 }
 
+fn list_templates(dir: Option<&Path>) -> std::result::Result<Value, ToolCallError> {
+    let entries = match dir {
+        Some(path) => templates::list_templates(path).context("listing role templates")?,
+        None => Vec::new(),
+    };
+    Ok(json!({
+        "directory": dir.map(|path| path.display().to_string()),
+        "templates": entries,
+    }))
+}
+
+fn list_hosts<H: HostBackend>(hosts: &H) -> std::result::Result<Value, ToolCallError> {
+    let entries = hosts
+        .summaries()
+        .context("listing configured Triage hosts")?;
+    Ok(json!({
+        "local": true,
+        "hosts": entries,
+    }))
+}
+
 fn start_session(
     api: &impl SessionApi,
+    templates_dir: Option<&Path>,
     arguments: Value,
 ) -> std::result::Result<Value, ToolCallError> {
-    arguments_object(&arguments)?;
+    let raw_map = arguments_object(&arguments)?;
+    let explicit_null_cwd = raw_map.get("cwd").is_some_and(Value::is_null);
     let arguments: StartSessionArguments = serde_json::from_value(arguments).map_err(|error| {
         JsonRpcError::invalid_params(format!("invalid start_session arguments: {error}"))
     })?;
-    if arguments.command.trim().is_empty()
-        || arguments.command.contains('\0')
-        || arguments.args.iter().any(|arg| arg.contains('\0'))
+    if explicit_null_cwd {
+        return Err(
+            JsonRpcError::invalid_params("cwd must be an absolute path string, not null").into(),
+        );
+    }
+    if let Some(cmd) = arguments.command.as_deref()
+        && (cmd.trim().is_empty() || cmd.contains('\0'))
+    {
+        return Err(JsonRpcError::invalid_params(
+            "command must be non-blank and must not contain NUL bytes",
+        )
+        .into());
+    }
+    if let Some(raw_cwd) = arguments.cwd.as_deref() {
+        let parsed = Path::new(raw_cwd);
+        if raw_cwd.trim().is_empty() || raw_cwd.contains('\0') || !parsed.is_absolute() {
+            return Err(JsonRpcError::invalid_params(
+                "cwd must be an absolute path without NUL bytes",
+            )
+            .into());
+        }
+    }
+    if arguments.args.iter().any(|arg| arg.contains('\0')) {
+        return Err(JsonRpcError::invalid_params("args must not contain NUL bytes").into());
+    }
+
+    let loaded_template = match arguments.template.as_deref() {
+        Some(name) => {
+            templates::validate_template_name(name)
+                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+            let dir = templates_dir.ok_or_else(|| {
+                JsonRpcError::invalid_params("templates directory could not be resolved")
+            })?;
+            Some(
+                templates::load_template(dir, name)
+                    .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?,
+            )
+        }
+        None => None,
+    };
+
+    let resolved = templates::resolve_template_launch(
+        loaded_template.as_ref(),
+        arguments.command,
+        arguments.args,
+        arguments.cwd,
+        arguments.outlive_parent,
+        arguments.task,
+    )
+    .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
+
+    if resolved.command.trim().is_empty()
+        || resolved.command.contains('\0')
+        || resolved.args.iter().any(|arg| arg.contains('\0'))
     {
         return Err(JsonRpcError::invalid_params(
             "command must be non-blank and command/args must not contain NUL bytes",
         )
         .into());
     }
-    let cwd = PathBuf::from(&arguments.cwd);
-    if !cwd.is_absolute() || arguments.cwd.contains('\0') {
+    let cwd = PathBuf::from(&resolved.cwd);
+    if !cwd.is_absolute() || resolved.cwd.contains('\0') {
         return Err(
             JsonRpcError::invalid_params("cwd must be an absolute path without NUL bytes").into(),
         );
@@ -582,13 +838,13 @@ fn start_session(
         .map(SessionId::new)
         .transpose()
         .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
-    let mut request = StartSessionRequest::new(arguments.command);
-    request.args = arguments.args;
+    let mut request = StartSessionRequest::new(resolved.command);
+    request.args = resolved.args;
     request.cwd = Some(cwd);
     request.size.rows = arguments.rows;
     request.size.cols = arguments.cols;
     request.parent_session_id = parent_session_id;
-    request.outlive_parent = arguments.outlive_parent;
+    request.outlive_parent = resolved.outlive_parent;
     request
         .validate()
         .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?;
@@ -1351,7 +1607,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
         assert_eq!(tools[0]["name"], "list_sessions");
         let names = tools
             .iter()
@@ -1370,6 +1626,8 @@ mod tests {
                 "wait_for_session_message",
                 "wait_for_sessions",
                 "ack_session_messages",
+                "list_templates",
+                "list_hosts",
             ]
         );
     }
@@ -2282,5 +2540,257 @@ mod tests {
             snap_struct["structuredContent"]["snapshot"]["pending_approval_reason"],
             "Proceed? [y/N]"
         );
+    }
+
+    struct MockHostBackend {
+        registry: hosts::HostRegistry,
+        remote: RecordingApi,
+    }
+
+    impl HostBackend for MockHostBackend {
+        type RemoteApi = RecordingApi;
+
+        fn summaries(&self) -> Result<Vec<hosts::RemoteHostSummary>> {
+            Ok(self.registry.summaries())
+        }
+
+        fn connect(&self, host: &str) -> Result<Self::RemoteApi> {
+            if self.registry.get(host).is_none() {
+                bail!("unknown Triage host {host:?}");
+            }
+            Ok(self.remote.clone())
+        }
+    }
+
+    #[test]
+    fn templates_list_and_start_session_resolution() {
+        let dir = std::env::temp_dir().join(format!(
+            "triage-mcp-templates-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let default_cwd = absolute_test_cwd();
+        std::fs::write(
+            dir.join("reviewer.md"),
+            format!(
+                "---\ncommand: claude\nargs:\n  - --model\n  - sonnet\ncwd: {default_cwd}\noutlive_parent: true\ntask_flag: -p\n---\nReview changes carefully: {{{{task}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let local = RecordingApi::new();
+        let starts = Rc::clone(&local.starts);
+        let server = McpServer::with_resources(
+            local,
+            Some(dir.clone()),
+            RegistryHostBackend { hosts_path: None },
+        );
+
+        let listed = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_templates",
+                        "arguments": {}
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(listed["isError"], false);
+        assert_eq!(
+            listed["structuredContent"]["templates"][0]["name"],
+            "reviewer"
+        );
+        assert_eq!(
+            listed["structuredContent"]["templates"][0]["command"],
+            "claude"
+        );
+        assert_eq!(
+            listed["structuredContent"]["templates"][0]["has_prompt_body"],
+            true
+        );
+
+        let started = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_session",
+                        "arguments": {
+                            "template": "reviewer",
+                            "task": "check auth",
+                            "args": ["--verbose"]
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(started["isError"], false);
+        let reqs = starts.borrow();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].command, "claude");
+        assert_eq!(reqs[0].cwd, Some(PathBuf::from(&default_cwd)));
+        assert!(reqs[0].outlive_parent);
+        assert_eq!(
+            reqs[0].args,
+            vec![
+                "--model",
+                "sonnet",
+                "--verbose",
+                "-p",
+                "Review changes carefully: check auth",
+            ]
+        );
+
+        let invalid = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_session",
+                        "arguments": {
+                            "template": "../escape"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(invalid.error.unwrap().code, -32602);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosts_list_redacts_secrets_and_delegates_session_calls() {
+        let hosts_toml = r#"
+            [hosts.gpu]
+            url = "http://127.0.0.1:9999/"
+            client_id = "orch-1"
+            token = "super-secret-token"
+            description = "A100 node"
+        "#;
+        let registry = hosts::HostRegistry::parse(hosts_toml).unwrap();
+        let local = RecordingApi::new();
+        let remote = RecordingApi::new();
+        let local_starts = Rc::clone(&local.starts);
+        let remote_starts = Rc::clone(&remote.starts);
+        let remote_waits = Rc::clone(&remote.waits);
+        let backend = MockHostBackend { registry, remote };
+        let server = McpServer::with_resources(local, None, backend);
+
+        let hosts_resp = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "list_hosts",
+                        "arguments": {}
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(hosts_resp["isError"], false);
+        let serialized = serde_json::to_string(&hosts_resp).unwrap();
+        assert!(!serialized.contains("super-secret-token"));
+        assert_eq!(hosts_resp["structuredContent"]["hosts"][0]["name"], "gpu");
+        assert_eq!(
+            hosts_resp["structuredContent"]["hosts"][0]["has_token"],
+            true
+        );
+
+        let cwd = absolute_test_cwd();
+        let start_remote = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_session",
+                        "arguments": {
+                            "host": "gpu",
+                            "command": "worker",
+                            "cwd": cwd
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(start_remote["isError"], false);
+        assert!(local_starts.borrow().is_empty());
+        assert_eq!(remote_starts.borrow().len(), 1);
+
+        let wait_remote = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "wait_for_sessions",
+                        "arguments": {
+                            "host": "gpu",
+                            "session_ids": ["worker-1"],
+                            "timeout_ms": 500
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(wait_remote["isError"], false);
+        assert_eq!(remote_waits.borrow().len(), 1);
+
+        // "local" targets the local API without remote lookup.
+        let start_local = server
+            .handle(
+                serde_json::from_value::<JsonRpcRequest>(json!({
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "start_session",
+                        "arguments": {
+                            "host": "local",
+                            "command": "local-worker",
+                            "cwd": cwd
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(start_local["isError"], false);
+        assert_eq!(local_starts.borrow().len(), 1);
     }
 }
