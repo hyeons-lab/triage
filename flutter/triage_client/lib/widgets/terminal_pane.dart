@@ -551,7 +551,9 @@ class _TerminalPaneState extends State<TerminalPane>
     text: _kImeSentinel,
     selection: TextSelection.collapsed(offset: _kImeSentinel.length),
   );
-  String _imeCommittedPrefix = '';
+  // Text after `_kImeSentinel` on the current unsubmitted line already emitted to
+  // the PTY; keeping it in `_textInputConnection` preserves keyboard word context.
+  String _imeLineBuffer = '';
 
   double? _pageAnchorPixels;
   int? _pageAnchorLines;
@@ -1024,6 +1026,9 @@ class _TerminalPaneState extends State<TerminalPane>
   bool get _useWebPaste => TerminalPane.debugOverrideWebPaste ?? kIsWeb;
 
   void _onFocusChanged() {
+    if (!_focusNode.hasFocus && mounted && !widget.isExited) {
+      _flushImeComposing();
+    }
     _syncFocusReporting();
     _syncImeConnection();
   }
@@ -1054,7 +1059,7 @@ class _TerminalPaneState extends State<TerminalPane>
       text: _kImeSentinel,
       selection: TextSelection.collapsed(offset: _kImeSentinel.length),
     );
-    _imeCommittedPrefix = '';
+    _imeLineBuffer = '';
   }
 
   void _syncImeConnection({bool showKeyboard = false}) {
@@ -1132,16 +1137,18 @@ class _TerminalPaneState extends State<TerminalPane>
   void _flushImeComposing() {
     final value = _currentImeValue;
     final text = value.text;
-    if (text == _kImeSentinel && _imeCommittedPrefix.isEmpty) {
+    if (text == _kImeSentinel && _imeLineBuffer.isEmpty) {
       if (!value.selection.isCollapsed ||
           value.selection.extentOffset != _kImeSentinel.length) {
         _resetImeSentinel();
       }
+      _mobileAutoSpace.reset();
       return;
     }
-    final expected = '$_kImeSentinel$_imeCommittedPrefix';
+    final expected = '$_kImeSentinel$_imeLineBuffer';
     _resetImeSentinel();
     _emitImeTextDiff(expected, text);
+    _mobileAutoSpace.reset();
   }
 
   @override
@@ -1153,7 +1160,7 @@ class _TerminalPaneState extends State<TerminalPane>
   @override
   void updateEditingValue(TextEditingValue value) {
     _currentImeValue = value;
-    final expected = '$_kImeSentinel$_imeCommittedPrefix';
+    final expected = '$_kImeSentinel$_imeLineBuffer';
     if (_ctrlArmed && value.text.startsWith(expected)) {
       final pending = value.text.substring(expected.length);
       if (pending.length == 1 && controlByteForChar(pending) != null) {
@@ -1173,24 +1180,44 @@ class _TerminalPaneState extends State<TerminalPane>
           _kImeSentinel.length,
           value.composing.start,
         );
-        if (committedPrefix != _imeCommittedPrefix) {
-          final previousPrefix = _imeCommittedPrefix;
-          _imeCommittedPrefix = committedPrefix;
+        if (committedPrefix != _imeLineBuffer) {
+          final previousPrefix = _imeLineBuffer;
+          _imeLineBuffer = committedPrefix;
           _emitImeTextDiff(previousPrefix, committedPrefix);
         }
       }
       return;
     }
     final text = value.text;
-    if (text == _kImeSentinel && _imeCommittedPrefix.isEmpty) {
+    if (text == _kImeSentinel && _imeLineBuffer.isEmpty) {
       if (!value.selection.isCollapsed ||
           value.selection.extentOffset != _kImeSentinel.length) {
         _resetImeSentinel();
       }
       return;
     }
+    final hasLineBreak = text.contains('\n') || text.contains('\r');
+    if (text.startsWith(_kImeSentinel) && !hasLineBreak) {
+      _imeLineBuffer = text.substring(_kImeSentinel.length);
+      if (!value.selection.isCollapsed ||
+          value.selection.extentOffset < _kImeSentinel.length) {
+        final clamped = TextEditingValue(
+          text: text,
+          selection: TextSelection.collapsed(offset: text.length),
+        );
+        _currentImeValue = clamped;
+        if (_textInputConnection != null && _textInputConnection!.attached) {
+          _textInputConnection!.setEditingState(clamped);
+        }
+      }
+      _emitImeTextDiff(expected, text);
+      return;
+    }
     _resetImeSentinel();
     _emitImeTextDiff(expected, text);
+    if (hasLineBreak) {
+      _mobileAutoSpace.reset();
+    }
   }
 
   @override
