@@ -25151,6 +25151,33 @@ mod tests {
         let _ = fs::remove_dir_all(&log_dir);
     }
 
+    #[cfg(windows)]
+    fn shell_command_request(
+        unix_cmd: &str,
+        windows_cmd: &str,
+        stay_open: bool,
+    ) -> StartSessionRequest {
+        let _ = unix_cmd;
+        let mut req = StartSessionRequest::new("cmd.exe");
+        req.args = vec![
+            if stay_open { "/K" } else { "/C" }.to_string(),
+            windows_cmd.to_string(),
+        ];
+        req
+    }
+
+    #[cfg(not(windows))]
+    fn shell_command_request(
+        unix_cmd: &str,
+        windows_cmd: &str,
+        _stay_open: bool,
+    ) -> StartSessionRequest {
+        let _ = windows_cmd;
+        let mut req = StartSessionRequest::new("/bin/sh");
+        req.args = vec!["-c".to_string(), unix_cmd.to_string()];
+        req
+    }
+
     #[test]
     fn child_unexpected_exit_sends_parent_inbox_alert() {
         let log_dir = unique_log_dir();
@@ -25162,11 +25189,12 @@ mod tests {
         let parent = manager
             .start_session(StartSessionRequest::new(long_running_shell_command()))
             .expect("start parent");
-        let mut child_req = StartSessionRequest::new("/bin/sh").with_parent(parent.clone());
-        child_req.args = vec![
-            "-c".to_string(),
-            "printf 'fatal error\\n'; exit 1".to_string(),
-        ];
+        let child_req = shell_command_request(
+            "printf 'fatal error\\n'; exit 1",
+            "echo fatal error & exit 1",
+            false,
+        )
+        .with_parent(parent.clone());
         let child = manager.start_session(child_req).expect("start child");
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -25196,12 +25224,13 @@ mod tests {
         let log_dir = unique_log_dir();
         let manager = SessionManager::new(SessionManagerConfig::new(log_dir.clone()));
 
-        let mut req = StartSessionRequest::new("/bin/sh");
-        req.args = vec![
-            "-c".to_string(),
-            "printf 'agent> \\n'; printf 'Proceed? [y/N] '; sleep 30".to_string(),
-        ];
-        let target = manager.start_session(req).expect("start target");
+        let target = manager
+            .start_session(shell_command_request(
+                "printf 'agent> \\n'; printf 'Proceed? [y/N] '; sleep 30",
+                "echo agent ready & echo Proceed? [y/N]",
+                true,
+            ))
+            .expect("start target");
         let sender = manager
             .start_session(StartSessionRequest::new(long_running_shell_command()))
             .expect("start sender");
@@ -25263,10 +25292,8 @@ mod tests {
         );
 
         // 3. Human unsubmitted draft blocks agent writes even without confirmation prompt.
-        let mut draft_req = StartSessionRequest::new("/bin/sh");
-        draft_req.args = vec!["-c".to_string(), "cat".to_string()];
         let draft_target = manager
-            .start_session(draft_req)
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
             .expect("start draft target");
         let human_client = ClientId::new("human-tui").expect("client id");
         manager
@@ -25369,16 +25396,17 @@ mod tests {
             log_dir.clone(),
         )));
 
-        let mut fast_req = StartSessionRequest::new("/bin/sh");
-        fast_req.args = vec![
-            "-c".to_string(),
-            "printf 'WORKER_READY\\n'; sleep 30".to_string(),
-        ];
-        let fast = manager.start_session(fast_req).expect("start fast");
+        let fast = manager
+            .start_session(shell_command_request(
+                "printf 'WORKER_READY\\n'; sleep 30",
+                "echo WORKER_READY",
+                true,
+            ))
+            .expect("start fast");
 
-        let mut slow_req = StartSessionRequest::new("/bin/sh");
-        slow_req.args = vec!["-c".to_string(), "sleep 30".to_string()];
-        let slow = manager.start_session(slow_req).expect("start slow");
+        let slow = manager
+            .start_session(StartSessionRequest::new(long_running_shell_command()))
+            .expect("start slow");
 
         let coord = manager
             .start_session(StartSessionRequest::new(long_running_shell_command()))
@@ -25404,12 +25432,13 @@ mod tests {
         );
 
         // 2. Blocked prompt triggers SessionWaitOutcome::Blocked.
-        let mut blocked_req = StartSessionRequest::new("/bin/sh");
-        blocked_req.args = vec![
-            "-c".to_string(),
-            "printf 'Approve write? [y/N]'; sleep 30".to_string(),
-        ];
-        let blocked = manager.start_session(blocked_req).expect("start blocked");
+        let blocked = manager
+            .start_session(shell_command_request(
+                "printf 'Approve write? [y/N]'; sleep 30",
+                "echo Approve write? [y/N]",
+                true,
+            ))
+            .expect("start blocked");
         let blocked_wait = manager
             .wait_for_sessions(WaitForSessionsRequest {
                 session_ids: vec![blocked.clone()],
@@ -25469,9 +25498,9 @@ mod tests {
         assert!(!timed_out.interrupted_by_inbox);
 
         // 5. Exited worker reports Exited.
-        let mut exit_req = StartSessionRequest::new("/bin/sh");
-        exit_req.args = vec!["-c".to_string(), "exit 0".to_string()];
-        let exiting = manager.start_session(exit_req).expect("start exiting");
+        let exiting = manager
+            .start_session(shell_command_request("exit 0", "exit 0", false))
+            .expect("start exiting");
         let exit_wait = manager
             .wait_for_sessions(WaitForSessionsRequest {
                 session_ids: vec![exiting.clone()],

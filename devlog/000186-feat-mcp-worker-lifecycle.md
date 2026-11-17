@@ -38,8 +38,10 @@ Add structured multi-agent worker lifecycle orchestration and automated input sa
 ## Issues
 
 - `2026-11-16T18:05-0800 crates/triaged/src/session.rs`: Importing `JudgeDecision` at module scope made the pre-existing explicit doc link target `triage_core::judge::JudgeDecision::Ask` redundant under `RUSTDOCFLAGS="-D warnings"` (`rustdoc::redundant_explicit_links`). Removed the redundant explicit target.
+- `2026-11-16T18:18-0800 crates/triaged/src/session.rs`: Three new lifecycle/wait/guard tests (`child_unexpected_exit_sends_parent_inbox_alert`, `wake_and_agent_write_enforce_draft_and_approval_guards`, `wait_for_sessions_covers_output_blocked_exit_inbox_and_timeout`) hardcoded `/bin/sh`, failing with `os error 3` on Windows CI. Added a `shell_command_request` helper selecting `cmd.exe` (`/C` / `/K`) on Windows and used `long_running_shell_command()` for long-lived interactive targets.
 
 ## Commits
 
-- `0160a30`: feat: add worker lifecycle, blocking wait, and input guards
-- `HEAD`: fix(triaged): remove redundant rustdoc link on JudgeDecision::Ask
+- `9d84557`: feat: add worker lifecycle, blocking wait, and input guards
+- `1c6096f`: fix(triaged): remove redundant rustdoc link on JudgeDecision::Ask
+- `HEAD`: fix(triaged): make worker lifecycle tests cross-platform on Windows
