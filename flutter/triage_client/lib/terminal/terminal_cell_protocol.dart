@@ -679,7 +679,10 @@ const int kMaxViewportRows = 4096;
 /// malformed wire envelopes cannot overflow 64-bit integers, exceed JS 53-bit
 /// safe-integer precision on Web, or stall scrollback range loops.
 const int kMaxScrollbackRows = 1 << 24;
-const int kMaxTrimmedTopRows = 1 << 50;
+// Use a hex literal rather than `1 << 50`: dart2js narrows shift operands to
+// 32 bits, so `1 << 50` constant-folds to `0` on Flutter web and clamps every
+// `trimmedTopRows` value to zero.
+const int kMaxTrimmedTopRows = 0x4000000000000;
 const int kMaxWireSafeInt = 0x1FFFFFFFFFFFFF;
 
 bool _isControlRune(int rune) => rune < 0x20 || (rune >= 0x7F && rune < 0xA0);
