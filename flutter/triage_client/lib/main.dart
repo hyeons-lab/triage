@@ -466,6 +466,26 @@ class SessionVm {
   /// Effective auto-approval judge policy (true = auto-approval enabled, false = manual approval).
   bool judgePolicyEffective = true;
 
+  /// Parent session id when this session was spawned as a tracked worker.
+  String? parentSessionId;
+
+  /// Whether this worker stays alive after its parent exits.
+  bool outliveParent = false;
+
+  /// Whether the daemon or agent hook currently awaits user confirmation.
+  bool pendingApproval = false;
+
+  /// Short confirmation prompt or reason reported alongside [pendingApproval].
+  String? pendingApprovalReason;
+
+  void applySnapshotMeta(Map<String, dynamic>? snapshot) {
+    if (snapshot == null) return;
+    parentSessionId = snapshot['parent_session_id']?.toString();
+    outliveParent = snapshot['outlive_parent'] as bool? ?? false;
+    pendingApproval = snapshot['pending_approval'] as bool? ?? false;
+    pendingApprovalReason = snapshot['pending_approval_reason']?.toString();
+  }
+
   /// Whether DEC Mode 2004 (bracketed paste) is enabled by the active shell/application.
   bool bracketedPasteEnabled = false;
 
@@ -4721,6 +4741,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       session.snippet = snapshot?['snippet'] as String?;
       session.snippetDetail = snapshot?['snippet_detail'] as String?;
       session.agent = _asMap(snapshot?['agent']);
+      session.applySnapshotMeta(snapshot);
       final bracketedPaste =
           snapshot?['bracketed_paste_enabled'] as bool? ?? false;
       session.setBracketedPasteEnabled(bracketedPaste);
@@ -5995,6 +6016,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
       final prevCwd = session.cwd;
       final prevAgent = session.agent;
       final prevBracketedPaste = session.bracketedPasteEnabled;
+      final prevPendingApproval = session.pendingApproval;
+      final prevPendingApprovalReason = session.pendingApprovalReason;
 
       final prevSubId = session.syncSubscriptionId;
       if (exited || wantSubscribe) {
@@ -6048,6 +6071,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
       if (snapshot != null) {
         session.agent = _asMap(snapshot['agent']);
+        session.applySnapshotMeta(snapshot);
         final snapshotCwd = snapshot['current_working_directory']?.toString();
         if (snapshotCwd != null) {
           session.cwd = snapshotCwd;
@@ -6127,6 +6151,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           agentChanged ||
           session.cwd != prevCwd ||
           session.bracketedPasteEnabled != prevBracketedPaste ||
+          session.pendingApproval != prevPendingApproval ||
+          session.pendingApprovalReason != prevPendingApprovalReason ||
           prevExited != exited ||
           session.status != nextStatus ||
           session.statusColor != nextStatusColor;
@@ -6378,6 +6404,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.snippet = snapshot?['snippet'] as String?;
           session.snippetDetail = snapshot?['snippet_detail'] as String?;
           session.agent = _asMap(snapshot?['agent']);
+          session.applySnapshotMeta(snapshot);
           final bracketedPaste =
               snapshot?['bracketed_paste_enabled'] as bool? ?? false;
           session.setBracketedPasteEnabled(bracketedPaste);
@@ -11775,6 +11802,8 @@ class SessionWorkspace extends StatelessWidget {
             onFetchScrollbackRows: onFetchScrollbackRows,
             focusCursorRevision: session.focusCursorRevision,
             bracketedPasteEnabled: session.bracketedPasteEnabled,
+            pendingApproval: session.pendingApproval,
+            pendingApprovalReason: session.pendingApprovalReason,
             isExited: session.status == 'exited',
             isLoading: session.status == 'loading' || !session.loaded,
             isObscured: isObscured,

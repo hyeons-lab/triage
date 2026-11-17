@@ -17,6 +17,8 @@ class TerminalAccessoryBar extends StatelessWidget {
     required this.onToggleCtrl,
     required this.onPaste,
     required this.ctrlArmed,
+    this.onToggleComposer,
+    this.composeOpen = false,
   });
 
   /// Called with the raw byte sequence a key emits (e.g. `'\x1b'` for esc).
@@ -34,6 +36,12 @@ class TerminalAccessoryBar extends StatelessWidget {
   /// Whether sticky Ctrl is currently armed, to highlight the key.
   final bool ctrlArmed;
 
+  /// Optional toggle for the multiline bottom composer bar.
+  final VoidCallback? onToggleComposer;
+
+  /// Whether the multiline bottom composer bar is currently expanded.
+  final bool composeOpen;
+
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -45,6 +53,8 @@ class TerminalAccessoryBar extends StatelessWidget {
           children: [
             _key('esc', () => onSend('\x1b')),
             _key('ctrl', onToggleCtrl, active: ctrlArmed),
+            if (onToggleComposer != null)
+              _key('compose', onToggleComposer!, active: composeOpen),
             _key('tab', () => onSend('\t')),
             // Shift+Tab (back-tab, `ESC [ Z`) — e.g. to cycle Claude Code's
             // auto / accept-edits / plan modes from a phone.
