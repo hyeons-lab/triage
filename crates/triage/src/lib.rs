@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -20,6 +21,7 @@ const MAX_EVENTS_PER_SESSION_TICK: usize = 256;
 /// How often the background poller re-queries the daemon for update status.
 /// The query is a blocking IPC round-trip, so it runs off the UI thread.
 const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const RAIL_LABELS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionView {
@@ -28,6 +30,7 @@ pub struct SessionView {
     pub lease: InputLeaseState,
     pub last_completed: Option<CompletedSession>,
     pub scroll_offset: usize,
+    pub custom_label: Option<String>,
 }
 
 pub struct LocalSessionApp {
@@ -48,6 +51,8 @@ pub struct LocalSessionApp {
     /// drains this channel without ever blocking. `None` in embedded mode, where
     /// status never changes.
     update_rx: Option<Receiver<ServerUpdateInfo>>,
+    /// Fresh custom rail labels pushed by the background poller (IPC mode only).
+    rail_labels_rx: Option<Receiver<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +79,10 @@ impl LocalSessionApp {
         // The poller owns its own stateless client (each round-trip reconnects),
         // so it can block on IPC without touching the UI thread's manager.
         let update_rx = spawn_update_poller(manager.clone());
+        let rail_labels_rx = spawn_rail_labels_poller(manager.clone());
         let mut app = Self::start_with_manager(Box::new(manager), size, false)?;
         app.update_rx = Some(update_rx);
+        app.rail_labels_rx = Some(rail_labels_rx);
         Ok(app)
     }
 
@@ -116,6 +123,7 @@ impl LocalSessionApp {
             last_error: None,
             update,
             update_rx: None,
+            rail_labels_rx: None,
         };
         app.activate_selected_session();
         Ok(app)
@@ -141,6 +149,29 @@ impl LocalSessionApp {
             }
             _ => false,
         }
+    }
+
+    /// Drain custom rail labels pushed by the background metadata poller.
+    pub fn refresh_rail_labels(&mut self) -> bool {
+        let Some(rx) = self.rail_labels_rx.as_ref() else {
+            return false;
+        };
+        let mut latest = None;
+        while let Ok(labels) = rx.try_recv() {
+            latest = Some(labels);
+        }
+        let Some(labels) = latest else {
+            return false;
+        };
+        let mut changed = false;
+        for session in &mut self.sessions {
+            let next = normalized_custom_label(labels.get(session.view.session_id.as_str()));
+            if session.view.custom_label != next {
+                session.view.custom_label = next;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Whether the daemon has seen a strictly newer stable release.
@@ -603,15 +634,54 @@ fn spawn_update_poller(client: IpcClient) -> Receiver<ServerUpdateInfo> {
     rx
 }
 
+#[cfg(any(unix, windows))]
+fn spawn_rail_labels_poller(client: IpcClient) -> Receiver<HashMap<String, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("triage-rail-labels-poller".to_string())
+        .spawn(move || {
+            let mut last: Option<HashMap<String, String>> = None;
+            loop {
+                std::thread::sleep(RAIL_LABELS_POLL_INTERVAL);
+                let Ok(layout) = client.get_rail_layout() else {
+                    continue;
+                };
+                if last.as_ref() == Some(&layout.custom_labels) {
+                    continue;
+                }
+                if tx.send(layout.custom_labels.clone()).is_err() {
+                    break;
+                }
+                last = Some(layout.custom_labels);
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("triage: could not start rail label poller: {error}");
+    }
+    rx
+}
+
+fn normalized_custom_label(raw: Option<&String>) -> Option<String> {
+    raw.map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn attach_existing_sessions(
     manager: &dyn SessionApi,
     client_id: &ClientId,
     size: SessionSize,
 ) -> Result<Vec<SessionRuntime>> {
+    let custom_labels = manager
+        .get_rail_layout()
+        .map(|layout| layout.custom_labels)
+        .unwrap_or_default();
     let mut sessions = Vec::new();
 
     for session_id in manager.list_sessions()? {
-        let session = attach_existing_session(manager, client_id, session_id, size.clone())?;
+        let custom_label = normalized_custom_label(custom_labels.get(session_id.as_str()));
+        let mut session = attach_existing_session(manager, client_id, session_id, size.clone())?;
+        session.view.custom_label = custom_label;
         sessions.push(session);
     }
 
@@ -649,6 +719,7 @@ fn attach_existing_session(
                 lease: InputLeaseState::default(),
                 last_completed: None,
                 scroll_offset: 0,
+                custom_label: None,
             },
             judge_policy,
         });
@@ -662,6 +733,7 @@ fn attach_existing_session(
             lease: attached.lease,
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         },
         judge_policy,
     })
@@ -707,6 +779,7 @@ fn start_local_session(
             lease: attached.lease,
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         },
         judge_policy,
     })
@@ -762,6 +835,12 @@ pub fn apply_event_to_view(view: &mut SessionView, event: SessionEvent) -> bool 
 fn merge_push_snapshot(view: &mut SessionView, mut snapshot: SessionSnapshot) {
     if snapshot.agent.is_none() {
         snapshot.agent = view.snapshot.agent.clone();
+    }
+    if snapshot.snippet.is_none() {
+        snapshot.snippet = view.snapshot.snippet.clone();
+    }
+    if snapshot.snippet_detail.is_none() {
+        snapshot.snippet_detail = view.snapshot.snippet_detail.clone();
     }
     replace_snapshot_preserving_scroll(view, snapshot);
 }
@@ -1276,6 +1355,7 @@ mod tests {
                     lease: InputLeaseState::default(),
                     last_completed: None,
                     scroll_offset: 2,
+                    custom_label: None,
                 },
                 judge_policy: None,
             }],
@@ -1288,6 +1368,7 @@ mod tests {
                 latest_version: None,
             },
             update_rx: None,
+            rail_labels_rx: None,
         };
 
         assert!(app.ensure_selected_styled_rows(2));
@@ -1324,6 +1405,7 @@ mod tests {
                     lease: InputLeaseState::default(),
                     last_completed: None,
                     scroll_offset: 2,
+                    custom_label: None,
                 },
                 judge_policy: None,
             }],
@@ -1336,6 +1418,7 @@ mod tests {
                 latest_version: None,
             },
             update_rx: None,
+            rail_labels_rx: None,
         };
 
         assert!(app.ensure_selected_styled_rows(2));
@@ -1372,6 +1455,7 @@ mod tests {
                     lease: InputLeaseState::default(),
                     last_completed: None,
                     scroll_offset: 2,
+                    custom_label: None,
                 },
                 judge_policy: None,
             }],
@@ -1384,6 +1468,7 @@ mod tests {
                 latest_version: None,
             },
             update_rx: None,
+            rail_labels_rx: None,
         };
 
         assert!(!app.ensure_selected_styled_rows(2));
@@ -1643,6 +1728,7 @@ mod tests {
                 latest_version: None,
             },
             update_rx: None,
+            rail_labels_rx: None,
         };
 
         assert_eq!(app.close_selected_session(), CloseSessionOutcome::NotClosed);
@@ -1689,6 +1775,7 @@ mod tests {
                 latest_version: None,
             },
             update_rx: None,
+            rail_labels_rx: None,
         };
 
         app.resize(new_size.clone());
@@ -1765,6 +1852,7 @@ mod tests {
             lease: InputLeaseState::default(),
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         }
     }
 
@@ -2248,5 +2336,78 @@ mod tests {
         fn shutdown_session(&self, _session_id: SessionId) -> Result<CompletedSession> {
             unreachable!("test does not shut down sessions")
         }
+    }
+
+    #[test]
+    fn merge_push_snapshot_preserves_overlaid_snippet() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let mut view = test_view(session_id.clone());
+        view.snapshot.snippet = Some("Running tests".to_string());
+        view.snapshot.snippet_detail = Some("Full test detail".to_string());
+
+        let push = test_view(session_id).snapshot;
+        merge_push_snapshot(&mut view, push);
+
+        assert_eq!(view.snapshot.snippet.as_deref(), Some("Running tests"));
+        assert_eq!(
+            view.snapshot.snippet_detail.as_deref(),
+            Some("Full test detail")
+        );
+    }
+
+    #[test]
+    fn refresh_rail_labels_updates_custom_labels_from_channel() {
+        let session_id = SessionId::new("session-1").expect("session id");
+        let snapshot = test_view(session_id.clone()).snapshot;
+        let (_ev_tx, ev_rx) = std::sync::mpsc::channel();
+        let (labels_tx, labels_rx) = std::sync::mpsc::channel();
+        let mut app = LocalSessionApp {
+            manager: Box::new(ResizeRecordingSessionApi {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            client_id: ClientId::new("local-tui").expect("client id"),
+            owns_sessions: false,
+            sessions: vec![SessionRuntime {
+                events: ev_rx,
+                view: SessionView {
+                    session_id: session_id.clone(),
+                    snapshot,
+                    lease: InputLeaseState::default(),
+                    last_completed: None,
+                    scroll_offset: 0,
+                    custom_label: None,
+                },
+                judge_policy: None,
+            }],
+            selected: 0,
+            current_size: SessionSize::default(),
+            last_error: None,
+            update: ServerUpdateInfo {
+                server_version: String::new(),
+                update_available: false,
+                latest_version: None,
+            },
+            update_rx: None,
+            rail_labels_rx: Some(labels_rx),
+        };
+
+        assert!(!app.refresh_rail_labels());
+        labels_tx
+            .send(HashMap::from([(
+                "session-1".to_string(),
+                "  backend daemon ".to_string(),
+            )]))
+            .expect("send labels");
+        assert!(app.refresh_rail_labels());
+        assert_eq!(app.view().custom_label.as_deref(), Some("backend daemon"));
+        // Blank updates clear the label cleanly.
+        labels_tx
+            .send(HashMap::from([(
+                "session-1".to_string(),
+                "   ".to_string(),
+            )]))
+            .expect("send blank label");
+        assert!(app.refresh_rail_labels());
+        assert_eq!(app.view().custom_label, None);
     }
 }

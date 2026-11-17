@@ -27,7 +27,6 @@ use triage::{
 use triage_core::judge::SessionJudgePolicy;
 use triage_core::session::{
     InputControllerKind, SessionSize, StyledRow, TerminalColor, TerminalCursor, TerminalStyle,
-    path_leaf_name,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -455,6 +454,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut LocalSession
         // Cheap non-blocking drain of the background poller's channel; the
         // blocking IPC round-trip happens on the poller thread.
         needs_draw |= app.refresh_update_status();
+        needs_draw |= app.refresh_rail_labels();
 
         if sidebar_visible
             && selected_sidebar_context_overflows(app, usize::from(SIDEBAR_COLS.saturating_sub(1)))
@@ -941,6 +941,235 @@ fn sidebar_content_width(area: Rect) -> usize {
     usize::from(area.width.saturating_sub(1))
 }
 
+struct SidebarActivity {
+    prefix: &'static str,
+    text: String,
+    style: Style,
+}
+
+struct SidebarCardFields {
+    title_compact: String,
+    title_full: String,
+    suffix: String,
+    meta: Option<String>,
+    activity: Option<SidebarActivity>,
+}
+
+fn split_cross_platform_path(path: &Path) -> Vec<String> {
+    let raw = path.to_string_lossy();
+    raw.split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn cross_platform_path_leaf(path: &Path) -> Option<String> {
+    let parts = split_cross_platform_path(path);
+    let leaf = parts.last()?;
+    // Ignore bare Windows drive designators like `C:` that carry no folder name.
+    if leaf.len() == 2 && leaf.as_bytes()[1] == b':' && leaf.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    Some(leaf.clone())
+}
+
+fn is_uninformative_cwd(path: &Path) -> bool {
+    let parts = split_cross_platform_path(path);
+    let Some(leaf) = cross_platform_path_leaf(path) else {
+        return true;
+    };
+    let lower_leaf = leaf.to_ascii_lowercase();
+    if matches!(lower_leaf.as_str(), "system32" | "syswow64") {
+        return true;
+    }
+    if lower_leaf == "windows" && parts.len() <= 2 {
+        return true;
+    }
+    false
+}
+
+fn meaningful_cwd_leaf(path: &Path) -> Option<String> {
+    if is_uninformative_cwd(path) {
+        None
+    } else {
+        cross_platform_path_leaf(path)
+    }
+}
+
+fn collapse_single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_default_branch(branch: &str) -> bool {
+    matches!(branch, "main" | "master")
+}
+
+fn sidebar_card_fields(
+    view: &SessionView,
+    judge_policy: Option<SessionJudgePolicy>,
+) -> SidebarCardFields {
+    let context = view.snapshot.context.as_ref();
+    let repo_name = context
+        .and_then(|c| {
+            c.repository_root
+                .as_deref()
+                .or(c.worktree_root.as_deref())
+                .and_then(cross_platform_path_leaf)
+        })
+        .filter(|s| !s.is_empty());
+    let worktree_name = context
+        .and_then(|c| c.distinct_worktree_root())
+        .and_then(cross_platform_path_leaf)
+        .filter(|s| !s.is_empty());
+    let branch_full = context
+        .and_then(|c| c.branch.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let branch_short = branch_full.map(|b| b.rsplit('/').next().unwrap_or(b));
+    let cwd_leaf = view
+        .snapshot
+        .current_working_directory
+        .as_deref()
+        .and_then(meaningful_cwd_leaf);
+    let custom_label = view
+        .custom_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut used_branch_in_title = false;
+    let mut used_agent_name_only_in_title = false;
+    let (title_compact, title_full) = if let Some(label) = custom_label {
+        (label.to_string(), label.to_string())
+    } else if let Some(wt) = worktree_name.as_deref() {
+        (wt.to_string(), wt.to_string())
+    } else if let (Some(full), Some(short)) = (branch_full, branch_short)
+        && (!is_default_branch(full) || repo_name.is_none())
+    {
+        used_branch_in_title = true;
+        (short.to_string(), full.to_string())
+    } else if let Some(repo) = repo_name.as_deref() {
+        (repo.to_string(), repo.to_string())
+    } else if let Some(dir) = cwd_leaf.as_deref() {
+        (dir.to_string(), dir.to_string())
+    } else if let Some(agent) = view.snapshot.agent.as_ref() {
+        used_agent_name_only_in_title = agent.conversation_id.as_deref().is_none_or(str::is_empty);
+        let badge = agent_badge_text(agent);
+        (badge.clone(), badge)
+    } else {
+        let id = view.session_id.as_str().to_string();
+        (id.clone(), id)
+    };
+
+    let mut suffix = String::new();
+    if view.snapshot.pending_approval {
+        suffix.push_str(" [!]");
+    }
+    if view.snapshot.exited {
+        suffix.push_str(" [exit]");
+    }
+    // Use plain ASCII badges (never emoji that degrade to `*` on console fonts)
+    // and omit them on default un-overridden plain shells.
+    if let Some(policy) = judge_policy
+        && (policy.explicit.is_some() || view.snapshot.agent.is_some())
+    {
+        suffix.push_str(if policy.effective {
+            " [auto]"
+        } else {
+            " [ask]"
+        });
+    }
+
+    let mut meta_parts = Vec::new();
+    if let Some(agent) = &view.snapshot.agent {
+        if !used_agent_name_only_in_title && title_full != agent_badge_text(agent) {
+            meta_parts.push(agent_badge_text(agent));
+        }
+    } else if view
+        .lease
+        .holder
+        .as_ref()
+        .is_some_and(|holder| holder.kind == InputControllerKind::Agent)
+    {
+        meta_parts.push("agent".to_string());
+    }
+
+    if context.is_some() {
+        if let Some(repo) = repo_name.as_deref()
+            && repo != title_full
+        {
+            meta_parts.push(repo.to_string());
+        }
+        if let Some(short) = branch_short
+            && !used_branch_in_title
+            && !short.eq_ignore_ascii_case(&title_full)
+        {
+            meta_parts.push(short.to_string());
+        }
+    } else if let Some(dir) = cwd_leaf.as_deref()
+        && dir != title_full
+    {
+        meta_parts.push(dir.to_string());
+    }
+
+    let meta = (!meta_parts.is_empty()).then(|| meta_parts.join(" · "));
+
+    let activity = if view.snapshot.pending_approval {
+        let reason = view
+            .snapshot
+            .pending_approval_reason
+            .as_deref()
+            .map(collapse_single_line)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "approval needed".to_string());
+        Some(SidebarActivity {
+            prefix: "  ! ",
+            text: reason,
+            style: Style::default().fg(Color::Yellow),
+        })
+    } else {
+        view.snapshot
+            .snippet
+            .as_deref()
+            .map(collapse_single_line)
+            .filter(|s| !s.is_empty())
+            .map(|text| SidebarActivity {
+                prefix: "  ",
+                text,
+                style: Style::default().fg(Color::Gray),
+            })
+    };
+
+    SidebarCardFields {
+        title_compact,
+        title_full,
+        suffix,
+        meta,
+        activity,
+    }
+}
+
+fn format_sidebar_row(
+    prefix: &str,
+    value: &str,
+    suffix: &str,
+    width: usize,
+    selected: bool,
+    scroll_offset: usize,
+) -> String {
+    let chrome_width = UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix);
+    if chrome_width >= width {
+        return truncate_to_width(format!("{prefix}{value}{suffix}"), width);
+    }
+    let value_budget = width - chrome_width;
+    let rendered_value = if selected {
+        scrolling_value(value, value_budget, scroll_offset)
+    } else {
+        compact_value(value, value_budget)
+    };
+    truncate_to_width(format!("{prefix}{rendered_value}{suffix}"), width)
+}
+
 fn session_sidebar_rows(
     index: usize,
     selected: usize,
@@ -949,62 +1178,54 @@ fn session_sidebar_rows(
     width: usize,
     scroll_offset: usize,
 ) -> Vec<Line<'static>> {
-    let holder = view
-        .lease
-        .holder
-        .as_ref()
-        .map(|holder| match holder.kind {
-            InputControllerKind::Interactive => "interactive",
-            InputControllerKind::Agent => "agent",
-        })
-        .unwrap_or("observer");
-    let state = if view.snapshot.exited {
-        "exited"
-    } else {
-        "running"
-    };
-    let marker = if index == selected { ">" } else { " " };
-    let style = if index == selected {
+    let is_selected = index == selected;
+    let marker = if is_selected { "> " } else { "  " };
+    let title_style = if is_selected || view.snapshot.pending_approval {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
+    } else if view.snapshot.exited {
+        Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
     };
-    let judge_badge = match judge_policy {
-        Some(p) if p.effective => " 🤖",
-        Some(_) => " 👤",
-        None => "",
-    };
 
-    let mut rows = vec![
-        Line::from(Span::styled(
-            truncate_to_width(
-                format!("{marker} {}{judge_badge}  {state}", view.session_id),
-                width,
-            ),
-            style,
-        )),
-        Line::from(truncate_to_width(
-            format!(
-                "  {holder}  {}x{}",
-                view.snapshot.size.cols, view.snapshot.size.rows
-            ),
-            width,
-        )),
-    ];
-    if let Some(agent) = &view.snapshot.agent {
-        rows.push(Line::from(truncate_to_width(
-            format!("  {}", agent_badge_text(agent)),
-            width,
-        )));
-    }
-    rows.extend(session_context_rows(
-        view,
+    let card = sidebar_card_fields(view, judge_policy);
+    let title_source = if is_selected {
+        &card.title_full
+    } else {
+        &card.title_compact
+    };
+    let title_line = format_sidebar_row(
+        marker,
+        title_source,
+        &card.suffix,
         width,
-        index == selected,
+        is_selected,
         scroll_offset,
-    ));
+    );
+
+    let mut rows = vec![Line::from(Span::styled(title_line, title_style))];
+    if let Some(meta) = card.meta {
+        let meta_style = if is_selected {
+            Style::default().fg(Color::Gray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let meta_line = format_sidebar_row("  ", &meta, "", width, is_selected, scroll_offset);
+        rows.push(Line::from(Span::styled(meta_line, meta_style)));
+    }
+    if let Some(activity) = card.activity {
+        let activity_line = format_sidebar_row(
+            activity.prefix,
+            &activity.text,
+            "",
+            width,
+            is_selected,
+            scroll_offset,
+        );
+        rows.push(Line::from(Span::styled(activity_line, activity.style)));
+    }
     rows.push(Line::from(""));
     rows
 }
@@ -1020,78 +1241,6 @@ fn agent_badge_text(agent: &triage_core::agent::AgentAttachment) -> String {
         }
         _ => format!("{kind} (recent)"),
     }
-}
-
-fn session_context_rows(
-    view: &SessionView,
-    width: usize,
-    selected: bool,
-    scroll_offset: usize,
-) -> Vec<Line<'static>> {
-    let context = view.snapshot.context.as_ref();
-
-    let mut rows = Vec::with_capacity(3);
-    if let Some(context) = context {
-        if let Some(root) = context
-            .repository_root
-            .as_ref()
-            .or(context.worktree_root.as_ref())
-        {
-            rows.push(context_path_row("r", root, width, selected, scroll_offset));
-        } else {
-            rows.push(Line::from(""));
-        }
-
-        if let Some(worktree_root) = context.distinct_worktree_root() {
-            rows.push(context_path_row(
-                "w",
-                worktree_root,
-                width,
-                selected,
-                scroll_offset,
-            ));
-        }
-    } else {
-        let cwd = view.snapshot.current_working_directory.as_ref();
-        if let Some(cwd) = cwd {
-            rows.push(context_path_row("c", cwd, width, selected, scroll_offset));
-        } else {
-            rows.push(Line::from(""));
-        }
-    }
-
-    if let Some(branch) = context.and_then(|context| context.branch.as_ref()) {
-        let branch_width = width.saturating_sub(4);
-        let branch_name = if selected {
-            scrolling_value(branch, branch_width, scroll_offset)
-        } else {
-            compact_value(branch.rsplit('/').next().unwrap_or(branch), branch_width)
-        };
-        rows.push(Line::from(truncate_to_width(
-            format!("  b {branch_name}"),
-            width,
-        )));
-    } else {
-        rows.push(Line::from(""));
-    }
-    rows
-}
-
-fn context_path_row(
-    label: &str,
-    path: &Path,
-    width: usize,
-    selected: bool,
-    scroll_offset: usize,
-) -> Line<'static> {
-    let name = context_path_display_name(path);
-    let value_width = width.saturating_sub(label.len() + 3);
-    let value = if selected {
-        scrolling_value(&name, value_width, scroll_offset)
-    } else {
-        compact_value(&name, value_width)
-    };
-    Line::from(truncate_to_width(format!("  {label} {value}"), width))
 }
 
 /// Collects the longest leading run of `value` whose terminal display width
@@ -1178,42 +1327,26 @@ fn scrolling_value(value: &str, width: usize, offset: usize) -> String {
 }
 
 fn selected_sidebar_context_overflows(app: &LocalSessionApp, width: usize) -> bool {
-    session_context_overflows(app.view(), width)
+    session_sidebar_overflows(app.view(), app.selected_judge_policy(), width)
 }
 
-fn session_context_overflows(view: &SessionView, width: usize) -> bool {
-    let context = view.snapshot.context.as_ref();
-    let location_overflows = if let Some(context) = context {
-        let repo_overflows = context
-            .repository_root
-            .as_ref()
-            .or(context.worktree_root.as_ref())
-            .is_some_and(|root| context_path_overflows(root, width));
-        let worktree_overflows = context
-            .distinct_worktree_root()
-            .is_some_and(|worktree_root| context_path_overflows(worktree_root, width));
-        repo_overflows || worktree_overflows
-    } else {
-        view.snapshot
-            .current_working_directory
-            .as_ref()
-            .is_some_and(|cwd| context_path_overflows(cwd, width))
-    };
-    let branch_overflows = context
-        .and_then(|context| context.branch.as_ref())
-        .map(|branch| UnicodeWidthStr::width(branch.as_str()) > width.saturating_sub(4))
-        .unwrap_or(false);
-    location_overflows || branch_overflows
-}
-
-fn context_path_overflows(path: &Path, width: usize) -> bool {
-    UnicodeWidthStr::width(context_path_display_name(path).as_str()) > width.saturating_sub(4)
-}
-
-fn context_path_display_name(path: &Path) -> String {
-    // Shared leaf extraction with triage-core; fall back to the full path when
-    // there's no final component (e.g. `/`) so the row is never blank.
-    path_leaf_name(path).unwrap_or_else(|| path.display().to_string())
+fn session_sidebar_overflows(
+    view: &SessionView,
+    judge_policy: Option<SessionJudgePolicy>,
+    width: usize,
+) -> bool {
+    let card = sidebar_card_fields(view, judge_policy);
+    let title_overflows = UnicodeWidthStr::width(card.title_full.as_str())
+        > width.saturating_sub(2 + UnicodeWidthStr::width(card.suffix.as_str()));
+    let meta_overflows = card
+        .meta
+        .as_deref()
+        .is_some_and(|meta| UnicodeWidthStr::width(meta) > width.saturating_sub(2));
+    let activity_overflows = card.activity.as_ref().is_some_and(|act| {
+        UnicodeWidthStr::width(act.text.as_str())
+            > width.saturating_sub(UnicodeWidthStr::width(act.prefix))
+    });
+    title_overflows || meta_overflows || activity_overflows
 }
 
 fn draw_terminal(
@@ -2304,11 +2437,19 @@ mod tests {
     }
 
     #[test]
-    fn context_path_overflows_uses_display_name_for_roots() {
-        let root = Path::new("/");
-
-        assert!(!context_path_overflows(root, 5));
-        assert!(context_path_overflows(root, 4));
+    fn meaningful_cwd_leaf_filters_roots_and_windows_system_dirs() {
+        assert_eq!(meaningful_cwd_leaf(Path::new("/")), None);
+        assert_eq!(meaningful_cwd_leaf(Path::new(r"C:\")), None);
+        assert_eq!(meaningful_cwd_leaf(Path::new(r"C:\Windows\System32")), None);
+        assert_eq!(meaningful_cwd_leaf(Path::new(r"C:\Windows\SysWOW64")), None);
+        assert_eq!(
+            meaningful_cwd_leaf(Path::new("/home/dev/notes")).as_deref(),
+            Some("notes")
+        );
+        assert_eq!(
+            meaningful_cwd_leaf(Path::new(r"C:\Users\dev\notes")).as_deref(),
+            Some("notes")
+        );
     }
 
     #[test]
@@ -2653,45 +2794,15 @@ mod tests {
 
     #[test]
     fn sidebar_rows_include_git_session_context() {
-        let view = SessionView {
-            session_id: triage_core::session::SessionId::new("session-1").expect("session id"),
-            snapshot: triage_core::session::SessionSnapshot {
-                output_seq: 0,
-                bytes_logged: 0,
-                size: SessionSize::default(),
-                visible_rows: Vec::new(),
-                styled_rows_start: 0,
-                styled_rows: Vec::new(),
-                cursor: triage_core::session::TerminalCursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                },
-                current_working_directory: Some(PathBuf::from("/workspace/triage/crates")),
-                context: Some(triage_core::session::SessionContext {
-                    repository_root: Some(PathBuf::from("/workspace/triage")),
-                    worktree_root: Some(PathBuf::from(
-                        "/workspace/triage/worktrees/websocket-session-api",
-                    )),
-                    branch: Some("feat/session-context".to_string()),
-                }),
-                bracketed_paste_enabled: false,
-                exited: false,
-                raw_output: Vec::new(),
-                raw_output_start: 0,
-                raw_output_prefix: Vec::new(),
-                snippet: None,
-                snippet_detail: None,
-                agent: None,
-                parent_session_id: None,
-                outlive_parent: false,
-                pending_approval: false,
-                pending_approval_reason: None,
-            },
-            lease: triage_core::session::InputLeaseState::default(),
-            last_completed: None,
-            scroll_offset: 0,
-        };
+        let mut view = sidebar_test_view("session-1");
+        view.snapshot.current_working_directory = Some(PathBuf::from("/workspace/triage/crates"));
+        view.snapshot.context = Some(triage_core::session::SessionContext {
+            repository_root: Some(PathBuf::from("/workspace/triage")),
+            worktree_root: Some(PathBuf::from(
+                "/workspace/triage/worktrees/websocket-session-api",
+            )),
+            branch: Some("feat/session-context".to_string()),
+        });
 
         let rows = session_sidebar_rows(
             0,
@@ -2702,59 +2813,99 @@ mod tests {
             0,
         );
 
-        assert_eq!(rows[2].spans[0].content.as_ref(), "  r triage");
+        assert_eq!(rows[0].spans[0].content.as_ref(), "  websocket-session-api");
         assert_eq!(
-            rows[3].spans[0].content.as_ref(),
-            "  w websocket-session-api"
+            rows[1].spans[0].content.as_ref(),
+            "  triage · session-context"
         );
-        assert_eq!(rows[4].spans[0].content.as_ref(), "  b session-context");
+        assert!(rows[2].spans.is_empty());
+        let rendered = rows
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("session-1"));
+        assert!(!rendered.contains("running"));
+        assert!(!rendered.contains("80x24"));
+        assert!(!rendered.contains("observer"));
+        assert!(!rendered.contains("interactive"));
     }
 
     #[test]
     fn sidebar_rows_include_agent_badge() {
-        let view = SessionView {
-            session_id: triage_core::session::SessionId::new("session-1").expect("session id"),
-            snapshot: triage_core::session::SessionSnapshot {
-                output_seq: 0,
-                bytes_logged: 0,
-                size: SessionSize::default(),
-                visible_rows: Vec::new(),
-                styled_rows_start: 0,
-                styled_rows: Vec::new(),
-                cursor: triage_core::session::TerminalCursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                },
-                current_working_directory: None,
-                context: None,
-                bracketed_paste_enabled: false,
-                exited: false,
-                raw_output: Vec::new(),
-                raw_output_start: 0,
-                raw_output_prefix: Vec::new(),
-                snippet: None,
-                snippet_detail: None,
-                agent: Some(triage_core::agent::AgentAttachment {
-                    kind: triage_core::agent::AgentKind::Claude,
-                    conversation_id: Some("abc12345ef".to_string()),
-                    transcript_path: None,
-                    exe_path: None,
-                    last_seen_ms: 1,
-                }),
-                parent_session_id: None,
-                outlive_parent: false,
-                pending_approval: false,
-                pending_approval_reason: None,
-            },
-            lease: triage_core::session::InputLeaseState::default(),
-            last_completed: None,
-            scroll_offset: 0,
-        };
+        let mut view = sidebar_test_view("session-1");
+        view.snapshot.current_working_directory = Some(PathBuf::from("/workspace/my-project"));
+        view.snapshot.agent = Some(triage_core::agent::AgentAttachment {
+            kind: triage_core::agent::AgentKind::Claude,
+            conversation_id: Some("abc12345ef".to_string()),
+            transcript_path: None,
+            exe_path: None,
+            last_seen_ms: 1,
+        });
 
         let rows = session_sidebar_rows(0, 1, &view, None, 40, 0);
 
-        assert_eq!(rows[2].spans[0].content.as_ref(), "  claude abc12345");
+        assert_eq!(rows[0].spans[0].content.as_ref(), "  my-project");
+        assert_eq!(rows[1].spans[0].content.as_ref(), "  claude abc12345");
+    }
+
+    #[test]
+    fn sidebar_rows_suppress_windows_system32_boilerplate() {
+        let mut view = sidebar_test_view("session-23");
+        view.snapshot.current_working_directory = Some(PathBuf::from(r"C:\Windows\System32"));
+        view.snapshot.snippet = Some("Tail daemon logs".to_string());
+
+        let rows = session_sidebar_rows(0, 0, &view, None, 30, 0);
+
+        let rendered = rows
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.to_ascii_lowercase().contains("system32"));
+        assert!(!rendered.contains("running"));
+        assert!(!rendered.contains("80x24"));
+        assert_eq!(rows[0].spans[0].content.as_ref(), "> session-23");
+        assert_eq!(rows[1].spans[0].content.as_ref(), "  Tail daemon logs");
+    }
+
+    #[test]
+    fn sidebar_rows_prefer_custom_label_and_surface_approval_or_exit() {
+        let mut view = sidebar_test_view("session-7");
+        view.custom_label = Some("api server".to_string());
+        view.snapshot.context = Some(triage_core::session::SessionContext {
+            repository_root: Some(PathBuf::from("/workspace/triage")),
+            worktree_root: Some(PathBuf::from("/workspace/triage")),
+            branch: Some("main".to_string()),
+        });
+        view.snapshot.pending_approval = true;
+        view.snapshot.pending_approval_reason = Some("Run cargo test? [y/N]".to_string());
+
+        let rows = session_sidebar_rows(0, 1, &view, None, 32, 0);
+        assert_eq!(rows[0].spans[0].content.as_ref(), "  api server [!]");
+        assert_eq!(rows[1].spans[0].content.as_ref(), "  triage · main");
+        assert_eq!(
+            rows[2].spans[0].content.as_ref(),
+            "  ! Run cargo test? [y/N]"
+        );
+
+        view.snapshot.pending_approval = false;
+        view.snapshot.exited = true;
+        let exited_rows = session_sidebar_rows(0, 1, &view, None, 32, 0);
+        assert_eq!(
+            exited_rows[0].spans[0].content.as_ref(),
+            "  api server [exit]"
+        );
     }
 
     #[test]
@@ -2800,98 +2951,38 @@ mod tests {
 
     #[test]
     fn selected_sidebar_context_scrolls_overflowing_branch_text() {
-        let view = SessionView {
-            session_id: triage_core::session::SessionId::new("session-1").expect("session id"),
-            snapshot: triage_core::session::SessionSnapshot {
-                output_seq: 0,
-                bytes_logged: 0,
-                size: SessionSize::default(),
-                visible_rows: Vec::new(),
-                styled_rows_start: 0,
-                styled_rows: Vec::new(),
-                cursor: triage_core::session::TerminalCursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                },
-                current_working_directory: Some(PathBuf::from("/workspace/triage")),
-                context: Some(triage_core::session::SessionContext {
-                    repository_root: Some(PathBuf::from("/workspace/triage")),
-                    worktree_root: Some(PathBuf::from("/workspace/triage")),
-                    branch: Some("feat/very-long-session-context-label".to_string()),
-                }),
-                bracketed_paste_enabled: false,
-                exited: false,
-                raw_output: Vec::new(),
-                raw_output_start: 0,
-                raw_output_prefix: Vec::new(),
-                snippet: None,
-                snippet_detail: None,
-                agent: None,
-                parent_session_id: None,
-                outlive_parent: false,
-                pending_approval: false,
-                pending_approval_reason: None,
-            },
-            lease: triage_core::session::InputLeaseState::default(),
-            last_completed: None,
-            scroll_offset: 0,
-        };
+        let mut view = sidebar_test_view("session-1");
+        view.snapshot.current_working_directory = Some(PathBuf::from("/workspace/triage"));
+        view.snapshot.context = Some(triage_core::session::SessionContext {
+            repository_root: Some(PathBuf::from("/workspace/triage")),
+            worktree_root: Some(PathBuf::from("/workspace/triage")),
+            branch: Some("feat/very-long-session-context-label".to_string()),
+        });
 
         let first = session_sidebar_rows(0, 0, &view, None, 20, 0);
         let later = session_sidebar_rows(0, 0, &view, None, 20, 5);
 
-        assert_ne!(first[3].spans[0].content, later[3].spans[0].content);
-        assert!(first[3].spans[0].content.starts_with("  b "));
-        assert_eq!(first[3].width(), 20);
-        assert_eq!(later[3].width(), 20);
+        assert_ne!(first[0].spans[0].content, later[0].spans[0].content);
+        assert!(first[0].spans[0].content.starts_with("> "));
+        assert_eq!(first[0].width(), 20);
+        assert_eq!(later[0].width(), 20);
     }
 
     #[test]
     fn selected_sidebar_context_overflows_when_worktree_name_overflows() {
-        let view = SessionView {
-            session_id: triage_core::session::SessionId::new("session-1").expect("session id"),
-            snapshot: triage_core::session::SessionSnapshot {
-                output_seq: 0,
-                bytes_logged: 0,
-                size: SessionSize::default(),
-                visible_rows: Vec::new(),
-                styled_rows_start: 0,
-                styled_rows: Vec::new(),
-                cursor: triage_core::session::TerminalCursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                },
-                current_working_directory: Some(PathBuf::from(
-                    "/workspace/triage/worktrees/websocket-session-api",
-                )),
-                context: Some(triage_core::session::SessionContext {
-                    repository_root: Some(PathBuf::from("/workspace/triage")),
-                    worktree_root: Some(PathBuf::from(
-                        "/workspace/triage/worktrees/very-long-websocket-session-api",
-                    )),
-                    branch: Some("feat/ws".to_string()),
-                }),
-                bracketed_paste_enabled: false,
-                exited: false,
-                raw_output: Vec::new(),
-                raw_output_start: 0,
-                raw_output_prefix: Vec::new(),
-                snippet: None,
-                snippet_detail: None,
-                agent: None,
-                parent_session_id: None,
-                outlive_parent: false,
-                pending_approval: false,
-                pending_approval_reason: None,
-            },
-            lease: triage_core::session::InputLeaseState::default(),
-            last_completed: None,
-            scroll_offset: 0,
-        };
+        let mut view = sidebar_test_view("session-1");
+        view.snapshot.current_working_directory = Some(PathBuf::from(
+            "/workspace/triage/worktrees/websocket-session-api",
+        ));
+        view.snapshot.context = Some(triage_core::session::SessionContext {
+            repository_root: Some(PathBuf::from("/workspace/triage")),
+            worktree_root: Some(PathBuf::from(
+                "/workspace/triage/worktrees/very-long-websocket-session-api",
+            )),
+            branch: Some("feat/ws".to_string()),
+        });
 
-        assert!(session_context_overflows(&view, 20));
+        assert!(session_sidebar_overflows(&view, None, 20));
     }
 
     #[test]
@@ -2900,16 +2991,17 @@ mod tests {
             .map(|index| sidebar_test_view(&format!("session-{index}")))
             .collect::<Vec<_>>();
 
-        let rows = sidebar_visible_rows(sessions.iter().map(|s| (s, None)), 3, 20, 0, 5);
+        let rows = sidebar_visible_rows(sessions.iter().map(|s| (s, None)), 3, 20, 0, 3);
 
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[0].spans[0].content.as_ref(), "> session-4  running");
-        assert_eq!(rows[1].spans[0].content.as_ref(), "  observer  80x24");
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].spans.is_empty());
+        assert_eq!(rows[1].spans[0].content.as_ref(), "> session-4");
+        assert!(rows[2].spans.is_empty());
     }
 
     #[test]
-    fn sidebar_renders_judge_robot_and_user_badges() {
-        let view = sidebar_test_view("session-1");
+    fn sidebar_renders_ascii_judge_badges_without_default_shell_noise() {
+        let plain = sidebar_test_view("session-1");
         let auto_policy = Some(SessionJudgePolicy {
             explicit: Some(true),
             effective: true,
@@ -2918,16 +3010,31 @@ mod tests {
             explicit: Some(false),
             effective: false,
         });
+        let inherited_auto = Some(SessionJudgePolicy {
+            explicit: None,
+            effective: true,
+        });
 
-        let auto_rows = session_sidebar_rows(0, 0, &view, auto_policy, 30, 0);
-        assert!(auto_rows[0].spans[0].content.contains("🤖"));
+        let auto_rows = session_sidebar_rows(0, 0, &plain, auto_policy, 30, 0);
+        assert!(auto_rows[0].spans[0].content.contains("[auto]"));
 
-        let manual_rows = session_sidebar_rows(0, 0, &view, manual_policy, 30, 0);
-        assert!(manual_rows[0].spans[0].content.contains("👤"));
+        let manual_rows = session_sidebar_rows(0, 0, &plain, manual_policy, 30, 0);
+        assert!(manual_rows[0].spans[0].content.contains("[ask]"));
 
-        let unconfigured_rows = session_sidebar_rows(0, 0, &view, None, 30, 0);
-        assert!(!unconfigured_rows[0].spans[0].content.contains("🤖"));
-        assert!(!unconfigured_rows[0].spans[0].content.contains("👤"));
+        let inherited_plain = session_sidebar_rows(0, 0, &plain, inherited_auto, 30, 0);
+        assert!(!inherited_plain[0].spans[0].content.contains("[auto]"));
+        assert!(!inherited_plain[0].spans[0].content.contains("*"));
+
+        let mut agent_view = sidebar_test_view("session-2");
+        agent_view.snapshot.agent = Some(triage_core::agent::AgentAttachment {
+            kind: triage_core::agent::AgentKind::Claude,
+            conversation_id: None,
+            transcript_path: None,
+            exe_path: None,
+            last_seen_ms: 1,
+        });
+        let inherited_agent = session_sidebar_rows(0, 0, &agent_view, inherited_auto, 30, 0);
+        assert!(inherited_agent[0].spans[0].content.contains("[auto]"));
     }
 
     #[test]
@@ -2978,6 +3085,7 @@ mod tests {
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         };
         let area = Rect {
             x: 28,
@@ -3027,6 +3135,7 @@ mod tests {
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         };
         let area = Rect {
             x: SIDEBAR_COLS,
@@ -3076,6 +3185,7 @@ mod tests {
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         };
         let area = Rect {
             x: SIDEBAR_COLS,
@@ -3465,6 +3575,7 @@ mod tests {
             lease: triage_core::session::InputLeaseState::default(),
             last_completed: None,
             scroll_offset: 0,
+            custom_label: None,
         }
     }
 
