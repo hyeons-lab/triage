@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 import 'package:triage_client/terminal/terminal_cell_protocol.dart';
+import 'package:triage_client/terminal/terminal_links.dart';
 import 'package:triage_client/terminal/terminal_selection.dart';
 import 'package:triage_client/widgets/terminal_grid_render_box.dart';
 
@@ -428,6 +429,99 @@ void main() {
 
         // Exact integer fallbackCols/fallbackRows preserved on unbounded axes (no IEEE-754 floor loss to 92/26).
         expect(reported, (93, 27));
+        expect(tester.takeException(), isNull);
+      },
+    );
+
+    testWidgets(
+      'hitTestCellOffset rejects margins while linkAtOffset resolves hovered links',
+      (WidgetTester tester) async {
+        final buffer = TerminalCellBuffer(cols: 40, rows: 6);
+        final scrollController = ScrollController();
+        final focusNode = FocusNode();
+        addTearDown(() {
+          focusNode.dispose();
+          scrollController.dispose();
+          buffer.dispose();
+        });
+
+        buffer.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: 6,
+            cols: 40,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 0,
+            cursorStyle: 2,
+            modeFlags: kModeCursorVisible | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'visit https://example.com/docs',
+              'second line',
+            ], cols: 40),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+
+        final expectedLink = detectLinkAtCell(buffer, const CellOffset(8, 0));
+        expect(expectedLink, isNotNull);
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 600,
+                height: 200,
+                child: TerminalGridView(
+                  buffer: buffer,
+                  scrollController: scrollController,
+                  focusNode: focusNode,
+                  autoResize: false,
+                  hoveredLink: expectedLink,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final gridState = tester.state<TerminalGridViewState>(
+          find.byType(TerminalGridView),
+        );
+        final renderGrid = gridState.renderGrid!;
+        final cellW = renderGrid.cellWidth;
+        final cellH = renderGrid.lineHeight;
+
+        expect(
+          renderGrid.hitTestCellOffset(
+            Offset(8 * cellW + cellW / 2, cellH / 2),
+          ),
+          const CellOffset(8, 0),
+        );
+        expect(
+          renderGrid.linkAtOffset(Offset(8 * cellW + cellW / 2, cellH / 2)),
+          equals(expectedLink),
+        );
+        expect(renderGrid.hitTestCellOffset(const Offset(-1, 5)), isNull);
+        expect(
+          renderGrid.hitTestCellOffset(Offset(40 * cellW + 5, cellH / 2)),
+          isNull,
+        );
+        expect(renderGrid.hitTestCellOffset(Offset(5, 6 * cellH + 5)), isNull);
+        expect(
+          renderGrid.linkAtOffset(Offset(40 * cellW + 5, cellH / 2)),
+          isNull,
+        );
         expect(tester.takeException(), isNull);
       },
     );

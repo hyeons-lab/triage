@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/gestures.dart'
     show
         GestureBinding,
+        PointerExitEvent,
         PointerHoverEvent,
         PointerPanZoomEndEvent,
         PointerPanZoomStartEvent,
@@ -45,6 +46,7 @@ import 'package:flutter/services.dart'
 import 'package:triage_client/models/terminal_models.dart';
 import 'package:triage_client/platform_env_io.dart'
     if (dart.library.js_util) 'package:triage_client/platform_env_web.dart';
+import 'package:triage_client/services/external_navigation.dart';
 import 'package:triage_client/terminal/control_bytes.dart';
 import 'package:triage_client/terminal/copy_button_layout.dart';
 import 'package:triage_client/terminal/debug_log.dart';
@@ -54,6 +56,7 @@ import 'package:triage_client/terminal/terminal_cell_buffer.dart';
 import 'package:triage_client/terminal/terminal_cell_protocol.dart';
 import 'package:triage_client/terminal/terminal_key_encoder.dart';
 import 'package:triage_client/terminal/terminal_keyboard_mode.dart';
+import 'package:triage_client/terminal/terminal_links.dart';
 import 'package:triage_client/terminal/terminal_mouse_encoder.dart';
 import 'package:triage_client/terminal/terminal_paste.dart';
 import 'package:triage_client/terminal/terminal_scroll_anchor.dart';
@@ -360,6 +363,7 @@ class TerminalPane extends StatefulWidget {
     this.onViewFit,
     this.onNearTop,
     this.onFetchScrollbackRows,
+    this.onOpenUrl,
     this.bracketedPasteEnabled = false,
     this.isExited = false,
     this.isLoading = false,
@@ -374,6 +378,7 @@ class TerminalPane extends StatefulWidget {
   final bool Function()? onNearTop;
   final void Function(int firstVirtualRow, int lastVirtualRow)?
   onFetchScrollbackRows;
+  final FutureOr<void> Function(Uri uri)? onOpenUrl;
   final bool bracketedPasteEnabled;
 
   /// Plain rows rendered only by the FLUTTER_TEST fallback view.
@@ -460,6 +465,20 @@ class TerminalPane extends StatefulWidget {
   /// ([RenderTerminalGrid]) instead of the [SingleChildScrollView] fallback.
   @visibleForTesting
   static bool debugForceNativeTerminalView = false;
+
+  /// Overrides [kIsWeb] paste chord deferral in widget tests so both web
+  /// DOM-paste and native clipboard-paste paths can be verified on the VM.
+  @visibleForTesting
+  static bool? debugOverrideWebPaste;
+
+  /// Simulates a browser DOM `paste` event routed to the mounted pane for
+  /// [terminalId], returning whether the pane consumed it.
+  @visibleForTesting
+  static bool dispatchWebDomPasteForTest(String terminalId, String text) {
+    final pane = _TerminalPaneState._mountedPanes[terminalId];
+    if (pane == null) return false;
+    return pane._onWebDomPaste(text);
+  }
 
   @override
   State<TerminalPane> createState() => _TerminalPaneState();
@@ -573,6 +592,9 @@ class _TerminalPaneState extends State<TerminalPane>
   bool _ctrlArmed = false;
   bool _isPasting = false;
   bool _isPasteDialogShowing = false;
+  void Function()? _disposeWebPasteListener;
+  Timer? _webPasteFallbackTimer;
+  int _domPasteSeq = 0;
   final MobileAutoSpaceTracker _mobileAutoSpace = MobileAutoSpaceTracker();
 
   TerminalSelectionRange? _selection;
@@ -606,6 +628,12 @@ class _TerminalPaneState extends State<TerminalPane>
   Offset? _mobileTapDownPosition;
   CellOffset? _mobileTapDownCell;
   _AnchoredCell? _mobileLongPressAnchor;
+  TerminalLink? _hoveredLink;
+  Offset? _lastHoverGlobalPosition;
+  int? _linkTapPointer;
+  Offset? _linkTapDownPosition;
+  TerminalLink? _linkTapCandidate;
+  bool _linkRefreshScheduled = false;
   Timer? _autoScrollTimer;
   double _autoScrollVelocity = 0;
   static const double _autoScrollEdge = 28.0;
@@ -624,7 +652,6 @@ class _TerminalPaneState extends State<TerminalPane>
   bool _nearTopCheckScheduled = false;
   double _altScrollDeltaAccum = 0.0;
   final List<Timer> _pointerReleaseTimers = [];
-  VoidCallback? _disposeWebPasteListener;
 
   _AnchoredCell _anchorAt(CellOffset cell) => _AnchoredCell(
     cell: cell,
@@ -639,6 +666,7 @@ class _TerminalPaneState extends State<TerminalPane>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    HardwareKeyboard.instance.addHandler(_handleHardwareKeyForLinks);
     _disposeWebPasteListener = registerWebPasteListener(_onWebDomPaste);
     final savedGen = _sessionSavedEraseScrollbackGen[widget.terminalId];
     if (savedGen != null &&
@@ -827,6 +855,9 @@ class _TerminalPaneState extends State<TerminalPane>
       _mobileTapDownPosition = null;
       _mobileTapDownCell = null;
       _mobileLongPressAnchor = null;
+      _clearLinkTap();
+      _hoveredLink = null;
+      _lastHoverGlobalPosition = null;
       _mouseReportPointer = null;
       _mouseReportButton = TerminalMouseButton.left;
       _mouseReportLastCell = null;
@@ -889,6 +920,9 @@ class _TerminalPaneState extends State<TerminalPane>
       _mobileTapDownPosition = null;
       _mobileTapDownCell = null;
       _mobileLongPressAnchor = null;
+      _clearLinkTap();
+      _hoveredLink = null;
+      _lastHoverGlobalPosition = null;
       _mouseHoverLastCell = null;
       _desktopClickCount = 0;
       _lastDesktopClickAt = null;
@@ -907,6 +941,7 @@ class _TerminalPaneState extends State<TerminalPane>
           );
         }
       });
+      _scheduleHoveredLinkRefresh();
     }
     if (!sessionSwapped &&
         oldWidget.focusCursorRevision != widget.focusCursorRevision) {
@@ -938,6 +973,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleHardwareKeyForLinks);
     WidgetsBinding.instance.removeObserver(this);
     _disposeWebPasteListener?.call();
     _disposeWebPasteListener = null;
@@ -964,6 +1000,8 @@ class _TerminalPaneState extends State<TerminalPane>
     _resizeOutDebounceTimer?.cancel();
     _scrollToCursorTimer?.cancel();
     _autoScrollTimer?.cancel();
+    _webPasteFallbackTimer?.cancel();
+    _webPasteFallbackTimer = null;
     _clearPointerReleaseTimers();
     if (runningUnderFlutterTest()) {
       _lastWorkspaceFittedSize = null;
@@ -981,6 +1019,8 @@ class _TerminalPaneState extends State<TerminalPane>
       !widget.isExited &&
       _isRouteCurrentAndUnobscured &&
       _focusNode.hasFocus;
+
+  bool get _useWebPaste => TerminalPane.debugOverrideWebPaste ?? kIsWeb;
 
   void _onFocusChanged() {
     _syncFocusReporting();
@@ -1548,6 +1588,111 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  TerminalLink? _linkAtGlobal(Offset globalPosition) {
+    final render = _renderGrid;
+    if (render == null || !render.attached || !render.hasSize) return null;
+    try {
+      return render.linkAtOffset(render.globalToLocal(globalPosition));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool get _isLinkModifierPressed {
+    final kb = HardwareKeyboard.instance;
+    return kb.isControlPressed || kb.isMetaPressed;
+  }
+
+  bool get _linksInteractiveNow =>
+      !widget.isObscured &&
+      !widget.isLoading &&
+      widget.interactionEnabled &&
+      (_terminal.mouseMode == 0 || _isLinkModifierPressed);
+
+  MouseCursor get _terminalMouseCursor {
+    if (_hoveredLink != null) return SystemMouseCursors.click;
+    if (_terminal.mouseMode > 0 && !_isLinkModifierPressed) {
+      return SystemMouseCursors.basic;
+    }
+    return SystemMouseCursors.text;
+  }
+
+  void _setHoveredLink(TerminalLink? next) {
+    if (_hoveredLink == next || !mounted) return;
+    setState(() {
+      _hoveredLink = next;
+    });
+    _renderGrid?.hoveredLink = next;
+  }
+
+  void _updateHoveredLinkAt(Offset? globalPosition) {
+    if (_isMobile || globalPosition == null || !_linksInteractiveNow) {
+      _setHoveredLink(null);
+      return;
+    }
+    if (ModalRoute.of(context)?.isCurrent == false) {
+      _setHoveredLink(null);
+      return;
+    }
+    _setHoveredLink(_linkAtGlobal(globalPosition));
+  }
+
+  void _scheduleHoveredLinkRefresh() {
+    if (_isMobile ||
+        _lastHoverGlobalPosition == null ||
+        _linkRefreshScheduled) {
+      return;
+    }
+    _linkRefreshScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _linkRefreshScheduled = false;
+      if (!mounted) return;
+      _updateHoveredLinkAt(_lastHoverGlobalPosition);
+    });
+  }
+
+  bool _handleHardwareKeyForLinks(KeyEvent event) {
+    if (!mounted || _isMobile || _lastHoverGlobalPosition == null) {
+      return false;
+    }
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.controlLeft ||
+        key == LogicalKeyboardKey.controlRight ||
+        key == LogicalKeyboardKey.metaLeft ||
+        key == LogicalKeyboardKey.metaRight) {
+      _updateHoveredLinkAt(_lastHoverGlobalPosition);
+    }
+    return false;
+  }
+
+  void _handleMouseHover(PointerHoverEvent event) {
+    _lastHoverGlobalPosition = event.position;
+    _updateHoveredLinkAt(event.position);
+  }
+
+  void _handleMouseExit(PointerExitEvent _) {
+    _lastHoverGlobalPosition = null;
+    _setHoveredLink(null);
+  }
+
+  void _clearLinkTap() {
+    _linkTapPointer = null;
+    _linkTapDownPosition = null;
+    _linkTapCandidate = null;
+  }
+
+  void _launchTerminalLink(TerminalLink link) {
+    final handler = widget.onOpenUrl ?? openExternalUri;
+    unawaited(
+      Future<void>.sync(() => handler(link.uri)).catchError((
+        Object error,
+        StackTrace stack,
+      ) {
+        tdbg('link', 'openExternalUri failed for ${link.uri}: $error');
+      }),
+    );
+  }
+
   CellOffset? _viewportCellAtGlobal(Offset globalPosition) {
     final render = _renderGrid;
     if (render != null && render.attached && render.hasSize) {
@@ -1608,6 +1753,8 @@ class _TerminalPaneState extends State<TerminalPane>
     if (widget.isObscured || !widget.interactionEnabled) return;
     _mobileAutoSpace.reset();
     _activePointers.add(event.pointer);
+    final hadNonCollapsedSelection =
+        _selection != null && !_selection!.isCollapsed;
     if (!_isMobile) {
       _focusTerminal();
     } else if (_isRouteCurrentAndUnobscured) {
@@ -1631,15 +1778,43 @@ class _TerminalPaneState extends State<TerminalPane>
         _mobileTapDownPosition = null;
         _mobileTapDownCell = null;
       }
+      if (_activePointers.length == 1 &&
+          (event.buttons & kPrimaryButton) != 0 &&
+          _terminal.mouseMode == 0 &&
+          !hadNonCollapsedSelection) {
+        final link = _linkAtGlobal(event.position);
+        if (link != null) {
+          _linkTapPointer = event.pointer;
+          _linkTapDownPosition = event.position;
+          _linkTapCandidate = link;
+        } else {
+          _clearLinkTap();
+        }
+      } else {
+        _clearLinkTap();
+      }
     }
     if (_isMobile || !_isRouteCurrentAndUnobscured) {
       return;
     }
     final mouseButton = _mouseButtonFromFlags(event.buttons);
-    if (!HardwareKeyboard.instance.isShiftPressed &&
+    final kb = HardwareKeyboard.instance;
+    final bypassMouseModeLink =
+        !widget.isExited &&
+            _terminal.mouseMode > 0 &&
+            _isLinkModifierPressed &&
+            !kb.isShiftPressed &&
+            !kb.isAltPressed &&
+            !hadNonCollapsedSelection &&
+            (event.buttons & kPrimaryButton) != 0
+        ? _linkAtGlobal(event.position)
+        : null;
+    if (!kb.isShiftPressed &&
         !widget.isExited &&
         _terminal.mouseMode > 0 &&
-        mouseButton != null) {
+        mouseButton != null &&
+        bypassMouseModeLink == null) {
+      _clearLinkTap();
       final cell = _viewportCellAtGlobal(event.position);
       if (cell == null) return;
       _mouseReportPointer = event.pointer;
@@ -1650,17 +1825,34 @@ class _TerminalPaneState extends State<TerminalPane>
       return;
     }
     if ((event.buttons & kPrimaryButton) == 0) return;
-    if (HardwareKeyboard.instance.isShiftPressed) {
+    if (kb.isShiftPressed) {
+      _clearLinkTap();
       _shiftClickPointer = event.pointer;
       _shiftClickDownPosition = event.position;
     } else {
-      final anchor = _cellAtGlobal(event.position);
-      if (anchor == null) return;
-      _dragPointer = event.pointer;
-      _dragDownPosition = event.position;
-      _dragLastPosition = event.position;
-      _dragAnchorCell = _anchorAt(anchor);
-      _dragSelecting = false;
+      final link =
+          bypassMouseModeLink ??
+          ((!hadNonCollapsedSelection &&
+                  !kb.isAltPressed &&
+                  _terminal.mouseMode == 0)
+              ? _linkAtGlobal(event.position)
+              : null);
+      if (link != null) {
+        _linkTapPointer = event.pointer;
+        _linkTapDownPosition = event.position;
+        _linkTapCandidate = link;
+      } else {
+        _clearLinkTap();
+      }
+      if (_terminal.mouseMode == 0 || widget.isExited) {
+        final anchor = _cellAtGlobal(event.position);
+        if (anchor == null) return;
+        _dragPointer = event.pointer;
+        _dragDownPosition = event.position;
+        _dragLastPosition = event.position;
+        _dragAnchorCell = _anchorAt(anchor);
+        _dragSelecting = false;
+      }
     }
   }
 
@@ -1701,6 +1893,15 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _handlePointerMove(PointerMoveEvent event) {
+    if (event.pointer == _linkTapPointer) {
+      final downPos = _linkTapDownPosition;
+      final slop = _isMobile ? kTouchSlop : _clickMoveSlop;
+      if (_activePointers.length != 1 ||
+          downPos == null ||
+          (event.position - downPos).distance > slop) {
+        _clearLinkTap();
+      }
+    }
     if (event.pointer == _mobileTapPointer) {
       final downPos = _mobileTapDownPosition;
       if (_activePointers.length != 1 ||
@@ -1823,8 +2024,10 @@ class _TerminalPaneState extends State<TerminalPane>
     if (event.pointer == _mouseReportPointer) {
       _cancelActiveMouseReport(event.position);
     }
+    var dragMovedBeyondSlop = false;
     if (event.pointer == _dragPointer) {
       final wasDragSelecting = _dragSelecting;
+      dragMovedBeyondSlop = wasDragSelecting;
       final downPos = _dragDownPosition;
       final anchor = _dragAnchorCell;
       final endPosition = event.position;
@@ -1872,6 +2075,21 @@ class _TerminalPaneState extends State<TerminalPane>
         }
       }
     }
+    if (event.pointer == _linkTapPointer) {
+      final downPos = _linkTapDownPosition;
+      final candidate = _linkTapCandidate;
+      _clearLinkTap();
+      final slop = _isMobile ? kTouchSlop : _clickMoveSlop;
+      if (!dragMovedBeyondSlop &&
+          downPos != null &&
+          candidate != null &&
+          (event.position - downPos).distance <= slop) {
+        final currentLink = _linkAtGlobal(event.position);
+        if (currentLink == null || currentLink.url == candidate.url) {
+          _launchTerminalLink(candidate);
+        }
+      }
+    }
     _checkDeferredBottomSnapOnPointerRelease();
     if (!_hasActivePointerOrPanZoom && _scrollAnchor.hasAnchor) {
       _repinScrollAnchor();
@@ -1898,6 +2116,9 @@ class _TerminalPaneState extends State<TerminalPane>
       _mobileTapPointer = null;
       _mobileTapDownPosition = null;
       _mobileTapDownCell = null;
+    }
+    if (event.pointer == _linkTapPointer) {
+      _clearLinkTap();
     }
     if (event.pointer == _mouseReportPointer) {
       _cancelActiveMouseReport(event.position);
@@ -2030,6 +2251,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _handleMobileLongPressStart(LongPressStartDetails details) {
+    _clearLinkTap();
     if (!_isMobile ||
         widget.isObscured ||
         !widget.interactionEnabled ||
@@ -2561,6 +2783,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _onScrollChanged() {
+    _scheduleHoveredLinkRefresh();
     if (_copyTarget != null) {
       _rebuildForCopyButton();
     }
@@ -2739,6 +2962,7 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   void _onTerminalContentChanged() {
+    _scheduleHoveredLinkRefresh();
     if (!_sessionDestroyed &&
         identical(_mountedPanes[widget.terminalId], this) &&
         (!widget.isLoading || _terminal.lastFrameSeq > 0)) {
@@ -3102,6 +3326,20 @@ class _TerminalPaneState extends State<TerminalPane>
       return KeyEventResult.ignored;
     }
     if (_isPasteChord(event)) {
+      if (_useWebPaste) {
+        if (event is KeyDownEvent) {
+          final seq = _domPasteSeq;
+          _webPasteFallbackTimer?.cancel();
+          _webPasteFallbackTimer = Timer(const Duration(milliseconds: 50), () {
+            if (!mounted || _domPasteSeq != seq) return;
+            unawaited(_pasteFromClipboard());
+          });
+        }
+        // Let the browser process the keystroke so it dispatches a native
+        // DOM `paste` ClipboardEvent (which also works on insecure `http://`
+        // URLs where `navigator.clipboard.readText()` is unavailable).
+        return KeyEventResult.ignored;
+      }
       unawaited(_pasteFromClipboard());
       return KeyEventResult.handled;
     }
@@ -3123,6 +3361,9 @@ class _TerminalPaneState extends State<TerminalPane>
         _disposeWebPasteListener != null &&
         (_isBrowserNativePasteKey(event) ||
             (!canReadWebClipboardAsync() && _isPasteChord(event)))) {
+      return KeyEventResult.ignored;
+    }
+    if (_useWebPaste && _isPasteChord(event)) {
       return KeyEventResult.ignored;
     }
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
@@ -3355,15 +3596,42 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  bool _hasNonTerminalEditableFocus() {
+    final primaryFocus = FocusManager.instance.primaryFocus;
+    if (primaryFocus == null || primaryFocus == _focusNode) {
+      return false;
+    }
+    final focusContext = primaryFocus.context;
+    if (focusContext == null) {
+      return false;
+    }
+    if (focusContext.widget is EditableText) {
+      return true;
+    }
+    return focusContext.findAncestorWidgetOfExactType<EditableText>() != null;
+  }
+
   bool _onWebDomPaste(String text) {
     if (!mounted ||
         text.isEmpty ||
         widget.isExited ||
+        widget.isLoading ||
         !_isRouteCurrentAndUnobscured ||
-        !_focusNode.hasFocus ||
-        _isPasteDialogShowing) {
+        _isPasteDialogShowing ||
+        _hasNonTerminalEditableFocus()) {
       return false;
     }
+    if (!_focusNode.hasFocus) {
+      final activePanes = _mountedPanes.values
+          .where((pane) => pane.mounted && pane._isRouteCurrentAndUnobscured)
+          .length;
+      if (activePanes > 1) {
+        return false;
+      }
+    }
+    _domPasteSeq++;
+    _webPasteFallbackTimer?.cancel();
+    _webPasteFallbackTimer = null;
     if (!_isPasting) {
       unawaited(_handlePaste(text));
     }
@@ -3371,7 +3639,6 @@ class _TerminalPaneState extends State<TerminalPane>
   }
 
   bool _isBracketedPasteEnabled() => _terminal.bracketedPasteMode;
-
   Future<void> _handlePaste(String text) async {
     if (!mounted ||
         text.isEmpty ||
@@ -3395,6 +3662,7 @@ class _TerminalPaneState extends State<TerminalPane>
     if (isBracketed || !isMultiLine(text)) {
       snapOnSend();
       final formatted = formatPasteInput(text, isBracketed);
+      widget.controller.notifyInteraction();
       widget.controller.sendInput(formatted);
       _clearSelection();
       return;
@@ -3415,6 +3683,7 @@ class _TerminalPaneState extends State<TerminalPane>
           chosenText,
           _isBracketedPasteEnabled(),
         );
+        widget.controller.notifyInteraction();
         widget.controller.sendInput(formatted);
         _clearSelection();
       }
@@ -3608,75 +3877,82 @@ class _TerminalPaneState extends State<TerminalPane>
                         duration: const Duration(milliseconds: 150),
                         child: Padding(
                           padding: padding,
-                          child: Listener(
-                            behavior: HitTestBehavior.translucent,
-                            onPointerDown: _handlePointerDown,
-                            onPointerMove: _handlePointerMove,
-                            onPointerHover: _handlePointerHover,
-                            onPointerUp: _handlePointerUp,
-                            onPointerCancel: _handlePointerCancel,
-                            onPointerSignal: _handlePointerSignal,
-                            onPointerPanZoomStart: _handlePointerPanZoomStart,
-                            onPointerPanZoomUpdate: _handlePointerPanZoomUpdate,
-                            onPointerPanZoomEnd: _handlePointerPanZoomEnd,
-                            child: NotificationListener<ScrollEndNotification>(
-                              onNotification: (notification) {
-                                scheduleMicrotask(() {
-                                  if (!mounted ||
-                                      !_scrollController.hasClients) {
-                                    return;
-                                  }
-                                  if (_scrollAnchor.hasAnchor) {
-                                    _repinScrollAnchor();
-                                  } else if (_pendingBottomSnapOnPointerUp) {
-                                    final pos = _scrollController.position;
-                                    if (pos.hasContentDimensions &&
-                                        !pos.isScrollingNotifier.value &&
-                                        !_hasActivePointerOrPanZoom) {
-                                      _pendingBottomSnapOnPointerUp = false;
-                                      _snapToBottom(pos);
+                          child: MouseRegion(
+                            cursor: _terminalMouseCursor,
+                            onHover: _isMobile ? null : _handleMouseHover,
+                            onExit: _isMobile ? null : _handleMouseExit,
+                            child: Listener(
+                              behavior: HitTestBehavior.translucent,
+                              onPointerDown: _handlePointerDown,
+                              onPointerMove: _handlePointerMove,
+                              onPointerHover: _handlePointerHover,
+                              onPointerUp: _handlePointerUp,
+                              onPointerCancel: _handlePointerCancel,
+                              onPointerSignal: _handlePointerSignal,
+                              onPointerPanZoomStart: _handlePointerPanZoomStart,
+                              onPointerPanZoomUpdate:
+                                  _handlePointerPanZoomUpdate,
+                              onPointerPanZoomEnd: _handlePointerPanZoomEnd,
+                              child: NotificationListener<ScrollEndNotification>(
+                                onNotification: (notification) {
+                                  scheduleMicrotask(() {
+                                    if (!mounted ||
+                                        !_scrollController.hasClients) {
+                                      return;
                                     }
-                                  }
-                                });
-                                return false;
-                              },
-                              child: ScrollConfiguration(
-                                behavior: ScrollConfiguration.of(context)
-                                    .copyWith(
-                                      scrollbars: false,
+                                    if (_scrollAnchor.hasAnchor) {
+                                      _repinScrollAnchor();
+                                    } else if (_pendingBottomSnapOnPointerUp) {
+                                      final pos = _scrollController.position;
+                                      if (pos.hasContentDimensions &&
+                                          !pos.isScrollingNotifier.value &&
+                                          !_hasActivePointerOrPanZoom) {
+                                        _pendingBottomSnapOnPointerUp = false;
+                                        _snapToBottom(pos);
+                                      }
+                                    }
+                                  });
+                                  return false;
+                                },
+                                child: ScrollConfiguration(
+                                  behavior: ScrollConfiguration.of(context)
+                                      .copyWith(
+                                        scrollbars: false,
+                                        physics:
+                                            (!widget.isExited &&
+                                                _terminal.isUsingAltBuffer)
+                                            ? const NeverScrollableScrollPhysics()
+                                            : const _TerminalScrollPhysics(),
+                                      ),
+                                  child: MediaQuery(
+                                    data: const MediaQueryData(),
+                                    child: TerminalGridView(
+                                      key: _gridViewKey,
+                                      buffer: _terminal,
+                                      scrollController: _scrollController,
+                                      selection: _selection,
+                                      hoveredLink: _hoveredLink,
+                                      focusNode: _focusNode,
+                                      autofocus: _mayTakeFocus,
+                                      onKeyEvent: _handleGridKeyEvent,
+                                      autoResize: !_metricsResizeSettling,
+                                      stickToBottom: !hasSavedScroll,
+                                      showCursor: !widget.isExited,
+                                      fontSize: _kFontSize,
+                                      lineHeightScale: _kLineHeightScale,
+                                      textScaler: MediaQuery.textScalerOf(
+                                        context,
+                                      ),
                                       physics:
                                           (!widget.isExited &&
                                               _terminal.isUsingAltBuffer)
                                           ? const NeverScrollableScrollPhysics()
                                           : const _TerminalScrollPhysics(),
+                                      onGridMetricsChanged:
+                                          _handleGridMetricsChanged,
+                                      onMissingRowsVisible:
+                                          widget.onFetchScrollbackRows,
                                     ),
-                                child: MediaQuery(
-                                  data: const MediaQueryData(),
-                                  child: TerminalGridView(
-                                    key: _gridViewKey,
-                                    buffer: _terminal,
-                                    scrollController: _scrollController,
-                                    selection: _selection,
-                                    focusNode: _focusNode,
-                                    autofocus: _mayTakeFocus,
-                                    onKeyEvent: _handleGridKeyEvent,
-                                    autoResize: !_metricsResizeSettling,
-                                    stickToBottom: !hasSavedScroll,
-                                    showCursor: !widget.isExited,
-                                    fontSize: _kFontSize,
-                                    lineHeightScale: _kLineHeightScale,
-                                    textScaler: MediaQuery.textScalerOf(
-                                      context,
-                                    ),
-                                    physics:
-                                        (!widget.isExited &&
-                                            _terminal.isUsingAltBuffer)
-                                        ? const NeverScrollableScrollPhysics()
-                                        : const _TerminalScrollPhysics(),
-                                    onGridMetricsChanged:
-                                        _handleGridMetricsChanged,
-                                    onMissingRowsVisible:
-                                        widget.onFetchScrollbackRows,
                                   ),
                                 ),
                               ),
