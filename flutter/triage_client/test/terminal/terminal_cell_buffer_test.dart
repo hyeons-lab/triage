@@ -454,6 +454,61 @@ void main() {
     );
 
     test(
+      'resize keeps bottom cursor rows on shrink and pulls resident scrollback on grow',
+      () {
+        final buf = TerminalCellBuffer(cols: 40, rows: 6);
+        buf.applySyncFrame(
+          _makeFrame(
+            frameSeq: 1,
+            cols: 40,
+            rows: 6,
+            totalScrollbackRows: 2,
+            cursorY: 5,
+            cursorX: 4,
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 2,
+            pushedScrollbackPayload: encodeTcg1PlainTextRows(const <String>[
+              'sb-0',
+              'sb-1',
+            ], cols: 40),
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'line-0',
+              'line-1',
+              'line-2',
+              'line-3',
+              'line-4',
+              'prompt>',
+            ], cols: 40),
+          ),
+        );
+
+        // Shrinking from 6 rows to 3 keeps the bottom prompt and cursor visible.
+        buf.resize(40, 3);
+        expect(buf.viewHeight, 3);
+        expect(buf.cursorY, 2);
+        expect(
+          buf
+              .viewportStyledRows(trimTrailingBlankRows: false)
+              .map((r) => r.spans.map((s) => s.text).join().trimRight())
+              .toList(),
+          ['line-3', 'line-4', 'prompt>'],
+        );
+
+        // Growing from 3 rows to 5 pulls resident scrollback rows down cleanly.
+        buf.resize(40, 5);
+        expect(buf.viewHeight, 5);
+        expect(buf.cursorY, 4);
+        expect(
+          buf
+              .viewportStyledRows(trimTrailingBlankRows: false)
+              .map((r) => r.spans.map((s) => s.text).join().trimRight())
+              .toList(),
+          ['sb-0', 'sb-1', 'line-3', 'line-4', 'prompt>'],
+        );
+      },
+    );
+
+    test(
       'missingScrollbackRanges scans past row 0 in partially populated page',
       () {
         final buf = TerminalCellBuffer(cols: 40, rows: 4);

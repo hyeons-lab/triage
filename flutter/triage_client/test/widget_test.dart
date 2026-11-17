@@ -2333,6 +2333,9 @@ void main() {
     await tester.pumpWidget(TriageClientApp(client: client));
     await tester.pumpAndSettle();
 
+    tester.widget<TerminalPane>(find.byType(TerminalPane)).onViewFit!(95, 34);
+    await tester.pumpAndSettle();
+
     int resizesFor(String sid) =>
         client.resizeSessionCalls.where((c) => c.startsWith('$sid:')).length;
     // 'flutter-spike' is the default-selected remote session.
@@ -2346,10 +2349,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(resizesFor('flutter-spike'), baseline);
 
-    // Full occlusion (screen sleep / hidden) then resume jiggles the host PTY
-    // size (rows-1, then back) so the program repaints over the live stream at
-    // our width — the same heal a manual resize triggers, with no history replay.
-    // Desktop walks through `inactive` on the way down and back up.
+    // Un-hiding / returning from occlusion when the PTY size already matches
+    // must NOT jiggle SIGWINCH and force a redundant full-screen redraw.
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
     await tester.pump();
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
@@ -2358,8 +2359,21 @@ void main() {
     await tester.pump();
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.pumpAndSettle();
-    // Two resizes: the jiggle down to rows-1 and back to the real size.
-    expect(resizesFor('flutter-spike'), baseline + 2);
+    expect(resizesFor('flutter-spike'), baseline);
+
+    // If another device drifted the shared PTY while hidden, resuming reclaims
+    // our grid dimensions cleanly in a single resize.
+    client.emitSnapshot('flutter-spike', ['drifted'], size: (19, 47));
+    await tester.pumpAndSettle();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await tester.pump();
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await tester.pumpAndSettle();
+    expect(resizesFor('flutter-spike'), baseline + 1);
   });
 
   testWidgets(
@@ -2408,13 +2422,9 @@ void main() {
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
       await tester.pumpAndSettle();
 
-      // The reclaim refits and jiggles the host one row short and back, so the
-      // program repaints over the live stream. What it asserts is that a
-      // reclaim happened and took the shape of a jiggle: the refit reads
-      // `session.terminal`, which `SessionVm._flushPendingHistory` resized to
-      // the fitted 95x34 viewport when replaying the snapshot above.
+      // Reclaiming size drift from another device sends a single resize to this
+      // device's fitted grid rather than a double-SIGWINCH rows-1 jiggle.
       expect(client.resizeSessionCalls.skip(beforeReclaim.length), [
-        'flutter-spike:95:33',
         'flutter-spike:95:34',
       ]);
     },

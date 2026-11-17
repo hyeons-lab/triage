@@ -525,5 +525,62 @@ void main() {
         expect(tester.takeException(), isNull);
       },
     );
+
+    testWidgets(
+      'paints contiguous ASCII text runs, multi-space gaps, boxes, and wide glyphs cleanly',
+      (WidgetTester tester) async {
+        final buffer = TerminalCellBuffer(cols: 30, rows: 4);
+        final scrollController = ScrollController();
+        addTearDown(() {
+          scrollController.dispose();
+          buffer.dispose();
+        });
+        buffer.applySyncFrame(
+          TerminalSyncFrameData(
+            frameSeq: 1,
+            rows: 4,
+            cols: 30,
+            totalScrollbackRows: 0,
+            trimmedTopRows: 0,
+            eraseScrollbackGen: 0,
+            cursorX: 0,
+            cursorY: 1,
+            cursorStyle: 2,
+            modeFlags: kModeCursorVisible | kModeFullViewport,
+            mouseMode: 0,
+            mouseReportMode: 0,
+            kittyKeyboardFlags: 0,
+            title: null,
+            viewportCompression: kCellCompressionNone,
+            viewportPayload: encodeTcg1PlainTextRows(const <String>[
+              'git status   col2  ┌─┐  hi',
+              '🚀 rocket  launch',
+            ], cols: 30),
+            pushedScrollbackStartRow: 0,
+            pushedScrollbackRowCount: 0,
+            pushedScrollbackCompression: kCellCompressionNone,
+            pushedScrollbackPayload: Uint8List(0),
+          ),
+        );
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: SizedBox(
+                width: 400,
+                height: 150,
+                child: TerminalGridView(
+                  buffer: buffer,
+                  scrollController: scrollController,
+                  autoResize: false,
+                ),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+        expect(tester.takeException(), isNull);
+      },
+    );
   });
 }

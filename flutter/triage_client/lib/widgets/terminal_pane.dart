@@ -603,6 +603,7 @@ class _TerminalPaneState extends State<TerminalPane>
 
   bool _ctrlArmed = false;
   bool _composerOpen = false;
+  double _observedViewInsetsBottom = 0.0;
   final TextEditingController _composerController = TextEditingController();
   final FocusNode _composerFocusNode = FocusNode();
   String? _dismissedApprovalSignature;
@@ -2557,6 +2558,27 @@ class _TerminalPaneState extends State<TerminalPane>
 
   // --- Grid sizing & resize debounce ---
 
+  bool get _isSoftKeyboardOrComposerActive {
+    if (!_isMobile) return false;
+    if (_composerOpen || _observedViewInsetsBottom > 0.5) return true;
+    final view = WidgetsBinding.instance.platformDispatcher.implicitView;
+    return view != null && view.viewInsets.bottom > 0.5;
+  }
+
+  int _effectiveTerminalRowsForViewport(int nextCols, int fittedRows) {
+    // Keep backend PTY rows at full height while mobile soft keyboard or
+    // composer bar temporarily occludes a primary-screen terminal so
+    // opening/closing the keyboard never sends SIGWINCH or triggers a full
+    // TUI clear-and-reload. Alt-screen apps (vim/less) still shrink cleanly.
+    if (_isSoftKeyboardOrComposerActive &&
+        !_terminal.isUsingAltBuffer &&
+        nextCols == _terminal.viewWidth &&
+        fittedRows < _terminal.viewHeight) {
+      return _terminal.viewHeight;
+    }
+    return fittedRows;
+  }
+
   void _handleGridMetricsChanged(
     int cols,
     int rows,
@@ -2564,7 +2586,8 @@ class _TerminalPaneState extends State<TerminalPane>
     double cellHeight,
   ) {
     final nextCols = cols.clamp(1, kMaxEncodedCols);
-    final nextRows = rows.clamp(1, kMaxViewportRows);
+    final fittedRows = rows.clamp(1, kMaxViewportRows);
+    final nextRows = _effectiveTerminalRowsForViewport(nextCols, fittedRows);
     final pw = (nextCols * cellWidth).round();
     final ph = (nextRows * cellHeight).round();
     _onTerminalResize(nextCols, nextRows, pw, ph);
@@ -2607,7 +2630,12 @@ class _TerminalPaneState extends State<TerminalPane>
       if (isAtBottom && !_metricsRestoreInFlight) {
         _scrollAnchor.clear();
         _clearSavedSessionScroll(widget.terminalId);
-        if (_scrollController.hasClients) {
+        _renderGrid?.stickToBottom = true;
+        if (pos != null &&
+            pos.hasContentDimensions &&
+            pos.pixels < pos.maxScrollExtent - 0.5) {
+          _snapToBottom(pos);
+        } else if (_scrollController.hasClients) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted && !_sessionDestroyed && _scrollController.hasClients) {
               final p = _scrollController.position;
@@ -2703,7 +2731,7 @@ class _TerminalPaneState extends State<TerminalPane>
     if (render != null && render.attached && render.hasSize) {
       final lh = render.lineHeight;
       if (lh > 0) {
-        return max(_terminal.totalLines * lh - render.size.height, 0.0);
+        return max(render.effectiveTotalLines * lh - render.size.height, 0.0);
       }
     }
     return position.maxScrollExtent;
@@ -2717,8 +2745,12 @@ class _TerminalPaneState extends State<TerminalPane>
       setState(() => _metricsResizeSettling = true);
     }
     _metricsSettleTimer?.cancel();
+    // Mobile soft-keyboard open/close inset animations span ~200-250 ms; wait
+    // until animation settles before dispatching SIGWINCH to the daemon.
     _metricsSettleTimer = Timer(
-      const Duration(milliseconds: 80),
+      _isMobile
+          ? const Duration(milliseconds: 260)
+          : const Duration(milliseconds: 80),
       _finishMetricsResizeSettle,
     );
     final hasSavedScroll = _hasValidSavedScroll();
@@ -2766,8 +2798,9 @@ class _TerminalPaneState extends State<TerminalPane>
       return;
     }
     final cols = max(2, render.size.width ~/ cell.width);
-    final rows = max(1, render.size.height ~/ cell.height);
-    if (cols <= 0 || rows <= 0) return;
+    final fittedRows = max(1, render.size.height ~/ cell.height);
+    if (cols <= 0 || fittedRows <= 0) return;
+    final rows = _effectiveTerminalRowsForViewport(cols, fittedRows);
 
     _lastWorkspaceFittedSize = (rows, cols);
     if (widget.isExited) {
@@ -3005,9 +3038,13 @@ class _TerminalPaneState extends State<TerminalPane>
     }
   }
 
+  double _autoBottomTarget(ScrollPosition position) {
+    return _effectiveMaxScrollExtent(position);
+  }
+
   void _snapToBottom(ScrollPosition position) {
     if (!position.hasContentDimensions) return;
-    final target = _effectiveMaxScrollExtent(position);
+    final target = _autoBottomTarget(position);
     _jumpPositionTo(position, target, stickToBottom: true);
     _clearSavedSessionScroll(widget.terminalId);
     _scrollAnchor.clear();
@@ -3904,6 +3941,9 @@ class _TerminalPaneState extends State<TerminalPane>
   @override
   Widget build(BuildContext context) {
     _didBuildOnce = true;
+    final mqInsetBottom = MediaQuery.maybeViewInsetsOf(context)?.bottom ?? 0.0;
+    final viewInsetBottom = View.maybeOf(context)?.viewInsets.bottom ?? 0.0;
+    _observedViewInsetsBottom = max(mqInsetBottom, viewInsetBottom);
     final isTest = runningUnderFlutterTest();
     final useTestFallback =
         isTest && !TerminalPane.debugForceNativeTerminalView;
@@ -4108,6 +4148,9 @@ class _TerminalPaneState extends State<TerminalPane>
                                       onKeyEvent: _handleGridKeyEvent,
                                       autoResize: !_metricsResizeSettling,
                                       stickToBottom: !hasSavedScroll,
+                                      keepKeyboardCursorVisible:
+                                          _isSoftKeyboardOrComposerActive &&
+                                          !_terminal.isUsingAltBuffer,
                                       showCursor: !widget.isExited,
                                       fontSize: _kFontSize,
                                       lineHeightScale: _kLineHeightScale,

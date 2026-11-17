@@ -1630,7 +1630,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         // Same as the resume path: don't wait out the accrued backoff after a
         // sleep/wake that never delivered a lifecycle event.
         _reconnectNowOnResume();
-        _refitActiveSession();
+        _reclaimTerminalSizeIfDrifted();
         _refocusActiveSession();
       }
     });
@@ -2058,15 +2058,9 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           // Reattach at once instead of waiting out the reconnect backoff that
           // accrued while we were backgrounded.
           _reconnectNowOnResume();
-          _refitActiveSession();
+          _reclaimTerminalSizeIfDrifted();
           _refocusActiveSession();
         } else if (regainedFocus) {
-          // Focused again without having been occluded: a desktop window that
-          // was merely behind another, or a browser tab that lost focus. The
-          // occlusion path above always refits; this one only does so when the
-          // PTY has actually drifted from this device's size, since the refit
-          // deliberately jiggles the host to force a repaint and doing that on
-          // every alt-tab would be its own kind of churn.
           _reclaimTerminalSizeIfDrifted();
         }
         break;
@@ -2090,13 +2084,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
         !_selectedSessionGridDriftedFromHost()) {
       return;
     }
-    // Refit and refocus together, through the shared helper so this keeps its
-    // carve-out: on mobile the refocus raises the soft keyboard, which insets
-    // the Scaffold, shrinks the viewport and fires another fit at the smaller
-    // size, which on this path would push that shrunken size onto the shared
-    // PTY. Desktop needs the refocus, since a refit alone leaves the terminal
-    // ignoring input until the session is switched away from and back.
-    _refitAndFocusActiveSession();
+    _refitAndFocusActiveSession(forceJiggle: false);
   }
 
   /// Companion to [SessionVm.hostSizeDriftedFromOwnFit]: true when the
@@ -2146,7 +2134,7 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
   // `RenderTerminalGrid` dimensions first. Because a same-size resize sends no
   // SIGWINCH on the host PTY, the jiggle below (one row shorter, then back)
   // triggers a clean redraw and authoritative `TerminalSync` update.
-  void _refitActiveSession() {
+  void _refitActiveSession({bool forceJiggle = true}) {
     // `_client` is `late` and only assigned by _connectWebSocket; in mock mode it
     // is never set, so guard on _clientInitialized before touching it.
     if (_disposed || !_clientInitialized || _sessions.isEmpty) return;
@@ -2165,13 +2153,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
 
     final generation = _connectGeneration;
     // Ask the unified pane to reconcile `session.terminal` to the live
-    // `RenderTerminalGrid` size before jiggling the daemon PTY.
+    // `RenderTerminalGrid` size before syncing/jiggling the daemon PTY.
     session.terminalController.refit();
     if (session.refitInFlight) return;
 
     final cols = session.terminal.viewWidth;
     final rows = session.terminal.viewHeight;
     if (cols < 2 || rows < 2) return;
+    final sizeMatchesHost =
+        session.hostSizeCols == cols && session.hostSizeRows == rows;
+    final needsJiggle = forceJiggle || sizeMatchesHost;
     final reqSeq = ++session.resizeRequestSeq;
     session.refitInFlight = true;
     unawaited(() async {
@@ -2183,14 +2174,16 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
           session.status == 'exited' ||
           reqSeq != session.resizeRequestSeq;
       try {
-        await _client.resizeSession(
-          sessionId: sessionId,
-          cols: cols,
-          rows: rows - 1,
-        );
-        if (shouldAbortRefit()) return;
-        await Future<void>.delayed(const Duration(milliseconds: 60));
-        if (shouldAbortRefit()) return;
+        if (needsJiggle) {
+          await _client.resizeSession(
+            sessionId: sessionId,
+            cols: cols,
+            rows: rows - 1,
+          );
+          if (shouldAbortRefit()) return;
+          await Future<void>.delayed(const Duration(milliseconds: 60));
+          if (shouldAbortRefit()) return;
+        }
         await _client.resizeSession(
           sessionId: sessionId,
           cols: cols,
@@ -2207,20 +2200,8 @@ class _TriageHomeState extends State<TriageHome> with WidgetsBindingObserver {
     }());
   }
 
-  // Refit and reclaim focus together — what the header "refit" button runs.
-  //
-  // The button is pressed precisely when a session is misbehaving, and a refit
-  // alone leaves the terminal correctly sized but unfocused, so the user has to
-  // click into the pane before they can type.
-  //
-  // Not on mobile, though: there the terminal takes IME input
-  // (`hardwareKeyboardOnly: false`), so requesting focus raises the soft
-  // keyboard, which insets the Scaffold, shrinks the viewport and fires another
-  // fit at the smaller size — undoing the resize the user just asked for. That
-  // viewport jump is the same one #105 fixed for scroll swipes, and it would be
-  // worst on the one control whose whole purpose is sizing.
-  void _refitAndFocusActiveSession() {
-    _refitActiveSession();
+  void _refitAndFocusActiveSession({bool forceJiggle = true}) {
+    _refitActiveSession(forceJiggle: forceJiggle);
     if (!isMobilePlatform()) _refocusActiveSession();
   }
 
@@ -11786,7 +11767,6 @@ class SessionWorkspace extends StatelessWidget {
           ),
         Expanded(
           child: TerminalPane(
-            key: ValueKey(session.title),
             terminalId: session.title,
             controller: session.terminalController,
             terminal: session.terminal,

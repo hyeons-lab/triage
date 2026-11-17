@@ -42,6 +42,7 @@ class TerminalGridView extends StatefulWidget {
     this.onKeyEvent,
     this.autoResize = true,
     this.stickToBottom = true,
+    this.keepKeyboardCursorVisible = false,
     this.showCursor = true,
     this.fontSize = 15.0,
     this.lineHeightScale = 1.2,
@@ -60,6 +61,7 @@ class TerminalGridView extends StatefulWidget {
   final FocusOnKeyEventCallback? onKeyEvent;
   final bool autoResize;
   final bool stickToBottom;
+  final bool keepKeyboardCursorVisible;
   final bool showCursor;
   final double fontSize;
   final double lineHeightScale;
@@ -147,6 +149,7 @@ class TerminalGridViewState extends State<TerminalGridView> {
           hasFocus: _hasFocus,
           autoResize: widget.autoResize,
           stickToBottom: widget.stickToBottom,
+          keepKeyboardCursorVisible: widget.keepKeyboardCursorVisible,
           showCursor: widget.showCursor,
           fontSize: widget.fontSize,
           lineHeightScale: widget.lineHeightScale,
@@ -181,6 +184,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
     required this.hasFocus,
     required this.autoResize,
     required this.stickToBottom,
+    required this.keepKeyboardCursorVisible,
     required this.showCursor,
     required this.fontSize,
     required this.lineHeightScale,
@@ -197,6 +201,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
   final bool hasFocus;
   final bool autoResize;
   final bool stickToBottom;
+  final bool keepKeyboardCursorVisible;
   final bool showCursor;
   final double fontSize;
   final double lineHeightScale;
@@ -215,6 +220,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
       hasFocus: hasFocus,
       autoResize: autoResize,
       stickToBottom: stickToBottom,
+      keepKeyboardCursorVisible: keepKeyboardCursorVisible,
       showCursor: showCursor,
       fontSize: fontSize,
       lineHeightScale: lineHeightScale,
@@ -238,6 +244,7 @@ class _TerminalGridRenderWidget extends LeafRenderObjectWidget {
       ..hasFocus = hasFocus
       ..autoResize = autoResize
       ..stickToBottom = stickToBottom
+      ..keepKeyboardCursorVisible = keepKeyboardCursorVisible
       ..showCursor = showCursor
       ..fontSize = fontSize
       ..lineHeightScale = lineHeightScale
@@ -279,6 +286,7 @@ class RenderTerminalGrid extends RenderBox {
     required bool hasFocus,
     required bool autoResize,
     required bool stickToBottom,
+    required bool keepKeyboardCursorVisible,
     required bool showCursor,
     required double fontSize,
     required double lineHeightScale,
@@ -293,6 +301,7 @@ class RenderTerminalGrid extends RenderBox {
        _hasFocus = hasFocus,
        _autoResize = autoResize,
        _stickToBottom = stickToBottom,
+       _keepKeyboardCursorVisible = keepKeyboardCursorVisible,
        _showCursor = showCursor,
        _fontSize = fontSize,
        _lineHeightScale = lineHeightScale,
@@ -313,6 +322,7 @@ class RenderTerminalGrid extends RenderBox {
   bool _hasFocus;
   bool _autoResize;
   bool _stickToBottom;
+  bool _keepKeyboardCursorVisible;
   bool _showCursor;
   double _fontSize;
   double _lineHeightScale;
@@ -334,6 +344,7 @@ class RenderTerminalGrid extends RenderBox {
   double _notifiedCellHeight = -1.0;
   int _knownTotalLines = -1;
   double _lastMaxScrollExtent = 0.0;
+  double _lastAutoBottomExtent = 0.0;
   bool _inPerformLayout = false;
   bool _layoutInputsConsumed = false;
   bool _deferredLayoutNeeded = false;
@@ -418,6 +429,7 @@ class RenderTerminalGrid extends RenderBox {
     }
     _knownTotalLines = -1;
     _lastMaxScrollExtent = 0.0;
+    _lastAutoBottomExtent = 0.0;
     _resetMetricsNotification();
     _pendingMissingFirst = -1;
     _pendingMissingLast = -1;
@@ -445,6 +457,7 @@ class RenderTerminalGrid extends RenderBox {
     _scrollControllerSwapped = false;
     if (!preserveExtent) {
       _lastMaxScrollExtent = 0.0;
+      _lastAutoBottomExtent = 0.0;
     }
     if (attached) {
       _offset.removeListener(_onScrollOffsetChanged);
@@ -496,6 +509,13 @@ class RenderTerminalGrid extends RenderBox {
     if (value) {
       markNeedsLayout();
     }
+  }
+
+  bool get keepKeyboardCursorVisible => _keepKeyboardCursorVisible;
+  set keepKeyboardCursorVisible(bool value) {
+    if (_keepKeyboardCursorVisible == value) return;
+    _keepKeyboardCursorVisible = value;
+    markNeedsLayout();
   }
 
   bool get showCursor => _showCursor;
@@ -608,18 +628,30 @@ class RenderTerminalGrid extends RenderBox {
   }
 
   void _onBufferChanged() {
+    final nextTotalLines = effectiveTotalLines;
     if (_inPerformLayout) {
       markNeedsPaint();
-      if (_layoutInputsConsumed && _buffer.totalLines != _knownTotalLines) {
+      if (_layoutInputsConsumed && nextTotalLines != _knownTotalLines) {
         _scheduleDeferredLayout();
       }
       return;
     }
-    if (_buffer.totalLines != _knownTotalLines) {
+    if (nextTotalLines != _knownTotalLines) {
       markNeedsLayout();
     } else {
       markNeedsPaint();
     }
+  }
+
+  int get effectiveTotalLines {
+    final totalLines = _buffer.totalLines;
+    if (_keepKeyboardCursorVisible &&
+        !_buffer.isUsingAltBuffer &&
+        _buffer.viewHeight > _fittedRows) {
+      final trimmed = totalLines - _buffer.trailingBlankViewportRows;
+      return min(totalLines, max(_fittedRows, max(0, trimmed)));
+    }
+    return totalLines;
   }
 
   void _onScrollOffsetChanged() {
@@ -794,11 +826,12 @@ class RenderTerminalGrid extends RenderBox {
         }
       }
 
-      final totalLines = _buffer.totalLines;
+      final totalLines = effectiveTotalLines;
       _knownTotalLines = totalLines;
       _layoutInputsConsumed = true;
       final contentHeight = max(size.height, totalLines * _cellHeight);
       final newMaxExtent = max(0.0, contentHeight - size.height);
+      final autoBottomExtent = newMaxExtent;
 
       _offset.applyViewportDimension(size.height);
 
@@ -809,15 +842,18 @@ class RenderTerminalGrid extends RenderBox {
         final currentPixels = _offset.pixels;
         if (!currentPixels.isFinite) {
           final targetPixels = currentPixels.isNaN
-              ? (_stickToBottom ? newMaxExtent : 0.0)
-              : (currentPixels > 0.0 ? newMaxExtent : 0.0);
+              ? (_stickToBottom ? autoBottomExtent : 0.0)
+              : (currentPixels > 0.0 ? autoBottomExtent : 0.0);
           if (_offset is ScrollPosition) {
             (_offset as ScrollPosition).correctPixels(targetPixels);
           }
         } else {
-          final wasAtBottom = currentPixels >= _lastMaxScrollExtent - 0.5;
-          if (_stickToBottom && wasAtBottom && newMaxExtent != currentPixels) {
-            _offset.correctBy(newMaxExtent - currentPixels);
+          final pinAnchor = min(_lastMaxScrollExtent, _lastAutoBottomExtent);
+          final wasAtBottom = currentPixels >= pinAnchor - 0.5;
+          if (_stickToBottom &&
+              wasAtBottom &&
+              autoBottomExtent != currentPixels) {
+            _offset.correctBy(autoBottomExtent - currentPixels);
           } else if (currentPixels > newMaxExtent) {
             _offset.correctBy(newMaxExtent - currentPixels);
           } else if (currentPixels < 0.0) {
@@ -826,6 +862,7 @@ class RenderTerminalGrid extends RenderBox {
         }
       }
       _lastMaxScrollExtent = newMaxExtent;
+      _lastAutoBottomExtent = autoBottomExtent;
       _offset.applyContentDimensions(0.0, newMaxExtent);
     } finally {
       _inPerformLayout = false;
@@ -984,22 +1021,95 @@ class RenderTerminalGrid extends RenderBox {
       }
 
       // 3. Foregrounds, box-drawing/block elements, and text decorations.
-      for (var col = 0; col < maxStored; col++) {
+      var col = 0;
+      while (col < maxStored) {
         final cp = line.getCodePoint(col);
         final width = line.getWidth(col);
         if (cp == 0 && width == 0) {
           // Trailing half of a wide glyph.
+          col++;
           continue;
         }
         final attrs = line.getAttrs(col);
         if ((attrs & kAttrInvisible) != 0) {
+          col++;
           continue;
         }
         final fg = _effectiveCellForeground(line, col, defaultFg, defaultBg);
+        final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
+        if (!hasExtraCombining && width == 1 && cp >= 0x21 && cp <= 0x7E) {
+          final styleMask =
+              ((attrs & kAttrBold) != 0 ? 1 : 0) |
+              ((attrs & kAttrItalic) != 0 ? 2 : 0);
+          final runStart = col;
+          final runBuf = StringBuffer()..writeCharCode(cp);
+          var pendingSpaces = 0;
+          var scan = col + 1;
+          while (scan < maxStored) {
+            final nextCp = line.getCodePoint(scan);
+            final nextWidth = line.getWidth(scan);
+            if (nextWidth != 1) break;
+            final nextAttrs = line.getAttrs(scan);
+            if ((nextAttrs & kAttrInvisible) != 0) break;
+            if (line.getCombining(scan)?.isNotEmpty ?? false) break;
+            if (nextCp == 0x20 || nextCp == 0) {
+              if (pendingSpaces >= 1) break;
+              pendingSpaces++;
+              scan++;
+              continue;
+            }
+            if (nextCp < 0x21 || nextCp > 0x7E) break;
+            final nextFg = _effectiveCellForeground(
+              line,
+              scan,
+              defaultFg,
+              defaultBg,
+            );
+            final nextMask =
+                ((nextAttrs & kAttrBold) != 0 ? 1 : 0) |
+                ((nextAttrs & kAttrItalic) != 0 ? 2 : 0);
+            if (nextFg != fg || nextMask != styleMask) break;
+            if (pendingSpaces == 1) {
+              runBuf.writeCharCode(0x20);
+              pendingSpaces = 0;
+            }
+            runBuf.writeCharCode(nextCp);
+            scan++;
+          }
+          final runEnd = scan - pendingSpaces;
+          final tp = _obtainGlyphPainter(runBuf.toString(), fg, attrs);
+          tp.paint(
+            canvas,
+            Offset(
+              offset.dx + runStart * _cellWidth,
+              rowTop + _glyphBaselineOffset,
+            ),
+          );
+          for (var d = runStart; d < runEnd; d++) {
+            final cellAttrs = line.getAttrs(d);
+            if ((cellAttrs &
+                    (kAttrUnderline | kAttrStrikethrough | kAttrOverline)) !=
+                0) {
+              _paintCellDecorations(
+                canvas,
+                Rect.fromLTWH(
+                  offset.dx + d * _cellWidth,
+                  rowTop,
+                  _cellWidth,
+                  _cellHeight,
+                ),
+                fg,
+                cellAttrs,
+              );
+            }
+          }
+          col = runEnd;
+          continue;
+        }
+
         final cellX = offset.dx + col * _cellWidth;
         final spanWidth = (width == 2 ? 2 : 1) * _cellWidth;
 
-        final hasExtraCombining = line.getCombining(col)?.isNotEmpty ?? false;
         if (cp != 0 && (cp != 0x20 || hasExtraCombining)) {
           final paintedVector =
               !hasExtraCombining &&
@@ -1029,6 +1139,7 @@ class RenderTerminalGrid extends RenderBox {
             attrs,
           );
         }
+        col++;
       }
     }
 
