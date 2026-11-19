@@ -55,6 +55,12 @@ jobs:
       - name: Install flatc
         uses: ./.github/actions/setup-flatc
 
+      - name: Verify agent skill bundles
+        run: |
+          bash -n install.sh
+          bash -n tests/verify-install.sh
+          tests/verify-install.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

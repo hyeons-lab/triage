@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Install the Triage agent skill (triage-coordination) for Muse, Claude Code,
+# Install Triage coordination and teamwork skills for Muse, Claude Code,
 # Codex, and Antigravity/Gemini, so agents in Triage sessions know how to
 # coordinate through the triage-mcp tools.
 #
@@ -30,7 +30,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILLS="triage-coordination"
+SKILLS="triage-coordination agent-teamwork"
 
 AGENTS_BASE="${HOME}/.agents/skills"
 MUSE_BASE="${XDG_CONFIG_HOME:-${HOME}/.config}/muse/skills"
@@ -42,6 +42,7 @@ skill_files() {
   # skill_files <skill>: print the bundled files that make up one skill.
   case "$1" in
     triage-coordination) printf 'SKILL.md agents/openai.yaml\n' ;;
+    agent-teamwork) printf 'SKILL.md agents/openai.yaml references/native-workers.md references/triage-workers.md\n' ;;
     *) printf 'ERROR: unknown skill: %s\n' "$1" >&2; return 1 ;;
   esac
 }
@@ -334,4 +335,4 @@ if [ "${failures}" -gt 0 ]; then
   log "Completed with ${failures} problem(s)."
   exit 1
 fi
-log "Done. Invoke with /triage-coordination in any supported agent."
+log "Done. Invoke /agent-teamwork or /triage-coordination in any supported agent."
