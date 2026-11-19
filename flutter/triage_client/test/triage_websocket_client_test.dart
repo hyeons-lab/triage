@@ -2273,6 +2273,43 @@ void main() {
   });
 
   group('Terminal Cell Sync Protocol (FlatBuffers & JSON)', () {
+    const trimmedOffsetCases = <int, int>{
+      0x100000001: 0x100000001,
+      0x3FFFFFFFFFFFF: 0x3FFFFFFFFFFFF,
+      0x4000000000000: 0x4000000000000,
+      0x4000000000001: 0x4000000000000,
+      0x1FFFFFFFFFFFFF: 0x4000000000000,
+    };
+
+    test('frame parser preserves wide trimmed offsets and clamps at 2^50', () {
+      for (final entry in trimmedOffsetCases.entries) {
+        final frame = TerminalSyncFrameData.fromMap(<String, dynamic>{
+          'trimmed_top_rows': entry.key,
+        });
+        expect(
+          frame.trimmedTopRows,
+          entry.value,
+          reason: 'frame trimmed_top_rows=${entry.key}',
+        );
+      }
+    });
+
+    test('page parser preserves wide trimmed offsets and clamps at 2^50', () {
+      for (final entry in trimmedOffsetCases.entries) {
+        for (final wrapped in <bool>[false, true]) {
+          final body = <String, dynamic>{'trimmed_top_rows': entry.key};
+          final page = TerminalRowsPageData.fromMap(
+            wrapped ? <String, dynamic>{'response': body} : body,
+          );
+          expect(
+            page.trimmedTopRows,
+            entry.value,
+            reason: 'page trimmed_top_rows=${entry.key}, wrapped=$wrapped',
+          );
+        }
+      }
+    });
+
     test(
       'syncTerminalSession, fetchTerminalRows, ackTerminalSync, and TerminalSyncEvent round-trip over binary FlatBuffers',
       () async {

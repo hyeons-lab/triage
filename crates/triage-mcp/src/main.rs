@@ -20,7 +20,13 @@ mod templates;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "triage-mcp";
 
+mod workers;
+
 fn main() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(OsStr::new("worker-update")) {
+        return workers::update_cli(args);
+    }
     let config = ServerConfig::from_args(std::env::args_os().skip(1))?;
     if config.help {
         println!("{}", ServerConfig::HELP);
@@ -253,6 +259,9 @@ impl<A: SessionApi, H: HostBackend> McpServer<A, H> {
             .unwrap_or_else(|| json!({}));
 
         match name {
+            name if workers::TOOL_NAMES.contains(&name) => {
+                return tool_result(workers::call(&self.api, name, arguments)?);
+            }
             "list_templates" => {
                 let map = arguments_object(&arguments)?;
                 if !map.is_empty() {
@@ -702,6 +711,7 @@ fn tool_definitions() -> Value {
             "openWorldHint": false
         }
     }));
+    tools.extend(workers::definitions());
     Value::Array(tools)
 }
 
@@ -1370,6 +1380,7 @@ mod tests {
         shutdowns: Rc<RefCell<Vec<SessionId>>>,
         waits: Rc<RefCell<Vec<WaitForSessionsRequest>>>,
         lifecycle_error: Option<&'static str>,
+        worker_calls: Rc<RefCell<Vec<triage_core::workers::WorkerRequest>>>,
     }
 
     impl RecordingApi {
@@ -1411,6 +1422,7 @@ mod tests {
                 shutdowns: Rc::new(RefCell::new(Vec::new())),
                 waits: Rc::new(RefCell::new(Vec::new())),
                 lifecycle_error: None,
+                worker_calls: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -1432,6 +1444,16 @@ mod tests {
     }
 
     impl SessionApi for RecordingApi {
+        fn worker_operation(
+            &self,
+            request: triage_core::workers::WorkerRequest,
+        ) -> Result<triage_core::workers::WorkerResponse> {
+            self.worker_calls.borrow_mut().push(request);
+            if let Some(error) = self.lifecycle_error {
+                bail!(error);
+            }
+            Ok(triage_core::workers::WorkerResponse::Groups(Vec::new()))
+        }
         fn list_sessions(&self) -> Result<Vec<SessionId>> {
             Ok(self.sessions.clone())
         }
@@ -1592,6 +1614,81 @@ mod tests {
     }
 
     #[test]
+    fn managed_worker_arguments_are_strict_and_errors_do_not_call_the_backend() {
+        let api = RecordingApi::new();
+        let server = McpServer::new(api.clone());
+        let spawn = json!({"group_id":"group-a","parent_session_id":"session-1","key":"a","profile":"codex","cwd":absolute_test_cwd(),"task":"Review"});
+        let mut invalid = spawn.clone();
+        invalid["cwd"] = json!("relative");
+        let mut unknown = spawn.clone();
+        unknown["extra"] = json!(true);
+        let mut null = spawn.clone();
+        null["task"] = Value::Null;
+        let mut bad_id = spawn.clone();
+        bad_id["parent_session_id"] = json!("../bad");
+        let mut bad_key = spawn.clone();
+        bad_key["key"] = json!("bad key");
+        for (name, args) in [
+            ("spawn_worker", json!([])),
+            ("spawn_worker", json!([spawn.clone()])),
+            ("spawn_worker", invalid),
+            ("spawn_worker", unknown),
+            ("spawn_worker", null),
+            ("spawn_worker", bad_id),
+            ("spawn_worker", bad_key),
+            ("list_worker_groups", json!({"extra":true})),
+            ("get_worker_group", json!({"group_id":null})),
+            (
+                "update_worker",
+                json!({"group_id":"group-a","task_id":"task-a","session_id":"worker-a","phase":"succeeded"}),
+            ),
+            (
+                "update_worker",
+                json!({"group_id":"group-a","task_id":"task-a","session_id":"worker-a","phase":"launched"}),
+            ),
+            (
+                "cleanup_worker_group",
+                json!({"group_id":"group-a","extra":true}),
+            ),
+            (
+                "cleanup_worker_group",
+                json!({"group_id":"group-a","subtree_session_id":null}),
+            ),
+            (
+                "update_worker",
+                json!({"group_id":"group-a","task_id":"task-a","session_id":"worker-a","phase":"ready","result":null}),
+            ),
+        ] {
+            let error = server
+                .call_tool(json!({"name":name,"arguments":args}))
+                .unwrap_err();
+            assert!(
+                matches!(error, ToolCallError::Protocol(_)),
+                "{name}: {error:?}"
+            );
+        }
+        assert!(api.worker_calls.borrow().is_empty());
+        server
+            .call_tool(json!({"name":"spawn_worker","arguments":spawn}))
+            .unwrap();
+        assert_eq!(api.worker_calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn managed_worker_backend_failures_are_tool_errors() {
+        let mut api = RecordingApi::new();
+        api.lifecycle_error = Some("registry unavailable");
+        let server = McpServer::new(api);
+        let response = server
+            .handle_request(
+                "tools/call",
+                Some(json!({"name":"list_worker_groups","arguments":{}})),
+            )
+            .unwrap();
+        assert_eq!(response["isError"], true);
+    }
+
+    #[test]
     fn lists_tools() {
         let server = McpServer::new(RecordingApi::new());
 
@@ -1607,7 +1704,7 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 19);
         assert_eq!(tools[0]["name"], "list_sessions");
         let names = tools
             .iter()
@@ -1628,6 +1725,13 @@ mod tests {
                 "ack_session_messages",
                 "list_templates",
                 "list_hosts",
+                "list_worker_profiles",
+                "create_worker_group",
+                "list_worker_groups",
+                "get_worker_group",
+                "spawn_worker",
+                "update_worker",
+                "cleanup_worker_group",
             ]
         );
     }

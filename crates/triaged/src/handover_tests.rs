@@ -118,6 +118,7 @@ mod tests {
     fn failed_recovery_log_reservation_does_not_change_session_identity() -> anyhow::Result<()> {
         let temp_dir = TempDir::new()?;
         let mut session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-1")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -163,6 +164,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path)?;
         let sessions = (0..crate::handover::MAX_FDS_PER_SEND + 1)
             .map(|index| crate::handover::HandoverSession {
+                instance_id: crate::session::new_session_instance(),
                 id: SessionId::new(format!("session-{}", index + 1)).unwrap(),
                 command: "/bin/sh".to_string(),
                 args: Vec::new(),
@@ -246,6 +248,7 @@ mod tests {
         let socket_path = temp_dir.path.join("fallback.sock");
         let listener = UnixListener::bind(&socket_path)?;
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-fallback").unwrap(),
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -339,6 +342,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path)?;
         let state = crate::handover::HandoverState {
             sessions: vec![crate::handover::HandoverSession {
+                instance_id: crate::session::new_session_instance(),
                 id: SessionId::new("session-1")?,
                 command: "/bin/sh".to_string(),
                 args: Vec::new(),
@@ -689,6 +693,7 @@ mod tests {
     #[test]
     fn handover_json_without_lease_defaults_to_unheld() {
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("legacy-session").unwrap(),
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -858,6 +863,7 @@ mod tests {
         // `log_path` points at a directory, so opening it for append fails and
         // the first session never becomes live.
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-1")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -958,6 +964,7 @@ mod tests {
 
         let session = |id: &str, pid: u32| -> anyhow::Result<crate::handover::HandoverSession> {
             Ok(crate::handover::HandoverSession {
+                instance_id: crate::session::new_session_instance(),
                 id: SessionId::new(id)?,
                 command: "/bin/sh".to_string(),
                 args: Vec::new(),
@@ -1098,6 +1105,7 @@ mod tests {
         crate::handover::remember_handover_peer_token(Some([1; 16]));
         let stale = FdProbe::new(&temp_dir.path, "stale-recovery-session")?;
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-1")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -1161,6 +1169,7 @@ mod tests {
         crate::handover::remember_handover_peer_token(Some([1; 16]));
         let retained = FdProbe::new(&temp_dir.path, "legacy-retained")?;
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-1")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -1230,6 +1239,7 @@ mod tests {
             .expect("bound socket has an identity");
         let stale = FdProbe::new(&temp_dir.path, "tokenless-stale")?;
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-1")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -1308,6 +1318,7 @@ mod tests {
         let stale = FdProbe::new(&temp_dir.path, "stale-duplicate")?;
         let fresh = FdProbe::new(&temp_dir.path, "fresh-duplicate")?;
         let session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-1")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),
@@ -1814,6 +1825,7 @@ mod tests {
         // A pre-field blob (watermark fields absent) beside a live session:
         // adoption must claim the live counters as fully logged, not zero.
         let mut session = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-legacy")?,
             command: "/bin/sh".to_string(),
             args: Vec::new(),

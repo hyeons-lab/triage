@@ -188,6 +188,8 @@ pub struct PtySession {
 }
 
 pub struct SessionActor {
+    /// Shared exit observation avoids actor round trips for worker status.
+    child_exited: Arc<AtomicBool>,
     tx: Sender<ActorCommand>,
     worker: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
@@ -284,12 +286,16 @@ struct ActorWaitProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionManagerConfig {
     pub log_dir: PathBuf,
+    /// Optional profiles for embedded managers; otherwise read the daemon config.
+    pub worker_profiles:
+        Option<std::collections::BTreeMap<String, triage_core::workers::WorkerProfile>>,
 }
 
 impl SessionManagerConfig {
     pub fn new(log_dir: impl Into<PathBuf>) -> Self {
         Self {
             log_dir: log_dir.into(),
+            worker_profiles: None,
         }
     }
 
@@ -455,7 +461,14 @@ impl SessionInbox {
     }
 }
 
+mod workers;
+
+pub(crate) fn new_session_instance() -> String {
+    hex::encode(rand::random::<[u8; 16]>())
+}
+
 pub struct SessionManager {
+    worker_registry: Mutex<std::result::Result<workers::WorkerRegistry, String>>,
     config: SessionManagerConfig,
     next_session: AtomicU64,
     /// Side inboxes for session-to-session coordination mail (agents via
@@ -648,6 +661,7 @@ struct SessionStamps {
 /// Bounded capacity for each connection's global-push channel. If a client
 /// can't keep up, snippet updates are dropped (the next regeneration resends).
 const GLOBAL_PUSH_CHANNEL_CAPACITY: usize = 256;
+const CONTEXT_RESEND_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct PairingChallengeInfo {
@@ -785,6 +799,8 @@ fn encode_manifest(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSession {
     id: SessionId,
+    #[serde(default = "new_session_instance")]
+    instance_id: String,
     command: String,
     args: Vec<String>,
     cwd: Option<PathBuf>,
@@ -830,6 +846,7 @@ struct PersistedSession {
 
 #[derive(Debug, Clone)]
 struct PersistedSessionLaunch {
+    instance_id: String,
     command: String,
     args: Vec<String>,
     cwd: Option<PathBuf>,
@@ -842,6 +859,7 @@ struct PersistedSessionLaunch {
 impl From<&SessionConfig> for PersistedSessionLaunch {
     fn from(config: &SessionConfig) -> Self {
         Self {
+            instance_id: new_session_instance(),
             command: config.command.clone(),
             args: config.args.clone(),
             cwd: config.cwd.clone(),
@@ -857,6 +875,7 @@ impl PersistedSessionLaunch {
     fn into_persisted(self, id: SessionId, exited: bool) -> PersistedSession {
         PersistedSession {
             id,
+            instance_id: self.instance_id,
             command: self.command,
             args: self.args,
             cwd: self.cwd,
@@ -884,6 +903,8 @@ impl SessionManager {
             (HashMap::new(), SessionPins::default(), HashMap::new())
         });
         let next_session = next_session_sequence(sessions.keys());
+        let worker_registry =
+            workers::WorkerRegistry::load(&config.log_dir).map_err(|e| format!("{e:#}"));
         let paired_devices = load_paired_devices(&config.log_dir);
         #[cfg(not(test))]
         let (require_pairing, tailscale_pair_users) =
@@ -904,6 +925,7 @@ impl SessionManager {
         let compression_worker = Arc::new(crate::storage::CompressionWorker::start());
         Self {
             config,
+            worker_registry: Mutex::new(worker_registry),
             next_session: AtomicU64::new(next_session),
             inboxes: Mutex::new(HashMap::new()),
             inbox_signal: Condvar::new(),
@@ -965,6 +987,7 @@ impl SessionManager {
     /// drop — a handover that fails before committing leaves the daemon able to
     /// serve a later one and to start sessions again.
     pub fn begin_handover(&self) -> Option<HandoverGuard<'_>> {
+        let _workers = self.worker_registry.try_lock().ok()?;
         if self.handover_operation_in_flight() {
             return None;
         }
@@ -2917,10 +2940,9 @@ impl SessionManager {
     }
 
     /// Converts a `Live` session whose child process has already exited into a
-    /// `Historical` session in place, so it can be restored. Nothing else moves
-    /// a dead `Live` session to `Historical` (that only happens on a daemon
-    /// restart via the manifest), so without this a session that dies while live
-    /// — notably one adopted across a handover — can never be re-spawned.
+    /// `Historical` session in place, so it can be restored. This path retains
+    /// the historical session for a later restore; owned cleanup removes a
+    /// finished actor directly after confirming child exit.
     ///
     /// Returns `Ok(())` when the session is left unchanged (still running, not
     /// `Live`, or not restorable) or successfully demoted; returns `Err`
@@ -3355,6 +3377,7 @@ impl SessionManager {
 
             handover_sessions.push(crate::handover::HandoverSession {
                 id,
+                instance_id: launch.instance_id,
                 command: launch.command,
                 args: launch.args,
                 cwd: launch.cwd,
@@ -3676,6 +3699,7 @@ impl SessionManager {
         mut state: crate::handover::HandoverState,
         fds: Vec<std::os::unix::io::RawFd>,
     ) -> Result<()> {
+        self.reload_workers();
         if !state.judge_history.is_empty() {
             self.merge_inherited_judge_history(std::mem::take(&mut state.judge_history));
         }
@@ -3893,6 +3917,7 @@ impl SessionManager {
         }
 
         let launch = PersistedSessionLaunch {
+            instance_id: h_sess.instance_id.clone(),
             command: h_sess.command.clone(),
             args: h_sess.args.clone(),
             cwd: h_sess.cwd.clone(),
@@ -3942,6 +3967,8 @@ impl SessionManager {
         // a real state (never typed in), not a collapse to repair.
         let last_input_ms = Arc::new(AtomicU64::new(h_sess.last_input_ms));
         let actor_last_input_ms = Arc::clone(&last_input_ms);
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let actor_child_exited = Arc::clone(&child_exited);
 
         let (reader_start_tx, reader_start_rx) = mpsc::channel();
         let reader = thread::Builder::new()
@@ -3968,6 +3995,7 @@ impl SessionManager {
             .name("session-actor-worker".into())
             .spawn(move || {
                 let state = ActorState {
+                    child_exited: actor_child_exited,
                     master,
                     child,
                     process_identity,
@@ -3994,6 +4022,7 @@ impl SessionManager {
                     agent_tracker: crate::agent_detect::FgAgentTracker::seeded(inherited_agent),
                     global_senders,
                     context_resend_pending: false,
+                    last_context_broadcast: None,
                     last_cwd_poll: Some(Instant::now()),
                     subscribers: Vec::new(),
                     event_log: VecDeque::new(),
@@ -4016,6 +4045,7 @@ impl SessionManager {
         };
 
         let actor = SessionActor {
+            child_exited,
             tx: command_tx,
             worker: Some(worker),
             reader: Some(reader),
@@ -4480,6 +4510,14 @@ fn spawn_adopted_pty_runtime(
 }
 
 impl ManagedSession {
+    fn instance_id(&self) -> &str {
+        match self {
+            Self::Live { launch, .. } => &launch.instance_id,
+            Self::Historical { session, .. } | Self::Restoring { session, .. } => {
+                &session.persisted.instance_id
+            }
+        }
+    }
     fn persisted(&self, session_id: SessionId) -> PersistedSession {
         match self {
             Self::Live {
@@ -4579,6 +4617,12 @@ impl Drop for HandoverGuard<'_> {
 }
 
 impl SessionApi for SessionManager {
+    fn worker_operation(
+        &self,
+        request: triage_core::workers::WorkerRequest,
+    ) -> Result<triage_core::workers::WorkerResponse> {
+        self.manage_workers(request)
+    }
     fn list_sessions(&self) -> Result<Vec<SessionId>> {
         let sessions = self.sessions()?;
         let mut ids: Vec<SessionId> = sessions.keys().cloned().collect();
@@ -4592,139 +4636,7 @@ impl SessionApi for SessionManager {
     }
 
     fn start_session(&self, request: StartSessionRequest) -> Result<SessionId> {
-        // Refuse while a handover is in flight: the outgoing daemon has already
-        // snapshotted the session set it is transferring, so a session started
-        // now would not be among the handed-off descriptors and would be lost
-        // when that daemon detaches and exits. The window is brief (a swap), and
-        // failing loudly is far better than silently dropping the session.
-        //
-        // This early check is only a courtesy so we don't fork a PTY we are about
-        // to throw away; it is NOT the one that makes this safe. The authoritative
-        // re-check happens below under the `sessions` lock — see there.
-        if self.handover_in_flight() {
-            bail!("a handover is in progress; try again once the daemon swap completes");
-        }
-        request.validate()?;
-        let parent_session_id = request.parent_session_id;
-        let outlive_parent = request.outlive_parent;
-        if let Some(parent_id) = parent_session_id.as_ref() {
-            let sessions = self.sessions()?;
-            ensure!(
-                matches!(sessions.get(parent_id), Some(ManagedSession::Live { .. })),
-                "parent session {parent_id} not found or not live"
-            );
-        }
-        fs::create_dir_all(&self.config.log_dir).with_context(|| {
-            format!("creating session log dir {}", self.config.log_dir.display())
-        })?;
-
-        let session_id = self.allocate_session_id()?;
-        let log_path = self.log_path(&session_id);
-        let config = SessionConfig {
-            command: request.command,
-            args: request.args,
-            cwd: request.cwd,
-            size: request.size,
-            log_path,
-            session_id: Some(session_id.clone()),
-        };
-        let mut launch = PersistedSessionLaunch::from(&config);
-        launch.parent_session_id = parent_session_id;
-        launch.outlive_parent = outlive_parent;
-        let last_known_cwd = launch.cwd.clone().or_else(|| std::env::current_dir().ok());
-        let agent_update_tx = self.agent_update_tx();
-        let agent_tracking = agent_update_tx.is_some();
-        let actor = SessionActor::spawn_managed_with_lifecycle(
-            config,
-            session_id.clone(),
-            self.dirty_tx(),
-            self.cwd_update_tx(),
-            agent_update_tx,
-            Some(self.global_senders()),
-            self.compression_tx(),
-            self.actor_lifecycle_hooks(),
-        )?;
-        let actor_tx = actor.tx.clone();
-        let last_activity_ms = actor.last_activity_ms();
-        let last_input_ms = actor.last_input_ms();
-        let initial_cwd = last_known_cwd.clone();
-
-        let mut sessions = self.sessions()?;
-
-        // Authoritative handover gate. The check at the top of this function ran
-        // before `spawn_managed` forked the PTY (tens of milliseconds ago), so a
-        // handover that began in the meantime would have snapshotted the session
-        // set without this session, and `detach_all_live_sessions` would then drop
-        // it on the floor when the outgoing daemon exits. Re-checking here closes
-        // that window, because `begin_handover` sets the flag before
-        // `serialize_active_sessions` takes this lock at all: either we insert first,
-        // under this guard, and are transferred, or we observe the flag and refuse.
-        // (Note what the argument no longer rests on: that snapshot releases the lock
-        // before its actor round-trips, so "held across the whole snapshot" would be
-        // the wrong reason to trust this gate.)
-        //
-        // The forked child is killed by dropping `actor` on this path, which is
-        // correct: it never became a session anyone can reach.
-        if self.handover_in_flight() {
-            drop(sessions);
-            bail!("a handover is in progress; try again once the daemon swap completes");
-        }
-
-        sessions.insert(
-            session_id.clone(),
-            ManagedSession::Live {
-                actor,
-                lease: InputLeaseState::default(),
-                launch,
-                last_known_cwd,
-                agent: None,
-                agent_tracking,
-                agent_observed: false,
-            },
-        );
-        if let Err(error) = self.persist_manifest(&sessions) {
-            let inserted = sessions.remove(&session_id);
-            drop(sessions);
-            // A send racing the failed start could have queued mail for a
-            // session that now never exists; drop it with the session.
-            self.forget_inbox(&session_id);
-            if let Some(ManagedSession::Live { actor, .. }) = inserted
-                && let Err(shutdown_error) = actor.shutdown()
-            {
-                tracing::warn!(
-                    error = ?shutdown_error,
-                    "failed to shut down session after manifest persistence failure"
-                );
-            }
-            return Err(error);
-        }
-        drop(sessions);
-
-        let context = request_session_context(&actor_tx).ok().flatten();
-        let (repository_root, worktree_root, branch) = match &context {
-            Some(ctx) => (
-                ctx.repository_root
-                    .as_deref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                ctx.worktree_root
-                    .as_deref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                ctx.branch_name().map(str::to_string),
-            ),
-            None => (None, None, None),
-        };
-        let current_working_directory = initial_cwd.map(|p| p.to_string_lossy().into_owned());
-        self.broadcast_global(ServerMessage::SessionStarted {
-            session_id: session_id.clone(),
-            current_working_directory,
-            repository_root,
-            worktree_root,
-            branch,
-            last_activity_ms,
-            last_input_ms,
-        });
-        self.state_signal.notify();
-        Ok(session_id)
+        self.start_session_inner(request, None)
     }
 
     fn attach_session(&self, request: AttachSessionRequest) -> Result<AttachSessionResponse> {
@@ -5067,6 +4979,7 @@ impl SessionApi for SessionManager {
         // respawning an agent: if the attachment later proves stale, restore
         // still has a baseline to fall back to.
         let launch = PersistedSessionLaunch {
+            instance_id: persisted.instance_id.clone(),
             command: persisted.command.clone(),
             args: persisted.args.clone(),
             cwd: shell_config.cwd.clone(),
@@ -5731,179 +5644,8 @@ impl SessionApi for SessionManager {
     }
 
     fn shutdown_session(&self, session_id: SessionId) -> Result<CompletedSession> {
-        let _shutdown_guard = self.begin_session_shutdown(&session_id)?;
-        ensure!(
-            !self.session_awaits_adoption(&session_id),
-            "session {session_id} is awaiting inherited PTY adoption"
-        );
-        self.shutdown_initiated_ids
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(session_id.clone());
-
-        enum ShutdownTarget {
-            Live {
-                tx: Sender<ActorCommand>,
-                launch: PersistedSessionLaunch,
-                last_known_cwd: Option<PathBuf>,
-                last_activity_ms: u64,
-                last_input_ms: u64,
-                prepared_manifest: PathBuf,
-            },
-            Historical {
-                completed: CompletedSession,
-                log_path: PathBuf,
-            },
-        }
-
-        let target = {
-            let mut sessions = self.sessions()?;
-            let session = sessions
-                .get(&session_id)
-                .with_context(|| format!("session {session_id} not found"))?;
-            match session {
-                ManagedSession::Live {
-                    actor,
-                    launch,
-                    last_known_cwd,
-                    ..
-                } => ShutdownTarget::Live {
-                    tx: actor.tx.clone(),
-                    launch: launch.clone(),
-                    last_known_cwd: last_known_cwd.clone(),
-                    last_activity_ms: actor.last_activity_ms(),
-                    last_input_ms: actor.last_input_ms(),
-                    // Validate that the removal manifest can be encoded and
-                    // written before doing anything irreversible to the child.
-                    // It is rewritten from the current map after termination,
-                    // so unrelated session changes made meanwhile are retained.
-                    prepared_manifest: self.prepare_shutdown_manifest(&sessions, &session_id)?,
-                },
-                ManagedSession::Historical { session, .. } => {
-                    let completed = session.completed_session();
-                    let log_path = session.persisted.log_path.clone();
-                    let temp_path = self.prepare_shutdown_manifest(&sessions, &session_id)?;
-                    if let Err(error) = replace_manifest(&temp_path, &self.config.manifest_path()) {
-                        let _ = fs::remove_file(&temp_path);
-                        return Err(error);
-                    }
-                    let Some(_removed) = sessions.remove(&session_id) else {
-                        bail!("historical session {session_id} disappeared during shutdown");
-                    };
-                    self.forget_custom_label(&session_id);
-                    ShutdownTarget::Historical {
-                        completed,
-                        log_path,
-                    }
-                }
-                ManagedSession::Restoring { .. } => {
-                    bail!("session {session_id} is being restored")
-                }
-            }
-        };
-
-        let (completed, log_path) = match target {
-            ShutdownTarget::Historical {
-                completed,
-                log_path,
-            } => (completed, log_path),
-            ShutdownTarget::Live {
-                tx,
-                launch,
-                last_known_cwd,
-                last_activity_ms,
-                last_input_ms,
-                prepared_manifest,
-            } => {
-                let completed = match request_actor_shutdown(&tx) {
-                    Ok(completed) => completed,
-                    Err(error) => {
-                        let _ = fs::remove_file(&prepared_manifest);
-                        return Err(error);
-                    }
-                };
-
-                let mut persisted = launch.clone().into_persisted(session_id.clone(), true);
-                persisted.last_known_cwd = last_known_cwd;
-                persisted.last_activity_ms = last_activity_ms;
-                persisted.last_input_ms = last_input_ms;
-                let historical_fallback = HistoricalSession::restore(persisted).map(Box::new);
-
-                let (mut actor, commit_result) = {
-                    // Termination already succeeded, so a poisoned manager lock
-                    // cannot be allowed to leave a dead actor registered as live.
-                    let mut sessions = self
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let rewrite_result = self
-                        .prepare_shutdown_manifest(&sessions, &session_id)
-                        .and_then(|temp_path| {
-                            replace_manifest(&temp_path, &self.config.manifest_path())
-                        });
-                    if rewrite_result.is_err() {
-                        let _ = fs::remove_file(&prepared_manifest);
-                    }
-                    let removed = sessions.remove(&session_id).with_context(|| {
-                        format!("session {session_id} disappeared during shutdown")
-                    })?;
-                    let ManagedSession::Live { actor, .. } = removed else {
-                        sessions.insert(session_id.clone(), removed);
-                        bail!("session {session_id} changed state during shutdown");
-                    };
-                    if let Err(error) = &rewrite_result {
-                        match historical_fallback {
-                            Ok(session) => {
-                                sessions.insert(
-                                    session_id.clone(),
-                                    ManagedSession::Historical {
-                                        session,
-                                        lease: InputLeaseState::default(),
-                                    },
-                                );
-                            }
-                            Err(ref fallback_error) => tracing::error!(
-                                session_id = %session_id,
-                                error = ?fallback_error,
-                                "could not rebuild a historical view after shutdown manifest commit failed"
-                            ),
-                        }
-                        tracing::error!(
-                            session_id = %session_id,
-                            error = ?error,
-                            "session stopped, but committing its manifest removal failed"
-                        );
-                    } else {
-                        self.forget_custom_label(&session_id);
-                    }
-                    (actor, rewrite_result)
-                };
-                actor.join_threads();
-                commit_result?;
-                (completed, launch.log_path)
-            }
-        };
-
-        self.forget_snippet(&session_id);
-        self.forget_judge_override(&session_id);
-        self.clear_pending_approval(&session_id);
-        self.processed_exit_events
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&session_id);
-        self.forget_inbox(&session_id);
-        self.forget_parked_input(&session_id);
-        self.forget_custom_label(&session_id);
-        // Only after the actor has shut down, so nothing is still writing to it.
-        // A session removed from the manifest can never be restored, so its log
-        // is unreachable from here on and would otherwise leak forever.
-        remove_session_log(&session_id, &log_path);
-        self.cascade_shutdown_children(&session_id);
-        self.state_signal.notify();
-        self.broadcast_global(ServerMessage::SessionTerminated {
-            session_id: session_id.clone(),
-        });
-        Ok(completed)
+        self.shutdown_session_inner(session_id, None, None)?
+            .context("raw session shutdown did not return completed output")
     }
 
     #[allow(clippy::type_complexity)]
@@ -8138,6 +7880,8 @@ impl SessionActor {
         let actor_last_input_ms = Arc::clone(&last_input_ms);
         let lifecycle = Arc::new(ActorLifecycleShared::default());
         let actor_lifecycle = Arc::clone(&lifecycle);
+        let child_exited = Arc::new(AtomicBool::new(false));
+        let actor_child_exited = Arc::clone(&child_exited);
         let reader = thread::Builder::new()
             .name("session-actor-reader".into())
             .spawn(move || read_pty_output(reader, output_tx))
@@ -8146,6 +7890,7 @@ impl SessionActor {
             .name("session-actor-worker".into())
             .spawn(move || {
                 let state = ActorState {
+                    child_exited: actor_child_exited,
                     master,
                     child,
                     process_identity,
@@ -8168,6 +7913,7 @@ impl SessionActor {
                     agent_tracker: crate::agent_detect::FgAgentTracker::seeded(initial_agent),
                     global_senders,
                     context_resend_pending: false,
+                    last_context_broadcast: None,
                     // Throttle the cwd poll from spawn so the idle refresh doesn't
                     // fire before the session has settled (and races the initial
                     // snapshot); the first poll runs one interval in.
@@ -8184,6 +7930,7 @@ impl SessionActor {
             .context("spawning session actor worker thread")?;
 
         Ok(Self {
+            child_exited,
             tx: command_tx,
             worker: Some(worker),
             reader: Some(reader),
@@ -8280,9 +8027,9 @@ impl SessionActor {
     /// Taking `self` by value is load-bearing, not incidental: it is what stops a
     /// future caller keeping a detached actor — and so its `Sender` — alive, which
     /// would leave the worker loop nothing to end on. Clearing the handles only
-    /// gives up the right to join. The sole caller,
-    /// `SessionManager::detach_all_live_sessions`, documents what threads do
-    /// from here and why the PTY master closing is safe.
+    /// gives up the right to join. `SessionManager::detach_all_live_sessions`
+    /// documents PTY ownership during handover. Owned cleanup also disarms an
+    /// already-finished actor after observing its child exit.
     fn detach(mut self) {
         self.worker = None;
         self.reader = None;
@@ -8321,6 +8068,7 @@ pub(crate) struct DirtyTick {
 pub(crate) type DirtySender = std::sync::mpsc::Sender<DirtyTick>;
 
 struct ActorState {
+    child_exited: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     process_identity: Option<crate::handover::HandoverProcessIdentity>,
@@ -8366,9 +8114,10 @@ struct ActorState {
     global_senders: Option<GlobalSenders>,
     /// Set when the last [`ServerMessage::SessionContextUpdated`] broadcast was
     /// dropped for at least one full client channel. Because context updates are
-    /// only emitted on change, the actor re-attempts the broadcast (with the
-    /// current context) on the next output event until it is delivered.
+    /// only emitted on change, the actor periodically retries the cached context
+    /// until every live client accepts it.
     context_resend_pending: bool,
+    last_context_broadcast: Option<Instant>,
     /// Timestamp of the last OS-level working-directory poll, used to throttle
     /// the fallback so git context is not re-resolved on every output chunk.
     last_cwd_poll: Option<Instant>,
@@ -8544,6 +8293,8 @@ enum ActorCommand {
     Context {
         response: Sender<ActorResult<Option<SessionContext>>>,
     },
+    /// Publishes cached context after the manager announces a managed launch.
+    ResendContext,
     /// Installs a git context resolved on the caller's behalf, for a session adopted
     /// through a handover. Adoption deliberately leaves the context unresolved so the
     /// `git` subprocesses it costs stay off the session-manager lock; the resolved answer
@@ -8645,6 +8396,7 @@ fn run_actor(
     output_rx: Receiver<ActorMessage>,
 ) {
     loop {
+        state.retry_context_update();
         if state.output_closed {
             match command_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(command) => {
@@ -8761,6 +8513,16 @@ impl ActorState {
         })
     }
 
+    fn retry_context_update(&mut self) {
+        if self.context_resend_pending
+            && self
+                .last_context_broadcast
+                .is_none_or(|last| last.elapsed() >= CONTEXT_RESEND_INTERVAL)
+        {
+            self.broadcast_context_update();
+        }
+    }
+
     /// Pushes the current working directory + git context to every connected
     /// client so their side rails update live (e.g. when the shell `cd`s into or
     /// out of a repo). No-op for unmanaged actors or before a session id is
@@ -8773,6 +8535,7 @@ impl ActorState {
         else {
             return;
         };
+        self.last_context_broadcast = Some(Instant::now());
         let to_string = |path: &Path| path.to_string_lossy().into_owned();
         let current_working_directory = self.current_working_directory.as_deref().map(to_string);
         let (repository_root, worktree_root, branch) = match &self.context {
@@ -8793,9 +8556,7 @@ impl ActorState {
                 branch,
             },
         );
-        // If a client's channel was full the update was dropped for it; since
-        // context updates are only emitted on change, remember to resend the
-        // current context on the next output event until it lands.
+        // Context can remain unchanged after a drop, so retry it from the actor loop.
         self.context_resend_pending = !delivered;
     }
 
@@ -9184,6 +8945,10 @@ impl ActorState {
                 let _ = response.send(Ok(self.context.clone()));
                 false
             }
+            ActorCommand::ResendContext => {
+                self.broadcast_context_update();
+                false
+            }
             #[cfg(unix)]
             ActorCommand::SetContext { context } => {
                 if self.context != context {
@@ -9555,6 +9320,7 @@ impl ActorState {
                 }
                 self.child.kill().context("terminating PTY child")?;
                 self.exited = true;
+                self.child_exited.store(true, Ordering::Relaxed);
             }
         }
         self.drain_shutdown_output(command_rx, output_rx);
@@ -9721,7 +9487,10 @@ impl ActorState {
 
     fn reap_child(&mut self) {
         match self.child.try_wait() {
-            Ok(Some(_)) => self.exited = true,
+            Ok(Some(_)) => {
+                self.exited = true;
+                self.child_exited.store(true, Ordering::Relaxed);
+            }
             Ok(None) => {}
             Err(error) => tracing::warn!(error = ?error, "failed polling PTY child"),
         }
@@ -9779,6 +9548,7 @@ impl ActorState {
                     self.output.flush_pending_translated_bytes();
                     self.output_closed = true;
                     self.exited = true;
+                    self.child_exited.store(true, Ordering::Relaxed);
                     self.broadcast_exit();
                     break;
                 }
@@ -12871,6 +12641,7 @@ fn reject_command_during_shutdown(command: ActorCommand) {
     match command {
         // No response channel to fail: dropping these is the whole rejection.
         ActorCommand::WriteInput { .. } | ActorCommand::WriteHumanInput { .. } => {}
+        ActorCommand::ResendContext => {}
         ActorCommand::WakeForInbox { response, .. } => {
             let _ = response.send(false);
         }
@@ -13806,6 +13577,421 @@ impl triage_transport_ws::WebSocketAuthenticator for SessionManager {
     }
 }
 
+impl SessionManager {
+    fn start_session_inner(
+        &self,
+        request: StartSessionRequest,
+        owned: Option<triage_core::workers::SessionIdentity>,
+    ) -> Result<SessionId> {
+        // Refuse while a handover is in flight: the outgoing daemon has already
+        // snapshotted the session set it is transferring, so a session started
+        // now would not be among the handed-off descriptors and would be lost
+        // when that daemon detaches and exits. The window is brief (a swap), and
+        // failing loudly is far better than silently dropping the session.
+        //
+        // This early check is only a courtesy so we don't fork a PTY we are about
+        // to throw away; it is NOT the one that makes this safe. The authoritative
+        // re-check happens below under the `sessions` lock — see there.
+        if self.handover_in_flight() {
+            bail!("a handover is in progress; try again once the daemon swap completes");
+        }
+        request.validate()?;
+        let parent_session_id = request.parent_session_id;
+        let outlive_parent = request.outlive_parent;
+        if let Some(parent_id) = parent_session_id.as_ref() {
+            let sessions = self.sessions()?;
+            ensure!(
+                matches!(sessions.get(parent_id), Some(ManagedSession::Live { .. })),
+                "parent session {parent_id} not found or not live"
+            );
+        }
+        fs::create_dir_all(&self.config.log_dir).with_context(|| {
+            format!("creating session log dir {}", self.config.log_dir.display())
+        })?;
+
+        let session_id = match &owned {
+            Some(identity) => identity.session_id.clone(),
+            None => self.allocate_session_id()?,
+        };
+        let log_path = self.log_path(&session_id);
+        let config = SessionConfig {
+            command: request.command,
+            args: request.args,
+            cwd: request.cwd,
+            size: request.size,
+            log_path,
+            session_id: Some(session_id.clone()),
+        };
+        let managed_worker = owned.is_some();
+        let mut launch = PersistedSessionLaunch::from(&config);
+        launch.parent_session_id = parent_session_id;
+        launch.outlive_parent = outlive_parent;
+        if let Some(identity) = owned {
+            launch.instance_id = identity.instance_id;
+        }
+        let last_known_cwd = launch.cwd.clone().or_else(|| std::env::current_dir().ok());
+        let agent_update_tx = self.agent_update_tx();
+        let agent_tracking = agent_update_tx.is_some();
+        let actor = SessionActor::spawn_managed_with_lifecycle(
+            config,
+            session_id.clone(),
+            self.dirty_tx(),
+            self.cwd_update_tx(),
+            agent_update_tx,
+            Some(self.global_senders()),
+            self.compression_tx(),
+            self.actor_lifecycle_hooks(),
+        )?;
+        let actor_tx = actor.tx.clone();
+        let last_activity_ms = actor.last_activity_ms();
+        let last_input_ms = actor.last_input_ms();
+        let initial_cwd = last_known_cwd.clone();
+
+        let mut sessions = self.sessions()?;
+
+        // Authoritative handover gate. The check at the top of this function ran
+        // before `spawn_managed` forked the PTY (tens of milliseconds ago), so a
+        // handover that began in the meantime would have snapshotted the session
+        // set without this session, and `detach_all_live_sessions` would then drop
+        // it on the floor when the outgoing daemon exits. Re-checking here closes
+        // that window, because `begin_handover` sets the flag before
+        // `serialize_active_sessions` takes this lock at all: either we insert first,
+        // under this guard, and are transferred, or we observe the flag and refuse.
+        // (Note what the argument no longer rests on: that snapshot releases the lock
+        // before its actor round-trips, so "held across the whole snapshot" would be
+        // the wrong reason to trust this gate.)
+        //
+        // The forked child is killed by dropping `actor` on this path, which is
+        // correct: it never became a session anyone can reach.
+        if self.handover_in_flight() {
+            drop(sessions);
+            bail!("a handover is in progress; try again once the daemon swap completes");
+        }
+
+        ensure!(
+            !sessions.contains_key(&session_id),
+            "session {session_id} already exists"
+        );
+        sessions.insert(
+            session_id.clone(),
+            ManagedSession::Live {
+                actor,
+                lease: InputLeaseState::default(),
+                launch,
+                last_known_cwd,
+                agent: None,
+                agent_tracking,
+                agent_observed: false,
+            },
+        );
+        if let Err(error) = self.persist_manifest(&sessions) {
+            let inserted = sessions.remove(&session_id);
+            drop(sessions);
+            // A send racing the failed start could have queued mail for a
+            // session that now never exists; drop it with the session.
+            self.forget_inbox(&session_id);
+            if let Some(ManagedSession::Live { actor, .. }) = inserted
+                && let Err(shutdown_error) = actor.shutdown()
+            {
+                tracing::warn!(
+                    error = ?shutdown_error,
+                    "failed to shut down session after manifest persistence failure"
+                );
+            }
+            return Err(error);
+        }
+        drop(sessions);
+
+        // Managed launches must not wait on an actor while holding the worker registry.
+        let context = if managed_worker {
+            None
+        } else {
+            request_session_context(&actor_tx).ok().flatten()
+        };
+        let (repository_root, worktree_root, branch) = match &context {
+            Some(ctx) => (
+                ctx.repository_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                ctx.worktree_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                ctx.branch_name().map(str::to_string),
+            ),
+            None => (None, None, None),
+        };
+        let current_working_directory = initial_cwd.map(|p| p.to_string_lossy().into_owned());
+        self.broadcast_global(ServerMessage::SessionStarted {
+            session_id: session_id.clone(),
+            current_working_directory,
+            repository_root,
+            worktree_root,
+            branch,
+            last_activity_ms,
+            last_input_ms,
+        });
+        if managed_worker {
+            let _ = actor_tx.send(ActorCommand::ResendContext);
+        }
+        self.state_signal.notify();
+        Ok(session_id)
+    }
+    fn shutdown_session_inner(
+        &self,
+        session_id: SessionId,
+        expected_instance: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<CompletedSession>> {
+        let _shutdown_guard = self.begin_session_shutdown(&session_id)?;
+        ensure!(
+            !self.session_awaits_adoption(&session_id),
+            "session {session_id} is awaiting inherited PTY adoption"
+        );
+        self.shutdown_initiated_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.clone());
+
+        enum ShutdownTarget {
+            Live {
+                tx: Sender<ActorCommand>,
+                launch: Box<PersistedSessionLaunch>,
+                last_known_cwd: Option<PathBuf>,
+                last_activity_ms: u64,
+                last_input_ms: u64,
+                prepared_manifest: PathBuf,
+            },
+            Historical {
+                completed: Option<CompletedSession>,
+                log_path: PathBuf,
+            },
+            FinishedOwned {
+                log_path: PathBuf,
+            },
+        }
+
+        let target = {
+            let mut sessions = self.sessions()?;
+            let session = sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            if let Some(expected) = expected_instance {
+                ensure!(
+                    session.instance_id() == expected,
+                    "session {session_id} ownership changed; refusing shutdown"
+                );
+            }
+            match session {
+                ManagedSession::Live {
+                    actor,
+                    launch,
+                    last_known_cwd,
+                    ..
+                } => {
+                    if expected_instance.is_some()
+                        && actor.worker.as_ref().is_some_and(JoinHandle::is_finished)
+                    {
+                        ensure!(
+                            actor.child_exited.load(Ordering::Relaxed),
+                            "worker actor stopped without confirmed child exit; session ownership retained"
+                        );
+                        let log_path = launch.log_path.clone();
+                        let temp_path = self.prepare_shutdown_manifest(&sessions, &session_id)?;
+                        if let Err(error) =
+                            replace_manifest(&temp_path, &self.config.manifest_path())
+                        {
+                            let _ = fs::remove_file(&temp_path);
+                            return Err(error);
+                        }
+                        let Some(ManagedSession::Live { actor, .. }) = sessions.remove(&session_id)
+                        else {
+                            bail!("finished worker {session_id} disappeared during shutdown");
+                        };
+                        actor.detach();
+                        ShutdownTarget::FinishedOwned { log_path }
+                    } else {
+                        ShutdownTarget::Live {
+                            tx: actor.tx.clone(),
+                            launch: Box::new(launch.clone()),
+                            last_known_cwd: last_known_cwd.clone(),
+                            last_activity_ms: actor.last_activity_ms(),
+                            last_input_ms: actor.last_input_ms(),
+                            // Validate removal persistence before terminating the child.
+                            // Rewrite from the current map after termination to retain
+                            // unrelated session changes made in the meantime.
+                            prepared_manifest: self
+                                .prepare_shutdown_manifest(&sessions, &session_id)?,
+                        }
+                    }
+                }
+                ManagedSession::Historical { session, .. } => {
+                    let completed = expected_instance
+                        .is_none()
+                        .then(|| session.completed_session());
+                    let log_path = session.persisted.log_path.clone();
+                    let temp_path = self.prepare_shutdown_manifest(&sessions, &session_id)?;
+                    if let Err(error) = replace_manifest(&temp_path, &self.config.manifest_path()) {
+                        let _ = fs::remove_file(&temp_path);
+                        return Err(error);
+                    }
+                    let Some(_removed) = sessions.remove(&session_id) else {
+                        bail!("historical session {session_id} disappeared during shutdown");
+                    };
+                    self.forget_custom_label(&session_id);
+                    ShutdownTarget::Historical {
+                        completed,
+                        log_path,
+                    }
+                }
+                ManagedSession::Restoring { .. } => {
+                    bail!("session {session_id} is being restored")
+                }
+            }
+        };
+
+        let (completed, log_path) = match target {
+            ShutdownTarget::Historical {
+                completed,
+                log_path,
+            } => (completed, log_path),
+            ShutdownTarget::FinishedOwned { log_path } => (None, log_path),
+            ShutdownTarget::Live {
+                tx,
+                launch,
+                last_known_cwd,
+                last_activity_ms,
+                last_input_ms,
+                prepared_manifest,
+            } => {
+                let shutdown = if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        Err(anyhow!(
+                            "worker cleanup time budget exhausted; retry cleanup"
+                        ))
+                    } else {
+                        let (response, rx) = mpsc::channel();
+                        tx.send(ActorCommand::Shutdown { response })
+                            .context("sending owned worker shutdown")
+                            .and_then(|()| {
+                                rx.recv_timeout(remaining).context(
+                                    "worker shutdown did not finish before deadline; retry cleanup",
+                                )?
+                            })
+                    }
+                } else {
+                    request_actor_shutdown(&tx)
+                };
+                let completed = match shutdown {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        let _ = fs::remove_file(&prepared_manifest);
+                        return Err(error);
+                    }
+                };
+
+                // Only raw shutdown needs a reconstructed fallback view. Owned cleanup
+                // retains the stopped actor on commit failure and retries direct removal.
+                let historical_fallback = if expected_instance.is_none() {
+                    let mut persisted = (*launch).clone().into_persisted(session_id.clone(), true);
+                    persisted.last_known_cwd = last_known_cwd;
+                    persisted.last_activity_ms = last_activity_ms;
+                    persisted.last_input_ms = last_input_ms;
+                    Some(HistoricalSession::restore(persisted).map(Box::new))
+                } else {
+                    None
+                };
+
+                let (mut actor, commit_result) = {
+                    // Termination succeeded. Recover the lock to commit removal or
+                    // retain the owned actor identity for a later cleanup retry.
+                    let mut sessions = self
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let rewrite_result = self
+                        .prepare_shutdown_manifest(&sessions, &session_id)
+                        .and_then(|temp_path| {
+                            replace_manifest(&temp_path, &self.config.manifest_path())
+                        });
+                    if rewrite_result.is_err() {
+                        let _ = fs::remove_file(&prepared_manifest);
+                    }
+                    let rewrite_result = match rewrite_result {
+                        Err(error) if expected_instance.is_some() => {
+                            return Err(error.context(
+                                "worker stopped, but committing its removal failed; ownership retained for retry",
+                            ));
+                        }
+                        result => result,
+                    };
+                    let removed = sessions.remove(&session_id).with_context(|| {
+                        format!("session {session_id} disappeared during shutdown")
+                    })?;
+                    let ManagedSession::Live { actor, .. } = removed else {
+                        sessions.insert(session_id.clone(), removed);
+                        bail!("session {session_id} changed state during shutdown");
+                    };
+                    if let Err(error) = &rewrite_result {
+                        match historical_fallback {
+                            Some(Ok(session)) => {
+                                sessions.insert(
+                                    session_id.clone(),
+                                    ManagedSession::Historical {
+                                        session,
+                                        lease: InputLeaseState::default(),
+                                    },
+                                );
+                            }
+                            Some(Err(ref fallback_error)) => tracing::error!(
+                                session_id = %session_id,
+                                error = ?fallback_error,
+                                "could not rebuild a historical view after shutdown manifest commit failed"
+                            ),
+                            None => {}
+                        }
+                        tracing::error!(
+                            session_id = %session_id,
+                            error = ?error,
+                            "session stopped, but committing its manifest removal failed"
+                        );
+                    } else {
+                        self.forget_custom_label(&session_id);
+                    }
+                    (actor, rewrite_result)
+                };
+                actor.join_threads();
+                commit_result?;
+                (
+                    expected_instance.is_none().then_some(completed),
+                    launch.log_path,
+                )
+            }
+        };
+
+        self.forget_snippet(&session_id);
+        self.forget_judge_override(&session_id);
+        self.clear_pending_approval(&session_id);
+        self.processed_exit_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&session_id);
+        self.forget_inbox(&session_id);
+        self.forget_parked_input(&session_id);
+        self.forget_custom_label(&session_id);
+        // Only after the actor has shut down, so nothing is still writing to it.
+        // A session removed from the manifest can never be restored, so its log
+        // is unreachable from here on and would otherwise leak forever.
+        remove_session_log(&session_id, &log_path);
+        self.cascade_shutdown_children(&session_id);
+        self.state_signal.notify();
+        self.broadcast_global(ServerMessage::SessionTerminated {
+            session_id: session_id.clone(),
+        });
+        Ok(completed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14267,6 +14453,7 @@ mod tests {
         std::fs::write(&seg1, b"line 1\r\nline 2\r\n").expect("write segment");
 
         let h_sess = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-mono").unwrap(),
             command: "/bin/sh".into(),
             args: vec![],
@@ -14429,6 +14616,7 @@ mod tests {
             .queue_handover_adoptions(
                 crate::handover::HandoverState {
                     sessions: vec![crate::handover::HandoverSession {
+                        instance_id: crate::session::new_session_instance(),
                         id: session_id,
                         command: "/bin/sh".to_string(),
                         args: Vec::new(),
@@ -15546,6 +15734,7 @@ mod tests {
             .adopt_sessions(
                 crate::handover::HandoverState {
                     sessions: vec![crate::handover::HandoverSession {
+                        instance_id: crate::session::new_session_instance(),
                         id: session_id.clone(),
                         command: "/bin/sh".to_string(),
                         args: Vec::new(),
@@ -16604,6 +16793,7 @@ mod tests {
         let manifest = SessionManifest {
             version: 1,
             sessions: vec![PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: "/bin/sh".to_string(),
                 args: Vec::new(),
@@ -16699,6 +16889,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -17134,6 +17325,7 @@ mod tests {
                     wedged_id.clone(),
                     ManagedSession::Live {
                         actor: SessionActor {
+                            child_exited: Arc::new(AtomicBool::new(false)),
                             tx,
                             worker: None,
                             reader: None,
@@ -17144,6 +17336,7 @@ mod tests {
                         },
                         lease: InputLeaseState::default(),
                         launch: PersistedSessionLaunch {
+                            instance_id: crate::session::new_session_instance(),
                             command: "true".to_string(),
                             args: Vec::new(),
                             cwd: None,
@@ -17647,6 +17840,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<ActorCommand>();
         drop(rx);
         let actor = SessionActor {
+            child_exited: Arc::new(AtomicBool::new(false)),
             tx,
             worker: None,
             reader: None,
@@ -17968,6 +18162,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: vec![
@@ -18189,6 +18384,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -18273,6 +18469,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -18339,6 +18536,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -18411,6 +18609,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 // The `-c` wrapper shape triage itself launches with, so
@@ -18597,6 +18796,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -18650,6 +18850,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -18707,6 +18908,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: long_running_shell_command().to_string(),
                 args: Vec::new(),
@@ -18759,6 +18961,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: "python".to_string(),
                 args: Vec::new(),
@@ -21511,6 +21714,7 @@ mod tests {
             session_id.clone(),
             ManagedSession::Live {
                 actor: SessionActor {
+                    child_exited: Arc::new(AtomicBool::new(false)),
                     tx,
                     worker: None,
                     reader: None,
@@ -21521,6 +21725,7 @@ mod tests {
                 },
                 lease,
                 launch: PersistedSessionLaunch {
+                    instance_id: crate::session::new_session_instance(),
                     command: "/bin/sh".to_string(),
                     args: Vec::new(),
                     cwd: None,
@@ -21642,6 +21847,7 @@ mod tests {
                 id,
                 ManagedSession::Live {
                     actor: SessionActor {
+                        child_exited: Arc::new(AtomicBool::new(false)),
                         tx,
                         worker: None,
                         reader: None,
@@ -21652,6 +21858,7 @@ mod tests {
                     },
                     lease: InputLeaseState::default(),
                     launch: PersistedSessionLaunch {
+                        instance_id: crate::session::new_session_instance(),
                         command: "/bin/sh".to_string(),
                         args: Vec::new(),
                         cwd: None,
@@ -21759,6 +21966,7 @@ mod tests {
             session_id,
             ManagedSession::Live {
                 actor: SessionActor {
+                    child_exited: Arc::new(AtomicBool::new(false)),
                     tx,
                     worker: None,
                     reader: None,
@@ -21769,6 +21977,7 @@ mod tests {
                 },
                 lease: InputLeaseState::default(),
                 launch: PersistedSessionLaunch {
+                    instance_id: crate::session::new_session_instance(),
                     command: "/bin/sh".to_string(),
                     args: Vec::new(),
                     cwd: None,
@@ -22321,6 +22530,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: SessionId::new("session-1").expect("session id"),
                 command: "/bin/sh".into(),
                 args: Vec::new(),
@@ -22691,6 +22901,7 @@ mod tests {
             .adopt_sessions(
                 crate::handover::HandoverState {
                     sessions: vec![crate::handover::HandoverSession {
+                        instance_id: crate::session::new_session_instance(),
                         id: session_id.clone(),
                         command: "/bin/sh".to_string(),
                         args: Vec::new(),
@@ -23324,6 +23535,7 @@ mod tests {
         let (writer_tx, _writer_rx) = mpsc::sync_channel(1);
         let (agent_tx, agent_rx) = mpsc::channel();
         let mut state = ActorState {
+            child_exited: Arc::new(AtomicBool::new(false)),
             master,
             child,
             process_identity,
@@ -23346,6 +23558,7 @@ mod tests {
             agent_tracker: crate::agent_detect::FgAgentTracker::seeded(Some(test_attachment())),
             global_senders: None,
             context_resend_pending: false,
+            last_context_broadcast: None,
             last_cwd_poll: None,
             subscribers: Vec::new(),
             event_log: VecDeque::new(),
@@ -23652,6 +23865,7 @@ mod tests {
     #[test]
     fn restorable_launch_covers_shells_attachments_and_agent_commands() {
         let persisted = |command: &str, agent: bool| PersistedSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-x").expect("session id"),
             command: command.to_string(),
             args: Vec::new(),
@@ -23726,6 +23940,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: agent_bin.to_string_lossy().into_owned(),
                 args: vec!["resume".to_string(), conversation.clone()],
@@ -23818,6 +24033,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: agent_bin.to_string_lossy().into_owned(),
                 args: Vec::new(),
@@ -23907,6 +24123,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: agent_bin.to_string_lossy().into_owned(),
                 args: Vec::new(),
@@ -24005,6 +24222,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: wrapper.to_string_lossy().into_owned(),
                 args: Vec::new(),
@@ -24114,6 +24332,7 @@ mod tests {
         write_manifest(
             &log_dir,
             PersistedSession {
+                instance_id: crate::session::new_session_instance(),
                 id: session_id.clone(),
                 command: agent_bin.to_string_lossy().into_owned(),
                 args: vec!["resume".to_string(), conversation.clone()],
@@ -24247,6 +24466,7 @@ mod tests {
         std::fs::write(&seg1, historical_queries).expect("write segment");
 
         let h_sess = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-adopted-queries").unwrap(),
             command: "/bin/sh".into(),
             args: vec!["-lc".into(), "exec \"${SHELL:-/bin/sh}\"".into()],
@@ -24373,6 +24593,7 @@ mod tests {
         std::fs::write(&log_path, &payload).expect("write log");
 
         let h_sess = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-handover-size").unwrap(),
             command: "/bin/sh".into(),
             args: vec!["-c".into(), "cat".into()],
@@ -24603,6 +24824,7 @@ mod tests {
         fs::write(&log_path, b"\x1b[>5uprompt> ").expect("write tail log");
 
         let h_sess = crate::handover::HandoverSession {
+            instance_id: crate::session::new_session_instance(),
             id: SessionId::new("session-handover-modes").unwrap(),
             command: "/bin/sh".into(),
             args: vec!["-c".into(), "cat".into()],
