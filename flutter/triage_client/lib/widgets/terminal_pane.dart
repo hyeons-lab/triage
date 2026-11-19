@@ -2191,8 +2191,8 @@ class _TerminalPaneState extends State<TerminalPane>
 
   bool get _shouldForwardWheelToTerminal {
     if (widget.isExited) return false;
-    if (_terminal.isUsingAltBuffer) return true;
     if (_terminal.mouseMode < kMouseModeNormal) return false;
+    if (_terminal.isUsingAltBuffer) return true;
     if (!_scrollController.hasClients) return true;
     final pos = _scrollController.position;
     return !pos.hasContentDimensions || pos.maxScrollExtent <= 0;
@@ -2291,16 +2291,9 @@ class _TerminalPaneState extends State<TerminalPane>
       }
       return;
     }
-    if (!_terminal.isUsingAltBuffer) return;
-    final fallback = encodeAltScreenFallbackWheel(
-      up: up,
-      appCursorKeys: _terminal.appCursorKeys,
-      isUsingAltBuffer: _terminal.isUsingAltBuffer,
-      steps: 1,
-    );
-    if (fallback.isNotEmpty) {
-      widget.controller.sendInput(fallback);
-    }
+    // Alt-screen apps that never enabled mouse tracking get no wheel input.
+    // Translating the wheel to arrow keys here moved the app's composer /
+    // input history instead of scrolling anything.
   }
 
   void _handleMobileLongPressStart(LongPressStartDetails details) {

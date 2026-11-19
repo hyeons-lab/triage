@@ -1039,6 +1039,61 @@ void main() {
     );
 
     testWidgets(
+      'alt-screen terminal without mouse tracking ignores wheel and swipe without sending arrow keys',
+      (tester) async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        try {
+          final terminal = TerminalCellBuffer(cols: 47, rows: 41);
+          terminal.setModesForTest(
+            altScreen: true,
+            mouseMode: 0,
+            appCursorKeys: true,
+          );
+          final sentInputs = <String>[];
+          final controller = TerminalController();
+          controller.addInputListener(sentInputs.add);
+
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 470,
+                  height: 820,
+                  child: TerminalPane(
+                    terminalId: 'test-alt-no-mouse-scroll',
+                    terminal: terminal,
+                    controller: controller,
+                    fallbackRows: const [],
+                    onTerminalResizeBind: (_) {},
+                    focusCursorRevision: 0,
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final gesture = await tester.startGesture(const Offset(200, 300));
+          await gesture.moveBy(const Offset(0, 80));
+          await gesture.up();
+          await tester.pump();
+          expect(sentInputs, isEmpty);
+
+          await tester.sendEventToBinding(
+            const PointerScrollEvent(
+              position: Offset(200, 300),
+              scrollDelta: Offset(0, -60),
+            ),
+          );
+          await tester.pump();
+          expect(sentInputs, isEmpty);
+        } finally {
+          debugDefaultTargetPlatformOverride = null;
+        }
+      },
+    );
+
+    testWidgets(
       'TerminalGridView stays pinned to bottom across loading, history sync, session swaps, and live output without phantom onNearTop paging',
       (tester) async {
         debugDefaultTargetPlatformOverride = TargetPlatform.android;
