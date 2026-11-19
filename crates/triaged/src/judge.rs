@@ -1534,6 +1534,186 @@ pub fn resolve_d1_model_path(
     }
 }
 
+pub(crate) fn format_hook_command(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw.chars().any(char::is_whitespace) {
+        format!("\"{raw}\"")
+    } else {
+        raw.into_owned()
+    }
+}
+
+pub(crate) fn resolve_hook_command() -> String {
+    let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".cargo").join("bin").join(&hook_name))
+        .filter(|p| p.exists())
+        .map(|p| format_hook_command(&p))
+        .unwrap_or_else(|| "triage-hook".to_string())
+}
+
+pub(crate) fn is_triage_hook_command_valid(cmd: &str) -> bool {
+    let unquoted = cmd.trim().trim_matches('"');
+    if !unquoted.contains("triage-hook") {
+        return false;
+    }
+    if unquoted.contains('/') || unquoted.contains('\\') {
+        return std::path::Path::new(unquoted).is_file();
+    }
+    true
+}
+
+fn pre_tool_use_has_valid_triage_hook(pre: &serde_json::Value) -> bool {
+    pre.as_array()
+        .map(|arr| {
+            arr.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|cmd| {
+                            cmd.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(is_triage_hook_command_valid)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn pre_tool_use_needs_command_update(
+    pre: Option<&serde_json::Value>,
+    hook_cmd: &str,
+) -> bool {
+    let Some(arr) = pre.and_then(|v| v.as_array()) else {
+        return true;
+    };
+    if arr.is_empty() {
+        return true;
+    }
+    let mut found_hook = false;
+    for entry in arr {
+        let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) else {
+            continue;
+        };
+        for h in hooks {
+            if let Some(cmd) = h.get("command").and_then(|c| c.as_str())
+                && cmd.contains("triage-hook")
+            {
+                found_hook = true;
+                if cmd != hook_cmd {
+                    return true;
+                }
+            }
+        }
+    }
+    !found_hook
+}
+
+/// Inserts, repairs, or removes the `triage-hook` `PreToolUse` entry in a
+/// Claude Code or Muse `settings.json` file. Returns `true` if the file changed.
+pub(crate) fn upsert_settings_pretooluse_hook(
+    settings_path: &std::path::Path,
+    hook_cmd: &str,
+    enabled: bool,
+) -> anyhow::Result<bool> {
+    let existed = settings_path.is_file();
+    let mut json = if existed {
+        let content = std::fs::read_to_string(settings_path).unwrap_or_default();
+        serde_json::from_str::<serde_json::Value>(&content)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !json.is_object() {
+        json = serde_json::json!({});
+    }
+
+    let map = json.as_object_mut().expect("must be object");
+    let mut hooks_obj = map
+        .get("hooks")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    let mut changed = !existed;
+
+    if enabled {
+        let mut pre_arr = hooks_obj
+            .get("PreToolUse")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        if !hooks_obj.get("PreToolUse").is_some_and(|v| v.is_array()) {
+            changed = true;
+        }
+        let mut found_triage_hook = false;
+        for entry in &mut pre_arr {
+            let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            for cmd_obj in inner.iter_mut() {
+                let Some(obj) = cmd_obj.as_object_mut() else {
+                    continue;
+                };
+                if let Some(existing) = obj.get("command").and_then(|c| c.as_str())
+                    && existing.contains("triage-hook")
+                {
+                    found_triage_hook = true;
+                    if existing != hook_cmd {
+                        obj.insert("command".to_string(), serde_json::json!(hook_cmd));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !found_triage_hook {
+            pre_arr.push(serde_json::json!({
+                "matcher": ".*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": hook_cmd,
+                        "timeout": 15
+                    }
+                ]
+            }));
+            changed = true;
+        }
+        hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
+    } else if let Some(pre_arr) = hooks_obj
+        .get_mut("PreToolUse")
+        .and_then(|v| v.as_array_mut())
+    {
+        let before = pre_arr.len();
+        pre_arr.retain(|entry| {
+            !entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|inner| {
+                    inner.iter().any(|cmd| {
+                        cmd.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.contains("triage-hook"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        if pre_arr.len() != before {
+            changed = true;
+        }
+    }
+
+    if changed {
+        map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
+        let pretty = serde_json::to_string_pretty(&json)?;
+        atomic_write_file(settings_path, &pretty)?;
+    }
+    Ok(changed)
+}
+
 /// Inspects the status of the `.agents/hooks.json`, `.claude/settings.json`, or Muse `settings.json` file in the workspace or home directory.
 pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
     let path = resolve_hooks_json_path(workspace_path);
@@ -1551,8 +1731,16 @@ pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|json| json.get("triage-approval-judge").cloned())
-            .and_then(|judge| judge.get("enabled").and_then(|e| e.as_bool()))
-            .unwrap_or(false)
+            .is_some_and(|judge| {
+                let enabled = judge
+                    .get("enabled")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
+                let has_valid_pre = judge
+                    .get("PreToolUse")
+                    .is_some_and(pre_tool_use_has_valid_triage_hook);
+                enabled && has_valid_pre
+            })
     };
     let agents_enabled = read_agents_enabled(&path) || read_agents_enabled(&gemini_path);
 
@@ -1565,24 +1753,7 @@ pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
             .and_then(|json| json.get("hooks").cloned())
             .and_then(|hooks| hooks.get("PreToolUse").cloned())
-            .and_then(|pre| pre.as_array().cloned())
-            .map(|arr| {
-                arr.iter().any(|entry| {
-                    entry
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|inner| {
-                            inner.iter().any(|cmd| {
-                                cmd.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(|s| s.contains("triage-hook"))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
+            .is_some_and(|pre| pre_tool_use_has_valid_triage_hook(&pre))
     };
 
     let claude_enabled = check_pre_tool_use(&claude_path);
@@ -1606,7 +1777,7 @@ pub fn get_hook_status(workspace_path: Option<&str>) -> JudgeHookStatus {
     }
 }
 
-fn atomic_write_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn atomic_write_file(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1627,7 +1798,7 @@ fn atomic_write_file(path: &std::path::Path, content: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Creates or updates `.agents/hooks.json` and `.claude/settings.json` in the resolved workspace directory.
+/// Creates or updates `.agents/hooks.json`, `.claude/settings.json`, and Muse `settings.json` in the resolved workspace directory.
 pub fn configure_hook(
     workspace_path: Option<&str>,
     enabled: bool,
@@ -1655,17 +1826,10 @@ pub fn configure_hook(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
-    let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
-    let cargo_hook = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .map(|h| h.join(".cargo").join("bin").join(&hook_name))
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "triage-hook".to_string());
+    let hook_cmd = resolve_hook_command();
 
     judge_obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
-    if !judge_obj.contains_key("PreToolUse") {
+    if pre_tool_use_needs_command_update(judge_obj.get("PreToolUse"), &hook_cmd) {
         judge_obj.insert(
             "PreToolUse".to_string(),
             serde_json::json!([
@@ -1674,7 +1838,7 @@ pub fn configure_hook(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": cargo_hook,
+                            "command": hook_cmd,
                             "timeout": 15
                         }
                     ]
@@ -1693,162 +1857,14 @@ pub fn configure_hook(
 
     // Also configure .claude/settings.json if present or workspace root exists
     let claude_path = resolve_claude_settings_path(workspace_path);
-    if let Some(parent) = claude_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut claude_json = if claude_path.is_file() {
-        let content = std::fs::read_to_string(&claude_path).unwrap_or_default();
-        serde_json::from_str::<serde_json::Value>(&content)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    if !claude_json.is_object() {
-        claude_json = serde_json::json!({});
-    }
-    let claude_map = claude_json.as_object_mut().expect("must be object");
-    let mut hooks_obj = claude_map
-        .get("hooks")
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
-
-    if enabled {
-        let mut pre_arr = hooks_obj
-            .get("PreToolUse")
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        let already_has = pre_arr.iter().any(|entry| {
-            entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|inner| {
-                    inner.iter().any(|cmd| {
-                        cmd.get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.contains("triage-hook"))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
-        });
-        if !already_has {
-            pre_arr.push(serde_json::json!({
-                "matcher": ".*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "triage-hook",
-                        "timeout": 15
-                    }
-                ]
-            }));
-        }
-        hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
-    } else {
-        if let Some(pre_arr) = hooks_obj
-            .get_mut("PreToolUse")
-            .and_then(|v| v.as_array_mut())
-        {
-            pre_arr.retain(|entry| {
-                !entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .map(|inner| {
-                        inner.iter().any(|cmd| {
-                            cmd.get("command")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.contains("triage-hook"))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-        }
-    }
-    claude_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
-    if let Ok(pretty_claude) = serde_json::to_string_pretty(&claude_json) {
-        let _ = atomic_write_file(&claude_path, &pretty_claude);
-    }
+    let _ = upsert_settings_pretooluse_hook(&claude_path, &hook_cmd, enabled);
 
     // Also configure Muse settings.json if present or muse config dir exists
     let muse_path = resolve_muse_settings_path(workspace_path);
     let should_configure_muse =
         muse_path.is_file() || muse_path.parent().map(|p| p.is_dir()).unwrap_or(false);
     if should_configure_muse {
-        if let Some(parent) = muse_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut muse_json = if muse_path.is_file() {
-            let content = std::fs::read_to_string(&muse_path).unwrap_or_default();
-            serde_json::from_str::<serde_json::Value>(&content)
-                .unwrap_or_else(|_| serde_json::json!({}))
-        } else {
-            serde_json::json!({})
-        };
-        if !muse_json.is_object() {
-            muse_json = serde_json::json!({});
-        }
-        let muse_map = muse_json.as_object_mut().expect("must be object");
-        let mut hooks_obj = muse_map
-            .get("hooks")
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-
-        if enabled {
-            let mut pre_arr = hooks_obj
-                .get("PreToolUse")
-                .and_then(|v| v.as_array().cloned())
-                .unwrap_or_default();
-            let already_has = pre_arr.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .map(|inner| {
-                        inner.iter().any(|cmd| {
-                            cmd.get("command")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.contains("triage-hook"))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-            if !already_has {
-                pre_arr.push(serde_json::json!({
-                    "matcher": ".*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": cargo_hook,
-                            "timeout": 15
-                        }
-                    ]
-                }));
-            }
-            hooks_obj.insert("PreToolUse".to_string(), serde_json::Value::Array(pre_arr));
-        } else if let Some(pre_arr) = hooks_obj
-            .get_mut("PreToolUse")
-            .and_then(|v| v.as_array_mut())
-        {
-            pre_arr.retain(|entry| {
-                !entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .map(|inner| {
-                        inner.iter().any(|cmd| {
-                            cmd.get("command")
-                                .and_then(|c| c.as_str())
-                                .map(|s| s.contains("triage-hook"))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-        }
-        muse_map.insert("hooks".to_string(), serde_json::Value::Object(hooks_obj));
-        if let Ok(pretty_muse) = serde_json::to_string_pretty(&muse_json) {
-            let _ = atomic_write_file(&muse_path, &pretty_muse);
-        }
+        let _ = upsert_settings_pretooluse_hook(&muse_path, &hook_cmd, enabled);
     }
 
     let shim_installed = check_shim_installed();
@@ -3806,6 +3822,89 @@ mod tests {
         assert!(!denies.is_empty());
         assert!(denies.contains(&"cargo publish".to_string()));
         assert!(denies.contains(&"security find-generic-password".to_string()));
+    }
+
+    #[test]
+    fn configure_hook_repairs_stale_foreign_hook_paths() {
+        let temp_path =
+            std::env::temp_dir().join(format!("triage-test-stale-{}", rand::random::<u64>()));
+        let agents_dir = temp_path.join(".agents");
+        let claude_dir = temp_path.join(".claude");
+        std::fs::create_dir_all(&agents_dir).expect("create .agents");
+        std::fs::create_dir_all(&claude_dir).expect("create .claude");
+
+        let foreign_path = "/Users/nonexistent_user_12345/.cargo/bin/triage-hook";
+        let hooks_file = agents_dir.join("hooks.json");
+        std::fs::write(
+            &hooks_file,
+            format!(
+                r#"{{
+  "triage-approval-judge": {{
+    "enabled": true,
+    "PreToolUse": [
+      {{
+        "matcher": ".*",
+        "hooks": [
+          {{
+            "type": "command",
+            "command": "{foreign_path}",
+            "timeout": 15
+          }}
+        ]
+      }}
+    ]
+  }}
+}}"#
+            ),
+        )
+        .expect("write stale hooks.json");
+
+        let claude_file = claude_dir.join("settings.json");
+        std::fs::write(
+            &claude_file,
+            format!(
+                r#"{{
+  "hooks": {{
+    "PreToolUse": [
+      {{
+        "matcher": ".*",
+        "hooks": [
+          {{
+            "type": "command",
+            "command": "{foreign_path}",
+            "timeout": 15
+          }}
+        ]
+      }}
+    ]
+  }}
+}}"#
+            ),
+        )
+        .expect("write stale claude settings");
+
+        let ws = temp_path.to_str().unwrap();
+        // Before repair, a foreign absolute path must not report enabled=true.
+        assert!(!get_hook_status(Some(ws)).enabled);
+
+        let repaired = configure_hook(Some(ws), true).expect("repair hooks");
+        assert!(repaired.enabled);
+
+        let updated_hooks = std::fs::read_to_string(&hooks_file).expect("read hooks.json");
+        assert!(!updated_hooks.contains(foreign_path));
+        let updated_claude = std::fs::read_to_string(&claude_file).expect("read claude settings");
+        assert!(!updated_claude.contains(foreign_path));
+        assert!(get_hook_status(Some(ws)).enabled);
+
+        let quoted = format_hook_command(std::path::Path::new(
+            r"C:\Users\First Last\.cargo\bin\triage-hook.exe",
+        ));
+        assert_eq!(
+            quoted,
+            r#""C:\Users\First Last\.cargo\bin\triage-hook.exe""#
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_path);
     }
 
     #[test]

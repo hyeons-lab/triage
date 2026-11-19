@@ -450,6 +450,47 @@ pub const BUILTIN_ALLOW_COMMANDS: &[&str] = &[
     "muse *",
 ];
 
+pub const BUILTIN_POWERSHELL_ALLOW_COMMANDS: &[&str] = &[
+    // Read-only Windows CLI utilities.
+    "dir",
+    "where",
+    "findstr",
+    // Read-only PowerShell cmdlets (matched case-insensitively).
+    "Get-ChildItem",
+    "Get-Content",
+    "Get-Item",
+    "Get-ItemProperty",
+    "Get-Location",
+    "Get-Date",
+    "Get-Command",
+    "Get-Process",
+    "Get-Service",
+    "Get-Acl",
+    "Get-Help",
+    "Get-Member",
+    "Get-Unique",
+    "Get-Host",
+    "Test-Path",
+    "Resolve-Path",
+    "Split-Path",
+    "Join-Path",
+    "Select-String",
+    "Select-Object",
+    "Where-Object",
+    "Format-List",
+    "Format-Table",
+    "Format-Wide",
+    "Format-Custom",
+    "Measure-Object",
+    "Sort-Object",
+    "Group-Object",
+    "Out-String",
+    "Write-Output",
+    "Push-Location",
+    "Pop-Location",
+    "Set-Location",
+];
+
 pub const BUILTIN_SENSITIVE_SUBSTRINGS: &[&str] = &[
     // Privilege escalation.
     "sudo ",
@@ -848,6 +889,12 @@ impl JudgeRules {
         }
         self.matching_token_allow_rule(&self.custom_allow_commands, tokens)
             .or_else(|| self.matching_token_allow_rule(self.builtin_allow_commands, tokens))
+            .or_else(|| {
+                BUILTIN_POWERSHELL_ALLOW_COMMANDS
+                    .iter()
+                    .copied()
+                    .find(|&cmd| cmd.eq_ignore_ascii_case(prog))
+            })
     }
 
     fn matching_token_allow_rule<'a>(
@@ -1583,6 +1630,7 @@ pub fn builtin_allow_commands() -> Vec<String> {
         .get_or_init(|| {
             BUILTIN_ALLOW_COMMANDS
                 .iter()
+                .chain(BUILTIN_POWERSHELL_ALLOW_COMMANDS.iter())
                 .map(|s| (*s).to_string())
                 .collect()
         })
@@ -2296,48 +2344,132 @@ pub fn pipeline_and_chain_segments(command: &str) -> Vec<&str> {
     segments
 }
 
+fn has_windows_path_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\')
+        || s.starts_with(r".\")
+        || s.starts_with(r"..\")
+        || s.starts_with(r"\\")
+}
+
+/// Tokenizes a command segment while preserving Windows path backslashes (e.g.
+/// `C:\Users\...`, `.\scripts\...`, `\\server\share`) that POSIX `shlex` would
+/// otherwise strip as escape characters.
 pub fn tokenize_words(segment: &str) -> Vec<String> {
-    if let Some(words) = shlex::split(segment)
+    if !segment.contains('\\')
+        && let Some(words) = shlex::split(segment)
         && !words.is_empty()
     {
         return words;
     }
-    fallback_tokenize_words(segment)
+    tokenize_words_preserving_windows_paths(segment)
 }
 
-fn fallback_tokenize_words(segment: &str) -> Vec<String> {
+fn tokenize_words_preserving_windows_paths(segment: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut escaped = false;
+    let mut token_is_windows_path = false;
+    let mut chars = segment.char_indices().peekable();
 
-    for ch in segment.chars() {
-        if escaped {
+    while let Some((idx, ch)) = chars.next() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        if in_double {
+            if ch == '"' {
+                in_double = false;
+                continue;
+            }
+            if ch == '\\' {
+                if let Some(&(_, next_ch)) = chars.peek() {
+                    if matches!(next_ch, '"' | '$' | '`') {
+                        chars.next();
+                        current.push(next_ch);
+                        continue;
+                    }
+                    if next_ch == '\\' {
+                        let after_second = segment[idx + 2..].chars().next();
+                        if matches!(after_second, Some('"' | '$' | '`')) {
+                            chars.next();
+                            current.push('\\');
+                            continue;
+                        }
+                        // Preserve leading UNC `\\` at the start of a double-quoted path.
+                        if current.is_empty() {
+                            chars.next();
+                            current.push_str(r"\\");
+                            token_is_windows_path = true;
+                            continue;
+                        }
+                    }
+                }
+                current.push('\\');
+                continue;
+            }
             current.push(ch);
-            escaped = false;
             continue;
         }
-        if ch == '\\' && !in_single {
-            escaped = true;
+
+        if ch == '\'' {
+            in_single = true;
             continue;
         }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
+        if ch == '"' {
+            in_double = true;
             continue;
         }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if ch.is_whitespace() && !in_single && !in_double {
+        if ch.is_whitespace() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
+                token_is_windows_path = false;
             }
-        } else {
-            current.push(ch);
+            continue;
         }
+        if ch == '\\' {
+            let rest = &segment[idx..];
+            if current.is_empty() && has_windows_path_prefix(rest) {
+                token_is_windows_path = true;
+            }
+            let combined_starts_windows_path = if !token_is_windows_path {
+                let mut probe = String::with_capacity(current.len() + 1);
+                probe.push_str(&current);
+                probe.push('\\');
+                has_windows_path_prefix(&probe)
+            } else {
+                false
+            };
+            if combined_starts_windows_path {
+                token_is_windows_path = true;
+            }
+            let next_ch = chars.peek().map(|&(_, c)| c);
+            let is_shell_special_escape = matches!(next_ch, Some('"' | '\'' | '$' | '`'))
+                || next_ch.is_some_and(char::is_whitespace);
+            let preserve_literal = token_is_windows_path
+                || (cfg!(windows) && !is_shell_special_escape)
+                || (rest[1..].contains('\\')
+                    && !is_shell_special_escape
+                    && next_ch.is_some_and(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                    }));
+            if preserve_literal {
+                current.push('\\');
+            } else if let Some((_, escaped_ch)) = chars.next() {
+                current.push(escaped_ch);
+            }
+            continue;
+        }
+
+        current.push(ch);
     }
+
     if !current.is_empty() {
         words.push(current);
     }
@@ -2858,11 +2990,22 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
         })
     };
 
+    let has_powershell_env_provider = || {
+        matches!(
+            program.to_ascii_lowercase().as_str(),
+            "get-content" | "get-childitem" | "get-item" | "get-itemproperty" | "dir"
+        ) && arguments.iter().any(|arg| {
+            let trimmed = arg.trim_matches(['"', '\'']);
+            trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("env:")
+        })
+    };
+
     has_flag()
         || has_bundled()
         || has_remote_helper()
         || has_dangerous_git_config()
         || has_write_git_subcommand(program, arguments)
+        || has_powershell_env_provider()
 }
 
 pub fn is_dangerous_git_config_key(arg: &str) -> bool {
@@ -2990,8 +3133,8 @@ pub fn unquote_segment(segment: &str) -> std::borrow::Cow<'_, str> {
 pub fn program_name(token: &str) -> &str {
     let unescaped = token.strip_prefix('\\').unwrap_or(token);
     let base = unescaped.rsplit(['/', '\\']).next().unwrap_or(unescaped);
-    if let Some(stripped) = base.strip_suffix(".exe") {
-        stripped
+    if base.len() > 4 && base[base.len() - 4..].eq_ignore_ascii_case(".exe") {
+        &base[..base.len() - 4]
     } else {
         base
     }
@@ -5222,5 +5365,51 @@ mod tests {
         assert_eq!(parsed2.judge.min_allow_confidence_pct, 82);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_paths_and_powershell_cmdlets_evaluate_safely() {
+        assert_eq!(
+            tokenize_words(r#"git -C "C:\Users\dev\repo" status"#),
+            vec!["git", "-C", r"C:\Users\dev\repo", "status"]
+        );
+        assert_eq!(
+            tokenize_words(r".\scripts\custom_build.ps1 --check"),
+            vec![r".\scripts\custom_build.ps1", "--check"]
+        );
+        assert_eq!(program_name(r"C:\Program Files\Git\cmd\git.EXE"), "git");
+
+        assert_eq!(
+            evaluate_cmd(r"C:\Users\dev\.cargo\bin\git.exe status").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd(r".\scripts\custom_build.ps1").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("Get-ChildItem -Force | Select-Object -ExpandProperty Name")
+                .map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("get-content Cargo.toml | select-string triage").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+        assert_eq!(
+            evaluate_cmd("dir /b").map(|v| v.decision),
+            Some(JudgeDecision::Allow)
+        );
+
+        // Windows destructive path & credential protections must hold.
+        assert_eq!(
+            evaluate_cmd(r"C:\Windows\System32\rm.exe -rf /").map(|v| v.decision),
+            Some(JudgeDecision::Ask)
+        );
+        assert_eq!(
+            evaluate_cmd(r"Get-Content C:\Users\dev\.ssh\id_rsa").map(|v| v.decision),
+            Some(JudgeDecision::Ask)
+        );
+        assert_eq!(evaluate_cmd("Get-ChildItem Env:").map(|v| v.decision), None);
     }
 }

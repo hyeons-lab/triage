@@ -106,6 +106,7 @@ mod transport {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+    #[cfg(unix)]
     const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[cfg(unix)]
@@ -170,27 +171,7 @@ mod transport {
     /// the connect/listen name builder and by user-facing endpoint display.
     #[cfg(windows)]
     pub fn windows_pipe_token(path: &Path) -> std::io::Result<String> {
-        let raw = path.to_str().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "named pipe name is not valid UTF-8",
-            )
-        })?;
-        // Accept either a bare token (`triage-<user>`, the default) or a full pipe
-        // path (`\\.\pipe\triage-<user>` / `\\?\pipe\...`); strip the well-known
-        // prefix so a user-typed full path maps to the same token, then collapse
-        // any remaining separators into the single legal token.
-        let bare = raw
-            .strip_prefix(r"\\.\pipe\")
-            .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
-            .unwrap_or(raw);
-        let collapsed: String = bare
-            .chars()
-            .map(|c| match c {
-                '\\' | '/' | ':' => '_',
-                other => other,
-            })
-            .collect();
+        let collapsed = triage_core::ipc::windows_pipe_token_raw(path)?;
 
         // The full pipe path `\\.\pipe\<token>` is capped by NPFS at 256 UTF-16
         // code units (the Win32 string unit), not chars — a non-BMP char is one
@@ -211,7 +192,7 @@ mod transport {
     /// the full `\\.\pipe\<token>` path at 256 units; this leaves margin for the
     /// 9-unit `\\.\pipe\` prefix.
     #[cfg(windows)]
-    pub const MAX_PIPE_TOKEN_LEN: usize = 210;
+    pub const MAX_PIPE_TOKEN_LEN: usize = triage_core::ipc::MAX_WINDOWS_PIPE_TOKEN_LEN;
 
     /// Truncate `s` to at most `max_units` UTF-16 code units, stopping on a
     /// `char` boundary so a surrogate pair is never split.
@@ -2892,6 +2873,7 @@ mod tests {
         let parent = client
             .start_session(StartSessionRequest::new(long_running_shell_command()))
             .expect("start parent via IPC");
+        #[cfg_attr(windows, allow(unused_mut))]
         let mut child_req = StartSessionRequest::new(long_running_shell_command())
             .with_parent(parent.clone())
             .with_outlive_parent(true);

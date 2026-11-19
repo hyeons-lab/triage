@@ -47,6 +47,47 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!(r"\\.\pipe\triage-{}", fallback_user_component()))
 }
 
+/// Maximum length, in UTF-16 code units, for a Windows named-pipe token. NPFS
+/// caps the full `\\.\pipe\<token>` path at 256 units; this leaves margin for
+/// the 9-unit `\\.\pipe\` prefix.
+pub const MAX_WINDOWS_PIPE_TOKEN_LEN: usize = 210;
+
+/// Normalizes a socket or pipe path into its bare Windows named-pipe token
+/// (stripping any `\\.\pipe\` / `\\?\pipe\` prefix and collapsing separators).
+pub fn windows_pipe_token_raw(path: &std::path::Path) -> std::io::Result<String> {
+    let raw = path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "named pipe name is not valid UTF-8",
+        )
+    })?;
+    let bare = raw
+        .strip_prefix(r"\\.\pipe\")
+        .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
+        .unwrap_or(raw);
+    Ok(bare
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' => '_',
+            other => other,
+        })
+        .collect())
+}
+
+/// Resolves a socket/pipe path to a `\\.\pipe\<token>` Windows named-pipe
+/// endpoint without hashing/truncating, rejecting tokens over
+/// [`MAX_WINDOWS_PIPE_TOKEN_LEN`] UTF-16 code units.
+pub fn windows_pipe_endpoint(path: &std::path::Path) -> std::io::Result<String> {
+    let token = windows_pipe_token_raw(path)?;
+    if token.is_empty() || token.encode_utf16().count() > MAX_WINDOWS_PIPE_TOKEN_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "named pipe token is empty or exceeds length limit",
+        ));
+    }
+    Ok(format!(r"\\.\pipe\{token}"))
+}
+
 #[cfg(not(any(unix, windows)))]
 pub fn default_socket_path() -> PathBuf {
     std::env::temp_dir()
@@ -121,5 +162,26 @@ mod tests {
             sanitize_path_component("valid-user_01".to_string()),
             "valid-user_01"
         );
+    }
+
+    #[test]
+    fn windows_pipe_endpoint_normalizes_prefixes_and_separators() {
+        assert_eq!(
+            windows_pipe_endpoint(std::path::Path::new(r"\\.\pipe\triage-alice")).unwrap(),
+            r"\\.\pipe\triage-alice"
+        );
+        assert_eq!(
+            windows_pipe_endpoint(std::path::Path::new(r"\\?\pipe\triage-alice")).unwrap(),
+            r"\\.\pipe\triage-alice"
+        );
+        assert_eq!(
+            windows_pipe_endpoint(std::path::Path::new("triage-alice")).unwrap(),
+            r"\\.\pipe\triage-alice"
+        );
+        assert_eq!(
+            windows_pipe_endpoint(std::path::Path::new(r"C:\tmp\triage.sock")).unwrap(),
+            r"\\.\pipe\C__tmp_triage.sock"
+        );
+        assert!(windows_pipe_endpoint(std::path::Path::new("")).is_err());
     }
 }

@@ -530,7 +530,7 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
     };
 
     #[cfg(not(unix))]
-    let tcp_listener = Some(std::net::TcpListener::bind(bind_addr)?);
+    let tcp_listener = std::net::TcpListener::bind(bind_addr)?;
 
     // If we have inherited sessions, adopt them!
     #[cfg(unix)]
@@ -687,9 +687,6 @@ fn run(invocation: Invocation) -> anyhow::Result<()> {
                     }
                 },
             };
-            #[cfg(not(unix))]
-            let tcp_listener = tcp_listener
-                .expect("non-Unix listener was bound before spawn");
             if let Err(error) = ws::start_websocket_server(
                 ws_manager,
                 tcp_listener,

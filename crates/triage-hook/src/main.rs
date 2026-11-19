@@ -41,11 +41,22 @@ const SESSION_ENV: &str = "TRIAGE_SESSION_ID";
 /// means the daemon itself is unresponsive.
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct ExtractedTool {
+    name: String,
+    args: serde_json::Value,
+    explicit_args: Option<serde_json::Value>,
+}
+
 /// Decodes the agent payload from arbitrary agent hook schemas (Claude, Antigravity, Gemini, etc.).
+#[cfg(test)]
 fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Value)> {
+    extract_tool_details(val).map(|tool| (tool.name, tool.args))
+}
+
+fn extract_tool_details(val: &serde_json::Value) -> Option<ExtractedTool> {
     if let Some(arr) = val.as_array() {
         for item in arr {
-            if let Some(res) = extract_tool_info(item) {
+            if let Some(res) = extract_tool_details(item) {
                 return Some(res);
             }
         }
@@ -67,7 +78,7 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
         "toolCallItem",
         "tool_call_item",
     ] {
-        if let Some(res) = val.get(key).and_then(extract_tool_info) {
+        if let Some(res) = val.get(key).and_then(extract_tool_details) {
             return Some(res);
         }
     }
@@ -82,7 +93,7 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
     ] {
         if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
             for item in arr {
-                if let Some(res) = extract_tool_info(item) {
+                if let Some(res) = extract_tool_details(item) {
                     return Some(res);
                 }
             }
@@ -137,6 +148,14 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
             .or_else(|| val.get("data"))
             .or_else(|| val.get("body"));
 
+        let explicit_args = raw_args.and_then(|v| match v {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                .ok()
+                .filter(|parsed| parsed.is_object()),
+            other if other.is_object() => Some(other.clone()),
+            _ => None,
+        });
+
         let args = match raw_args {
             Some(serde_json::Value::String(s)) => {
                 serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
@@ -144,7 +163,11 @@ fn extract_tool_info(val: &serde_json::Value) -> Option<(String, serde_json::Val
             Some(v) => v.clone(),
             None => val.clone(),
         };
-        return Some((name, args));
+        return Some(ExtractedTool {
+            name,
+            args,
+            explicit_args,
+        });
     }
 
     None
@@ -1167,6 +1190,55 @@ struct HookJsonResponse<'a> {
     permission_overrides: &'a [String],
 }
 
+fn encode_hook_specific_output(
+    verdict: &JudgeVerdict,
+    raw_args: Option<&serde_json::Value>,
+    always_include_updated_input: bool,
+) -> String {
+    match verdict.decision {
+        triage_core::judge::JudgeDecision::Allow => {
+            let mut hook_obj = serde_json::Map::new();
+            hook_obj.insert("hookEventName".to_string(), serde_json::json!("PreToolUse"));
+            hook_obj.insert("permissionDecision".to_string(), serde_json::json!("allow"));
+            if !verdict.reason.is_empty() {
+                hook_obj.insert(
+                    "permissionDecisionReason".to_string(),
+                    serde_json::json!(verdict.reason),
+                );
+            }
+            let explicit_obj = raw_args.filter(|v| v.is_object()).cloned();
+            if always_include_updated_input {
+                hook_obj.insert(
+                    "updatedInput".to_string(),
+                    explicit_obj.unwrap_or_else(|| serde_json::json!({})),
+                );
+            } else if let Some(args) = explicit_obj {
+                hook_obj.insert("updatedInput".to_string(), args);
+            }
+            serde_json::json!({
+                "hookSpecificOutput": serde_json::Value::Object(hook_obj)
+            })
+            .to_string()
+        }
+        triage_core::judge::JudgeDecision::Deny => {
+            let reason = if !verdict.reason.is_empty() {
+                verdict.reason.as_str()
+            } else {
+                "denied by triage approval judge"
+            };
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason
+                }
+            })
+            .to_string()
+        }
+        triage_core::judge::JudgeDecision::Ask => String::new(),
+    }
+}
+
 fn encode_response(
     format: AgentFormat,
     verdict: &JudgeVerdict,
@@ -1175,97 +1247,19 @@ fn encode_response(
     raw_args: Option<&serde_json::Value>,
 ) -> String {
     if format == AgentFormat::ClaudeCode {
-        return match verdict.decision {
-            triage_core::judge::JudgeDecision::Allow => {
-                let reason = if !verdict.reason.is_empty() {
-                    Some(verdict.reason.as_str())
-                } else {
-                    None
-                };
-                let mut out = serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "permissionDecisionReason": reason
-                    }
-                });
-                // Uses Rust nightly let_chains (pinned via rust-toolchain.toml).
-                if let Some(args) = raw_args
-                    && let Some(obj) = out
-                        .get_mut("hookSpecificOutput")
-                        .and_then(|o| o.as_object_mut())
-                {
-                    obj.insert("updatedInput".to_string(), args.clone());
-                }
-                out.to_string()
-            }
-            triage_core::judge::JudgeDecision::Deny => {
-                let reason = if !verdict.reason.is_empty() {
-                    verdict.reason.as_str()
-                } else {
-                    "denied by triage approval judge"
-                };
-                serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": reason
-                    }
-                })
-                .to_string()
-            }
-            triage_core::judge::JudgeDecision::Ask => String::new(),
-        };
+        return encode_hook_specific_output(verdict, raw_args, false);
     }
 
     if format == AgentFormat::Muse {
-        return match verdict.decision {
-            triage_core::judge::JudgeDecision::Allow => {
-                let reason = if !verdict.reason.is_empty() {
-                    Some(verdict.reason.as_str())
-                } else {
-                    None
-                };
-                let updated_input = raw_args.cloned().unwrap_or_else(|| serde_json::json!({}));
-                serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "allow",
-                        "permissionDecisionReason": reason,
-                        "updatedInput": updated_input
-                    }
-                })
-                .to_string()
-            }
-            triage_core::judge::JudgeDecision::Deny => {
-                let reason = if !verdict.reason.is_empty() {
-                    verdict.reason.as_str()
-                } else {
-                    "denied by triage approval judge"
-                };
-                serde_json::json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": reason
-                    }
-                })
-                .to_string()
-            }
-            triage_core::judge::JudgeDecision::Ask => String::new(),
-        };
+        return encode_hook_specific_output(verdict, raw_args, true);
     }
 
+    let reason_opt = (!verdict.reason.is_empty()).then_some(verdict.reason.as_str());
     match verdict.decision {
         triage_core::judge::JudgeDecision::Allow => {
             let permission_overrides = request
                 .map(|req| compute_permission_overrides(req, agent_name))
                 .unwrap_or_default();
-            let reason_opt = if !verdict.reason.is_empty() {
-                Some(verdict.reason.as_str())
-            } else {
-                None
-            };
             serde_json::to_string(&HookJsonResponse {
                 decision: "allow",
                 reason: reason_opt,
@@ -1273,24 +1267,18 @@ fn encode_response(
             })
             .unwrap_or_default()
         }
-        triage_core::judge::JudgeDecision::Deny => {
-            let reason_opt = if !verdict.reason.is_empty() {
-                Some(verdict.reason.as_str())
-            } else {
-                None
-            };
-            serde_json::to_string(&HookJsonResponse {
-                decision: "deny",
-                reason: reason_opt,
-                permission_overrides: &[],
-            })
-            .unwrap_or_default()
-        }
-        triage_core::judge::JudgeDecision::Ask => {
-            // Only approve or explicitly deny. Everything else falls through silently with no output
-            // so the agent handles the tool call using its own native default permissions.
-            String::new()
-        }
+        triage_core::judge::JudgeDecision::Deny => serde_json::to_string(&HookJsonResponse {
+            decision: "deny",
+            reason: reason_opt,
+            permission_overrides: &[],
+        })
+        .unwrap_or_default(),
+        triage_core::judge::JudgeDecision::Ask => serde_json::to_string(&HookJsonResponse {
+            decision: "ask",
+            reason: reason_opt,
+            permission_overrides: &[],
+        })
+        .unwrap_or_default(),
     }
 }
 
@@ -1384,7 +1372,7 @@ fn decide() -> (
     };
     let format = detect_format(&val);
     let agent_name = extract_agent_name(&val);
-    let Some((tool_name, tool_args)) = extract_tool_info(&val) else {
+    let Some(tool) = extract_tool_details(&val) else {
         return (
             JudgeVerdict::fallback("hook payload carried no tool call"),
             format,
@@ -1393,6 +1381,9 @@ fn decide() -> (
             None,
         );
     };
+    let tool_name = tool.name;
+    let tool_args = tool.args;
+    let explicit_args = tool.explicit_args;
 
     let session_id = extract_session_id(&val);
     let cwd = extract_cwd(&val);
@@ -1427,7 +1418,7 @@ fn decide() -> (
     };
     let remaining_timeout = JUDGE_TIMEOUT.saturating_sub(start_time.elapsed());
     let verdict = ask_daemon(request.clone(), remaining_timeout);
-    (verdict, format, Some(request), agent_name, Some(tool_args))
+    (verdict, format, Some(request), agent_name, explicit_args)
 }
 
 /// Evaluates deterministic Layer 1 deny and Layer 2 allow rules in-process using
@@ -1449,6 +1440,53 @@ fn evaluate_in_process(request: &JudgeRequest) -> Option<JudgeVerdict> {
 
 use triage_core::ipc::default_socket_path;
 
+fn round_trip_judge_stream<S: std::io::Read + std::io::Write>(
+    mut stream: S,
+    request: &JudgeRequest,
+) -> Result<JudgeVerdict, String> {
+    use std::io::{BufRead, BufReader};
+
+    #[derive(serde::Serialize)]
+    enum WireReq<'a> {
+        JudgeToolCall(&'a JudgeRequest),
+    }
+    let wire =
+        serde_json::to_string(&WireReq::JudgeToolCall(request)).map_err(|e| e.to_string())?;
+    stream
+        .write_all(wire.as_bytes())
+        .map_err(|e| e.to_string())?;
+    stream.write_all(b"\n").map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Err("daemon closed connection".to_string());
+    }
+
+    #[derive(serde::Deserialize)]
+    enum WireSucc {
+        JudgeVerdict(JudgeVerdict),
+        #[serde(other)]
+        Other,
+    }
+    #[derive(serde::Deserialize)]
+    enum WireResp {
+        Ok(Box<WireSucc>),
+        Err { message: String },
+    }
+
+    let resp: WireResp = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    match resp {
+        WireResp::Ok(succ) => match *succ {
+            WireSucc::JudgeVerdict(verdict) => Ok(verdict),
+            _ => Err("unexpected response payload".to_string()),
+        },
+        WireResp::Err { message } => Err(message),
+    }
+}
+
 fn send_ipc_judge_request(
     socket_path: &std::path::Path,
     request: &JudgeRequest,
@@ -1456,64 +1494,43 @@ fn send_ipc_judge_request(
 ) -> Result<JudgeVerdict, String> {
     #[cfg(unix)]
     {
-        use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixStream;
 
-        let mut stream = UnixStream::connect(socket_path).map_err(|e| e.to_string())?;
+        let stream = UnixStream::connect(socket_path).map_err(|e| e.to_string())?;
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
-
-        #[derive(serde::Serialize)]
-        enum WireReq<'a> {
-            JudgeToolCall(&'a JudgeRequest),
-        }
-        let wire =
-            serde_json::to_string(&WireReq::JudgeToolCall(request)).map_err(|e| e.to_string())?;
-        stream
-            .write_all(wire.as_bytes())
-            .map_err(|e| e.to_string())?;
-        stream.write_all(b"\n").map_err(|e| e.to_string())?;
-        stream.flush().map_err(|e| e.to_string())?;
-
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        if read == 0 {
-            return Err("daemon closed connection".to_string());
-        }
-
-        #[derive(serde::Deserialize)]
-        enum WireSucc {
-            JudgeVerdict(JudgeVerdict),
-            #[serde(other)]
-            Other,
-        }
-        #[derive(serde::Deserialize)]
-        enum WireResp {
-            Ok(Box<WireSucc>),
-            Err { message: String },
-        }
-
-        let resp: WireResp = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-        match resp {
-            WireResp::Ok(succ) => match *succ {
-                WireSucc::JudgeVerdict(verdict) => Ok(verdict),
-                _ => Err("unexpected response payload".to_string()),
-            },
-            WireResp::Err { message } => Err(message),
-        }
+        round_trip_judge_stream(stream, request)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // On non-Unix platforms (e.g. Windows), the shim relies directly on
-        // in-process deterministic rule evaluation via `evaluate_in_process`
-        // rather than linking heavyweight async named pipe runtimes, keeping
-        // the shim lightweight and dependency-free.
+        const ERROR_PIPE_BUSY: i32 = 231;
+
+        let pipe_path =
+            triage_core::ipc::windows_pipe_endpoint(socket_path).map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + timeout;
+        let stream = loop {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pipe_path)
+            {
+                Ok(file) => break file,
+                Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err(err.to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+                }
+                Err(err) => return Err(err.to_string()),
+            }
+        };
+        round_trip_judge_stream(stream, request)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = (socket_path, request, timeout);
-        Err(
-            "IPC socket evaluation unavailable on non-unix; falling back to offline rules"
-                .to_string(),
-        )
+        Err("IPC socket evaluation unavailable on this platform".to_string())
     }
 }
 
@@ -1694,7 +1711,14 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(ask_encoded, "");
+        let ask_val: serde_json::Value = serde_json::from_str(&ask_encoded).unwrap();
+        assert_eq!(ask_val["decision"], "ask");
+        assert_eq!(ask_val["reason"], "command requires confirmation");
+        assert!(ask_val.get("permissionOverrides").is_none());
+
+        let generic_ask = encode_response(AgentFormat::Generic, &ask_verdict, None, None, None);
+        let generic_val: serde_json::Value = serde_json::from_str(&generic_ask).unwrap();
+        assert_eq!(generic_val["decision"], "ask");
 
         let allow_cmd_verdict = JudgeVerdict {
             decision: JudgeDecision::Allow,
@@ -1808,6 +1832,52 @@ mod tests {
         assert_eq!(
             val["hookSpecificOutput"]["updatedInput"]["command"],
             "ls -la"
+        );
+
+        let empty_reason_allow = JudgeVerdict {
+            decision: JudgeDecision::Allow,
+            source: triage_core::judge::JudgeSource::AllowRule,
+            reason: String::new(),
+        };
+        let encoded_no_reason = encode_response(
+            AgentFormat::ClaudeCode,
+            &empty_reason_allow,
+            None,
+            None,
+            None,
+        );
+        let no_reason_val: serde_json::Value = serde_json::from_str(&encoded_no_reason).unwrap();
+        assert!(
+            no_reason_val["hookSpecificOutput"]
+                .get("permissionDecisionReason")
+                .is_none()
+        );
+
+        // A payload with no explicit tool_input/args must not leak outer hook envelope
+        // fields into `updatedInput`.
+        let no_args_payload: serde_json::Value = serde_json::from_str(
+            r#"{
+                "session_id": "sess-1",
+                "transcript_path": "/tmp/transcript.jsonl",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "search_web"
+            }"#,
+        )
+        .unwrap();
+        let details = extract_tool_details(&no_args_payload).unwrap();
+        assert!(details.explicit_args.is_none());
+        let encoded_no_args = encode_response(
+            AgentFormat::ClaudeCode,
+            &allow_verdict,
+            None,
+            None,
+            details.explicit_args.as_ref(),
+        );
+        let no_args_val: serde_json::Value = serde_json::from_str(&encoded_no_args).unwrap();
+        assert!(
+            no_args_val["hookSpecificOutput"]
+                .get("updatedInput")
+                .is_none()
         );
     }
 
@@ -2880,5 +2950,63 @@ mod tests {
             Some("git log -n 5 --format=\"%h\"")
         );
         assert_eq!(extract_cwd(&val).as_deref(), Some("/work/project"));
+    }
+
+    #[test]
+    fn round_trip_judge_stream_decodes_verdict_over_in_memory_pipe() {
+        struct MockPipe {
+            written: Vec<u8>,
+            response: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Write for MockPipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl std::io::Read for MockPipe {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.response.read(buf)
+            }
+        }
+
+        let pipe = MockPipe {
+            written: Vec::new(),
+            response: std::io::Cursor::new(
+                br#"{"Ok":{"JudgeVerdict":{"decision":"allow","source":"allow_rule","reason":"matched allow rule: git status"}}}"#
+                    .to_vec(),
+            ),
+        };
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("git status".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let verdict = round_trip_judge_stream(pipe, &req).expect("round trip succeeds");
+        assert_eq!(verdict.decision, JudgeDecision::Allow);
+        assert_eq!(verdict.reason, "matched allow rule: git status");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_windows_pipe_falls_back_cleanly() {
+        let missing = std::path::PathBuf::from(format!(
+            r"\\.\pipe\triage-nonexistent-test-{}",
+            std::process::id()
+        ));
+        let req = JudgeRequest {
+            session_id: SessionId::default(),
+            tool_name: "run_command".to_string(),
+            command_line: Some("git status".to_string()),
+            path: None,
+            cwd: None,
+        };
+        let res = send_ipc_judge_request(&missing, &req, Duration::from_millis(50));
+        assert!(res.is_err());
     }
 }
