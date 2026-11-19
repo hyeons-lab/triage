@@ -106,6 +106,7 @@ mod transport {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+    #[cfg(unix)]
     const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[cfg(unix)]
@@ -170,65 +171,14 @@ mod transport {
     /// the connect/listen name builder and by user-facing endpoint display.
     #[cfg(windows)]
     pub fn windows_pipe_token(path: &Path) -> std::io::Result<String> {
-        let raw = path.to_str().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "named pipe name is not valid UTF-8",
-            )
-        })?;
-        // Accept either a bare token (`triage-<user>`, the default) or a full pipe
-        // path (`\\.\pipe\triage-<user>` / `\\?\pipe\...`); strip the well-known
-        // prefix so a user-typed full path maps to the same token, then collapse
-        // any remaining separators into the single legal token.
-        let bare = raw
-            .strip_prefix(r"\\.\pipe\")
-            .or_else(|| raw.strip_prefix(r"\\?\pipe\"))
-            .unwrap_or(raw);
-        let collapsed: String = bare
-            .chars()
-            .map(|c| match c {
-                '\\' | '/' | ':' => '_',
-                other => other,
-            })
-            .collect();
-
-        // The full pipe path `\\.\pipe\<token>` is capped by NPFS at 256 UTF-16
-        // code units (the Win32 string unit), not chars — a non-BMP char is one
-        // `char` but two units. A deep override/test path could exceed that;
-        // collapse an over-long token to a readable prefix plus a stable hash so
-        // it stays legal and still unique per distinct path.
-        if collapsed.encode_utf16().count() <= MAX_PIPE_TOKEN_LEN {
-            return Ok(collapsed);
-        }
-        use sha2::{Digest, Sha256};
-        // 16 hex chars (ASCII → 16 units) + one `_` separator = 17 units.
-        let hash = hex::encode(&Sha256::digest(collapsed.as_bytes())[..8]);
-        let prefix = truncate_utf16_units(&collapsed, MAX_PIPE_TOKEN_LEN - 17);
-        Ok(format!("{prefix}_{hash}"))
+        triage_core::ipc::windows_pipe_token(path)
     }
 
     /// Maximum length, in UTF-16 code units, for a named-pipe token. NPFS caps
     /// the full `\\.\pipe\<token>` path at 256 units; this leaves margin for the
     /// 9-unit `\\.\pipe\` prefix.
-    #[cfg(windows)]
-    pub const MAX_PIPE_TOKEN_LEN: usize = 210;
-
-    /// Truncate `s` to at most `max_units` UTF-16 code units, stopping on a
-    /// `char` boundary so a surrogate pair is never split.
-    #[cfg(windows)]
-    fn truncate_utf16_units(s: &str, max_units: usize) -> String {
-        let mut out = String::new();
-        let mut units = 0usize;
-        for c in s.chars() {
-            let w = c.len_utf16();
-            if units + w > max_units {
-                break;
-            }
-            out.push(c);
-            units += w;
-        }
-        out
-    }
+    #[cfg(all(windows, test))]
+    pub const MAX_PIPE_TOKEN_LEN: usize = triage_core::ipc::MAX_WINDOWS_PIPE_TOKEN_LEN;
 
     #[cfg(windows)]
     pub fn windows_pipe_name(
@@ -2749,6 +2699,10 @@ mod tests {
         let long = format!(r"\\.\pipe\{}", "a".repeat(400));
         let token = transport::windows_pipe_token(Path::new(&long)).expect("token");
         assert!(token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
+        assert_eq!(
+            triage_core::ipc::windows_pipe_endpoint(Path::new(&long)).expect("core endpoint"),
+            format!(r"\\.\pipe\{token}")
+        );
         // Stable across calls...
         let again = transport::windows_pipe_token(Path::new(&long)).expect("token");
         assert_eq!(token, again);
@@ -2762,6 +2716,12 @@ mod tests {
         let astral = format!(r"\\.\pipe\{}", "🦀".repeat(400));
         let astral_token = transport::windows_pipe_token(Path::new(&astral)).expect("token");
         assert!(astral_token.encode_utf16().count() <= transport::MAX_PIPE_TOKEN_LEN);
+        assert_eq!(
+            triage_core::ipc::windows_pipe_endpoint(Path::new(&astral)).expect("core endpoint"),
+            format!(r"\\.\pipe\{astral_token}")
+        );
+
+        assert!(transport::windows_pipe_token(Path::new("")).is_err());
     }
 
     // The bounded Windows connect (`ConnectWaitMode::Timeout`) must fail *fast*
@@ -2892,6 +2852,7 @@ mod tests {
         let parent = client
             .start_session(StartSessionRequest::new(long_running_shell_command()))
             .expect("start parent via IPC");
+        #[cfg_attr(windows, allow(unused_mut))]
         let mut child_req = StartSessionRequest::new(long_running_shell_command())
             .with_parent(parent.clone())
             .with_outlive_parent(true);

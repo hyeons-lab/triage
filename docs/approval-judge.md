@@ -175,7 +175,7 @@ In the Flutter client:
 ## Cross-Platform Portability
 
 - **macOS & Linux**: Full Unix domain socket IPC (`/tmp/triage-<uid>/triage.sock` or `$XDG_RUNTIME_DIR/triage/triage.sock`) with zero-downtime descriptor handover and resident model inference.
-- **Windows**: `triaged` daemon supports Windows named pipes (`\\.\pipe\triage-<user>`); `triage-hook` on Windows falls back to offline deterministic rule evaluation with safe fallback to `ask`.
+- **Windows**: `triaged` daemon and `triage-hook` communicate over Windows named pipes (`\\.\pipe\triage-<user>`), with automatic fallback to offline deterministic rule evaluation and safe fallback to `ask` when the daemon is not running.
 
 ## Turning it off
 
