@@ -194,86 +194,95 @@ fn home_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home))
 }
 
+fn sync_global_agent_hooks_files(home: &std::path::Path) -> String {
+    let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+    let cargo_hook = home.join(".cargo").join("bin").join(&hook_name);
+    let hook_cmd = if cargo_hook.exists() {
+        crate::judge::format_hook_command(&cargo_hook)
+    } else {
+        "triage-hook".to_string()
+    };
+
+    let content = serde_json::json!({
+        "triage-approval-judge": {
+            "enabled": true,
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_cmd,
+                            "timeout": 15
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+
+    if let Ok(json_str) = serde_json::to_string_pretty(&content) {
+        let hook_paths = [
+            home.join(".gemini").join("config").join("hooks.json"),
+            home.join(".agents").join("hooks.json"),
+        ];
+        for path in hook_paths {
+            if !path.exists() {
+                let _ = atomic_write_file(&path, &json_str);
+                tracing::info!(path = %path.display(), "Configured global agent hooks");
+            } else if let Ok(existing_str) = std::fs::read_to_string(&path)
+                && let Ok(mut existing_val) =
+                    serde_json::from_str::<serde_json::Value>(&existing_str)
+                && let Some(obj) = existing_val.as_object_mut()
+            {
+                let mut judge_map = obj
+                    .get("triage-approval-judge")
+                    .and_then(|j| j.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                if crate::judge::repair_agents_judge_entry(&mut judge_map, &hook_cmd, None) {
+                    obj.insert(
+                        "triage-approval-judge".to_string(),
+                        serde_json::Value::Object(judge_map),
+                    );
+                    if let Ok(updated_str) = serde_json::to_string_pretty(&existing_val) {
+                        let _ = atomic_write_file(&path, &updated_str);
+                        tracing::info!(
+                            path = %path.display(),
+                            "Updated triage-approval-judge in agent hooks"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure ~/.gemini/antigravity-cli/bin/triage-hook symlink points to cargo_hook if antigravity-cli/bin exists
+    #[cfg(unix)]
+    {
+        let agy_bin_dir = home.join(".gemini").join("antigravity-cli").join("bin");
+        if agy_bin_dir.exists() && cargo_hook.exists() {
+            let agy_hook = agy_bin_dir.join(&hook_name);
+            let needs_link = if let Ok(target) = std::fs::read_link(&agy_hook) {
+                target != cargo_hook
+            } else {
+                true
+            };
+            if needs_link {
+                let _ = std::fs::remove_file(&agy_hook);
+                let _ = std::os::unix::fs::symlink(&cargo_hook, &agy_hook);
+            }
+        }
+    }
+
+    hook_cmd
+}
+
 /// Provisions global agent lifecycle hooks (in `~/.gemini/config/hooks.json` and `~/.agents/hooks.json`) if not already present.
 pub fn install_global_agent_hooks() {
     if let Ok(home) = home_dir() {
-        let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
-        let cargo_hook = home.join(".cargo").join("bin").join(&hook_name);
-        let hook_cmd = if cargo_hook.exists() {
-            crate::judge::format_hook_command(&cargo_hook)
-        } else {
-            "triage-hook".to_string()
-        };
-
-        let content = serde_json::json!({
-            "triage-approval-judge": {
-                "enabled": true,
-                "PreToolUse": [
-                    {
-                        "matcher": ".*",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": hook_cmd,
-                                "timeout": 15
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
-
-        if let Ok(json_str) = serde_json::to_string_pretty(&content) {
-            let hook_paths = [
-                home.join(".gemini").join("config").join("hooks.json"),
-                home.join(".agents").join("hooks.json"),
-            ];
-            for path in hook_paths {
-                if !path.exists() {
-                    let _ = atomic_write_file(&path, &json_str);
-                    tracing::info!(path = %path.display(), "Configured global agent hooks");
-                } else if let Ok(existing_str) = std::fs::read_to_string(&path)
-                    && let Ok(mut existing_val) =
-                        serde_json::from_str::<serde_json::Value>(&existing_str)
-                    && let Some(obj) = existing_val.as_object_mut()
-                {
-                    let needs_update = crate::judge::pre_tool_use_needs_command_update(
-                        obj.get("triage-approval-judge")
-                            .and_then(|j| j.get("PreToolUse")),
-                        &hook_cmd,
-                    );
-
-                    if needs_update
-                        && let Some(judge_obj) = content.get("triage-approval-judge").cloned()
-                    {
-                        obj.insert("triage-approval-judge".to_string(), judge_obj);
-                        if let Ok(updated_str) = serde_json::to_string_pretty(&existing_val) {
-                            let _ = atomic_write_file(&path, &updated_str);
-                            tracing::info!(
-                                path = %path.display(),
-                                "Updated triage-approval-judge in agent hooks"
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Ensure ~/.gemini/antigravity-cli/bin/triage-hook symlink points to cargo_hook if antigravity-cli/bin exists
-            let agy_bin_dir = home.join(".gemini").join("antigravity-cli").join("bin");
-            if agy_bin_dir.exists() && cargo_hook.exists() {
-                let agy_hook = agy_bin_dir.join(&hook_name);
-                let needs_link = if let Ok(target) = std::fs::read_link(&agy_hook) {
-                    target != cargo_hook
-                } else {
-                    true
-                };
-                if needs_link {
-                    let _ = std::fs::remove_file(&agy_hook);
-                    #[cfg(unix)]
-                    let _ = std::os::unix::fs::symlink(&cargo_hook, &agy_hook);
-                }
-            }
-
+        let hook_cmd = sync_global_agent_hooks_files(&home);
+        {
             // Ensure ~/.gemini/settings.json and ~/.gemini/antigravity-cli/settings.json pre-approve command(*)
             // so EnsurePermissions lets triage-hook act as the authoritative safety judge without interactive prompts.
             for settings_dir in [
@@ -1179,5 +1188,71 @@ mod tests {
             args.iter()
                 .any(|a| a.contains(r#"start "" /b "C:\Users\me\triaged.exe""#))
         );
+    }
+
+    #[test]
+    fn sync_global_agent_hooks_preserves_disabled_preference_while_repairing_stale_command() {
+        let temp_home = std::env::temp_dir().join(format!(
+            "triage-global-hooks-test-{}",
+            rand::random::<u64>()
+        ));
+        let cargo_bin = temp_home.join(".cargo").join("bin");
+        std::fs::create_dir_all(&cargo_bin).expect("create cargo bin");
+        let hook_name = format!("triage-hook{}", std::env::consts::EXE_SUFFIX);
+        let expected_bin = cargo_bin.join(&hook_name);
+        std::fs::write(&expected_bin, "").expect("create fake triage-hook");
+
+        let agents_dir = temp_home.join(".agents");
+        std::fs::create_dir_all(&agents_dir).expect("create .agents");
+        let agents_hooks = agents_dir.join("hooks.json");
+        std::fs::write(
+            &agents_hooks,
+            r#"{
+  "triage-approval-judge": {
+    "enabled": false,
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/stale/cross-os/triage-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}"#,
+        )
+        .expect("write disabled hooks");
+
+        let agy_bin_dir = temp_home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("bin");
+        std::fs::create_dir_all(&agy_bin_dir).expect("create agy bin");
+        let agy_hook = agy_bin_dir.join(&hook_name);
+        std::fs::write(&agy_hook, "existing-shim").expect("create agy shim");
+
+        let hook_cmd = sync_global_agent_hooks_files(&temp_home);
+        assert_eq!(hook_cmd, crate::judge::format_hook_command(&expected_bin));
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&agents_hooks).unwrap()).unwrap();
+        let judge = &updated["triage-approval-judge"];
+        assert_eq!(judge["enabled"].as_bool(), Some(false));
+        assert_eq!(
+            judge["PreToolUse"][0]["hooks"][0]["command"].as_str(),
+            Some(hook_cmd.as_str())
+        );
+
+        #[cfg(not(unix))]
+        assert!(
+            agy_hook.is_file(),
+            "non-unix install must not delete existing shim without replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_home);
     }
 }

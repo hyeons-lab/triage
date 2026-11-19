@@ -1301,6 +1301,23 @@ fn main() {
 
 const MAX_STDIN_BYTES: usize = 2 * 1024 * 1024;
 
+fn resolve_stdin_outcome(
+    outcome: Result<Result<serde_json::Value, String>, std::sync::mpsc::RecvTimeoutError>,
+    env: &FormatEnv,
+) -> Result<serde_json::Value, (JudgeVerdict, AgentFormat)> {
+    match outcome {
+        Ok(Ok(val)) => Ok(val),
+        Ok(Err(error)) => Err((
+            JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
+            detect_format_with_env(&serde_json::Value::Null, env),
+        )),
+        Err(_) => Err((
+            JudgeVerdict::fallback("timed out waiting for stdin payload"),
+            detect_format_with_env(&serde_json::Value::Null, env),
+        )),
+    }
+}
+
 /// Produces the verdict and detected agent format, resolving every failure to `ask`.
 fn decide() -> (
     JudgeVerdict,
@@ -1349,27 +1366,11 @@ fn decide() -> (
         }
     });
 
-    let val: serde_json::Value = match rx.recv_timeout(JUDGE_TIMEOUT) {
-        Ok(Ok(val)) => val,
-        Ok(Err(error)) => {
-            return (
-                JudgeVerdict::fallback(format!("could not parse the hook payload: {error}")),
-                AgentFormat::Generic,
-                None,
-                None,
-                None,
-            );
-        }
-        Err(_) => {
-            return (
-                JudgeVerdict::fallback("timed out waiting for stdin payload"),
-                AgentFormat::Generic,
-                None,
-                None,
-                None,
-            );
-        }
-    };
+    let val: serde_json::Value =
+        match resolve_stdin_outcome(rx.recv_timeout(JUDGE_TIMEOUT), &FormatEnv::from_process()) {
+            Ok(val) => val,
+            Err((verdict, format)) => return (verdict, format, None, None, None),
+        };
     let format = detect_format(&val);
     let agent_name = extract_agent_name(&val);
     let Some(tool) = extract_tool_details(&val) else {
@@ -3008,5 +3009,37 @@ mod tests {
         };
         let res = send_ipc_judge_request(&missing, &req, Duration::from_millis(50));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn stdin_fallback_preserves_ambient_claude_and_muse_formats() {
+        let claude_env = FormatEnv {
+            claude_env: true,
+            ..FormatEnv::default()
+        };
+        let (verdict, format) = resolve_stdin_outcome(
+            Ok(Err("stdin payload exceeded 2MB limit".into())),
+            &claude_env,
+        )
+        .unwrap_err();
+        assert_eq!(format, AgentFormat::ClaudeCode);
+        assert_eq!(encode_response(format, &verdict, None, None, None), "");
+
+        let muse_env = FormatEnv {
+            muse_env: true,
+            ..FormatEnv::default()
+        };
+        let (verdict, format) =
+            resolve_stdin_outcome(Err(std::sync::mpsc::RecvTimeoutError::Timeout), &muse_env)
+                .unwrap_err();
+        assert_eq!(format, AgentFormat::Muse);
+        assert_eq!(encode_response(format, &verdict, None, None, None), "");
+
+        let (verdict, format) =
+            resolve_stdin_outcome(Ok(Err("empty stdin".into())), &FormatEnv::default())
+                .unwrap_err();
+        assert_eq!(format, AgentFormat::Antigravity);
+        let encoded = encode_response(format, &verdict, None, None, None);
+        assert!(encoded.contains(r#""decision":"ask""#));
     }
 }

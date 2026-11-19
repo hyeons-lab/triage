@@ -2352,6 +2352,20 @@ fn has_windows_path_prefix(s: &str) -> bool {
         || s.starts_with(r"\\")
 }
 
+fn has_windows_path_prefix_or_flag_value(s: &str) -> bool {
+    has_windows_path_prefix(s)
+        || s.split_once('=')
+            .is_some_and(|(_, val)| has_windows_path_prefix(val))
+}
+
+fn strip_backslashes(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\\') {
+        std::borrow::Cow::Owned(s.replace('\\', ""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// Tokenizes a command segment while preserving Windows path backslashes (e.g.
 /// `C:\Users\...`, `.\scripts\...`, `\\server\share`) that POSIX `shlex` would
 /// otherwise strip as escape characters.
@@ -2435,6 +2449,10 @@ fn tokenize_words_preserving_windows_paths(segment: &str) -> Vec<String> {
         }
         if ch == '\\' {
             let rest = &segment[idx..];
+            let rest_of_token = rest[1..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'))
+                .map(|end| &rest[1..1 + end])
+                .unwrap_or(&rest[1..]);
             if current.is_empty() && has_windows_path_prefix(rest) {
                 token_is_windows_path = true;
             }
@@ -2442,7 +2460,7 @@ fn tokenize_words_preserving_windows_paths(segment: &str) -> Vec<String> {
                 let mut probe = String::with_capacity(current.len() + 1);
                 probe.push_str(&current);
                 probe.push('\\');
-                has_windows_path_prefix(&probe)
+                has_windows_path_prefix_or_flag_value(&probe)
             } else {
                 false
             };
@@ -2450,15 +2468,20 @@ fn tokenize_words_preserving_windows_paths(segment: &str) -> Vec<String> {
                 token_is_windows_path = true;
             }
             let next_ch = chars.peek().map(|&(_, c)| c);
+            let looks_like_cli_flag_or_kv = current.starts_with('-')
+                || current.contains('=')
+                || (current.is_empty() && next_ch == Some('-'))
+                || (!token_is_windows_path && rest_of_token.contains('='));
             let is_shell_special_escape = matches!(next_ch, Some('"' | '\'' | '$' | '`'))
                 || next_ch.is_some_and(char::is_whitespace);
             let preserve_literal = token_is_windows_path
-                || (cfg!(windows) && !is_shell_special_escape)
-                || (rest[1..].contains('\\')
-                    && !is_shell_special_escape
-                    && next_ch.is_some_and(|c| {
-                        c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
-                    }));
+                || (!looks_like_cli_flag_or_kv
+                    && ((cfg!(windows) && !is_shell_special_escape)
+                        || (rest_of_token.contains('\\')
+                            && !is_shell_special_escape
+                            && next_ch.is_some_and(|c| {
+                                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+                            }))));
             if preserve_literal {
                 current.push('\\');
             } else if let Some((_, escaped_ch)) = chars.next() {
@@ -2949,13 +2972,14 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
             .is_some_and(|(_, flags)| {
                 flags.iter().any(|&flag| {
                     arguments.iter().any(|argument| {
+                        let normalized = strip_backslashes(argument);
                         if flag.starts_with("--") {
-                            argument == &flag
-                                || argument
+                            normalized == flag
+                                || normalized
                                     .strip_prefix(flag)
                                     .is_some_and(|rest| rest.starts_with('='))
                         } else {
-                            !argument.starts_with("--") && argument.starts_with(flag)
+                            !normalized.starts_with("--") && normalized.starts_with(flag)
                         }
                     })
                 })
@@ -2966,9 +2990,10 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
             .iter()
             .find(|(name, _)| *name == program)
             .is_some_and(|(_, flags)| {
-                arguments
-                    .iter()
-                    .any(|argument| is_short_flag_bundle_containing(argument, flags))
+                arguments.iter().any(|argument| {
+                    let normalized = strip_backslashes(argument);
+                    is_short_flag_bundle_containing(&normalized, flags)
+                })
             })
     };
     let has_remote_helper =
@@ -2978,11 +3003,12 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
             return false;
         }
         arguments.iter().enumerate().any(|(i, &arg)| {
-            if arg == "-c" {
+            let normalized = strip_backslashes(arg);
+            if normalized == "-c" {
                 arguments
                     .get(i + 1)
                     .is_some_and(|val| is_dangerous_git_config_key(val))
-            } else if let Some(rest) = arg.strip_prefix("-c") {
+            } else if let Some(rest) = normalized.strip_prefix("-c") {
                 is_dangerous_git_config_key(rest)
             } else {
                 false
@@ -2991,12 +3017,41 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
     };
 
     let has_powershell_env_provider = || {
+        let prog_lower = program.to_ascii_lowercase();
+        if prog_lower == "get-content"
+            && arguments.iter().any(|a| {
+                strip_backslashes(a)
+                    .trim_matches(['"', '\''])
+                    .eq_ignore_ascii_case("-wait")
+            })
+        {
+            return true;
+        }
         matches!(
-            program.to_ascii_lowercase().as_str(),
-            "get-content" | "get-childitem" | "get-item" | "get-itemproperty" | "dir"
+            prog_lower.as_str(),
+            "get-content"
+                | "get-childitem"
+                | "get-item"
+                | "get-itemproperty"
+                | "test-path"
+                | "resolve-path"
+                | "get-acl"
+                | "dir"
         ) && arguments.iter().any(|arg| {
             let trimmed = arg.trim_matches(['"', '\'']);
-            trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("env:")
+            let value = if trimmed.starts_with('-') {
+                trimmed
+                    .split_once(':')
+                    .map_or(trimmed, |(_, v)| v.trim_matches(['"', '\'']))
+            } else {
+                trimmed
+            };
+            let lower = value.to_ascii_lowercase();
+            lower.starts_with("env:")
+                || lower.starts_with("variable:")
+                || lower.starts_with("cert:")
+                || lower.starts_with("hkcu:")
+                || lower.starts_with("hklm:")
         })
     };
 
@@ -3009,7 +3064,7 @@ pub fn has_disqualifying_argument(tokens: &[&str]) -> bool {
 }
 
 pub fn is_dangerous_git_config_key(arg: &str) -> bool {
-    let lower = arg.to_ascii_lowercase();
+    let lower = strip_backslashes(arg).to_ascii_lowercase();
     let is_dangerous_helper = || {
         if lower.contains("credential.") && (lower.contains(".helper") || lower.contains("helper"))
         {
@@ -3088,7 +3143,9 @@ pub fn has_write_git_subcommand(program: &str, arguments: &[&str]) -> bool {
         });
     match subcommand {
         "branch" if is_listing_branch => sub_args.iter().any(|token| {
-            WRITE_FLAGS.contains(token) || is_short_flag_bundle_containing(token, WRITE_SHORT_FLAGS)
+            let normalized = strip_backslashes(token);
+            WRITE_FLAGS.contains(&&*normalized)
+                || is_short_flag_bundle_containing(&normalized, WRITE_SHORT_FLAGS)
         }),
         "remote"
             if sub_args.iter().all(|a| a.starts_with('-'))
@@ -3101,7 +3158,9 @@ pub fn has_write_git_subcommand(program: &str, arguments: &[&str]) -> bool {
         "remote" => true,
         "branch" if sub_args.iter().any(|token| !token.starts_with('-')) => true,
         "branch" => sub_args.iter().any(|token| {
-            WRITE_FLAGS.contains(token) || is_short_flag_bundle_containing(token, WRITE_SHORT_FLAGS)
+            let normalized = strip_backslashes(token);
+            WRITE_FLAGS.contains(&&*normalized)
+                || is_short_flag_bundle_containing(&normalized, WRITE_SHORT_FLAGS)
         }),
         _ => false,
     }
@@ -3133,7 +3192,7 @@ pub fn unquote_segment(segment: &str) -> std::borrow::Cow<'_, str> {
 pub fn program_name(token: &str) -> &str {
     let unescaped = token.strip_prefix('\\').unwrap_or(token);
     let base = unescaped.rsplit(['/', '\\']).next().unwrap_or(unescaped);
-    if base.len() > 4 && base[base.len() - 4..].eq_ignore_ascii_case(".exe") {
+    if base.len() > 4 && base.as_bytes()[base.len() - 4..].eq_ignore_ascii_case(b".exe") {
         &base[..base.len() - 4]
     } else {
         base
@@ -5411,5 +5470,88 @@ mod tests {
             Some(JudgeDecision::Ask)
         );
         assert_eq!(evaluate_cmd("Get-ChildItem Env:").map(|v| v.decision), None);
+        assert_eq!(
+            evaluate_cmd("Get-ChildItem -Path:Env:").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("Get-Content -LiteralPath:Env:OPENAI_API_KEY").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("Get-Content Variable:API_KEY").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("Get-ChildItem Cert:").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd(r"Get-ItemProperty HKCU:\Environment").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd(r"Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("Test-Path Env:OPENAI_API_KEY").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("Resolve-Path Variable:SECRET").map(|v| v.decision),
+            None
+        );
+        assert_eq!(
+            evaluate_cmd("Get-Content -Wait app.log").map(|v| v.decision),
+            None
+        );
+    }
+
+    #[test]
+    fn non_ascii_utf8_boundaries_do_not_panic() {
+        assert_eq!(program_name("éabc"), "éabc");
+        assert_eq!(program_name("日本語"), "日本語");
+        assert_eq!(program_name("🎉a"), "🎉a");
+        assert_eq!(program_name("日本語.EXE"), "日本語");
+
+        // 4th byte lands inside multi-byte UTF-8 scalar in has_powershell_env_provider.
+        for cmd in ["dir café", "Get-Content 日本語", "Get-Item a🎉"] {
+            assert_eq!(
+                evaluate_cmd(cmd).map(|v| v.decision),
+                Some(JudgeDecision::Allow),
+                "{cmd}"
+            );
+        }
+        assert_eq!(evaluate_cmd("日本語"), None);
+    }
+
+    #[test]
+    fn backslash_escaped_flags_and_config_cannot_bypass_disqualifiers() {
+        for cmd in [
+            r"find . -\exec sh -c id \;",
+            r"find . \-\e\x\e\c sh -c id \;",
+            r"find . -\exec sh -c evil ';'",
+            r"git -c core.\sshCommand=evil status a\ b",
+            r"git -c c\o\r\e.\s\s\hCommand=evil status",
+            r"rg --\pre=sh pattern a\ b",
+            r"git branch -\D main",
+        ] {
+            assert_ne!(
+                evaluate_cmd(cmd).map(|v| v.decision),
+                Some(JudgeDecision::Allow),
+                "command must not auto-allow: {cmd}"
+            );
+        }
+
+        // Valid Windows flag=path tokens keep their backslashes.
+        assert_eq!(
+            tokenize_words(r"rg pattern --iglob C:\Users\dev\src\main.rs"),
+            vec!["rg", "pattern", "--iglob", r"C:\Users\dev\src\main.rs"]
+        );
+        assert_eq!(
+            tokenize_words(r"cargo check --target-dir=.\target\win"),
+            vec!["cargo", "check", r"--target-dir=.\target\win"]
+        );
     }
 }

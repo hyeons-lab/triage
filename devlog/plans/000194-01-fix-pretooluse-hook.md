@@ -46,3 +46,38 @@ Investigating the `PreToolUse` hook path across `triage-hook`, `triage-core`, `t
 5. **Validate**:
    - Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --workspace` (excluding or handling any unrelated environment issues cleanly).
    - Rebuild and test `triage-hook.exe` against sample Antigravity, Windows PowerShell, Claude Code, and Muse payloads.
+
+## Thinking
+
+Review of PR `#228` (`66ebf85`) identified two blocking issues in `crates/triage-core/src/judge_rules.rs`, four correctness/security warnings across `triage-hook`, `triage-core`, and `triaged`, and two hardening improvements:
+
+1. **UTF-8 slicing panics (`judge_rules.rs`):** `has_powershell_env_provider` (`&trimmed[..4]`) and `program_name` (`&base[base.len() - 4..]`) slice `&str` by byte index after checking byte length only, panicking when multi-byte UTF-8 scalars cross byte index 4 or `len - 4`. Compare `.as_bytes()` first (and `starts_with` on ASCII-lowercased `&str`).
+2. **Backslash-escape disqualifier bypass (`judge_rules.rs`):** `tokenize_words_preserving_windows_paths` checked `rest[1..].contains('\\')` across the whole remaining segment and preserved `\` unconditionally under `cfg!(windows)`, letting escaped flags/config keys like `find . -\exec sh -c evil \;`, `find . \-\exec ...`, `git -c core.\sshCommand=evil status a\ b`, and `rg --\pre=evil needle a\ b` evade `has_disqualifying_argument`. Bounding lookahead to the current token (`rest_of_token`), recognizing flag/kv tokens (while still keeping explicit `--flag=C:\...` Windows path values), and normalizing backslashes inside `has_disqualifying_argument` / `is_dangerous_git_config_key` / `has_write_git_subcommand` closes the bypass on both Unix and Windows.
+3. **Oversized/invalid stdin format detection (`triage-hook/src/main.rs`):** Returning `AgentFormat::Generic` on stdin read/parse failure or timeout emits Antigravity `{"decision":"ask"}` JSON inside Claude Code and Muse sessions instead of silent passthrough (`""`). Calling `detect_format(&serde_json::Value::Null)` preserves ambient env/CLI format detection on error paths.
+4. **PowerShell secret drives & `-Wait` hang (`judge_rules.rs`):** Parameter-colon forms (`-Path:Env:`, `-LiteralPath:Env:`), secret drives (`Variable:`, `Cert:`, `HKCU:`, `HKLM:`), `Test-Path`/`Resolve-Path`, and `Get-Content -Wait` must never auto-allow.
+5. **Windows pipe token parity (`triage-core/src/ipc.rs`, `triaged/src/ipc.rs`):** Long `TRIAGE_IPC_SOCKET` paths (`> 210` UTF-16 code units) and `""` differed between `triage-core` and `triaged`, and pipe prefixes `\\.\PIPE\` / `\\?\PIPE\` were stripped case-sensitively. Centralizing `windows_pipe_token` (with case-insensitive prefix stripping, empty rejection, and deterministic UTF-16 truncation + 64-bit FNV-1a digest) in `triage_core::ipc` keeps `triaged` and `triage-hook` identical without adding hashing crates to `triage-hook`.
+6. **Hook provisioning, `.gemini/config/hooks.json`, flag validation, and metacharacter quoting (`triaged/src/service.rs`, `triaged/src/judge.rs`):**
+   - `install_global_agent_hooks` must repair stale `"command"` strings in-place without resetting user `"enabled": false`, and gate `~/.gemini/antigravity-cli/bin/triage-hook` deletion + symlink maintenance to `#[cfg(unix)]`.
+   - `configure_hook` must also update `.gemini/config/hooks.json` when present so `get_hook_status` and Antigravity configs stay consistent.
+   - `is_triage_hook_command_valid` must tokenize commands so flags like `--format=muse` and quoted paths with spaces validate properly.
+   - `format_hook_command` should quote paths containing `&`, `(`, `)`, `'`, or `;` in addition to whitespace.
+
+## Plan
+
+1. **`crates/triage-core/src/ipc.rs` & `crates/triaged/src/ipc.rs`:**
+   - Case-insensitively strip `\\.\pipe\` / `\\?\pipe\` in `windows_pipe_token_raw`.
+   - Move `windows_pipe_token` (with empty check, UTF-16 limit, and FNV-1a hex suffix) into `triage_core::ipc`, derive `windows_pipe_endpoint` from it, and delegate `triaged::ipc::transport::windows_pipe_token` to `triage_core::ipc`.
+   - Add unit tests verifying case-insensitive stripping, empty rejection, overlong UTF-16 capping, and `triage-core`/`triaged` parity.
+2. **`crates/triage-core/src/judge_rules.rs`:**
+   - Fix UTF-8 slicing in `program_name` and `has_powershell_env_provider`.
+   - Restrict backslash lookahead to `rest_of_token`, preserve `--flag=<windows-path>` values while stripping shell escapes on flags/kvs/leading `\-`, and strip backslashes inside `has_disqualifying_argument`, `is_dangerous_git_config_key`, and `has_write_git_subcommand`.
+   - Extend PowerShell provider checks to `-Param:<drive>:`, `env:`, `variable:`, `cert:`, `hkcu:`, `hklm:`, `test-path`, `resolve-path`, and disqualify `get-content -wait`.
+   - Add regression tests for UTF-8 boundaries, backslash-escape evasion, and PowerShell secret providers / `-Wait`.
+3. **`crates/triage-hook/src/main.rs`:**
+   - Route `decide()` stdin parse/limit/timeout fallbacks through `detect_format(&serde_json::Value::Null)` (via testable `FormatEnv` helper) and add unit tests for Claude Code / Muse / Antigravity fallback behavior.
+4. **`crates/triaged/src/judge.rs` & `crates/triaged/src/service.rs`:**
+   - Harden `format_hook_command` quoting and argv[0] tokenization in `is_triage_hook_command_valid`.
+   - Extract shared `.agents`-format `PreToolUse` repair helper so `install_global_agent_hooks` preserves existing `"enabled"` states and `configure_hook` also updates existing `.gemini/config/hooks.json`; gate `agy_hook` remove+symlink cleanly to `#[cfg(unix)]`.
+   - Add unit tests for `--format=...` hook validation, metacharacter quoting, `.gemini/config/hooks.json` sync, and preserving `"enabled": false` during global hook repair.
+5. **Re-verify & Restack:**
+   - Run format, clippy, rustdoc, and tests on `fix/pretooluse-hook`, restack `feat/managed-worker-groups` (`#217`) and `feat/agent-teamwork` (`#218`), verify GitHub CI, rebuild release binaries with embedded Flutter web UI, reinstall to `~/.cargo/bin`, restart `triaged`, and smoke-test all binaries.

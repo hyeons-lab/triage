@@ -1536,7 +1536,10 @@ pub fn resolve_d1_model_path(
 
 pub(crate) fn format_hook_command(path: &std::path::Path) -> String {
     let raw = path.to_string_lossy();
-    if raw.chars().any(char::is_whitespace) {
+    if raw
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '&' | '(' | ')' | '\'' | ';'))
+    {
         format!("\"{raw}\"")
     } else {
         raw.into_owned()
@@ -1555,12 +1558,22 @@ pub(crate) fn resolve_hook_command() -> String {
 }
 
 pub(crate) fn is_triage_hook_command_valid(cmd: &str) -> bool {
-    let unquoted = cmd.trim().trim_matches('"');
-    if !unquoted.contains("triage-hook") {
+    let trimmed = cmd.trim();
+    if !trimmed.contains("triage-hook") {
         return false;
     }
-    if unquoted.contains('/') || unquoted.contains('\\') {
-        return std::path::Path::new(unquoted).is_file();
+    let tokens = triage_core::judge_rules::tokenize_words(trimmed);
+    let Some(exe) = tokens
+        .iter()
+        .find(|t| !t.contains('=') || t.contains('/') || t.contains('\\'))
+    else {
+        return false;
+    };
+    if !exe.contains("triage-hook") {
+        return false;
+    }
+    if exe.contains('/') || exe.contains('\\') {
+        return std::path::Path::new(exe).is_file();
     }
     true
 }
@@ -1798,18 +1811,88 @@ pub(crate) fn atomic_write_file(path: &std::path::Path, content: &str) -> anyhow
     Ok(())
 }
 
-/// Creates or updates `.agents/hooks.json`, `.claude/settings.json`, and Muse `settings.json` in the resolved workspace directory.
-pub fn configure_hook(
-    workspace_path: Option<&str>,
+/// Repairs the `triage-approval-judge` object inside an `.agents/hooks.json` or
+/// `.gemini/config/hooks.json` document. When `enabled_override` is `None`, any
+/// existing boolean `"enabled"` preference is preserved instead of forced to `true`.
+/// Returns `true` if `judge_obj` changed.
+pub(crate) fn repair_agents_judge_entry(
+    judge_obj: &mut serde_json::Map<String, serde_json::Value>,
+    hook_cmd: &str,
+    enabled_override: Option<bool>,
+) -> bool {
+    let mut changed = false;
+    match enabled_override {
+        Some(enabled) => {
+            if judge_obj.get("enabled").and_then(|v| v.as_bool()) != Some(enabled) {
+                judge_obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+                changed = true;
+            }
+        }
+        None => {
+            if judge_obj.get("enabled").and_then(|v| v.as_bool()).is_none() {
+                judge_obj.insert("enabled".to_string(), serde_json::Value::Bool(true));
+                changed = true;
+            }
+        }
+    }
+
+    if pre_tool_use_needs_command_update(judge_obj.get("PreToolUse"), hook_cmd) {
+        let mut updated_in_place = false;
+        if let Some(arr) = judge_obj
+            .get_mut("PreToolUse")
+            .and_then(|v| v.as_array_mut())
+        {
+            for entry in arr.iter_mut() {
+                let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                    continue;
+                };
+                for h in hooks.iter_mut() {
+                    let Some(h_obj) = h.as_object_mut() else {
+                        continue;
+                    };
+                    if let Some(cmd) = h_obj.get("command").and_then(|c| c.as_str())
+                        && cmd.contains("triage-hook")
+                    {
+                        h_obj.insert("command".to_string(), serde_json::json!(hook_cmd));
+                        updated_in_place = true;
+                    }
+                }
+            }
+        }
+        if !updated_in_place {
+            judge_obj.insert(
+                "PreToolUse".to_string(),
+                serde_json::json!([
+                    {
+                        "matcher": ".*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": hook_cmd,
+                                "timeout": 15
+                            }
+                        ]
+                    }
+                ]),
+            );
+        }
+        changed = true;
+    }
+
+    changed
+}
+
+fn configure_agents_hooks_file(
+    path: &std::path::Path,
+    hook_cmd: &str,
     enabled: bool,
-) -> anyhow::Result<JudgeHookStatus> {
-    let path = resolve_hooks_json_path(workspace_path);
+) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let mut json = if path.is_file() {
-        let content = std::fs::read_to_string(&path)?;
+        let content = std::fs::read_to_string(path)?;
         serde_json::from_str::<serde_json::Value>(&content)
             .unwrap_or_else(|_| serde_json::json!({}))
     } else {
@@ -1826,26 +1909,7 @@ pub fn configure_hook(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
-    let hook_cmd = resolve_hook_command();
-
-    judge_obj.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
-    if pre_tool_use_needs_command_update(judge_obj.get("PreToolUse"), &hook_cmd) {
-        judge_obj.insert(
-            "PreToolUse".to_string(),
-            serde_json::json!([
-                {
-                    "matcher": ".*",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": hook_cmd,
-                            "timeout": 15
-                        }
-                    ]
-                }
-            ]),
-        );
-    }
+    repair_agents_judge_entry(&mut judge_obj, hook_cmd, Some(enabled));
 
     map.insert(
         "triage-approval-judge".to_string(),
@@ -1853,7 +1917,23 @@ pub fn configure_hook(
     );
 
     let pretty = serde_json::to_string_pretty(&json)?;
-    atomic_write_file(&path, &pretty)?;
+    atomic_write_file(path, &pretty)
+}
+
+/// Creates or updates `.agents/hooks.json`, `.gemini/config/hooks.json` (when present),
+/// `.claude/settings.json`, and Muse `settings.json` in the resolved workspace directory.
+pub fn configure_hook(
+    workspace_path: Option<&str>,
+    enabled: bool,
+) -> anyhow::Result<JudgeHookStatus> {
+    let path = resolve_hooks_json_path(workspace_path);
+    let gemini_path = resolve_gemini_hooks_json_path(workspace_path);
+    let hook_cmd = resolve_hook_command();
+
+    configure_agents_hooks_file(&path, &hook_cmd, enabled)?;
+    if gemini_path.is_file() {
+        configure_agents_hooks_file(&gemini_path, &hook_cmd, enabled)?;
+    }
 
     // Also configure .claude/settings.json if present or workspace root exists
     let claude_path = resolve_claude_settings_path(workspace_path);
@@ -3903,6 +3983,61 @@ mod tests {
             quoted,
             r#""C:\Users\First Last\.cargo\bin\triage-hook.exe""#
         );
+
+        let meta_quoted =
+            format_hook_command(std::path::Path::new(r"C:\Users\R&D(1)\triage-hook.exe"));
+        assert_eq!(meta_quoted, r#""C:\Users\R&D(1)\triage-hook.exe""#);
+
+        // Flagged and quoted hook commands validate the argv[0] executable on disk.
+        let fake_bin = temp_path.join("Space Dir").join("triage-hook");
+        std::fs::create_dir_all(fake_bin.parent().unwrap()).expect("create fake bin dir");
+        std::fs::write(&fake_bin, "").expect("create fake triage-hook");
+        assert!(is_triage_hook_command_valid(&format!(
+            "{} --format=muse",
+            format_hook_command(&fake_bin)
+        )));
+        assert!(!is_triage_hook_command_valid(&format!(
+            "{} --format=claude",
+            temp_path.join("triage-hook-missing").display()
+        )));
+        assert!(is_triage_hook_command_valid("triage-hook --format=muse"));
+
+        // .gemini/config/hooks.json is also repaired and toggled when present.
+        let gemini_hooks_file = temp_path.join(".gemini").join("config").join("hooks.json");
+        std::fs::create_dir_all(gemini_hooks_file.parent().unwrap())
+            .expect("create .gemini/config");
+        std::fs::write(
+            &gemini_hooks_file,
+            format!(
+                r#"{{
+  "triage-approval-judge": {{
+    "enabled": true,
+    "PreToolUse": [
+      {{
+        "matcher": ".*",
+        "hooks": [
+          {{
+            "type": "command",
+            "command": "{foreign_path}",
+            "timeout": 15
+          }}
+        ]
+      }}
+    ]
+  }}
+}}"#
+            ),
+        )
+        .expect("write stale gemini hooks");
+        let repaired_gemini = configure_hook(Some(ws), true).expect("repair gemini hooks");
+        assert!(repaired_gemini.enabled);
+        let updated_gemini =
+            std::fs::read_to_string(&gemini_hooks_file).expect("read repaired gemini hooks");
+        assert!(!updated_gemini.contains(foreign_path));
+
+        // Disabling also disables .gemini/config/hooks.json so get_hook_status stays accurate.
+        let _ = configure_hook(Some(ws), false).expect("disable hooks");
+        assert!(!get_hook_status(Some(ws)).enabled);
 
         let _ = std::fs::remove_dir_all(&temp_path);
     }

@@ -11,11 +11,13 @@
 - 2026-11-19T08:54-0800 `crates/triage-hook/src/main.rs` & `docs/approval-judge.md` — emitted explicit `{"decision":"ask",...}` JSON for Antigravity/Generic `Ask` verdicts while keeping silent passthrough for Claude Code/Muse, added Windows named-pipe IPC (`OpenOptions` with `ERROR_PIPE_BUSY` retry), prevented outer hook envelope fields from leaking into `updatedInput`, omitted empty `permissionDecisionReason`, and documented Windows named-pipe IPC.
 - 2026-11-19T08:54-0800 `crates/triaged/src/judge.rs`, `crates/triaged/src/service.rs`, `crates/triaged/src/ipc.rs` — added hook command quoting (`format_hook_command`), disk validation (`is_triage_hook_command_valid`) and stale-path repair in `configure_hook` and `install_global_agent_hooks` (plus `configure_hook_repairs_stale_foreign_hook_paths` test), and shared `windows_pipe_token_raw` with `triage-core`.
 - 2026-11-19T10:39-0800 Rebased onto `fix/alt-screen-wheel-arrows` (`#216`), resolved the `judge_rules.rs` test-module merge cleanly alongside `#213` d1 config persistence tests, gated `CLIENT_WRITE_TIMEOUT` in `crates/triaged/src/ipc.rs` with `#[cfg(unix)]` (and fixed Windows-only clippy warnings on `child_req` in `crates/triaged/src/ipc.rs` and `tcp_listener` in `crates/triaged/src/main.rs`), and renumbered devlog/plan from `000181` to `000194` to avoid colliding with `#212`.
+- 2026-11-19T12:20-0800 Addressed PR `#228` Antigravity Code Review findings across `triage-core`, `triage-hook`, and `triaged`: replaced byte-index `&str` slicing in `has_powershell_env_provider` and `program_name` with byte-safe checks, bounded `tokenize_words_preserving_windows_paths` lookahead to the current token and stripped backslash escapes on flags/`=` key-values/`\-` prefixes plus disqualifier checks, extended PowerShell checks (`-Path:Env:`, `Variable:`, `Cert:`, `HKCU:`, `HKLM:`, `Test-Path`, `Resolve-Path`, `Get-Acl`, `Get-Content -Wait`), routed `triage-hook` stdin parse/limit/timeout fallbacks through `detect_format(&serde_json::Value::Null)`, centralized `windows_pipe_token` (with case-insensitive `\\.\PIPE\` / `\\?\PIPE\` prefix stripping and deterministic FNV-1a capping) in `triage_core::ipc`, preserved `"enabled": false` and gated `agy_hook` symlink removal to `#[cfg(unix)]` in `install_global_agent_hooks`, updated `.gemini/config/hooks.json` in `configure_hook`, added argv[0] tokenization in `is_triage_hook_command_valid`, quoted shell metacharacters (`&`, `(`, `)`, `'`, `;`) in `format_hook_command`, and added regression tests for each case.
 
 ## Decisions
 
 - 2026-11-19T08:11-0800 Preserve silent passthrough (`""`) on `JudgeDecision::Ask` for `ClaudeCode` and `Muse` while restoring explicit JSON `{"decision":"ask",...}` output for `Antigravity` and `Generic` to comply with Antigravity's `PreToolUse` stdout contract.
 - 2026-11-19T08:11-0800 Implement Windows named-pipe IPC in `triage-hook` using `std::fs::OpenOptions` with `ERROR_PIPE_BUSY` retry so `triage-hook` stays free of heavy runtime dependencies while matching `triaged`'s Windows IPC protocol.
+- 2026-11-19T12:20-0800 Hash overlong Windows pipe tokens in `triage_core::ipc::windows_pipe_token` using deterministic 64-bit FNV-1a and have `triaged::ipc::transport::windows_pipe_token` delegate to it so `triaged` and `triage-hook` derive identical pipe tokens without adding hashing crates to `triage-hook`.
 
 ## Issues
 
@@ -24,7 +26,8 @@
 
 ## Commits
 
-- HEAD — fix(hook,judge): repair PreToolUse output, Windows pipe IPC, and stale hook paths
+- 66ebf85 — fix(hook,judge): repair PreToolUse output, Windows pipe IPC, and stale hook paths
+- HEAD — fix(hook,judge): address PR #228 review findings
 
 ## Progress
 
@@ -32,3 +35,4 @@
 - [x] Implement fixes in `triage-core`, `triage-hook`, and `triaged`
 - [x] Format, lint modified crates, smoke-test `triage-hook.exe`, and run tests
 - [x] Update devlog and prepare commit
+- [x] Address PR #228 review blocking issues, warnings, and test cases
